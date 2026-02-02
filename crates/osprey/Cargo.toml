@@ -1,0 +1,35 @@
+[package]
+name = "osprey"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Peptide-centric DIA analysis tool"
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "osprey"
+path = "src/main.rs"
+
+[lib]
+name = "osprey"
+path = "src/lib.rs"
+
+[dependencies]
+osprey-core = { workspace = true }
+osprey-io = { workspace = true }
+osprey-regression = { workspace = true }
+osprey-chromatography = { workspace = true }
+osprey-scoring = { workspace = true }
+osprey-fdr = { workspace = true }
+
+clap = { workspace = true }
+rayon = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+indicatif = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

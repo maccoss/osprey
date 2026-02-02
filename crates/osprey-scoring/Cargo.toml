@@ -1,0 +1,17 @@
+[package]
+name = "osprey-scoring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Feature extraction and scoring for Osprey"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+osprey-core = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

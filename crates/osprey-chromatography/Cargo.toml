@@ -1,0 +1,17 @@
+[package]
+name = "osprey-chromatography"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Chromatographic analysis for Osprey (peak detection, EMG fitting)"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+osprey-core = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

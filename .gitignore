@@ -1,0 +1,48 @@
+# Build outputs
+/target/
+**/*.rs.bk
+
+# Cargo.lock is committed for binaries, but ignored for libraries
+# Since this is a binary application, we keep Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test data
+example_test_data/
+
+# Generated config files (user-specific)
+osprey-config.yaml
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+
+# Coverage reports
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Documentation build
+/target/doc/
+
+# Benchmark results
+/target/criterion/
+
+# OS-specific files
+Thumbs.db
+.DS_Store
+
+# Environment files (may contain secrets)
+.env
+.env.local

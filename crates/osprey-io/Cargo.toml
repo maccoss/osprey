@@ -1,0 +1,23 @@
+[package]
+name = "osprey-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "File I/O for Osprey (mzML, blib, elib, DIA-NN TSV)"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+osprey-core = { workspace = true }
+mzdata = { workspace = true }
+quick-xml = { workspace = true }
+rusqlite = { workspace = true }
+csv = { workspace = true }
+flate2 = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

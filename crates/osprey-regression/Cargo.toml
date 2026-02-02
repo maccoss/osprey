@@ -1,0 +1,20 @@
+[package]
+name = "osprey-regression"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Spectrum regression engine for Osprey DIA analysis"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+osprey-core = { workspace = true }
+ndarray = { workspace = true }
+sprs = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
