@@ -5,10 +5,12 @@
 
 pub mod config;
 pub mod error;
+pub mod isotope;
 pub mod traits;
 pub mod types;
 
 pub use config::*;
 pub use error::{OspreyError, Result};
+pub use isotope::*;
 pub use traits::*;
 pub use types::*;

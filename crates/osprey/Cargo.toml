@@ -30,6 +30,14 @@ log = { workspace = true }
 env_logger = { workspace = true }
 indicatif = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
+
+# Optional streaming dependencies
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+default = []
+streaming = ["tokio", "osprey-io/streaming", "osprey-scoring/streaming"]

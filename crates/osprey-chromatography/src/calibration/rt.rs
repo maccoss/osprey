@@ -556,7 +556,7 @@ impl Default for RTStratifiedSampler {
 // Helper functions
 
 /// Compute median of a slice
-fn median(values: &[f64]) -> f64 {
+pub fn median(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
@@ -571,7 +571,7 @@ fn median(values: &[f64]) -> f64 {
 }
 
 /// Compute standard deviation of a slice
-fn std_dev(values: &[f64]) -> f64 {
+pub fn std_dev(values: &[f64]) -> f64 {
     if values.len() < 2 {
         return 0.0;
     }

@@ -28,6 +28,10 @@ pub struct OspreyConfig {
     pub resolution_mode: ResolutionMode,
     /// Custom bin width override
     pub custom_bin_width: Option<f64>,
+    /// Fragment tolerance for LibCosine scoring (ppm-based matching, no binning)
+    pub fragment_tolerance: FragmentToleranceConfig,
+    /// Precursor tolerance for MS1 matching
+    pub precursor_tolerance: FragmentToleranceConfig,
 
     // Candidate selection
     /// Maximum candidates per spectrum
@@ -74,6 +78,12 @@ pub struct OspreyConfig {
     pub export_coefficients: bool,
     /// Write features to separate TSV
     pub export_features: bool,
+
+    // Processing mode
+    /// Use streaming mode for memory-efficient processing
+    /// When enabled, spectra are processed as they stream in from the mzML file
+    /// rather than loading everything into memory first
+    pub streaming: bool,
 }
 
 impl Default for OspreyConfig {
@@ -85,6 +95,8 @@ impl Default for OspreyConfig {
             output_report: None,
             resolution_mode: ResolutionMode::Auto,
             custom_bin_width: None,
+            fragment_tolerance: FragmentToleranceConfig::default(), // 10 ppm for HRAM
+            precursor_tolerance: FragmentToleranceConfig::hram(10.0), // 10 ppm for precursor
             max_candidates_per_spectrum: 200,
             rt_calibration: RTCalibrationConfig::default(),
             regularization_lambda: RegularizationSetting::CrossValidated,
@@ -100,6 +112,7 @@ impl Default for OspreyConfig {
             memory_limit_gb: None,
             export_coefficients: false,
             export_features: false,
+            streaming: false,
         }
     }
 }
@@ -189,23 +202,33 @@ output_report: results.tsv  # Optional TSV report
 
 # Resolution mode
 resolution_mode: Auto
-# Options: Auto, UnitResolution, or HRAM with tolerance_ppm
-# resolution_mode:
-#   HRAM:
-#     tolerance_ppm: 20.0
+# Options: Auto, UnitResolution, or HRAM
+# Unit resolution: 1.0005079 Th bins, 0.4 offset (for Stellar/low-res instruments)
+# HRAM: 0.02 Th bins, 0 offset (for Astral/high-res instruments)
+
+# Fragment tolerance for LibCosine scoring (ppm-based peak matching)
+# This is used for calibration scoring and RT/m/z calibration
+fragment_tolerance:
+  tolerance: 10.0   # Tolerance value
+  unit: Ppm         # Unit: Ppm or Da (use Ppm for HRAM, Da for unit resolution)
+
+# Precursor tolerance for MS1 matching
+precursor_tolerance:
+  tolerance: 10.0
+  unit: Ppm
 
 # Candidate selection (precursor filtering uses isolation window from mzML)
 max_candidates_per_spectrum: 200
 
-# RT Calibration (multi-file strategy)
-# First file: calibrates with ALL peptides using wide tolerance (25% of RT range)
-# Subsequent files: reuse calibration from first file
+# RT Calibration
+# Samples a subset of peptides for fast calibration
 rt_calibration:
   enabled: true
   loess_bandwidth: 0.3            # Fraction of data for local fits (0.2-0.5)
   min_calibration_points: 50      # Minimum detections required
   rt_tolerance_factor: 3.0        # Multiplier for residual SD (for calibrated search)
-  initial_tolerance_fraction: 0.25  # Initial tolerance as fraction of RT range (first file)
+  initial_tolerance_fraction: 1.0   # Initial tolerance as fraction of RT range (1.0 = no RT filtering during calibration)
+  calibration_sample_size: 10000  # Number of peptides to sample for calibration (0 = use all)
 
 # Regression
 regularization_lambda: CrossValidated
@@ -232,6 +255,9 @@ n_threads: 0  # 0 = auto-detect
 # Output options
 export_coefficients: false  # Include coefficient time series
 export_features: false      # Write features to TSV
+
+# Processing mode
+streaming: false  # Use streaming mode for memory-efficient processing (requires streaming feature)
 "#;
 
         fs::write(path.as_ref(), template).map_err(|e| {
@@ -276,6 +302,9 @@ export_features: false      # Write features to TSV
         if args.verbose {
             // Logging level would be handled separately
         }
+        if args.streaming {
+            self.streaming = true;
+        }
     }
 }
 
@@ -292,6 +321,7 @@ pub struct ConfigOverrides {
     pub lambda: Option<f64>,
     pub verbose: bool,
     pub disable_rt_calibration: bool,
+    pub streaming: bool,
 }
 
 /// Two-step search configuration
@@ -338,9 +368,16 @@ impl TwoStepConfig {
 /// Controls how library retention times are calibrated against measured RTs.
 /// Uses LOESS (Local Polynomial Regression) for calibration.
 ///
+/// ## Calibration Sampling Strategy (pyXcorrDIA-style)
+///
+/// For large libraries (millions of entries), calibration samples a subset:
+/// - **Default: 2000 peptides** sampled for calibration scoring
+/// - **Doubles to 4000** if first attempt doesn't yield enough calibration points
+/// - Dramatically faster than scoring the full library
+///
 /// ## Multi-File Strategy
 ///
-/// - **First file**: Uses ALL library peptides with wide tolerance (initial_tolerance_fraction × RT range)
+/// - **First file**: Sample peptides with wide RT tolerance (initial_tolerance_fraction × RT range)
 /// - **Subsequent files**: Reuse calibration from first file with tight tolerance (residual SD × factor)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RTCalibrationConfig {
@@ -354,8 +391,12 @@ pub struct RTCalibrationConfig {
     pub rt_tolerance_factor: f64,
     /// Fallback RT tolerance (minutes) if calibration fails
     pub fallback_rt_tolerance: f64,
-    /// Initial tolerance as fraction of library RT range for first file calibration (default: 0.25 = 25%)
+    /// Initial tolerance as fraction of library RT range for first file calibration (default: 1.0 = 100%)
+    /// Set to 1.0 to match pyXcorrDIA's approach of no RT filtering during calibration
     pub initial_tolerance_fraction: f64,
+    /// Number of peptides to sample for calibration (default: 2000, like pyXcorrDIA)
+    /// Set to 0 to use all library entries (slower but more comprehensive)
+    pub calibration_sample_size: usize,
 }
 
 impl Default for RTCalibrationConfig {
@@ -366,7 +407,8 @@ impl Default for RTCalibrationConfig {
             min_calibration_points: 50,
             rt_tolerance_factor: 3.0,
             fallback_rt_tolerance: 2.0,
-            initial_tolerance_fraction: 0.25, // 25% of RT range
+            initial_tolerance_fraction: 1.0, // 100% of RT range (no RT filtering, like pyXcorrDIA)
+            calibration_sample_size: 10000, // Sample 10000 peptides (Rust is faster than pyXcorrDIA's 2000)
         }
     }
 }
@@ -395,13 +437,10 @@ impl RTCalibrationConfig {
 /// Resolution mode for spectrum binning
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ResolutionMode {
-    /// Unit resolution (~1 Th bins)
+    /// Unit resolution (~1.0005079 Th bins, 0.4 offset)
     UnitResolution,
-    /// High-resolution accurate mass
-    HRAM {
-        /// Tolerance in ppm
-        tolerance_ppm: f64,
-    },
+    /// High-resolution accurate mass (0.02 Th bins, 0 offset)
+    HRAM,
     /// Auto-detect from data
     Auto,
 }
@@ -444,6 +483,84 @@ impl Default for DecoyMethod {
     fn default() -> Self {
         DecoyMethod::Reverse
     }
+}
+
+/// Fragment tolerance configuration for LibCosine scoring
+///
+/// LibCosine uses direct peak matching with a tolerance window, NOT binning.
+/// This matches pyXcorrDIA's implementation exactly.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FragmentToleranceConfig {
+    /// Fragment m/z tolerance value
+    pub tolerance: f64,
+    /// Tolerance unit (ppm or Da)
+    pub unit: ToleranceUnit,
+}
+
+impl Default for FragmentToleranceConfig {
+    fn default() -> Self {
+        // Default: 10 ppm for HRAM data (matches pyXcorrDIA default)
+        Self {
+            tolerance: 10.0,
+            unit: ToleranceUnit::Ppm,
+        }
+    }
+}
+
+impl FragmentToleranceConfig {
+    /// Create configuration for HRAM data (ppm-based)
+    pub fn hram(ppm: f64) -> Self {
+        Self {
+            tolerance: ppm,
+            unit: ToleranceUnit::Ppm,
+        }
+    }
+
+    /// Create configuration for unit resolution data (Da-based)
+    pub fn unit_resolution(da: f64) -> Self {
+        Self {
+            tolerance: da,
+            unit: ToleranceUnit::Da,
+        }
+    }
+
+    /// Calculate tolerance in Da for a given m/z
+    pub fn tolerance_da(&self, mz: f64) -> f64 {
+        match self.unit {
+            ToleranceUnit::Ppm => mz * self.tolerance / 1e6,
+            ToleranceUnit::Da => self.tolerance,
+        }
+    }
+
+    /// Check if a given m/z delta is within tolerance
+    pub fn within_tolerance(&self, lib_mz: f64, obs_mz: f64) -> bool {
+        let delta = (obs_mz - lib_mz).abs();
+        match self.unit {
+            ToleranceUnit::Ppm => {
+                let ppm_error = delta / lib_mz * 1e6;
+                ppm_error <= self.tolerance
+            }
+            ToleranceUnit::Da => delta <= self.tolerance,
+        }
+    }
+
+    /// Calculate mass error in the configured unit
+    pub fn mass_error(&self, lib_mz: f64, obs_mz: f64) -> f64 {
+        let delta = obs_mz - lib_mz;
+        match self.unit {
+            ToleranceUnit::Ppm => delta / lib_mz * 1e6,
+            ToleranceUnit::Da => delta,
+        }
+    }
+}
+
+/// Tolerance unit for m/z matching
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToleranceUnit {
+    /// Parts per million
+    Ppm,
+    /// Daltons (m/z units)
+    Da,
 }
 
 /// Spectral library source
@@ -541,25 +658,18 @@ impl BinConfig {
         }
     }
 
-    /// Create HRAM binning configuration
-    pub fn hram(tolerance_th: f64) -> Self {
+    /// Create HRAM binning configuration (fixed 0.02 Th bins, 0 offset)
+    pub fn hram() -> Self {
         let min_mz = 100.0;
         let max_mz = 2000.0;
+        let bin_width = 0.02; // Fixed 0.02 Th for HRAM Xcorr
         Self {
-            bin_width: tolerance_th,
+            bin_width,
             bin_offset: 0.0,
             min_mz,
             max_mz,
-            n_bins: ((max_mz - min_mz) / tolerance_th).ceil() as usize,
+            n_bins: ((max_mz - min_mz) / bin_width).ceil() as usize,
         }
-    }
-
-    /// Create HRAM binning configuration from ppm tolerance
-    pub fn hram_ppm(tolerance_ppm: f64) -> Self {
-        // Use tolerance at a reference m/z (e.g., 500 Th)
-        let ref_mz = 500.0;
-        let tolerance_th = ref_mz * tolerance_ppm / 1_000_000.0;
-        Self::hram(tolerance_th)
     }
 
     /// Convert m/z to bin index
@@ -656,9 +766,57 @@ mod tests {
         let config = RTCalibrationConfig::default();
         assert!(config.enabled);
         assert_eq!(config.loess_bandwidth, 0.3);
-        assert_eq!(config.initial_tolerance_fraction, 0.25);
+        assert_eq!(config.initial_tolerance_fraction, 1.0);
 
         let disabled = RTCalibrationConfig::disabled();
         assert!(!disabled.enabled);
+    }
+
+    #[test]
+    fn test_fragment_tolerance_ppm() {
+        let config = FragmentToleranceConfig::hram(10.0);
+        assert_eq!(config.tolerance, 10.0);
+        assert_eq!(config.unit, ToleranceUnit::Ppm);
+
+        // Test tolerance_da conversion at 500 m/z
+        // 10 ppm of 500 = 0.005 Da
+        let tol_da = config.tolerance_da(500.0);
+        assert!((tol_da - 0.005).abs() < 1e-10);
+
+        // Test within_tolerance at exactly 10 ppm
+        assert!(config.within_tolerance(500.0, 500.005));
+        assert!(!config.within_tolerance(500.0, 500.006)); // >10 ppm
+
+        // Test mass_error calculation
+        // (500.005 - 500.0) / 500.0 * 1e6 = 10 ppm
+        let error = config.mass_error(500.0, 500.005);
+        assert!((error - 10.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_fragment_tolerance_da() {
+        let config = FragmentToleranceConfig::unit_resolution(0.3);
+        assert_eq!(config.tolerance, 0.3);
+        assert_eq!(config.unit, ToleranceUnit::Da);
+
+        // Test tolerance_da (should be constant)
+        assert!((config.tolerance_da(500.0) - 0.3).abs() < 1e-10);
+        assert!((config.tolerance_da(1000.0) - 0.3).abs() < 1e-10);
+
+        // Test within_tolerance
+        assert!(config.within_tolerance(500.0, 500.29));  // 0.29 Da
+        assert!(!config.within_tolerance(500.0, 500.31)); // 0.31 Da
+
+        // Test mass_error calculation
+        let error = config.mass_error(500.0, 500.25);
+        assert!((error - 0.25).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_fragment_tolerance_default() {
+        let config = FragmentToleranceConfig::default();
+        // Default should be 10 ppm for HRAM
+        assert_eq!(config.tolerance, 10.0);
+        assert_eq!(config.unit, ToleranceUnit::Ppm);
     }
 }

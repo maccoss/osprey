@@ -12,6 +12,9 @@ repository.workspace = true
 osprey-core = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }

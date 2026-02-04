@@ -6,6 +6,7 @@
 //! - Peak boundary determination
 //! - Chromatographic feature extraction
 //! - RT calibration using LOESS regression
+//! - Mass calibration for MS1/MS2 measurements
 
 pub mod calibration;
 
@@ -13,7 +14,14 @@ use osprey_core::{PeakBoundaries, PeakQuality, Result};
 
 // Re-export calibration types
 pub use calibration::{
+    // Core types
+    CalibrationParams, CalibrationMetadata, MzCalibration, RTCalibrationParams, RTCalibrationMethod,
+    // RT calibration
     RTCalibration, RTCalibrationStats, RTCalibrator, RTCalibratorConfig, RTStratifiedSampler,
+    // Mass calibration
+    MzQCData, calculate_mz_calibration, apply_mz_calibration, calculate_ppm_error,
+    // I/O
+    save_calibration, load_calibration, calibration_filename,
 };
 
 /// Simple peak detector for coefficient time series

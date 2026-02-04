@@ -55,10 +55,6 @@ struct Args {
     #[arg(long, default_value = "auto")]
     resolution: String,
 
-    /// HRAM tolerance in ppm (used when resolution=hram)
-    #[arg(long, default_value_t = 20.0)]
-    hram_tolerance: f64,
-
     /// RT tolerance in minutes (fallback when calibration disabled)
     #[arg(long, default_value_t = 2.0)]
     rt_tolerance: f64,
@@ -86,6 +82,10 @@ struct Args {
     /// Write TSV report to this file
     #[arg(long)]
     report: Option<PathBuf>,
+
+    /// Use streaming mode for memory-efficient processing (requires streaming feature)
+    #[arg(long)]
+    streaming: bool,
 
     /// Verbose output
     #[arg(short, long)]
@@ -134,6 +134,7 @@ fn main() -> Result<()> {
         lambda: args.lambda,
         verbose: args.verbose,
         disable_rt_calibration: args.no_rt_calibration,
+        streaming: args.streaming,
     };
 
     // Apply CLI overrides
@@ -142,9 +143,7 @@ fn main() -> Result<()> {
     // Override resolution mode if specified
     let resolution_mode = match args.resolution.to_lowercase().as_str() {
         "unit" => ResolutionMode::UnitResolution,
-        "hram" => ResolutionMode::HRAM {
-            tolerance_ppm: args.hram_tolerance,
-        },
+        "hram" => ResolutionMode::HRAM,
         "auto" | _ => config.resolution_mode,
     };
     config.resolution_mode = resolution_mode;
@@ -157,6 +156,18 @@ fn main() -> Result<()> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build_global()?;
+    }
+
+    // Check streaming mode
+    #[cfg(feature = "streaming")]
+    if config.streaming {
+        log::info!("Streaming mode enabled");
+    }
+
+    #[cfg(not(feature = "streaming"))]
+    if args.streaming {
+        log::warn!("Streaming mode requested but 'streaming' feature not compiled. Ignoring.");
+        // Don't set config.streaming since we already merged args
     }
 
     // Run analysis

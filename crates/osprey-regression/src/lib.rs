@@ -9,6 +9,10 @@
 //! - **Ridge**: Solve regularized least squares problems
 //! - **Sparse**: HRAM support with sparse matrices and ppm-based matching
 
+// Ensure BLAS is linked for ndarray operations
+extern crate blas_src;
+extern crate openblas_src;
+
 pub mod binning;
 pub mod matrix;
 pub mod ridge;

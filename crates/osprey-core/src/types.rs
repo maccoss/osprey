@@ -180,6 +180,156 @@ impl NeutralLoss {
     }
 }
 
+/// MS1 (survey) spectrum from data file
+///
+/// Used for precursor isotope envelope extraction and MS1 mass calibration.
+/// pyXcorrDIA extracts M+0 peak from MS1 spectra for accurate mass calibration.
+#[derive(Debug, Clone)]
+pub struct MS1Spectrum {
+    /// Scan number in the file
+    pub scan_number: u32,
+    /// Retention time in minutes
+    pub retention_time: f64,
+    /// m/z values
+    pub mzs: Vec<f64>,
+    /// Intensities
+    pub intensities: Vec<f32>,
+}
+
+impl MS1Spectrum {
+    /// Create a new MS1 spectrum
+    pub fn new(scan_number: u32, retention_time: f64) -> Self {
+        Self {
+            scan_number,
+            retention_time,
+            mzs: Vec::new(),
+            intensities: Vec::new(),
+        }
+    }
+
+    /// Get the number of peaks
+    pub fn len(&self) -> usize {
+        self.mzs.len()
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.mzs.is_empty()
+    }
+
+    /// Find peak within tolerance and return (observed_mz, intensity)
+    ///
+    /// Returns the most intense peak within the tolerance window.
+    pub fn find_peak_ppm(&self, target_mz: f64, tolerance_ppm: f64) -> Option<(f64, f32)> {
+        let mut best_intensity = 0.0f32;
+        let mut best_mz = None;
+
+        for (&mz, &intensity) in self.mzs.iter().zip(self.intensities.iter()) {
+            let ppm_error = ((mz - target_mz) / target_mz).abs() * 1e6;
+            if ppm_error <= tolerance_ppm && intensity > best_intensity {
+                best_intensity = intensity;
+                best_mz = Some(mz);
+            }
+        }
+
+        best_mz.map(|mz| (mz, best_intensity))
+    }
+}
+
+/// Isotope envelope extracted from MS1 spectrum (pyXcorrDIA-compatible)
+///
+/// Contains intensities for M-1, M+0, M+1, M+2, M+3 isotope peaks.
+/// The M+0 (monoisotopic) peak is used for MS1 mass calibration.
+#[derive(Debug, Clone)]
+pub struct IsotopeEnvelope {
+    /// Extracted intensities [M-1, M+0, M+1, M+2, M+3]
+    pub intensities: [f64; 5],
+    /// Observed M+0 m/z (for mass calibration)
+    pub m0_observed_mz: Option<f64>,
+    /// Mass error of M+0 peak (observed - theoretical) in Da
+    pub m0_mass_error: Option<f64>,
+}
+
+impl IsotopeEnvelope {
+    /// Neutron mass for isotope spacing calculation
+    ///
+    /// This value (1.002868 Da) comes from Monocle:
+    /// Rad R, et al. "Improved Monoisotopic Mass Estimation for Deeper Proteome Coverage"
+    /// https://pmc.ncbi.nlm.nih.gov/articles/PMC12204116/
+    ///
+    /// Also used by pyXcorrDIA for isotope envelope extraction.
+    pub const NEUTRON_MASS: f64 = 1.002868;
+
+    /// Calculate expected isotope m/z values for a precursor
+    ///
+    /// Returns [M-1, M+0, M+1, M+2, M+3] m/z values
+    pub fn calculate_isotope_mzs(precursor_mz: f64, charge: u8) -> [f64; 5] {
+        let isotope_gap = Self::NEUTRON_MASS / charge as f64;
+        [
+            precursor_mz - isotope_gap,      // M-1
+            precursor_mz,                     // M+0 (monoisotopic)
+            precursor_mz + isotope_gap,       // M+1
+            precursor_mz + 2.0 * isotope_gap, // M+2
+            precursor_mz + 3.0 * isotope_gap, // M+3
+        ]
+    }
+
+    /// Extract isotope envelope from MS1 spectrum (pyXcorrDIA-compatible)
+    ///
+    /// For each expected isotope m/z, finds the best matching peak within tolerance.
+    /// Returns extracted intensities and M+0 mass error for calibration.
+    ///
+    /// # Arguments
+    /// * `ms1` - MS1 spectrum to extract from
+    /// * `precursor_mz` - Theoretical monoisotopic precursor m/z
+    /// * `charge` - Precursor charge state
+    /// * `tolerance_ppm` - m/z matching tolerance in ppm (default: 10)
+    pub fn extract(
+        ms1: &MS1Spectrum,
+        precursor_mz: f64,
+        charge: u8,
+        tolerance_ppm: f64,
+    ) -> Self {
+        let expected_mzs = Self::calculate_isotope_mzs(precursor_mz, charge);
+        let mut intensities = [0.0f64; 5];
+        let mut m0_observed_mz = None;
+        let mut m0_mass_error = None;
+
+        for (i, &target_mz) in expected_mzs.iter().enumerate() {
+            if let Some((obs_mz, intensity)) = ms1.find_peak_ppm(target_mz, tolerance_ppm) {
+                intensities[i] = intensity as f64;
+
+                // Track M+0 peak (index 1) for mass calibration
+                if i == 1 {
+                    m0_observed_mz = Some(obs_mz);
+                    m0_mass_error = Some(obs_mz - target_mz);
+                }
+            }
+        }
+
+        Self {
+            intensities,
+            m0_observed_mz,
+            m0_mass_error,
+        }
+    }
+
+    /// Calculate M+0 mass error in ppm
+    pub fn m0_ppm_error(&self, precursor_mz: f64) -> Option<f64> {
+        self.m0_mass_error.map(|delta| delta / precursor_mz * 1e6)
+    }
+
+    /// Get M+0 intensity
+    pub fn m0_intensity(&self) -> f64 {
+        self.intensities[1]
+    }
+
+    /// Check if M+0 was detected
+    pub fn has_m0(&self) -> bool {
+        self.m0_observed_mz.is_some()
+    }
+}
+
 /// MS/MS spectrum from data file
 #[derive(Debug, Clone)]
 pub struct Spectrum {
@@ -503,5 +653,102 @@ mod tests {
         assert_eq!(IonType::from_char('Y'), IonType::Y);
         assert_eq!(IonType::from_char('z'), IonType::Z);
         assert_eq!(IonType::from_char('?'), IonType::Unknown);
+    }
+
+    #[test]
+    fn test_ms1_spectrum_find_peak() {
+        let mut ms1 = MS1Spectrum::new(1, 10.0);
+        ms1.mzs = vec![499.995, 500.0, 500.005, 501.0];
+        ms1.intensities = vec![50.0, 100.0, 75.0, 25.0];
+
+        // Find peak at 500.0 with 10 ppm tolerance
+        let result = ms1.find_peak_ppm(500.0, 10.0);
+        assert!(result.is_some());
+        let (mz, int) = result.unwrap();
+        // Should find the 100.0 intensity peak at 500.0
+        assert!((mz - 500.0).abs() < 0.001);
+        assert!((int - 100.0).abs() < 0.1);
+
+        // Find peak at 501.0
+        let result2 = ms1.find_peak_ppm(501.0, 10.0);
+        assert!(result2.is_some());
+
+        // No peak at 600.0
+        let result3 = ms1.find_peak_ppm(600.0, 10.0);
+        assert!(result3.is_none());
+    }
+
+    #[test]
+    fn test_isotope_envelope_mz_calculation() {
+        // Test isotope m/z calculation for charge 2
+        let mzs = IsotopeEnvelope::calculate_isotope_mzs(500.0, 2);
+        let gap = IsotopeEnvelope::NEUTRON_MASS / 2.0; // ~0.501434
+
+        assert!((mzs[0] - (500.0 - gap)).abs() < 1e-6); // M-1
+        assert!((mzs[1] - 500.0).abs() < 1e-6);         // M+0
+        assert!((mzs[2] - (500.0 + gap)).abs() < 1e-6); // M+1
+        assert!((mzs[3] - (500.0 + 2.0 * gap)).abs() < 1e-6); // M+2
+        assert!((mzs[4] - (500.0 + 3.0 * gap)).abs() < 1e-6); // M+3
+    }
+
+    #[test]
+    fn test_isotope_envelope_extraction() {
+        // Create MS1 spectrum with isotope peaks
+        let mut ms1 = MS1Spectrum::new(1, 10.0);
+        let gap = IsotopeEnvelope::NEUTRON_MASS / 2.0; // charge 2
+
+        // Add isotope peaks with slight mass error on M+0
+        let m0_observed = 500.002; // 4 ppm error
+        ms1.mzs = vec![
+            500.0 - gap,       // M-1
+            m0_observed,       // M+0 with +2 mDa error
+            500.0 + gap,       // M+1
+            500.0 + 2.0 * gap, // M+2
+            500.0 + 3.0 * gap, // M+3
+        ];
+        ms1.intensities = vec![10.0, 100.0, 80.0, 40.0, 15.0];
+
+        // Extract envelope
+        let envelope = IsotopeEnvelope::extract(&ms1, 500.0, 2, 10.0);
+
+        // Check intensities
+        assert!((envelope.intensities[0] - 10.0).abs() < 0.1);  // M-1
+        assert!((envelope.intensities[1] - 100.0).abs() < 0.1); // M+0
+        assert!((envelope.intensities[2] - 80.0).abs() < 0.1);  // M+1
+        assert!((envelope.intensities[3] - 40.0).abs() < 0.1);  // M+2
+        assert!((envelope.intensities[4] - 15.0).abs() < 0.1);  // M+3
+
+        // Check M+0 was detected
+        assert!(envelope.has_m0());
+        assert!(envelope.m0_observed_mz.is_some());
+        assert!((envelope.m0_observed_mz.unwrap() - m0_observed).abs() < 1e-6);
+
+        // Check mass error (observed - theoretical = 0.002 Da)
+        assert!(envelope.m0_mass_error.is_some());
+        assert!((envelope.m0_mass_error.unwrap() - 0.002).abs() < 1e-6);
+
+        // Check ppm error (0.002 / 500.0 * 1e6 = 4 ppm)
+        let ppm = envelope.m0_ppm_error(500.0).unwrap();
+        assert!((ppm - 4.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_isotope_envelope_missing_peaks() {
+        // MS1 spectrum missing some isotope peaks
+        let mut ms1 = MS1Spectrum::new(1, 10.0);
+        ms1.mzs = vec![500.0, 500.5]; // Only M+0 and M+1
+        ms1.intensities = vec![100.0, 80.0];
+
+        let envelope = IsotopeEnvelope::extract(&ms1, 500.0, 2, 10.0);
+
+        // M-1 and M+2, M+3 should be 0
+        assert!(envelope.intensities[0] < 0.1); // M-1 missing
+        assert!(envelope.intensities[1] > 90.0); // M+0 present
+        assert!(envelope.intensities[2] > 70.0); // M+1 present
+        assert!(envelope.intensities[3] < 0.1); // M+2 missing
+        assert!(envelope.intensities[4] < 0.1); // M+3 missing
+
+        // M+0 should still be detected
+        assert!(envelope.has_m0());
     }
 }

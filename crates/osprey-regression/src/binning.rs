@@ -22,9 +22,9 @@ impl Binner {
         Self::new(BinConfig::unit_resolution())
     }
 
-    /// Create an HRAM binner with the given ppm tolerance
-    pub fn hram_ppm(tolerance_ppm: f64) -> Self {
-        Self::new(BinConfig::hram_ppm(tolerance_ppm))
+    /// Create an HRAM binner (0.02 Th bins, 0 offset)
+    pub fn hram() -> Self {
+        Self::new(BinConfig::hram())
     }
 
     /// Get the bin configuration
