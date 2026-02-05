@@ -7,6 +7,7 @@
 //! which fits local polynomial regressions weighted by distance.
 
 use osprey_core::{OspreyError, Result};
+use super::RTModelParams;
 
 /// RT calibration configuration
 #[derive(Debug, Clone)]
@@ -99,7 +100,7 @@ impl RTCalibrator {
             .zip(measured_rts.iter())
             .map(|(&x, &y)| (x, y))
             .collect();
-        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         let x: Vec<f64> = pairs.iter().map(|(x, _)| *x).collect();
         let y: Vec<f64> = pairs.iter().map(|(_, y)| *y).collect();
@@ -182,7 +183,7 @@ impl RTCalibrator {
                 .enumerate()
                 .map(|(j, &xj)| (j, (xj - xi).abs()))
                 .collect();
-            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            distances.sort_by(|a, b| a.1.total_cmp(&b.1));
 
             let neighbors: Vec<usize> = distances.iter().take(k).map(|(j, _)| *j).collect();
             let max_dist = distances[k - 1].1;
@@ -343,7 +344,7 @@ impl RTCalibration {
         // Find position in sorted array
         let idx = self
             .library_rts
-            .binary_search_by(|&x| x.partial_cmp(&library_rt).unwrap_or(std::cmp::Ordering::Equal))
+            .binary_search_by(|&x| x.total_cmp(&library_rt))
             .unwrap_or_else(|i| i);
 
         if idx == 0 {
@@ -443,6 +444,65 @@ impl RTCalibration {
             return false;
         }
         library_rt >= self.library_rts[0] && library_rt <= *self.library_rts.last().unwrap()
+    }
+
+    /// Export model parameters for serialization
+    ///
+    /// Returns the library RTs and fitted values which can be used
+    /// to reconstruct the calibration curve via interpolation.
+    pub fn export_model_params(&self) -> RTModelParams {
+        RTModelParams {
+            library_rts: self.library_rts.clone(),
+            fitted_rts: self.fitted_values.clone(),
+        }
+    }
+
+    /// Reconstruct an RTCalibration from saved model parameters
+    ///
+    /// This creates a calibration that can predict using interpolation
+    /// between the saved calibration points. The residual_std must be
+    /// provided separately (from RTCalibrationParams).
+    ///
+    /// # Arguments
+    /// * `params` - Model parameters containing library_rts and fitted_rts
+    /// * `residual_std` - The residual standard deviation from the original fit
+    ///
+    /// # Returns
+    /// A reconstructed RTCalibration that can be used for prediction
+    pub fn from_model_params(params: &RTModelParams, residual_std: f64) -> Result<Self> {
+        if params.library_rts.len() != params.fitted_rts.len() {
+            return Err(OspreyError::ConfigError(format!(
+                "Model params have mismatched lengths: {} library_rts vs {} fitted_rts",
+                params.library_rts.len(),
+                params.fitted_rts.len()
+            )));
+        }
+
+        if params.library_rts.is_empty() {
+            return Err(OspreyError::ConfigError(
+                "Model params have no calibration points".to_string()
+            ));
+        }
+
+        // Verify library_rts are sorted
+        let mut sorted_library = params.library_rts.clone();
+        sorted_library.sort_by(|a, b| a.total_cmp(b));
+
+        if sorted_library != params.library_rts {
+            return Err(OspreyError::ConfigError(
+                "Model params library_rts are not sorted".to_string()
+            ));
+        }
+
+        Ok(Self {
+            library_rts: params.library_rts.clone(),
+            // measured_rts not available from params, use fitted values as placeholder
+            measured_rts: params.fitted_rts.clone(),
+            fitted_values: params.fitted_rts.clone(),
+            bandwidth: 0.3, // Default value, not used for prediction
+            degree: 1,      // Default value, not used for prediction
+            residual_std,
+        })
     }
 }
 
@@ -561,7 +621,7 @@ pub fn median(values: &[f64]) -> f64 {
         return 0.0;
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let mid = sorted.len() / 2;
     if sorted.len() % 2 == 0 {
         (sorted[mid - 1] + sorted[mid]) / 2.0

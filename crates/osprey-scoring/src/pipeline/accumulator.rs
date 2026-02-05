@@ -235,7 +235,6 @@ pub struct AccumulatorStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array1;
     use osprey_core::IsolationWindow;
 
     fn make_preprocessed(scan: u32, rt: f64, window: (f64, f64)) -> PreprocessedSpectrum {
@@ -245,7 +244,6 @@ mod tests {
             scan_number: scan,
             retention_time: rt,
             isolation_window: IsolationWindow::new(center, half_width, half_width),
-            libcosine_vector: Array1::zeros(100),
             xcorr_vector: vec![0.0; 100],
         }
     }

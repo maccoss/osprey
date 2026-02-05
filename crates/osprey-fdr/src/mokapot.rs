@@ -334,8 +334,10 @@ fn get_feature_header() -> String {
         "peak_sharpness",
         "peak_prominence",
         "hyperscore",
+        "xcorr",
         "spectral_contrast_angle",
         "dot_product",
+        "dot_product_smz",
         "pearson_correlation",
         "spearman_correlation",
         "fragment_coverage",
@@ -357,7 +359,7 @@ fn get_feature_header() -> String {
 /// Format features for PIN output
 fn format_features(features: &FeatureSet) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         features.peak_apex,
         features.peak_area,
         features.emg_fit_quality,
@@ -370,8 +372,10 @@ fn format_features(features: &FeatureSet) -> String {
         features.peak_sharpness,
         features.peak_prominence,
         features.hyperscore,
+        features.xcorr,
         features.spectral_contrast_angle,
         features.dot_product,
+        features.dot_product_smz,
         features.pearson_correlation,
         features.spearman_correlation,
         features.fragment_coverage,

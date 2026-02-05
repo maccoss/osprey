@@ -1,160 +1,250 @@
 # Osprey Algorithm Documentation
 
-This folder contains detailed documentation of the algorithms used in Osprey.
+This folder contains detailed documentation of the algorithms used in Osprey, a peptide-centric DIA analysis tool that uses ridge regression to deconvolute mixed MS/MS spectra.
 
-## Contents
+## Algorithm Documentation
 
-- [RT Calibration](rt-calibration.md) - LibCosine-based RT calibration with target-decoy competition
-- [Mass Calibration](mass-calibration.md) - MS1 (precursor) and MS2 (fragment) mass calibration
-- [Spectral Scoring](spectral-scoring.md) - LibCosine, XCorr, and isotope cosine scoring
-- [XCorr Scoring](xcorr-scoring.md) - Detailed Comet-style XCorr implementation
-- [Decoy Generation](decoy-generation.md) - Enzyme-aware sequence reversal for FDR control
-- [Ridge Regression](ridge-regression.md) - Spectral deconvolution for peptide detection
-- [Peak Detection](peak-detection.md) - Chromatographic peak detection in coefficient time series
+| Document | Description |
+|----------|-------------|
+| [RT Calibration](rt-calibration.md) | LOESS-based RT calibration with target-decoy FDR |
+| [Mass Calibration](mass-calibration.md) | MS1 (precursor) and MS2 (fragment) mass calibration |
+| [Spectral Scoring](spectral-scoring.md) | LibCosine scoring (calibration phase) |
+| [XCorr Scoring](xcorr-scoring.md) | Comet-style XCorr implementation |
+| [Deconvolution Scoring](deconvolution-scoring.md) | Post-regression scoring: all scores computed after ridge regression |
+| [Ridge Regression](ridge-regression.md) | NNLS ridge regression for spectrum deconvolution |
+| [Peak Detection](peak-detection.md) | Chromatographic peak detection in coefficient time series |
+| [Decoy Generation](decoy-generation.md) | Enzyme-aware sequence reversal for FDR control |
 
-## Overview
+---
 
-Osprey uses a peptide-centric approach to DIA analysis with a two-phase calibration and search strategy:
+## Pipeline Overview
+
+Osprey's pipeline has four major phases. The calibration phase uses fast spectral scoring to establish RT and mass calibration. The main search phase uses ridge regression to deconvolute mixed DIA spectra. Post-regression scoring computes features for semi-supervised FDR control via Mokapot.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Input                                     │
-│   mzML files (DIA data) + Spectral Library (predicted spectra)  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              Phase 1: Calibration Discovery                      │
-│   1. Generate decoys (enzyme-aware reversal)                     │
-│   2. Sample ~2000 peptides for calibration                       │
-│   3. Score ALL spectra via LibCosine (pyXcorrDIA-compatible)     │
-│   4. Extract MS1 isotope envelopes → mass calibration            │
-│   5. Target-decoy competition → confident matches at 1% FDR      │
-│   6. Fit RT calibration (LOESS) from confident targets           │
-│   7. Calculate MS1/MS2 mass error statistics                     │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  Phase 2: Full Search                            │
-│   For each spectrum:                                             │
-│     1. Select candidates (isolation window + calibrated RT)      │
-│     2. Build design matrix from library spectra                  │
-│     3. Solve ridge regression                                    │
-│     4. Extract non-zero coefficients                             │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  Peak Detection                                  │
-│   Coefficient time series → Peak boundaries → Features           │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  FDR Control                                     │
-│   Target-decoy competition → q-value estimation                  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Output                                    │
-│   BiblioSpec (.blib) for Skyline + TSV report                   │
-└─────────────────────────────────────────────────────────────────┘
+INPUT
+  mzML files (DIA data) + Spectral Library (predicted spectra)
+  │
+  ▼
+PHASE 1: INITIALIZATION
+  ├─ Load spectral library (DIA-NN TSV, elib, or blib)
+  ├─ Generate decoys (enzyme-aware reversal)
+  ├─ Pre-bin library spectra (f32, one-time cost)
+  └─ Build m/z index for candidate lookup
+  │
+  ▼
+PHASE 2: CALIBRATION DISCOVERY (first file only)
+  ├─ Calculate library-to-measured RT mapping
+  ├─ Set wide RT tolerance (20-50% of gradient)
+  ├─ Score all peptides against all spectra:
+  │     ├─ XCorr (BLAS-accelerated) → find best RT per peptide
+  │     ├─ LibCosine (ppm matching) → score at best RT only
+  │     └─ E-value from XCorr survival function
+  ├─ Target-decoy competition → 1% FDR filtering
+  ├─ Fit LOESS RT calibration from confident targets
+  ├─ Calculate MS1/MS2 mass error statistics
+  └─ Set tight RT tolerance for main search (3× residual SD)
+  │
+  ▼
+PHASE 3: RIDGE REGRESSION (all files, per spectrum)
+  ├─ Select candidates (isolation window + calibrated RT)
+  ├─ Build design matrix from pre-binned library
+  ├─ Solve NNLS ridge regression (f32, projected gradient)
+  └─ Output: coefficients per candidate per spectrum
+  │
+  ▼
+PHASE 4: POST-REGRESSION SCORING (per peptide)
+  ├─ Aggregate coefficients into time series per peptide
+  ├─ Peak detection → apex RT, boundaries
+  ├─ Score at apex (all features computed here):
+  │     ├─ LibCosine (sqrt preprocessing)
+  │     ├─ LibCosine SMZ (sqrt × mz² preprocessing)
+  │     ├─ XCorr (Comet-style)
+  │     ├─ X!Tandem Hyperscore
+  │     ├─ Delta RT (observed - predicted)
+  │     ├─ Chromatographic features (peak shape)
+  │     └─ Contextual features (regression quality)
+  ├─ Write PIN file (targets + decoys, 30 features)
+  └─ Mokapot semi-supervised FDR → q-values
+  │
+  ▼
+OUTPUT
+  ├─ BiblioSpec (.blib) for Skyline
+  └─ TSV report
 ```
 
-## Key Concepts
+---
 
-### Peptide-Centric Analysis
+## Phase 2: Calibration Scoring (Quick Pass)
 
-Unlike spectrum-centric approaches that identify each spectrum independently, Osprey:
+The calibration phase is a **fast scoring pass** designed to establish RT and mass calibration before the main search. It does NOT use ridge regression.
 
-1. **Considers all candidate peptides simultaneously** using ridge regression
-2. **Aggregates evidence across the chromatographic dimension** before scoring
-3. **Handles co-eluting peptides** in overlapping isolation windows
+### How Calibration Scoring Works
 
-### Calibration Discovery (pyXcorrDIA-Compatible)
+Calibration uses a **hybrid XCorr + LibCosine** strategy for speed and accuracy:
 
-The calibration phase follows the pyXcorrDIA methodology:
+1. **XCorr via BLAS** (fast, all spectra): Preprocess library and spectra into f32 vectors, score all pairs via matrix multiplication. XCorr is used to find the best-matching spectrum RT for each peptide. This is computationally cheap because it uses BLAS batched operations.
 
-1. **LibCosine Scoring**: Score library vs observed spectra using:
-   - SMZ preprocessing: `sqrt(intensity) × mz²`
-   - ppm-based fragment matching (closest m/z, not highest intensity)
-   - L2 normalization and cosine similarity
+2. **LibCosine** (accurate, one spectrum): Once XCorr identifies the best RT, LibCosine is computed at that single spectrum using ppm-based fragment matching (no binning). This provides a high-quality score and mass error measurements.
 
-2. **Target-Decoy Competition**: Each target competes against its paired decoy
-   - Higher LibCosine score wins
-   - Ties go to decoy (conservative)
-   - Only targets passing 1% FDR used for calibration
+3. **E-value** (significance): Calculated from the XCorr survival function (Comet-style) to estimate the probability of a match occurring by chance.
 
-3. **Mass Calibration**: From FDR-filtered matches:
-   - MS1 (precursor) error: Extract M+0 peak from MS1 spectrum
-   - MS2 (fragment) error: Collect matched fragment mass errors
+See: [Spectral Scoring](spectral-scoring.md), [XCorr Scoring](xcorr-scoring.md)
 
-4. **RT Calibration**: LOESS fitting of (library_RT, measured_RT) pairs
+### What Calibration Produces
 
-### Scoring Methods
+- **RT calibration curve** (LOESS): Maps library RT → expected measured RT
+- **RT tolerance**: Residual SD × 3 (typically 0.5-2 min)
+- **Mass calibration**: Mean/median PPM error for MS1 and MS2
 
-Osprey provides multiple scoring methods for different use cases:
+See: [RT Calibration](rt-calibration.md), [Mass Calibration](mass-calibration.md)
 
-| Score | Use Case | Method |
-|-------|----------|--------|
-| **LibCosine** | Calibration, FDR | Cosine similarity with SMZ preprocessing |
-| **XCorr** | Secondary score | Comet-style cross-correlation with windowing |
-| **Isotope Cosine** | MS1 quality | Observed vs theoretical isotope pattern |
+### Multi-File Strategy
+
+- **First file**: Full calibration discovery (all peptides, wide tolerance)
+- **Subsequent files**: Reuse calibration from first file (same LC column)
+- Calibration saved to JSON for reuse on reruns
+
+---
+
+## Phase 3: Ridge Regression
+
+Ridge regression deconvolutes each DIA spectrum into individual peptide contributions. Each spectrum contains fragments from multiple co-eluting precursors; regression separates these overlapping signals.
+
+### Per-Spectrum Processing
+
+For each MS2 spectrum:
+
+1. **Candidate selection**: Find library entries whose precursor m/z falls within the isolation window AND whose calibrated RT is within tolerance
+2. **Design matrix**: Columns are pre-binned library spectra (no preprocessing, raw intensity)
+3. **NNLS ridge regression**: Minimize ‖Ax - b‖² + λ‖x‖² subject to x ≥ 0
+4. **Output**: Non-negative coefficient per candidate (how much of the observed signal this peptide explains)
+
+See: [Ridge Regression](ridge-regression.md)
+
+---
+
+## Phase 4: Post-Regression Scoring
+
+After ridge regression assigns coefficients to all peptides across all spectra, Osprey aggregates these into coefficient time series per peptide and computes scoring features. **All scores are computed at the apex** -- the RT where the deconvoluted signal is strongest.
+
+### Step 1: Coefficient Time Series
+
+For each library entry, collect all (RT, coefficient) pairs from regression results across spectra. This forms a chromatographic profile of the deconvoluted peptide signal.
+
+### Step 2: Peak Detection
+
+The peak detector identifies elution peaks in the coefficient time series using a **threshold-crossing algorithm**:
+
+1. Scan through the time series
+2. When coefficient crosses above `min_height` (default: 0.05), mark peak start
+3. Track the highest coefficient within the peak as the apex
+4. When coefficient drops below `min_height`, mark peak end
+5. Reject peaks narrower than `min_width` scans (default: 3)
+6. If multiple peaks, select the one with the highest apex coefficient near the expected RT
+
+See: [Peak Detection](peak-detection.md)
+
+### Step 3: Score Computation at Apex
+
+All spectral scores are computed at the apex spectrum (the observed MS2 spectrum closest to the coefficient apex RT). Each score captures a different aspect of the match:
+
+| Score | Field | Description | Requires Library Intensities |
+|-------|-------|-------------|------------------------------|
+| LibCosine (sqrt) | `dot_product` | Cosine similarity, sqrt(intensity) preprocessing | Yes |
+| LibCosine SMZ | `dot_product_smz` | Cosine similarity, sqrt(intensity)×mz² preprocessing | Yes |
+| XCorr | `xcorr` | Comet-style cross-correlation | No |
+| Hyperscore | `hyperscore` | X!Tandem: log(n_b!) + log(n_y!) + Σlog(I+1) | No |
+| Delta RT | `rt_deviation` | Observed apex - predicted RT (minutes) | N/A |
+
+Chromatographic features (peak shape, width, symmetry) and contextual features (regression quality, competitors) are also extracted.
+
+See: [Deconvolution Scoring](deconvolution-scoring.md)
+
+### Step 4: FDR Control via Mokapot
+
+All 30 features for both targets and decoys are written to a PIN file. Mokapot performs semi-supervised learning (linear SVM) to combine features into an optimal discriminant score, then estimates q-values via target-decoy competition.
+
+**Two-level FDR**:
+1. **Run-level**: Per-file FDR control
+2. **Experiment-level**: Best PSM per peptide across all files
+
+---
+
+## Key Distinction: Calibration Scoring vs Post-Regression Scoring
+
+| Aspect | Calibration (Phase 2) | Post-Regression (Phase 4) |
+|--------|----------------------|---------------------------|
+| **Purpose** | Establish RT/mass calibration | Determine peptide detections |
+| **Uses regression?** | No | Yes (scores the deconvoluted result) |
+| **Primary score** | LibCosine (with XCorr for RT) | All 5 spectral scores + features |
+| **Fragment matching** | ppm-based (pyXcorrDIA-style) | ppm-based at apex spectrum |
+| **FDR method** | Simple target-decoy (1% for calibration) | Mokapot semi-supervised ML |
+| **Output** | RT curve + mass calibration | Peptide detections with q-values |
+| **Scope** | First file only, wide tolerance | All files, tight calibrated tolerance |
+| **Speed** | BLAS-accelerated batch scoring | Per-peptide feature extraction |
+
+---
+
+## Why Peptide-Centric Analysis?
+
+Unlike spectrum-centric approaches (e.g., Comet, MSFragger) that identify each spectrum independently, Osprey:
+
+1. **Considers all candidate peptides simultaneously** using ridge regression, handling overlapping signals in wide DIA windows
+2. **Aggregates evidence across the chromatographic dimension** before scoring, using the coefficient time series rather than a single spectrum
+3. **Scores at the best RT** for each peptide, where the deconvoluted signal is strongest
 
 ### Why Ridge Regression?
 
 DIA spectra are mixed spectra containing fragments from multiple precursors. Ridge regression:
-
-- Deconvolutes overlapping signals
+- Deconvolutes overlapping signals into individual peptide contributions
 - Provides coefficients proportional to peptide abundance
-- Handles collinearity (similar spectra) gracefully
-- Is computationally efficient
+- Handles collinearity (similar spectra) gracefully via L2 regularization
+- Is computationally efficient with BLAS and f32 optimizations
 
 ### Why RT Calibration?
 
-Library retention times may be:
-- Predicted by deep learning models (e.g., Prosit, DeepLC)
-- Measured on different LC systems
-- Normalized to iRT scale
+Library retention times may be predicted by deep learning models (Prosit, DeepLC), measured on different LC systems, or normalized to iRT scale. RT calibration converts library RTs to expected measured RTs, enabling tight RT filtering that reduces the candidate set and improves regression quality.
 
-RT calibration converts library RTs to expected measured RTs, enabling tight RT filtering.
+---
 
 ## Crate Architecture
 
 ```
 osprey/
-├── osprey-core/           # Core types, config, errors, traits
-│   ├── config.rs          # YAML configuration structures
-│   ├── isotope.rs         # Isotope distribution calculations
-│   ├── types.rs           # LibraryEntry, Spectrum, IsolationWindow
-│   └── traits.rs          # MS1SpectrumLookup, etc.
+├── osprey-core/              # Core types, config, errors, traits
+│   ├── config.rs             # YAML configuration structures
+│   ├── isotope.rs            # Isotope distribution calculations
+│   ├── types.rs              # LibraryEntry, Spectrum, FeatureSet, RegressionResult
+│   └── traits.rs             # MS1SpectrumLookup, etc.
 │
-├── osprey-io/             # File I/O
-│   ├── library/           # DIA-NN TSV, EncyclopeDIA elib, BiblioSpec blib
-│   └── mzml.rs            # mzML parsing (via mzdata crate)
+├── osprey-io/                # File I/O
+│   ├── library/              # DIA-NN TSV, EncyclopeDIA elib, BiblioSpec blib
+│   ├── mzml/                 # mzML parsing (via mzdata crate)
+│   └── output/               # blib and report output
 │
-├── osprey-scoring/        # Spectral scoring
-│   ├── lib.rs             # SpectralScorer (LibCosine, XCorr)
-│   ├── batch.rs           # BLAS-accelerated batch scoring
-│   └── decoy.rs           # Decoy generation
+├── osprey-scoring/           # Spectral scoring and feature extraction
+│   ├── lib.rs                # SpectralScorer, FeatureExtractor, DecoyGenerator
+│   ├── batch.rs              # BLAS-accelerated batch scoring (calibration)
+│   └── pipeline/             # Streaming pipeline components
 │
-├── osprey-chromatography/ # RT processing
-│   ├── calibration/       # LOESS fitting, mass calibration
-│   └── peak/              # Peak detection
+├── osprey-chromatography/    # Chromatographic analysis
+│   ├── lib.rs                # PeakDetector
+│   └── calibration/          # LOESS RT calibration, mass calibration, I/O
 │
-├── osprey-regression/     # Ridge regression
-│   ├── ridge.rs           # Cholesky solver
-│   ├── sparse.rs          # Sparse HRAM solver
-│   └── binning.rs         # m/z binning
+├── osprey-regression/        # Ridge regression engine
+│   ├── optimized.rs          # Pre-binned library, f32 solver, spectra cache
+│   ├── ridge.rs              # Dense NNLS solver (f64)
+│   ├── sparse.rs             # Sparse HRAM solver
+│   └── binning.rs            # m/z binning
 │
-├── osprey-fdr/            # FDR control
-│   └── controller.rs      # Target-decoy competition, q-values
+├── osprey-fdr/               # FDR control
+│   ├── lib.rs                # Target-decoy competition, q-values
+│   └── mokapot.rs            # PIN file output, Mokapot integration
 │
-└── osprey/                # Main binary
-    ├── main.rs            # CLI entry point
-    └── pipeline.rs        # Analysis pipeline
+└── osprey/                   # Main library + CLI binary
+    ├── main.rs               # CLI entry point
+    └── pipeline.rs           # Analysis pipeline orchestration
 ```
 
 ## Configuration
@@ -198,23 +288,9 @@ run_fdr: 0.01
 decoy_method: Reverse
 ```
 
-## Debug Output
-
-Osprey writes a `calibration_debug.csv` with paired target-decoy scores for analysis:
-
-```csv
-target_entry_id,charge,target_sequence,decoy_sequence,
-target_libcosine,decoy_libcosine,target_xcorr,decoy_xcorr,
-target_isotope_score,decoy_isotope_score,
-target_precursor_error_ppm,decoy_precursor_error_ppm,
-target_rt,decoy_rt,library_rt,expected_rt,delta_rt,
-target_n_matched,decoy_n_matched
-```
-
-This enables analysis of what features best separate targets from decoys.
-
 ## References
 
 - pyXcorrDIA: https://github.com/maccoss/pyXcorrDIA
 - Comet: https://comet-ms.sourceforge.io/
+- Mokapot: https://github.com/wfondrie/mokapot
 - LOESS: Cleveland, W.S. (1979). "Robust locally weighted regression and smoothing scatterplots"

@@ -6,7 +6,8 @@
 //!
 //! pyXcorrDIA extracts the M+0 isotope peak from MS1 spectra for accurate mass calibration.
 //! This module provides:
-//! - `load_ms1_spectra()` - Load all MS1 spectra for isotope extraction
+//! - `load_all_spectra()` - Load both MS1 and MS2 spectra in a single pass (most efficient)
+//! - `load_ms1_spectra()` - Load only MS1 spectra for isotope extraction
 //! - `MS1Index` - Index MS1 spectra by retention time for efficient lookup
 
 use mzdata::io::mzml::MzMLReader;
@@ -234,7 +235,7 @@ impl MS1Index {
             .min_by(|&a, &b| {
                 let diff_a = (self.spectra[a].retention_time - retention_time).abs();
                 let diff_b = (self.spectra[b].retention_time - retention_time).abs();
-                diff_a.partial_cmp(&diff_b).unwrap_or(std::cmp::Ordering::Equal)
+                diff_a.total_cmp(&diff_b)
             })
             .map(|i| &self.spectra[i])
     }
@@ -260,10 +261,158 @@ impl MS1Index {
     }
 }
 
+/// Load all spectra (both MS1 and MS2) from an mzML file in a single pass
+///
+/// This is more efficient than calling MzmlReader and load_ms1_spectra separately,
+/// as it only parses the file once.
+///
+/// Returns: (MS2 spectra, MS1 index)
+pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1Index)> {
+    let path = path.as_ref();
+    let file = File::open(path).map_err(|e| {
+        OspreyError::MzmlParseError(format!("Failed to open file '{}': {}", path.display(), e))
+    })?;
+    let reader = BufReader::new(file);
+    let mzml_reader = MzMLReader::new(reader);
+
+    let mut ms2_spectra = Vec::new();
+    let mut ms1_spectra = Vec::new();
+
+    for mz_spectrum in mzml_reader {
+        let desc = mz_spectrum.description();
+        let ms_level = desc.ms_level;
+        let scan_number = desc.index as u32;
+        let retention_time = desc.acquisition.first_scan().map_or(0.0, |scan| {
+            scan.start_time // mzdata returns time in minutes
+        });
+
+        match ms_level {
+            1 => {
+                // Process MS1 spectrum
+                let peaks = mz_spectrum.peaks();
+                let (mzs, intensities) = match peaks {
+                    RefPeakDataLevel::Missing => continue,
+                    RefPeakDataLevel::RawData(arrays) => {
+                        let mz_data = arrays.mzs();
+                        let int_data = arrays.intensities();
+                        let mzs: Vec<f64> = match mz_data {
+                            Ok(cow) => cow.iter().copied().collect(),
+                            Err(_) => continue,
+                        };
+                        let intensities: Vec<f32> = match int_data {
+                            Ok(cow) => cow.iter().copied().collect(),
+                            Err(_) => continue,
+                        };
+                        (mzs, intensities)
+                    }
+                    RefPeakDataLevel::Centroid(peaks) => {
+                        let mzs: Vec<f64> = peaks.iter().map(|p| p.mz).collect();
+                        let intensities: Vec<f32> = peaks.iter().map(|p| p.intensity).collect();
+                        (mzs, intensities)
+                    }
+                    RefPeakDataLevel::Deconvoluted(peaks) => {
+                        let mzs: Vec<f64> = peaks.iter().map(|p| p.neutral_mass).collect();
+                        let intensities: Vec<f32> = peaks.iter().map(|p| p.intensity).collect();
+                        (mzs, intensities)
+                    }
+                };
+
+                ms1_spectra.push(MS1Spectrum {
+                    scan_number,
+                    retention_time,
+                    mzs,
+                    intensities,
+                });
+            }
+            2 => {
+                // Process MS2 spectrum
+                // Get isolation window from precursor
+                let isolation_window = if let Some(precursor) = desc.precursor.first() {
+                    let ion = match precursor.ion() {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    let isolation = &precursor.isolation_window;
+
+                    let center = ion.mz;
+                    let lower_offset = if isolation.lower_bound > 0.0 {
+                        center - isolation.lower_bound as f64
+                    } else {
+                        12.5
+                    };
+                    let upper_offset = if isolation.upper_bound > 0.0 {
+                        isolation.upper_bound as f64 - center
+                    } else {
+                        12.5
+                    };
+
+                    IsolationWindow::new(center, lower_offset, upper_offset)
+                } else {
+                    continue;
+                };
+
+                // Get peaks
+                let peaks = mz_spectrum.peaks();
+                let (mzs, intensities) = match peaks {
+                    RefPeakDataLevel::Missing => continue,
+                    RefPeakDataLevel::RawData(arrays) => {
+                        let mz_data = arrays.mzs();
+                        let int_data = arrays.intensities();
+                        let mzs: Vec<f64> = match mz_data {
+                            Ok(cow) => cow.iter().copied().collect(),
+                            Err(_) => continue,
+                        };
+                        let intensities: Vec<f32> = match int_data {
+                            Ok(cow) => cow.iter().copied().collect(),
+                            Err(_) => continue,
+                        };
+                        (mzs, intensities)
+                    }
+                    RefPeakDataLevel::Centroid(peaks) => {
+                        let mzs: Vec<f64> = peaks.iter().map(|p| p.mz).collect();
+                        let intensities: Vec<f32> = peaks.iter().map(|p| p.intensity).collect();
+                        (mzs, intensities)
+                    }
+                    RefPeakDataLevel::Deconvoluted(peaks) => {
+                        let mzs: Vec<f64> = peaks.iter().map(|p| p.neutral_mass).collect();
+                        let intensities: Vec<f32> = peaks.iter().map(|p| p.intensity).collect();
+                        (mzs, intensities)
+                    }
+                };
+
+                ms2_spectra.push(Spectrum {
+                    scan_number,
+                    retention_time,
+                    precursor_mz: isolation_window.center,
+                    isolation_window,
+                    mzs,
+                    intensities,
+                });
+            }
+            _ => {
+                // Skip other MS levels (MS3, etc.)
+                continue;
+            }
+        }
+    }
+
+    log::info!(
+        "Loaded {} MS2 spectra and {} MS1 spectra from '{}'",
+        ms2_spectra.len(),
+        ms1_spectra.len(),
+        path.display()
+    );
+
+    Ok((ms2_spectra, MS1Index::new(ms1_spectra)))
+}
+
 /// Load all MS1 spectra from an mzML file
 ///
 /// This is used for MS1 mass calibration (extracting M+0 isotope peaks).
 /// Returns an MS1Index for efficient nearest-neighbor lookup.
+///
+/// Note: If you need both MS1 and MS2, use `load_all_spectra()` instead
+/// to avoid parsing the file twice.
 pub fn load_ms1_spectra<P: AsRef<Path>>(path: P) -> Result<MS1Index> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|e| {

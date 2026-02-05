@@ -226,6 +226,21 @@ pub struct RTCalibrationParams {
     pub n_points: usize,
     /// R² (coefficient of determination)
     pub r_squared: f64,
+    /// LOESS model parameters for reconstruction (optional, for reuse)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_params: Option<RTModelParams>,
+}
+
+/// LOESS model parameters for serialization
+///
+/// Stores the library RTs and fitted measured RTs which allows
+/// the calibration curve to be reconstructed via interpolation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RTModelParams {
+    /// Library retention times (sorted, used as x-values for interpolation)
+    pub library_rts: Vec<f64>,
+    /// Fitted measured retention times (corresponding to library_rts)
+    pub fitted_rts: Vec<f64>,
 }
 
 impl RTCalibrationParams {
@@ -236,12 +251,20 @@ impl RTCalibrationParams {
             residual_sd: 0.0,
             n_points: 0,
             r_squared: 0.0,
+            model_params: None,
         }
     }
 
     /// Check if RT was calibrated
     pub fn is_calibrated(&self) -> bool {
         self.method != RTCalibrationMethod::None && self.n_points > 0
+    }
+
+    /// Check if this calibration has model data for reconstruction
+    pub fn has_model_data(&self) -> bool {
+        self.model_params.as_ref()
+            .map(|m| !m.library_rts.is_empty() && m.library_rts.len() == m.fitted_rts.len())
+            .unwrap_or(false)
     }
 }
 
@@ -259,7 +282,7 @@ pub enum RTCalibrationMethod {
 // Re-export key types and functions from submodules
 pub use mass::{calculate_mz_calibration, apply_mz_calibration, calculate_ppm_error, MzQCData};
 pub use rt::{RTCalibration, RTCalibrationStats, RTCalibrator, RTCalibratorConfig, RTStratifiedSampler};
-pub use io::{save_calibration, load_calibration, calibration_filename};
+pub use io::{save_calibration, load_calibration, calibration_filename, calibration_filename_for_input, calibration_path_for_input};
 
 #[cfg(test)]
 mod tests {
@@ -333,6 +356,10 @@ mod tests {
                 residual_sd: 0.8,
                 n_points: 100,
                 r_squared: 0.98,
+                model_params: Some(RTModelParams {
+                    library_rts: vec![0.0, 10.0, 20.0, 30.0],
+                    fitted_rts: vec![1.0, 11.0, 21.0, 31.0],
+                }),
             },
         };
 

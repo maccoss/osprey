@@ -16,12 +16,14 @@ use osprey_core::{PeakBoundaries, PeakQuality, Result};
 pub use calibration::{
     // Core types
     CalibrationParams, CalibrationMetadata, MzCalibration, RTCalibrationParams, RTCalibrationMethod,
+    RTModelParams,
     // RT calibration
     RTCalibration, RTCalibrationStats, RTCalibrator, RTCalibratorConfig, RTStratifiedSampler,
     // Mass calibration
     MzQCData, calculate_mz_calibration, apply_mz_calibration, calculate_ppm_error,
     // I/O
-    save_calibration, load_calibration, calibration_filename,
+    save_calibration, load_calibration, calibration_filename, calibration_filename_for_input,
+    calibration_path_for_input,
 };
 
 /// Simple peak detector for coefficient time series

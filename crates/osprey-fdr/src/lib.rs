@@ -94,33 +94,49 @@ impl FdrController {
             }
         }
 
+        log::debug!(
+            "FDR input: {} unique targets, {} unique decoys (by base ID)",
+            target_scores.len(),
+            decoy_scores.len()
+        );
+
         // Competition: for each target, compare with its decoy
         // Winner advances with (score, is_target_winner, Option<item>)
         // Note: Ties go to decoy (conservative for FDR estimation)
         let mut winners: Vec<(f64, bool, Option<T>)> = Vec::with_capacity(target_scores.len());
 
+        // Debug counters
+        let mut target_wins_count = 0usize;
+        let mut decoy_wins_count = 0usize;
+        let mut missing_decoy_count = 0usize;
+
         for (target_id, (item, target_score)) in target_scores {
-            let decoy_score = decoy_scores.get(&target_id).copied().unwrap_or(0.0);
+            let decoy_score = decoy_scores.get(&target_id).copied().unwrap_or(f64::NEG_INFINITY);
+
+            if decoy_scores.get(&target_id).is_none() {
+                missing_decoy_count += 1;
+            }
 
             if target_score > decoy_score {
                 // Target wins (strict greater than)
                 winners.push((target_score, true, Some(item)));
+                target_wins_count += 1;
             } else {
                 // Decoy wins (including ties - conservative)
                 winners.push((decoy_score, false, None));
+                decoy_wins_count += 1;
             }
         }
+
+        log::debug!(
+            "Competition results: {} targets won, {} decoys won, {} missing decoys",
+            target_wins_count,
+            decoy_wins_count,
+            missing_decoy_count
+        );
 
         // Sort winners by score descending (highest scores first)
-        winners.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Debug: show first few winners and their types
-        if winners.len() > 10 {
-            log::debug!("First 10 winners (score, is_target):");
-            for (i, (score, is_target, _)) in winners.iter().take(10).enumerate() {
-                log::debug!("  {}: score={:.4}, is_target={}", i + 1, score, is_target);
-            }
-        }
+        winners.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         // First pass: walk down and find MAX cumulative_targets at any position where FDR <= threshold
         // This matches pyXcorrDIA's approach: valid['cumulative_targets'].max()
@@ -129,32 +145,11 @@ impl FdrController {
         let mut max_targets_at_valid_fdr = 0usize;
         let mut fdr_at_threshold = 0.0;
 
-        // Debug: track FDR at key positions
-        let debug_positions = [10, 100, 1000, 10000, 100000, 500000, 1000000];
-        let mut next_debug_idx = 0;
-
-        for (i, (_, is_target_winner, _)) in winners.iter().enumerate() {
+        for (_, is_target_winner, _) in winners.iter() {
             if *is_target_winner {
                 n_target_wins += 1;
             } else {
                 n_decoy_wins += 1;
-            }
-
-            // Debug FDR at key positions
-            if next_debug_idx < debug_positions.len() && (i + 1) == debug_positions[next_debug_idx] {
-                let fdr = if n_target_wins > 0 {
-                    n_decoy_wins as f64 / n_target_wins as f64
-                } else {
-                    1.0
-                };
-                log::debug!(
-                    "Position {}: {} targets, {} decoys, FDR={:.4}",
-                    i + 1,
-                    n_target_wins,
-                    n_decoy_wins,
-                    fdr
-                );
-                next_debug_idx += 1;
             }
 
             // FDR at this position
@@ -222,7 +217,7 @@ impl FdrController {
             .collect();
 
         // Sort descending by score (higher is better)
-        all_scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        all_scores.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         // Compute FDR at each position and track target indices
         let mut target_count = 0usize;

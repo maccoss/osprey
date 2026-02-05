@@ -8,40 +8,20 @@ The scoring system follows the pyXcorrDIA methodology for calibration:
 
 ```
 Workflow:
-  1. For each library entry, find best matching spectrum (within RT tolerance)
-  2. Score using LibCosine (primary) and XCorr (secondary)
-  3. Extract MS1 isotope envelope → isotope cosine score
-  4. Use LibCosine for target-decoy competition
-  5. FDR filtering → calibration points
+  1. For each library entry, calculate XCorr against ALL spectra in RT window
+  2. Select best spectrum by XCorr (RT selection)
+  3. Calculate LibCosine at the best XCorr spectrum
+  4. Calculate E-value from XCorr survival function (Comet-style)
+  5. Extract MS1 isotope envelope → isotope cosine score
+  6. Use E-value for target-decoy competition
+  7. FDR filtering → calibration points
 ```
 
 ## Scoring Methods
 
-### LibCosine (Primary Score)
+### XCorr (RT Selection Score)
 
-LibCosine is a cosine similarity score with SMZ preprocessing (sqrt intensity × m/z²):
-
-```
-Preprocessing (per fragment):
-  value = sqrt(intensity) × m/z²
-
-Scoring:
-  1. Match library fragments to observed peaks (within ppm tolerance)
-  2. Apply SMZ preprocessing to both matched vectors
-  3. L2 normalize both vectors
-  4. Compute cosine similarity (dot product of normalized vectors)
-
-Score range: 0-1 (1 = perfect match)
-```
-
-**Why SMZ preprocessing?**
-- Square root dampens intensity differences (accounts for measurement variability)
-- m/z² weighting emphasizes higher mass fragments (more informative)
-- L2 normalization enables meaningful comparison regardless of total intensity
-
-### XCorr (Secondary Score)
-
-XCorr uses Comet-style preprocessing for cross-correlation scoring. See [XCorr Scoring](xcorr-scoring.md) for detailed implementation.
+XCorr uses Comet-style preprocessing for cross-correlation scoring. It is calculated for ALL spectra in the RT tolerance window and used to select the best retention time. See [XCorr Scoring](xcorr-scoring.md) for detailed implementation.
 
 ```
 Experimental Spectrum Preprocessing:
@@ -62,29 +42,43 @@ Scoring:
 
 **Key insight**: Comet does NOT preprocess the theoretical spectrum. It simply looks up values from the preprocessed experimental spectrum at each fragment bin position and sums them. Applying windowing to the theoretical spectrum would inflate scores by ~50x.
 
-**Batch XCorr Preprocessing (pyXcorrDIA approach):**
+### LibCosine (Fragment Match Score)
 
-For efficiency, Osprey preprocesses all spectra and library entries once per isolation window, then looks up XCorr at the best LibCosine match:
+LibCosine is a cosine similarity score with sqrt intensity preprocessing:
 
-```rust
-// Preprocess all spectra for XCorr ONCE per window
-let spec_xcorr_preprocessed: Vec<Vec<f64>> = window_spectra
-    .iter()
-    .map(|spec| xcorr_scorer.preprocess_spectrum_for_xcorr(spec))
-    .collect();
-
-// Preprocess all library entries for XCorr ONCE per window
-let entry_xcorr_preprocessed: HashMap<u32, Vec<f64>> = window_entries
-    .iter()
-    .map(|entry| (entry.id, xcorr_scorer.preprocess_library_for_xcorr(entry)))
-    .collect();
-
-// After finding best LibCosine match, lookup XCorr:
-let xcorr_score = SpectralScorer::xcorr_from_preprocessed(
-    &spec_xcorr_preprocessed[best_local_idx],
-    &entry_xcorr_preprocessed[entry.id],
-);
 ```
+Preprocessing (per fragment):
+  value = sqrt(intensity)
+
+Scoring:
+  1. Match library fragments to observed peaks (within ppm tolerance)
+  2. Apply sqrt preprocessing to matched intensities
+  3. L2 normalize both vectors
+  4. Compute cosine similarity (dot product of normalized vectors)
+
+Score range: 0-1 (1 = perfect match)
+```
+
+**Why sqrt preprocessing?**
+- Down-weights dominant peaks and gives more influence to smaller peaks
+- Accounts for measurement variability in fragment intensities
+- L2 normalization enables meaningful comparison regardless of total intensity
+
+**Note**: LibCosine uses **PPM matching** (no binning). Each library fragment is matched to the closest observed peak within the tolerance window.
+
+### E-Value (Significance Score)
+
+Osprey computes Comet-style E-values from the XCorr survival function for each peptide:
+
+```
+E-value calculation:
+  1. Collect ALL XCorr scores in RT window (~700 spectra typically)
+  2. Sort scores descending, build survival function
+  3. Fit linear regression: log10(survival_count) = intercept - slope × xcorr
+  4. E-value = 10^(intercept - slope × best_xcorr)
+```
+
+Lower E-value = better statistical significance. E-value is used for target-decoy competition.
 
 ### Isotope Cosine Score (MS1 Quality)
 
@@ -150,16 +144,37 @@ During calibration, each target competes against its paired decoy:
 ```
 Target-decoy pairing: decoy_id = target_id | 0x80000000
 
-Competition rules (pyXcorrDIA):
-  1. Compare LibCosine scores for target and decoy
-  2. Higher score wins
+Competition rules:
+  1. Compare E-values for target and decoy
+  2. Lower E-value wins
   3. Ties go to decoy (conservative)
   4. Winner enters FDR calculation
 
 FDR calculation:
-  1. Sort winners by score (descending)
+  1. Sort winners by E-value (ascending - lower is better)
   2. FDR = cumulative_decoys / cumulative_targets
   3. Filter to targets at ≤1% FDR
+```
+
+## Scoring Flow Summary
+
+```
+Per peptide (target or decoy):
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Find all spectra in RT tolerance window (~700 spectra)   │
+│                                                             │
+│ 2. Calculate XCorr for ALL spectra                          │
+│    → Collect all scores for E-value calculation             │
+│    → Track best XCorr and its spectrum index                │
+│                                                             │
+│ 3. At best XCorr spectrum:                                  │
+│    → Calculate LibCosine (PPM matching, sqrt intensity)     │
+│    → Extract MS1 isotope envelope                           │
+│                                                             │
+│ 4. Calculate E-value from XCorr survival function           │
+│                                                             │
+│ 5. Output: E-value, LibCosine, XCorr, isotope_cosine        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Configuration
@@ -182,6 +197,7 @@ Spectral scoring populates these fields in CalibrationMatch:
 
 | Field | Source | Description |
 |-------|--------|-------------|
+| `evalue` | XCorr survival | Comet-style E-value (lower = better) |
 | `score` | LibCosine | Cosine similarity score (0-1) |
 | `xcorr_score` | XCorr | Comet-style cross-correlation |
 | `isotope_cosine_score` | MS1 | Isotope envelope match (0-1) |
@@ -193,7 +209,7 @@ Spectral scoring populates these fields in CalibrationMatch:
 
 Key files:
 - `crates/osprey-scoring/src/lib.rs` - SpectralScorer (XCorr preprocessing)
-- `crates/osprey-scoring/src/batch.rs` - LibCosineScorer, batch scoring
+- `crates/osprey-scoring/src/batch.rs` - LibCosineScorer, E-value calculation, batch scoring
 - `crates/osprey-core/src/isotope.rs` - Isotope distribution calculations
 - `crates/osprey/src/pipeline.rs` - Integration in calibration workflow
 
@@ -232,6 +248,21 @@ let lib_preprocessed = xcorr_scorer.preprocess_library_for_xcorr(&entry);
 let xcorr = SpectralScorer::xcorr_from_preprocessed(&spec_preprocessed, &lib_preprocessed);
 ```
 
+### E-Value Calculation API
+
+```rust
+use osprey_scoring::batch::calculate_evalue_from_xcorr_distribution;
+
+// Collect ALL XCorr scores in RT window
+let all_xcorr_scores: Vec<f64> = spectra_in_window
+    .iter()
+    .map(|spec| xcorr_scorer.score(entry, spec))
+    .collect();
+
+// Calculate E-value from survival function
+let evalue = calculate_evalue_from_xcorr_distribution(&all_xcorr_scores, best_xcorr);
+```
+
 ### Isotope Scoring API
 
 ```rust
@@ -258,42 +289,55 @@ if envelope.has_m0() {
 Peptide: PEPTIDEK (charge 2+)
 Library fragments: y3(348.2), y4(461.3), y5(576.3), b3(357.2), b4(458.2)
 
-Observed spectrum at apex RT=25.3 min:
-  m/z: [348.201, 461.299, 576.305, 400.1, 550.2, ...]
-  intensity: [1000, 800, 600, 200, 150, ...]
+Step 1: XCorr against ALL spectra in RT window (20% tolerance)
+  700 spectra scored
+  Best XCorr: 0.42 at RT=25.3 min (scan 1234)
+  All XCorr scores collected for E-value calculation
 
-Fragment matching (10 ppm tolerance):
-  y3: 348.2 → 348.201 ✓ (error: +2.9 ppm, closest m/z)
-  y4: 461.3 → 461.299 ✓ (error: -2.2 ppm)
-  y5: 576.3 → 576.305 ✓ (error: +8.7 ppm)
-  b3: 357.2 → no match ✗
-  b4: 458.2 → no match ✗
+Step 2: LibCosine at best XCorr spectrum (RT=25.3 min)
+  Observed spectrum:
+    m/z: [348.201, 461.299, 576.305, 400.1, 550.2, ...]
+    intensity: [1000, 800, 600, 200, 150, ...]
 
-Metrics:
-  n_matched: 3
-  n_library: 5
-  avg_ms2_error: +3.1 ppm
+  Fragment matching (10 ppm tolerance):
+    y3: 348.2 → 348.201 ✓ (error: +2.9 ppm, closest m/z)
+    y4: 461.3 → 461.299 ✓ (error: -2.2 ppm)
+    y5: 576.3 → 576.305 ✓ (error: +8.7 ppm)
+    b3: 357.2 → no match ✗
+    b4: 458.2 → no match ✗
 
-LibCosine scoring:
-  Library SMZ: [sqrt(100)×348.2², sqrt(80)×461.3², sqrt(60)×576.3²]
-  Observed SMZ: [sqrt(1000)×348.2², sqrt(800)×461.3², sqrt(600)×576.3²]
-  (normalized and dot product computed)
-  LibCosine: 0.95
+  Metrics:
+    n_matched: 3
+    n_library: 5
+    avg_ms2_error: +3.1 ppm
 
-XCorr scoring:
-  (preprocessed via windowing + flanking subtraction)
-  XCorr: 0.42
+  LibCosine scoring (sqrt intensity, NO m/z weighting):
+    Library:  [sqrt(100), sqrt(80), sqrt(60)]
+    Observed: [sqrt(1000), sqrt(800), sqrt(600)]
+    (normalized and dot product computed)
+    LibCosine: 0.95
 
-Isotope cosine (from MS1):
+Step 3: E-value from XCorr survival function
+  700 XCorr scores → fit survival function → E-value: 1.2e-8
+
+Step 4: Isotope cosine (from MS1)
   Theoretical: [0.55, 0.30, 0.12, 0.03]  (from C41H68N10O15)
   Observed:    [0.52, 0.31, 0.13, 0.04]
+  Isotope cosine: 0.998
+
+Final scores:
+  E-value: 1.2e-8 (used for target-decoy competition)
+  LibCosine: 0.95
+  XCorr: 0.42
   Isotope cosine: 0.998
 ```
 
 ## Notes
 
-1. **Score interpretation**: LibCosine > 0.7 is typically a reasonable match
-2. **Closest m/z matching**: Ensures accurate mass error calculation for calibration
-3. **Batch preprocessing**: XCorr is precomputed for ALL spectrum-library pairs, not just the best match
-4. **Isotope scoring**: Only available when MS1 spectra are present in the mzML file
-5. **Multiple scores**: LibCosine for FDR, but all scores written to debug CSV for analysis
+1. **XCorr for RT selection**: XCorr is calculated against ALL spectra in RT window to find the best retention time
+2. **LibCosine at best RT**: LibCosine is only computed once, at the spectrum with the best XCorr
+3. **E-value for competition**: E-value (not LibCosine) is used for target-decoy competition
+4. **Score interpretation**: LibCosine > 0.7 is typically a reasonable match, E-value < 1e-5 is good
+5. **Closest m/z matching**: Ensures accurate mass error calculation for calibration
+6. **Isotope scoring**: Only available when MS1 spectra are present in the mzML file
+7. **Multiple scores**: All scores written to debug CSV for analysis

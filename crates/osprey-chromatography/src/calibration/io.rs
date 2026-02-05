@@ -108,6 +108,49 @@ pub fn calibration_filename(output_base: &str) -> String {
     format!("{}.calibration.json", output_base)
 }
 
+/// Generate calibration filename from input mzML file path
+///
+/// The calibration file is named after the input file, not the output,
+/// so that calibration can be reused when reprocessing the same data file.
+///
+/// # Arguments
+/// * `input_path` - Path to the input mzML file
+///
+/// # Returns
+/// Calibration filename based on input file (e.g., "sample.mzML" -> "sample.calibration.json")
+///
+/// # Example
+/// ```
+/// use osprey_chromatography::calibration::calibration_filename_for_input;
+/// use std::path::Path;
+///
+/// let filename = calibration_filename_for_input(Path::new("/data/sample.mzML"));
+/// assert_eq!(filename, "sample.calibration.json");
+///
+/// let filename = calibration_filename_for_input(Path::new("test.dia.mzML"));
+/// assert_eq!(filename, "test.dia.calibration.json");
+/// ```
+pub fn calibration_filename_for_input(input_path: &Path) -> String {
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    format!("{}.calibration.json", stem)
+}
+
+/// Get the full path for a calibration file based on input mzML and output directory
+///
+/// # Arguments
+/// * `input_path` - Path to the input mzML file
+/// * `output_dir` - Directory where calibration file should be stored
+///
+/// # Returns
+/// Full path to calibration file
+pub fn calibration_path_for_input(input_path: &Path, output_dir: &Path) -> std::path::PathBuf {
+    let filename = calibration_filename_for_input(input_path);
+    output_dir.join(filename)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +192,7 @@ mod tests {
                 residual_sd: 0.8,
                 n_points: 150,
                 r_squared: 0.98,
+                model_params: None,
             },
         }
     }
@@ -158,6 +202,43 @@ mod tests {
         assert_eq!(calibration_filename("results"), "results.calibration.json");
         assert_eq!(calibration_filename("my_search"), "my_search.calibration.json");
         assert_eq!(calibration_filename("test"), "test.calibration.json");
+    }
+
+    #[test]
+    fn test_calibration_filename_for_input() {
+        use std::path::Path;
+
+        // Basic mzML file
+        assert_eq!(
+            calibration_filename_for_input(Path::new("/data/sample.mzML")),
+            "sample.calibration.json"
+        );
+
+        // File with multiple extensions (e.g., sample.dia.mzML)
+        assert_eq!(
+            calibration_filename_for_input(Path::new("test.dia.mzML")),
+            "test.dia.calibration.json"
+        );
+
+        // Simple filename only (no path)
+        assert_eq!(
+            calibration_filename_for_input(Path::new("experiment.mzML")),
+            "experiment.calibration.json"
+        );
+    }
+
+    #[test]
+    fn test_calibration_path_for_input() {
+        use std::path::Path;
+
+        let input = Path::new("/data/raw/sample.mzML");
+        let output_dir = Path::new("/output/results");
+
+        let cal_path = calibration_path_for_input(input, output_dir);
+        assert_eq!(
+            cal_path,
+            Path::new("/output/results/sample.calibration.json")
+        );
     }
 
     // Note: File I/O tests require tempfile crate which isn't available here

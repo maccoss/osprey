@@ -3,10 +3,16 @@
 //! This module provides parsing of mzML files using the mzdata crate,
 //! converting to Osprey's internal spectrum representation.
 //!
+//! ## Single-Pass Loading (Recommended)
+//!
+//! For best performance, use `load_all_spectra()` to read both MS1 and MS2
+//! spectra in a single pass:
+//! - `load_all_spectra()` - Load both MS1 and MS2 spectra efficiently
+//!
 //! ## MS1 Spectra for Calibration
 //!
-//! For MS1 mass calibration (pyXcorrDIA-compatible), use:
-//! - `load_ms1_spectra()` - Load all MS1 spectra from an mzML file
+//! For MS1 mass calibration (pyXcorrDIA-compatible):
+//! - `load_ms1_spectra()` - Load only MS1 spectra (parses file again if MS2 already loaded)
 //! - `MS1Index` - Index for efficient nearest-neighbor lookup by RT
 //!
 //! ## Streaming Parser (optional, requires `streaming` feature)
@@ -21,7 +27,7 @@ mod parser;
 #[cfg(feature = "streaming")]
 pub mod streaming;
 
-pub use parser::{load_ms1_spectra, MS1Index, MzmlReader};
+pub use parser::{load_all_spectra, load_ms1_spectra, MS1Index, MzmlReader};
 
 #[cfg(feature = "streaming")]
 pub use streaming::{ParseStats, StreamingMzmlError, StreamingMzmlReader};

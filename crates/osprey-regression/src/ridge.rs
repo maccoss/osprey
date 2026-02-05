@@ -118,10 +118,14 @@ impl RidgeSolver {
         Ok(x)
     }
 
-    /// Solve with non-negativity constraint using active set method
+    /// Solve with non-negativity constraint using projected gradient descent
     ///
     /// Returns coefficient vector x ≥ 0 that minimizes:
     ///   ‖Ax - b‖² + λ‖x‖²
+    ///
+    /// Uses projected gradient descent which is well-suited for dense solutions
+    /// (many non-zero coefficients), as expected with unit resolution binning
+    /// where many precursor→product ion collisions occur.
     pub fn solve_nonnegative(
         &self,
         a: &Array2<f64>,
@@ -146,46 +150,70 @@ impl RidgeSolver {
             return Ok(Array1::zeros(0));
         }
 
-        // Compute A'A + λI and A'b once
+        // Precompute A'A + λI and A'b (reused every iteration)
         let mut ata_reg = a.t().dot(a);
         for i in 0..k {
             ata_reg[[i, i]] += lambda;
         }
         let atb = a.t().dot(b);
 
-        // Simple iterative projection method for NNLS
-        // Start with unconstrained solution
+        // Initialize with unconstrained solution
         let mut x = self.solve_cholesky(&ata_reg, &atb)?;
 
-        // Project to non-negative and iterate
-        let max_iter = 100;
-        for _ in 0..max_iter {
-            // Project: set negative values to zero
-            let mut changed = false;
-            for i in 0..k {
-                if x[i] < 0.0 {
-                    x[i] = 0.0;
-                    changed = true;
-                }
-            }
-
-            if !changed {
-                break;
-            }
-
-            // Re-solve on active set (variables > 0)
-            // This is a simplified version - a full active set method would be more efficient
-            // For now, we just zero out negative components and continue
+        // Check if unconstrained solution is already non-negative
+        let all_positive = x.iter().all(|&v| v >= 0.0);
+        if all_positive {
+            return Ok(x);
         }
 
-        // Final projection
-        for i in 0..k {
-            if x[i] < 0.0 {
-                x[i] = 0.0;
+        // Project initial solution to non-negative
+        x.mapv_inplace(|v| v.max(0.0));
+
+        // Projected gradient descent parameters
+        let max_iter = 1000;
+        let tol = 1e-8;
+
+        // Step size: use 1/L where L is the Lipschitz constant of the gradient
+        // L = largest eigenvalue of A'A + λI
+        // We use Frobenius norm as a conservative upper bound
+        let lipschitz = self.estimate_lipschitz(&ata_reg);
+        let step_size = 1.0 / lipschitz;
+
+        for _iter in 0..max_iter {
+            // Gradient: ∇f(x) = (A'A + λI)x - A'b
+            let gradient = ata_reg.dot(&x) - &atb;
+
+            // Gradient step: x_new = x - step_size * gradient
+            let x_new: Array1<f64> = &x - step_size * &gradient;
+
+            // Project to non-negative orthant: x_new = max(x_new, 0)
+            let x_new = x_new.mapv(|v| v.max(0.0));
+
+            // Check convergence: ||x_new - x||₂ < tol
+            let diff = &x_new - &x;
+            let change = diff.dot(&diff).sqrt();
+
+            x = x_new;
+
+            if change < tol {
+                break;
             }
         }
 
         Ok(x)
+    }
+
+    /// Estimate the Lipschitz constant of the gradient
+    ///
+    /// Uses Frobenius norm as an upper bound for the spectral norm (largest eigenvalue).
+    /// This gives a conservative step size that guarantees convergence.
+    fn estimate_lipschitz(&self, ata_reg: &Array2<f64>) -> f64 {
+        let mut sum = 0.0;
+        for val in ata_reg.iter() {
+            sum += val * val;
+        }
+        // Add small epsilon to avoid division by zero
+        sum.sqrt().max(1e-10)
     }
 
     /// Compute the residual norm ‖Ax - b‖²
@@ -239,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nonnegative() {
+    fn test_nonnegative_simple() {
         // Test that negative solutions are projected to zero
         let solver = RidgeSolver::new(0.0);
         let a = Array2::eye(3);
@@ -250,6 +278,86 @@ mod tests {
         assert!(x[0] >= 0.0);
         assert!(x[1] >= 0.0); // Should be 0, not -2
         assert!(x[2] >= 0.0);
+    }
+
+    #[test]
+    fn test_nonnegative_non_trivial() {
+        // Test with a non-identity matrix where the unconstrained solution
+        // has negative values and requires proper NNLS iteration
+        let solver = RidgeSolver::new(0.1);
+
+        // Design matrix with correlated columns (like overlapping spectra)
+        let a = array![
+            [1.0, 0.5, 0.2],
+            [0.5, 1.0, 0.3],
+            [0.2, 0.3, 1.0],
+            [0.1, 0.2, 0.8],
+        ];
+        // Observed vector that will cause negative coefficients in unconstrained solution
+        let b = array![0.8, 0.2, 0.9, 0.7];
+
+        let x = solver.solve_nonnegative(&a, &b, None).unwrap();
+
+        // All coefficients must be non-negative
+        for (i, &val) in x.iter().enumerate() {
+            assert!(val >= 0.0, "Coefficient {} is negative: {}", i, val);
+        }
+
+        // Verify the solution is reasonable by checking residual
+        let residual = solver.residual(&a, &x, &b);
+        assert!(residual < 1.0, "Residual too high: {}", residual);
+    }
+
+    #[test]
+    fn test_nonnegative_better_than_naive_projection() {
+        // Verify that NNLS produces a better solution than naive projection
+        let solver = RidgeSolver::new(0.1);
+
+        let a = array![
+            [1.0, 0.8, 0.1],
+            [0.8, 1.0, 0.2],
+            [0.1, 0.2, 1.0],
+        ];
+        let b = array![1.0, -0.5, 0.8];
+
+        // Get proper NNLS solution
+        let x_nnls = solver.solve_nonnegative(&a, &b, None).unwrap();
+
+        // Compute naive projection: just clamp negatives to zero
+        let x_unconstrained = solver.solve(&a, &b, None).unwrap();
+        let x_naive = x_unconstrained.mapv(|v| v.max(0.0));
+
+        // Both should be non-negative
+        assert!(x_nnls.iter().all(|&v| v >= 0.0));
+        assert!(x_naive.iter().all(|&v| v >= 0.0));
+
+        // NNLS solution should have equal or better residual than naive projection
+        let residual_nnls = solver.residual(&a, &x_nnls, &b);
+        let residual_naive = solver.residual(&a, &x_naive, &b);
+
+        assert!(
+            residual_nnls <= residual_naive + 1e-6,
+            "NNLS residual {} should be <= naive residual {}",
+            residual_nnls,
+            residual_naive
+        );
+    }
+
+    #[test]
+    fn test_nonnegative_all_positive_unconstrained() {
+        // When unconstrained solution is already all positive,
+        // NNLS should return the same result
+        let solver = RidgeSolver::new(0.1);
+        let a = Array2::eye(3);
+        let b = array![1.0, 2.0, 3.0];
+
+        let x_unconstrained = solver.solve(&a, &b, None).unwrap();
+        let x_nnls = solver.solve_nonnegative(&a, &b, None).unwrap();
+
+        // Should be the same (or very close)
+        for i in 0..3 {
+            assert_abs_diff_eq!(x_unconstrained[i], x_nnls[i], epsilon = 1e-6);
+        }
     }
 
     #[test]

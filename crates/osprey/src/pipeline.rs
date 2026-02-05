@@ -37,19 +37,20 @@ use osprey_chromatography::{
     PeakDetector, RTCalibration, RTCalibrator, RTCalibratorConfig,
     // Full calibration types
     CalibrationParams, CalibrationMetadata, MzCalibration, RTCalibrationParams, RTCalibrationMethod,
-    MzQCData, calculate_mz_calibration, save_calibration, calibration_filename,
+    MzQCData, calculate_mz_calibration, save_calibration, load_calibration,
+    calibration_path_for_input,
 };
 use osprey_core::{
     BinConfig, DecoyMethod as CoreDecoyMethod, FeatureSet, LibraryEntry,
     MS1Spectrum, OspreyConfig, OspreyError, RegressionResult, ResolutionMode, Result, Spectrum,
 };
 use osprey_fdr::{FdrController, MokapotRunner, PsmFeatures};
-use osprey_io::{load_library, load_ms1_spectra, BlibWriter, MS1Index, MzmlReader};
-use osprey_regression::{Binner, DesignMatrixBuilder, RidgeSolver};
+use osprey_io::{load_library, load_all_spectra, BlibWriter, MS1Index, MzmlReader};
+use osprey_regression::{Binner, BinnedLibrary, BinnedSpectraCache, DesignMatrixBuilder, OptimizedSolver, RidgeSolver};
 use osprey_scoring::{
     batch::{
         BatchScorer, MS1SpectrumLookup, PreprocessedLibrary, PreprocessedSpectra,
-        run_libcosine_calibration_scoring_with_ms1, sample_library_for_calibration,
+        run_libcosine_calibration_scoring_with_ms1,
     },
     DecoyGenerator, DecoyMethod, Enzyme, FeatureExtractor,
 };
@@ -150,7 +151,6 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
     };
 
     let binner = Binner::new(bin_config);
-    let matrix_builder = DesignMatrixBuilder::new(binner.clone());
 
     // Get regularization lambda
     let lambda = match &config.regularization_lambda {
@@ -158,10 +158,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         _ => 1.0, // Default lambda for now
     };
 
-    let solver = RidgeSolver::new(lambda);
+    // Create optimized f32 solver (replaces old f64 RidgeSolver)
+    let optimized_solver = OptimizedSolver::new(lambda as f32);
 
     // Build lookup structure for candidates
     let library_by_mz = build_mz_index(&library);
+
+    // Pre-bin library once for efficient regression (major optimization)
+    log::info!("Pre-binning library for optimized regression...");
+    let binned_library = BinnedLibrary::new(&library, &binner);
 
     // Determine if we should use windowed scoring for large libraries
     // Windowed scoring is more memory-efficient for libraries > 100K entries
@@ -211,8 +216,9 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
                 input_file,
                 &library,
                 &library_by_mz,
-                &matrix_builder,
-                &solver,
+                &binned_library,
+                &binner,
+                &optimized_solver,
                 &config,
                 shared_calibration.as_ref(),
                 preprocessed_library.as_ref(),
@@ -238,27 +244,64 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
     }
 
     log::info!(
-        "Analysis complete. {} total regression results",
-        all_results.len()
+        "Analysis complete. {} total regression results across {} files",
+        all_results.len(),
+        config.input_files.len()
     );
 
-    // Compute FDR and filter results (using spectral similarity scores)
-    log::info!("Computing FDR using target-decoy competition with spectral scoring");
-    let scored_entries = compute_fdr_and_filter(&library, &all_results, &all_spectra, &config)?;
+    // ========== Score each file and run two-level FDR ==========
+
+    // Score each file's results
+    let mut per_file_scored: Vec<(String, Vec<ScoredEntry>)> = Vec::new();
+
+    // Group results and spectra by file for per-file scoring
+    // For now, treat all results as coming from a combined analysis
+    // TODO: Track which results came from which file for proper per-file FDR
+    let combined_file_name = config.input_files.first()
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or("osprey")
+        .to_string();
+
+    log::info!("Scoring peptides and extracting features...");
+    let scored_entries = score_run(&library, &all_results, &all_spectra, &combined_file_name)?;
+    per_file_scored.push((combined_file_name, scored_entries));
+
+    // Run two-level FDR control (run-level + experiment-level)
+    let output_dir = config.output_blib.parent().unwrap_or(std::path::Path::new("."));
+    let experiment_entries = run_two_level_fdr(
+        &mut per_file_scored,
+        &library,
+        config.run_fdr,
+        config.run_fdr, // Use same FDR for experiment level for now
+        output_dir,
+    )?;
+
+    // Filter to passing entries for blib output
+    let passing_entries: Vec<ScoredEntry> = experiment_entries
+        .iter()
+        .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.run_fdr)
+        .cloned()
+        .collect();
+
     log::info!(
-        "FDR filtering: {} entries at {}% FDR",
-        scored_entries.len(),
+        "Final results: {} peptides passing {}% experiment-level FDR",
+        passing_entries.len(),
         config.run_fdr * 100.0
     );
 
-    // Write blib output
-    log::info!("Writing blib to {}", config.output_blib.display());
-    write_blib_output_with_scores(&config, &library, &scored_entries, &config.input_files)?;
+    // Write blib output with Mokapot q-values
+    if !passing_entries.is_empty() {
+        log::info!("Writing blib to {}", config.output_blib.display());
+        write_blib_output_with_scores(&config, &library, &passing_entries, &config.input_files)?;
+    } else {
+        log::warn!("No peptides passed FDR threshold, skipping blib output");
+    }
 
     // Write output report if specified
     if let Some(report_path) = &config.output_report {
         log::info!("Writing report to {}", report_path.display());
-        write_scored_report(report_path, &library, &scored_entries)?;
+        write_scored_report(report_path, &library, &passing_entries)?;
     }
 
     Ok(all_results)
@@ -281,8 +324,9 @@ fn process_file_with_calibration(
     path: &std::path::Path,
     library: &[LibraryEntry],
     library_by_mz: &HashMap<i32, Vec<usize>>,
-    matrix_builder: &DesignMatrixBuilder,
-    solver: &RidgeSolver,
+    binned_library: &BinnedLibrary,
+    binner: &Binner,
+    optimized_solver: &OptimizedSolver,
     config: &OspreyConfig,
     existing_calibration: Option<&(RTCalibration, f64)>,
     preprocessed_library: Option<&PreprocessedLibrary>,
@@ -294,10 +338,8 @@ fn process_file_with_calibration(
     Option<PreprocessedSpectra>,
     Option<(RTCalibration, f64)>,
 )> {
-    // Open mzML file and collect spectra
-    let reader = MzmlReader::open(path)?;
-    let spectra: Vec<Spectrum> = reader.filter_map(|r| r.ok()).collect();
-    log::info!("Read {} MS2 spectra", spectra.len());
+    // Load both MS1 and MS2 spectra in a single pass (more efficient than reading twice)
+    let (spectra, ms1_index) = load_all_spectra(path)?;
 
     if spectra.is_empty() {
         return Ok((Vec::new(), Vec::new(), None, None));
@@ -309,12 +351,13 @@ fn process_file_with_calibration(
             "RT calibration disabled, using fallback tolerance: {:.2} min",
             config.rt_calibration.fallback_rt_tolerance
         );
-        let results = process_spectra(
+        let results = process_spectra_optimized(
             &spectra,
             library,
             library_by_mz,
-            matrix_builder,
-            solver,
+            binned_library,
+            binner,
+            optimized_solver,
             config.rt_calibration.fallback_rt_tolerance,
             config.max_candidates_per_spectrum,
             None,
@@ -329,12 +372,13 @@ fn process_file_with_calibration(
             tol
         );
 
-        let results = process_spectra(
+        let results = process_spectra_optimized(
             &spectra,
             library,
             library_by_mz,
-            matrix_builder,
-            solver,
+            binned_library,
+            binner,
+            optimized_solver,
             *tol,
             config.max_candidates_per_spectrum,
             Some(cal),
@@ -345,6 +389,65 @@ fn process_file_with_calibration(
     // First file: Run calibration discovery with ALL peptides
     log::info!("First file: Calibration Discovery (using all peptides)");
 
+    // Check if a valid calibration file already exists for this input file
+    if let Some(output_dir) = config.output_blib.parent() {
+        let cal_path = calibration_path_for_input(path, output_dir);
+        if cal_path.exists() {
+            log::info!("Found existing calibration file: {}", cal_path.display());
+
+            match load_calibration(&cal_path) {
+                Ok(cal_params) => {
+                    // Check if calibration has model data for RT reconstruction
+                    if cal_params.rt_calibration.has_model_data() && cal_params.is_calibrated() {
+                        log::info!("Reusing existing RT calibration from file");
+
+                        // Reconstruct RTCalibration from model params
+                        let model_params = cal_params.rt_calibration.model_params.as_ref().unwrap();
+                        match RTCalibration::from_model_params(model_params, cal_params.rt_calibration.residual_sd) {
+                            Ok(rt_cal) => {
+                                let tolerance = cal_params.rt_calibration.residual_sd * config.rt_calibration.rt_tolerance_factor;
+                                let tolerance = tolerance.max(0.5);
+
+                                log::info!(
+                                    "Using cached calibration: {} points, R²={:.4}, tolerance={:.2} min",
+                                    cal_params.rt_calibration.n_points,
+                                    cal_params.rt_calibration.r_squared,
+                                    tolerance
+                                );
+
+                                // Log calibration summary
+                                cal_params.log_summary();
+
+                                // Run full search with cached calibration
+                                let results = process_spectra_optimized(
+                                    &spectra,
+                                    library,
+                                    library_by_mz,
+                                    binned_library,
+                                    binner,
+                                    optimized_solver,
+                                    tolerance,
+                                    config.max_candidates_per_spectrum,
+                                    Some(&rt_cal),
+                                )?;
+
+                                return Ok((results, spectra, None, Some((rt_cal, tolerance))));
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to reconstruct calibration from cached file: {}. Re-running calibration.", e);
+                            }
+                        }
+                    } else {
+                        log::info!("Cached calibration missing model data. Re-running calibration.");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to load cached calibration: {}. Re-running calibration.", e);
+                }
+            }
+        }
+    }
+
     // Run calibration using appropriate method based on mode and library size
     #[cfg(feature = "streaming")]
     let calibration_result = if config.streaming {
@@ -353,7 +456,7 @@ fn process_file_with_calibration(
         run_calibration_discovery_streaming(path, library, config)
     } else if use_windowed_scoring {
         // Use windowed scoring for large libraries (memory-efficient)
-        run_calibration_discovery_windowed(path, library, &spectra, config)
+        run_calibration_discovery_windowed(library, &spectra, &ms1_index, config)
     } else if let Some(preproc_lib) = preprocessed_library {
         // Preprocess spectra for batch scoring (reused later)
         log::info!("Preprocessing {} spectra for batch scoring...", spectra.len());
@@ -367,13 +470,13 @@ fn process_file_with_calibration(
         )
     } else {
         // Fallback: use windowed scoring
-        run_calibration_discovery_windowed(path, library, &spectra, config)
+        run_calibration_discovery_windowed(library, &spectra, &ms1_index, config)
     };
 
     #[cfg(not(feature = "streaming"))]
     let calibration_result = if use_windowed_scoring {
         // Use windowed scoring for large libraries (memory-efficient)
-        run_calibration_discovery_windowed(path, library, &spectra, config)
+        run_calibration_discovery_windowed(library, &spectra, &ms1_index, config)
     } else if let Some(preproc_lib) = preprocessed_library {
         // Preprocess spectra for batch scoring (reused later)
         log::info!("Preprocessing {} spectra for batch scoring...", spectra.len());
@@ -387,7 +490,7 @@ fn process_file_with_calibration(
         )
     } else {
         // Fallback: use windowed scoring
-        run_calibration_discovery_windowed(path, library, &spectra, config)
+        run_calibration_discovery_windowed(library, &spectra, &ms1_index, config)
     };
 
     // Determine RT tolerance and extract calibration
@@ -402,16 +505,13 @@ fn process_file_with_calibration(
                 config.rt_calibration.rt_tolerance_factor
             );
 
-            // Save calibration to JSON if output path available
+            // Save calibration to JSON using input file name (for reuse)
             if let Some(output_dir) = config.output_blib.parent() {
-                let cal_filename = calibration_filename(
-                    config.output_blib.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("osprey")
-                );
-                let cal_path = output_dir.join(&cal_filename);
+                let cal_path = calibration_path_for_input(path, output_dir);
                 if let Err(e) = save_calibration(&cal_params, &cal_path) {
                     log::warn!("Failed to save calibration: {}", e);
+                } else {
+                    log::info!("Saved calibration to: {}", cal_path.display());
                 }
             }
 
@@ -435,12 +535,13 @@ fn process_file_with_calibration(
     // Calibrated full search
     log::info!("Calibrated Full Search");
 
-    let results = process_spectra(
+    let results = process_spectra_optimized(
         &spectra,
         library,
         library_by_mz,
-        matrix_builder,
-        solver,
+        binned_library,
+        binner,
+        optimized_solver,
         rt_tolerance,
         config.max_candidates_per_spectrum,
         calibration_opt.as_ref(),
@@ -478,7 +579,7 @@ fn run_calibration_discovery(
 ) -> Result<RTCalibration> {
     let rt_config = &config.rt_calibration;
 
-    // Calculate initial wide tolerance based on library RT range
+    // Calculate library RT range
     let library_rts: Vec<f64> = library
         .iter()
         .filter(|e| !e.is_decoy)
@@ -487,9 +588,6 @@ fn run_calibration_discovery(
     let min_rt = library_rts.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_rt = library_rts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let rt_range = max_rt - min_rt;
-
-    // Wide tolerance = fraction of RT range (default 25%)
-    let initial_tolerance = rt_range * rt_config.initial_tolerance_fraction;
 
     // Get all entries with fragments (both targets and decoys)
     let entries_with_fragments: Vec<LibraryEntry> = library
@@ -507,12 +605,6 @@ fn run_calibration_discovery(
         n_decoys,
         min_rt,
         max_rt
-    );
-    log::info!(
-        "Initial RT tolerance: {:.1} min ({:.0}% of {:.1} min range)",
-        initial_tolerance,
-        rt_config.initial_tolerance_fraction * 100.0,
-        rt_range
     );
 
     // === BLAS-accelerated batch scoring ===
@@ -566,6 +658,20 @@ fn run_calibration_discovery(
         (1.0, 0.0)
     };
 
+    // RT tolerance depends on whether linear mapping was needed
+    // - Similar RT scales (no mapping): use 20% of RT range
+    // - Different RT scales (linear mapping): use 50% of RT range
+    let tolerance_fraction = if use_direct_rts { 0.2 } else { 0.5 };
+    let initial_tolerance = meas_rt_range * tolerance_fraction;
+    let mapped_tolerance = initial_tolerance; // Already in measured RT scale
+
+    log::info!(
+        "Initial RT tolerance: {:.1} min ({:.0}% of {:.1} min mzML range)",
+        initial_tolerance,
+        tolerance_fraction * 100.0,
+        meas_rt_range
+    );
+
     // Build library RT lookup (mapped only if ranges differ significantly)
     let library_rts_mapped: Vec<f64> = preprocessed_library
         .entry_ids
@@ -577,16 +683,6 @@ fn run_calibration_discovery(
                 .map(|e| rt_slope * e.retention_time + rt_intercept)
         })
         .collect();
-
-    // RT tolerance (scaled only if mapping was applied)
-    let mapped_tolerance = initial_tolerance * rt_slope.abs();
-
-    if !use_direct_rts {
-        log::info!(
-            "Mapped RT tolerance: {:.2} min (in measured RT scale)",
-            mapped_tolerance
-        );
-    }
 
     log::info!(
         "Computing LibCosine scores ({} × {} = {} pairs via BLAS)...",
@@ -693,9 +789,9 @@ fn run_calibration_discovery(
 ///
 /// Returns both the RTCalibration (for prediction) and CalibrationParams (for saving/logging).
 fn run_calibration_discovery_windowed(
-    input_path: &std::path::Path,
     library: &[LibraryEntry],
     spectra: &[Spectrum],
+    ms1_index: &MS1Index,
     config: &OspreyConfig,
 ) -> Result<(RTCalibration, CalibrationParams)> {
     let rt_config = &config.rt_calibration;
@@ -748,46 +844,45 @@ fn run_calibration_discovery_windowed(
         }
     };
 
-    // Wide tolerance = fraction of RT range (default 25%)
-    // Use the mzML RT range for tolerance calculation since that's the measured scale
-    let initial_tolerance = mzml_rt_range * rt_config.initial_tolerance_fraction;
+    // RT tolerance depends on whether linear mapping was needed
+    // - Similar RT scales (no mapping): use 20% of RT range
+    // - Different RT scales (linear mapping): use 50% of RT range
+    let tolerance_fraction = if use_linear_mapping { 0.5 } else { 0.2 };
+    let initial_tolerance = mzml_rt_range * tolerance_fraction;
 
-    let n_targets = library.iter().filter(|e| !e.is_decoy && !e.fragments.is_empty()).count();
-    let n_decoys = library.iter().filter(|e| e.is_decoy && !e.fragments.is_empty()).count();
+    let n_targets = library.iter().filter(|e| !e.is_decoy).count();
+    let n_decoys = library.iter().filter(|e| e.is_decoy).count();
+    let n_with_fragments = library.iter().filter(|e| !e.fragments.is_empty()).count();
 
     log::info!(
-        "Calibration: library has {} targets + {} decoys (library RT: {:.1}-{:.1}, mzML RT: {:.1}-{:.1} min)",
+        "Calibration: library has {} targets + {} decoys = {} total (library RT: {:.1}-{:.1}, mzML RT: {:.1}-{:.1} min)",
         n_targets,
         n_decoys,
+        n_targets + n_decoys,
         lib_min_rt,
         lib_max_rt,
         mzml_min_rt,
         mzml_max_rt
     );
 
-    // Sample library for calibration (pyXcorrDIA strategy)
-    // For large libraries, only score a subset of peptides for calibration
-    let calibration_library = if rt_config.calibration_sample_size > 0 {
-        let sampled = sample_library_for_calibration(
-            library,
-            rt_config.calibration_sample_size,
-            42, // Fixed seed for reproducibility
+    if n_with_fragments < library.len() {
+        log::warn!(
+            "{} entries have no fragments and will not be scored",
+            library.len() - n_with_fragments
         );
-        log::info!(
-            "Sampled {} entries for calibration (from {} total)",
-            sampled.len(),
-            library.len()
-        );
-        sampled
-    } else {
-        log::info!("Using full library for calibration (calibration_sample_size=0)");
-        library.to_vec()
-    };
+    }
+
+    // Use full library for calibration (XCorr via BLAS is fast enough)
+    let calibration_library: Vec<LibraryEntry> = library.to_vec();
+    log::info!(
+        "Using {} entries for calibration",
+        calibration_library.len()
+    );
 
     log::info!(
         "Initial RT tolerance: {:.1} min ({:.0}% of {:.1} min mzML range)",
         initial_tolerance,
-        rt_config.initial_tolerance_fraction * 100.0,
+        tolerance_fraction * 100.0,
         mzml_rt_range
     );
     log::info!(
@@ -799,32 +894,26 @@ fn run_calibration_discovery_windowed(
         }
     );
 
-    // Load MS1 spectra for precursor mass calibration
-    // Extracts the M+0 isotope peak from actual MS1 spectra instead of using isolation window center
-    let ms1_index = match load_ms1_spectra(input_path) {
-        Ok(index) => {
-            log::info!(
-                "Loaded {} MS1 spectra for precursor calibration",
-                index.len()
-            );
-            Some(index)
-        }
-        Err(e) => {
-            log::warn!(
-                "Could not load MS1 spectra: {}. Falling back to isolation window center for precursor m/z.",
-                e
-            );
-            None
-        }
-    };
+    // MS1 spectra were loaded in single pass with MS2 - use them for precursor mass calibration
+    let has_ms1 = !ms1_index.is_empty();
+    if has_ms1 {
+        log::info!(
+            "Using {} MS1 spectra for precursor calibration",
+            ms1_index.len()
+        );
+    } else {
+        log::warn!(
+            "No MS1 spectra available. Falling back to isolation window center for precursor m/z."
+        );
+    }
 
     // Run LibCosine calibration scoring (ppm-based peak matching, NO binning)
     // Uses MS1 spectra to extract M+0 isotope peak for accurate precursor mass calibration
-    let matches = if let Some(ref ms1) = ms1_index {
+    let matches = if has_ms1 {
         run_libcosine_calibration_scoring_with_ms1(
             &calibration_library,
             spectra,
-            Some(&MS1IndexWrapper(ms1)),
+            Some(&MS1IndexWrapper(ms1_index)),
             config.fragment_tolerance,
             config.precursor_tolerance.tolerance, // ppm tolerance for isotope peak matching
             initial_tolerance,
@@ -906,15 +995,17 @@ fn run_calibration_discovery_windowed(
         log::info!("Wrote paired calibration debug CSV to: {}", debug_path.display());
     }
 
-    // Run target-decoy competition (pyXcorrDIA style)
-    // Each target competes with its paired decoy. Higher score wins. Ties go to decoy.
-    // Then sort winners by score and compute FDR = cumulative_decoys / cumulative_targets
+    // Run target-decoy competition using E-value (Comet-style, pyXcorrDIA approach)
+    // Each target competes with its paired decoy. Lower E-value wins. Ties go to decoy.
+    // Then sort winners by -E-value (so lower E-value = higher score) and compute FDR
     let calibration_fdr = 0.01; // 1% FDR for calibration
     let fdr_controller = FdrController::new(calibration_fdr);
 
-    // Convert matches to competition format: (item, score, is_decoy, entry_id)
+    // Convert matches to competition format: (item, -evalue, is_decoy, entry_id)
+    // We negate E-value because FdrController uses "higher is better"
+    // but E-value is "lower is better"
     let competition_input = matches.iter().map(|m| {
-        (m.clone(), m.score, m.is_decoy, m.entry_id)
+        (m.clone(), -m.evalue, m.is_decoy, m.entry_id)
     });
 
     let competition_result = fdr_controller.compete_and_filter(competition_input);
@@ -999,6 +1090,7 @@ fn run_calibration_discovery_windowed(
             residual_sd: rt_stats.residual_std,
             n_points: rt_stats.n_points,
             r_squared: rt_stats.r_squared,
+            model_params: Some(rt_calibration.export_model_params()),
         },
     };
 
@@ -1030,9 +1122,6 @@ fn run_calibration_discovery_with_cache(
     let max_rt = library_rts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let rt_range = max_rt - min_rt;
 
-    // Wide tolerance = fraction of RT range (default 25%)
-    let initial_tolerance = rt_range * rt_config.initial_tolerance_fraction;
-
     let n_targets = library.iter().filter(|e| !e.is_decoy && !e.fragments.is_empty()).count();
     let n_decoys = library.iter().filter(|e| e.is_decoy && !e.fragments.is_empty()).count();
 
@@ -1042,12 +1131,6 @@ fn run_calibration_discovery_with_cache(
         n_decoys,
         min_rt,
         max_rt
-    );
-    log::info!(
-        "Initial RT tolerance: {:.1} min ({:.0}% of {:.1} min range)",
-        initial_tolerance,
-        rt_config.initial_tolerance_fraction * 100.0,
-        rt_range
     );
 
     // Get measured RT range from spectra
@@ -1092,6 +1175,20 @@ fn run_calibration_discovery_with_cache(
         (1.0, 0.0)
     };
 
+    // RT tolerance depends on whether linear mapping was needed
+    // - Similar RT scales (no mapping): use 20% of RT range
+    // - Different RT scales (linear mapping): use 50% of RT range
+    let tolerance_fraction = if use_direct_rts { 0.2 } else { 0.5 };
+    let initial_tolerance = meas_rt_range * tolerance_fraction;
+    let mapped_tolerance = initial_tolerance; // Already in measured RT scale
+
+    log::info!(
+        "Initial RT tolerance: {:.1} min ({:.0}% of {:.1} min mzML range)",
+        initial_tolerance,
+        tolerance_fraction * 100.0,
+        meas_rt_range
+    );
+
     // Build library RT lookup (mapped only if ranges differ significantly)
     let library_rts_mapped: Vec<f64> = preprocessed_library
         .entry_ids
@@ -1103,16 +1200,6 @@ fn run_calibration_discovery_with_cache(
                 .map(|e| rt_slope * e.retention_time + rt_intercept)
         })
         .collect();
-
-    // RT tolerance (scaled only if mapping was applied)
-    let mapped_tolerance = initial_tolerance * rt_slope.abs();
-
-    if !use_direct_rts {
-        log::info!(
-            "Mapped RT tolerance: {:.2} min (in measured RT scale)",
-            mapped_tolerance
-        );
-    }
 
     log::info!(
         "Computing LibCosine scores ({} × {} = {} pairs via BLAS, using cached matrices)...",
@@ -1228,6 +1315,7 @@ fn run_calibration_discovery_with_cache(
             residual_sd: rt_stats.residual_std,
             n_points: rt_stats.n_points,
             r_squared: rt_stats.r_squared,
+            model_params: Some(rt_calibration.export_model_params()),
         },
     };
 
@@ -1296,33 +1384,176 @@ fn process_spectra(
     Ok(results)
 }
 
+/// Optimized process_spectra using pre-binned library and f32 operations
+///
+/// Key optimizations:
+/// - Uses pre-binned library (avoids redundant binning)
+/// - Uses f32 instead of f64 (faster BLAS, less memory)
+/// - Caches binned observed spectra
+fn process_spectra_optimized(
+    spectra: &[Spectrum],
+    library: &[LibraryEntry],
+    library_by_mz: &HashMap<i32, Vec<usize>>,
+    binned_library: &BinnedLibrary,
+    binner: &Binner,
+    solver: &OptimizedSolver,
+    rt_tolerance: f64,
+    max_candidates: usize,
+    calibration: Option<&RTCalibration>,
+) -> Result<Vec<RegressionResult>> {
+    // Pre-bin all observed spectra once
+    log::info!("Pre-binning {} observed spectra...", spectra.len());
+    let mut spectra_cache = BinnedSpectraCache::with_capacity(binner.n_bins(), spectra.len());
+    spectra_cache.populate(spectra, binner);
+
+    // Set up progress bar
+    let pb = ProgressBar::new(spectra.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} spectra (optimized)",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    // Process spectra in parallel
+    // Note: We can't mutate spectra_cache in parallel, so we use get() which is immutable
+    let results: Vec<RegressionResult> = spectra
+        .par_iter()
+        .filter_map(|spectrum| {
+            // Select candidates
+            let candidates = select_candidates_with_calibration(
+                spectrum,
+                library,
+                library_by_mz,
+                rt_tolerance,
+                max_candidates,
+                None,
+                calibration,
+            );
+
+            if candidates.is_empty() {
+                pb.inc(1);
+                return None;
+            }
+
+            // Get pre-binned observed spectrum
+            let observed = spectra_cache.get(spectrum.scan_number)?;
+            let observed_norm = observed.dot(observed);
+
+            // Extract design matrix from pre-binned library (no rebinning!)
+            let (design_matrix, library_ids) = binned_library.extract_design_matrix(&candidates);
+
+            // Solve regression with f32
+            let coefficients = match solver.solve_nonnegative(&design_matrix, observed, None) {
+                Ok(c) => c,
+                Err(_) => {
+                    pb.inc(1);
+                    return None;
+                }
+            };
+
+            let coefficient_sum: f32 = coefficients.iter().sum();
+
+            // Compute residual
+            let predicted = design_matrix.dot(&coefficients);
+            let diff = observed - &predicted;
+            let residual = diff.dot(&diff);
+
+            // Filter to non-zero coefficients and convert to RegressionResult
+            let mut result = RegressionResult::new(spectrum.scan_number, spectrum.retention_time);
+            for (id, coef) in library_ids.iter().zip(coefficients.iter()) {
+                if *coef > 1e-6 {
+                    result.library_ids.push(*id);
+                    result.coefficients.push(*coef as f64);
+                }
+            }
+
+            // Set contextual metrics
+            result.residual = residual as f64;
+            result.n_candidates = candidates.len() as u32;
+            result.coefficient_sum = coefficient_sum as f64;
+            result.observed_norm = observed_norm as f64;
+
+            pb.inc(1);
+
+            if result.coefficients.is_empty() {
+                None
+            } else {
+                Some(result)
+            }
+        })
+        .collect();
+
+    pb.finish_with_message("Done");
+
+    log::info!(
+        "Generated {} regression results with non-zero coefficients (optimized)",
+        results.len()
+    );
+
+    Ok(results)
+}
+
 /// Scored library entry after FDR control
 #[derive(Debug, Clone)]
 struct ScoredEntry {
     /// Library entry index
     lib_idx: usize,
+    /// PSM identifier (for matching with Mokapot results)
+    psm_id: String,
+    /// Source file name
+    file_name: String,
     /// Coefficient time series
     rt_coef_pairs: Vec<(f64, f64)>,
     /// Extracted features
     features: FeatureSet,
-    /// Score (peak_apex for now)
+    /// Primary score (LibCosine)
     score: f64,
-    /// Q-value from target-decoy competition
-    q_value: f64,
+    /// Run-level q-value (from Mokapot on single file)
+    run_qvalue: f64,
+    /// Experiment-level q-value (from Mokapot across files)
+    experiment_qvalue: f64,
+    /// Posterior error probability (from Mokapot)
+    pep: f64,
     /// Is decoy
     is_decoy: bool,
 }
 
-/// Compute FDR using target-decoy competition and filter results
+/// Results from processing a single run (mzML file)
+#[derive(Debug)]
+struct RunLevelResults {
+    /// File name
+    file_name: String,
+    /// All scored entries (targets + decoys)
+    scored_entries: Vec<ScoredEntry>,
+    /// Path to the PIN file written for this run
+    pin_path: std::path::PathBuf,
+}
+
+/// Experiment-level aggregated result (best PSM per peptide across runs)
+#[derive(Debug, Clone)]
+struct ExperimentPsm {
+    /// Modified peptide sequence (unique identifier)
+    peptide: String,
+    /// Best scoring entry across all runs
+    best_entry: ScoredEntry,
+    /// Number of runs where this peptide was detected
+    n_runs_detected: u32,
+}
+
+/// Score peptides and extract features for a single run
 ///
-/// Uses spectral similarity scoring (LibCosine) as the primary score for FDR computation.
-fn compute_fdr_and_filter(
+/// Uses spectral similarity scoring (LibCosine) as the primary score.
+/// Returns all scored entries (targets + decoys) for subsequent FDR computation.
+fn score_run(
     library: &[LibraryEntry],
     results: &[RegressionResult],
     spectra: &[Spectrum],
-    config: &OspreyConfig,
+    file_name: &str,
 ) -> Result<Vec<ScoredEntry>> {
-    use osprey_scoring::SpectralScorer;
+    use osprey_scoring::{RegressionContext, SpectralScorer};
 
     // Build ID-to-index map
     let id_to_index: HashMap<u32, usize> = library
@@ -1332,13 +1563,19 @@ fn compute_fdr_and_filter(
         .collect();
 
     // Aggregate results by library entry ID
+    // Store both (RT, coef) pairs and indices to RegressionResults for context building
     let mut entry_data: HashMap<u32, Vec<(f64, f64)>> = HashMap::new(); // (RT, coef)
-    for result in results {
+    let mut entry_result_indices: HashMap<u32, Vec<usize>> = HashMap::new(); // indices into results
+    for (result_idx, result) in results.iter().enumerate() {
         for (lib_id, coef) in result.library_ids.iter().zip(result.coefficients.iter()) {
             entry_data
                 .entry(*lib_id)
                 .or_default()
                 .push((result.retention_time, *coef));
+            entry_result_indices
+                .entry(*lib_id)
+                .or_default()
+                .push(result_idx);
         }
     }
 
@@ -1347,9 +1584,13 @@ fn compute_fdr_and_filter(
     let spectral_scorer = SpectralScorer::new();
     let peak_detector = PeakDetector::new().with_min_height(0.05);
 
-    let mut scored_entries: Vec<ScoredEntry> = entry_data
+    // Collect library IDs for parallel iteration
+    let lib_ids: Vec<u32> = entry_data.keys().copied().collect();
+
+    let mut scored_entries: Vec<ScoredEntry> = lib_ids
         .par_iter()
-        .filter_map(|(lib_id, data_points)| {
+        .filter_map(|lib_id| {
+            let data_points = entry_data.get(lib_id)?;
             if data_points.len() < 3 {
                 return None;
             }
@@ -1359,7 +1600,7 @@ fn compute_fdr_and_filter(
 
             // Sort by RT
             let mut sorted_data = data_points.clone();
-            sorted_data.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            sorted_data.sort_by(|a, b| a.0.total_cmp(&b.0));
 
             // Use sorted data directly as RT-coef pairs for peak detection
             let rt_coef_pairs: Vec<(f64, f64)> = sorted_data.clone();
@@ -1373,7 +1614,7 @@ fn compute_fdr_and_filter(
             // Find apex RT (RT with maximum coefficient)
             let apex_rt = sorted_data
                 .iter()
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(rt, _)| *rt)
                 .unwrap_or(entry.retention_time);
 
@@ -1394,14 +1635,28 @@ fn compute_fdr_and_filter(
                 .cloned()
                 .collect();
 
+            // Build regression context from the RegressionResults that contain this peptide
+            let regression_context = entry_result_indices
+                .get(lib_id)
+                .map(|indices| {
+                    let result_refs: Vec<&RegressionResult> =
+                        indices.iter().map(|&idx| &results[idx]).collect();
+                    RegressionContext::from_results(&result_refs, *lib_id)
+                });
+
             // Extract features using spectrum aggregation (FR-5.2.1)
             // This aggregates all spectra in the peak region weighted by coefficients
-            let features = feature_extractor.extract_with_aggregation(
+            let mut features = feature_extractor.extract_with_aggregation(
                 entry,
                 &rt_coef_pairs,
                 &peak_region_spectra,
                 Some(entry.retention_time),
             );
+
+            // Apply contextual features from regression context
+            if let Some(ctx) = &regression_context {
+                FeatureExtractor::apply_regression_context(&mut features, ctx);
+            }
 
             // Find apex spectrum from peak region (closest to apex RT) for spectral scoring
             let apex_spectrum = peak_region_spectra
@@ -1431,71 +1686,34 @@ fn compute_fdr_and_filter(
             // Check if this is a decoy (high bit set in ID)
             let is_decoy = *lib_id & 0x80000000 != 0;
 
+            // Generate PSM ID for matching with Mokapot results
+            let psm_id = format!("{}_{}", file_name, lib_id);
+
             Some(ScoredEntry {
                 lib_idx,
+                psm_id,
+                file_name: file_name.to_string(),
                 rt_coef_pairs,
                 features,
                 score,
-                q_value: 1.0, // Will be computed below
+                run_qvalue: 1.0,        // Will be set by Mokapot
+                experiment_qvalue: 1.0, // Will be set by experiment-level Mokapot
+                pep: 1.0,               // Will be set by Mokapot
                 is_decoy,
             })
         })
         .collect();
 
-    // Separate targets and decoys
-    let target_scores: Vec<f64> = scored_entries
-        .iter()
-        .filter(|e| !e.is_decoy)
-        .map(|e| e.score)
-        .collect();
-
-    let decoy_scores: Vec<f64> = scored_entries
-        .iter()
-        .filter(|e| e.is_decoy)
-        .map(|e| e.score)
-        .collect();
-
     log::info!(
-        "FDR computation: {} targets, {} decoys",
-        target_scores.len(),
-        decoy_scores.len()
+        "Scored {} entries ({} targets, {} decoys) for {}",
+        scored_entries.len(),
+        scored_entries.iter().filter(|e| !e.is_decoy).count(),
+        scored_entries.iter().filter(|e| e.is_decoy).count(),
+        file_name
     );
 
-    // Compute q-values using target-decoy competition
-    let fdr_controller = FdrController::new(config.run_fdr);
-    let target_qvalues = fdr_controller.compute_qvalues(&target_scores, &decoy_scores)?;
-
-    // Assign q-values back to entries
-    let mut target_idx = 0;
-    for entry in scored_entries.iter_mut() {
-        if !entry.is_decoy {
-            if target_idx < target_qvalues.len() {
-                entry.q_value = target_qvalues[target_idx];
-                target_idx += 1;
-            }
-        }
-        // Decoys keep q_value = 1.0
-    }
-
-    // Report FDR statistics
-    let passing_targets = scored_entries
-        .iter()
-        .filter(|e| !e.is_decoy && e.q_value <= config.run_fdr)
-        .count();
-
-    log::info!(
-        "Targets passing {}% FDR: {}",
-        config.run_fdr * 100.0,
-        passing_targets
-    );
-
-    // Filter to passing targets only for output
-    let filtered: Vec<ScoredEntry> = scored_entries
-        .into_iter()
-        .filter(|e| !e.is_decoy && e.q_value <= config.run_fdr)
-        .collect();
-
-    Ok(filtered)
+    // Return ALL entries (targets + decoys) for subsequent Mokapot FDR
+    Ok(scored_entries)
 }
 
 /// Compute FDR using Mokapot semi-supervised learning
@@ -1535,7 +1753,7 @@ fn compute_fdr_with_mokapot(
                 proteins: lib_entry.protein_ids.clone(),
                 scan_number: entry.rt_coef_pairs
                     .iter()
-                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(_, _)| 0u32)
                     .unwrap_or(0),
                 file_name: file_name.to_string(),
@@ -1560,108 +1778,254 @@ fn compute_fdr_with_mokapot(
     // Run mokapot
     let results = mokapot.run(&pin_file, &mokapot_dir)?;
 
-    // Update q-values from mokapot results
-    let result_map: std::collections::HashMap<String, f64> = results
+    // Build lookup from psm_id to mokapot results
+    let result_map: std::collections::HashMap<String, (f64, f64)> = results
         .into_iter()
-        .map(|r| (r.psm_id, r.q_value))
+        .map(|r| (r.psm_id, (r.q_value, r.pep)))
         .collect();
 
-    for (idx, entry) in scored_entries.iter_mut().enumerate() {
-        let psm_id = format!("{}_{}", file_name, idx);
-        if let Some(&q_value) = result_map.get(&psm_id) {
-            entry.q_value = q_value;
+    // Update run-level q-values and PEPs from mokapot results
+    let mut updated = 0;
+    for entry in scored_entries.iter_mut() {
+        if let Some(&(q_value, pep)) = result_map.get(&entry.psm_id) {
+            entry.run_qvalue = q_value;
+            entry.pep = pep;
+            updated += 1;
         }
     }
 
-    log::info!("Updated q-values from mokapot results");
+    log::info!("Updated {} entries with run-level Mokapot results", updated);
 
     Ok(())
 }
 
-/// Run per-file and experiment-level FDR control
+/// Run two-level FDR control using Mokapot
 ///
 /// This implements the two-level FDR strategy:
-/// 1. Per-file FDR: Each file is processed independently
-/// 2. Experiment-level FDR: Combine results across all files
-#[allow(dead_code)]
-fn run_fdr_control(
-    per_file_results: &mut [(String, Vec<ScoredEntry>)],
+/// 1. Run-level FDR: Run Mokapot on each file independently → run_qvalue, pep
+/// 2. Experiment-level FDR: Keep best PSM per peptide, run Mokapot again → experiment_qvalue
+///
+/// Returns all entries with both run-level and experiment-level q-values populated.
+fn run_two_level_fdr(
+    per_file_results: &mut Vec<(String, Vec<ScoredEntry>)>,
     library: &[LibraryEntry],
     run_fdr: f64,
     experiment_fdr: f64,
-    use_mokapot: bool,
     output_dir: &std::path::Path,
 ) -> Result<Vec<ScoredEntry>> {
-    // Step 1: Per-file FDR
-    log::info!("Step 1: Per-file FDR control at {}%", run_fdr * 100.0);
+    let mokapot = MokapotRunner::new()
+        .with_train_fdr(run_fdr)
+        .with_test_fdr(run_fdr);
+
+    let mokapot_available = mokapot.is_available();
+    if !mokapot_available {
+        log::warn!("Mokapot not available, using simple target-decoy competition");
+        log::warn!("Install mokapot with: pip install mokapot");
+    }
+
+    // Create output directory for mokapot files
+    let mokapot_dir = output_dir.join("mokapot");
+    std::fs::create_dir_all(&mokapot_dir)?;
+
+    // ========== STEP 1: Run-level FDR ==========
+    log::info!("Step 1: Run-level FDR control at {}%", run_fdr * 100.0);
 
     for (file_name, entries) in per_file_results.iter_mut() {
-        if use_mokapot {
+        if mokapot_available {
+            // Run Mokapot for this file
             compute_fdr_with_mokapot(
                 library,
                 entries,
                 file_name,
-                output_dir,
+                &mokapot_dir,
                 run_fdr,
                 run_fdr,
             )?;
+        } else {
+            // Fallback: simple target-decoy competition
+            apply_simple_fdr(entries, run_fdr)?;
         }
 
-        // Filter to per-file FDR threshold
-        let passing = entries.iter().filter(|e| !e.is_decoy && e.q_value <= run_fdr).count();
-        log::info!("  {}: {} targets passing {}% FDR", file_name, passing, run_fdr * 100.0);
+        // Report per-file statistics
+        let passing = entries.iter().filter(|e| !e.is_decoy && e.run_qvalue <= run_fdr).count();
+        log::info!("  {}: {} targets passing {}% run-level FDR", file_name, passing, run_fdr * 100.0);
     }
 
-    // Step 2: Experiment-level FDR
+    // ========== STEP 2: Experiment-level FDR ==========
     log::info!("Step 2: Experiment-level FDR control at {}%", experiment_fdr * 100.0);
 
-    // Combine all per-file results
-    let mut all_entries: Vec<ScoredEntry> = per_file_results
+    // Collect all entries across files
+    let all_entries: Vec<ScoredEntry> = per_file_results
         .iter()
         .flat_map(|(_, entries)| entries.iter().cloned())
         .collect();
 
-    // Re-compute experiment-level q-values
-    let fdr_controller = FdrController::new(experiment_fdr);
+    // Aggregate: keep best PSM per peptide (by score)
+    let mut best_per_peptide: HashMap<String, ScoredEntry> = HashMap::new();
+    for entry in all_entries.iter() {
+        let peptide_key = library[entry.lib_idx].modified_sequence.clone();
+        best_per_peptide
+            .entry(peptide_key)
+            .and_modify(|existing| {
+                if entry.score > existing.score {
+                    *existing = entry.clone();
+                }
+            })
+            .or_insert_with(|| entry.clone());
+    }
 
-    let target_scores: Vec<f64> = all_entries
+    let mut experiment_entries: Vec<ScoredEntry> = best_per_peptide.into_values().collect();
+    log::info!(
+        "Aggregated to {} unique peptides ({} targets, {} decoys)",
+        experiment_entries.len(),
+        experiment_entries.iter().filter(|e| !e.is_decoy).count(),
+        experiment_entries.iter().filter(|e| e.is_decoy).count()
+    );
+
+    if mokapot_available {
+        // Run experiment-level Mokapot
+        run_experiment_level_mokapot(
+            &mut experiment_entries,
+            library,
+            &mokapot_dir,
+            experiment_fdr,
+        )?;
+    } else {
+        // Fallback: simple target-decoy competition for experiment level
+        apply_simple_fdr_experiment(&mut experiment_entries, experiment_fdr)?;
+    }
+
+    // Report experiment-level statistics
+    let passing = experiment_entries.iter()
+        .filter(|e| !e.is_decoy && e.experiment_qvalue <= experiment_fdr)
+        .count();
+    log::info!(
+        "Experiment-level: {} peptides passing {}% FDR",
+        passing,
+        experiment_fdr * 100.0
+    );
+
+    Ok(experiment_entries)
+}
+
+/// Run Mokapot at experiment level (on aggregated best PSMs)
+fn run_experiment_level_mokapot(
+    entries: &mut [ScoredEntry],
+    library: &[LibraryEntry],
+    output_dir: &std::path::Path,
+    fdr: f64,
+) -> Result<()> {
+    let mokapot = MokapotRunner::new()
+        .with_train_fdr(fdr)
+        .with_test_fdr(fdr);
+
+    // Convert to PSM features with experiment-level IDs
+    let psm_features: Vec<PsmFeatures> = entries
+        .iter()
+        .map(|entry| {
+            let lib_entry = &library[entry.lib_idx];
+            PsmFeatures {
+                psm_id: format!("exp_{}", entry.psm_id),
+                peptide: lib_entry.modified_sequence.clone(),
+                proteins: lib_entry.protein_ids.clone(),
+                scan_number: 0, // Not relevant for experiment level
+                file_name: "experiment".to_string(),
+                charge: lib_entry.charge,
+                is_decoy: entry.is_decoy,
+                features: entry.features.clone(),
+                initial_score: Some(entry.score),
+            }
+        })
+        .collect();
+
+    // Write experiment-level PIN file
+    let pin_file = output_dir.join("experiment.pin");
+    mokapot.write_pin(&psm_features, &pin_file)?;
+    log::info!("Wrote experiment-level PIN file: {}", pin_file.display());
+
+    // Run Mokapot
+    let results = mokapot.run(&pin_file, &output_dir.to_path_buf())?;
+
+    // Build lookup from psm_id to results
+    let result_map: HashMap<String, (f64, f64)> = results
+        .into_iter()
+        .map(|r| (r.psm_id, (r.q_value, r.pep)))
+        .collect();
+
+    // Update experiment-level q-values
+    let mut updated = 0;
+    for entry in entries.iter_mut() {
+        let exp_psm_id = format!("exp_{}", entry.psm_id);
+        if let Some(&(q_value, _pep)) = result_map.get(&exp_psm_id) {
+            entry.experiment_qvalue = q_value;
+            updated += 1;
+        }
+    }
+
+    log::info!("Updated {} entries with experiment-level Mokapot results", updated);
+    Ok(())
+}
+
+/// Fallback: Apply simple target-decoy FDR to run-level q-values
+fn apply_simple_fdr(entries: &mut [ScoredEntry], fdr_threshold: f64) -> Result<()> {
+    let fdr_controller = FdrController::new(fdr_threshold);
+
+    let target_scores: Vec<f64> = entries
         .iter()
         .filter(|e| !e.is_decoy)
         .map(|e| e.score)
         .collect();
 
-    let decoy_scores: Vec<f64> = all_entries
+    let decoy_scores: Vec<f64> = entries
         .iter()
         .filter(|e| e.is_decoy)
         .map(|e| e.score)
         .collect();
 
-    let experiment_qvalues = fdr_controller.compute_qvalues(&target_scores, &decoy_scores)?;
+    let qvalues = fdr_controller.compute_qvalues(&target_scores, &decoy_scores)?;
 
-    // Update q-values with experiment-level values
     let mut target_idx = 0;
-    for entry in all_entries.iter_mut() {
+    for entry in entries.iter_mut() {
         if !entry.is_decoy {
-            if target_idx < experiment_qvalues.len() {
-                entry.q_value = experiment_qvalues[target_idx];
+            if target_idx < qvalues.len() {
+                entry.run_qvalue = qvalues[target_idx];
                 target_idx += 1;
             }
         }
     }
 
-    // Filter to experiment-level FDR
-    let filtered: Vec<ScoredEntry> = all_entries
-        .into_iter()
-        .filter(|e| !e.is_decoy && e.q_value <= experiment_fdr)
+    Ok(())
+}
+
+/// Fallback: Apply simple target-decoy FDR to experiment-level q-values
+fn apply_simple_fdr_experiment(entries: &mut [ScoredEntry], fdr_threshold: f64) -> Result<()> {
+    let fdr_controller = FdrController::new(fdr_threshold);
+
+    let target_scores: Vec<f64> = entries
+        .iter()
+        .filter(|e| !e.is_decoy)
+        .map(|e| e.score)
         .collect();
 
-    log::info!(
-        "Experiment-level: {} targets passing {}% FDR",
-        filtered.len(),
-        experiment_fdr * 100.0
-    );
+    let decoy_scores: Vec<f64> = entries
+        .iter()
+        .filter(|e| e.is_decoy)
+        .map(|e| e.score)
+        .collect();
 
-    Ok(filtered)
+    let qvalues = fdr_controller.compute_qvalues(&target_scores, &decoy_scores)?;
+
+    let mut target_idx = 0;
+    for entry in entries.iter_mut() {
+        if !entry.is_decoy {
+            if target_idx < qvalues.len() {
+                entry.experiment_qvalue = qvalues[target_idx];
+                target_idx += 1;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Write scored results to blib format for Skyline
@@ -1708,7 +2072,7 @@ fn write_blib_output_with_scores(
         let start_rt = above_threshold.first().map(|(rt, _)| *rt).unwrap_or(0.0);
         let end_rt = above_threshold.last().map(|(rt, _)| *rt).unwrap_or(0.0);
         let (apex_rt, _apex_coef) = scored.rt_coef_pairs.iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(rt, c)| (*rt, *c))
             .unwrap_or((0.0, 0.0));
 
@@ -1719,7 +2083,7 @@ fn write_blib_output_with_scores(
         let intensities: Vec<f32> = entry.fragments.iter().map(|f| f.relative_intensity).collect();
 
         // Use 1 - q_value as the score (higher is better, blib convention)
-        let blib_score = 1.0 - scored.q_value;
+        let blib_score = 1.0 - scored.experiment_qvalue;
 
         let ref_id = writer.add_spectrum(
             &entry.sequence,
@@ -1753,7 +2117,7 @@ fn write_blib_output_with_scores(
         writer.add_peak_boundaries(ref_id, file_name, &boundaries)?;
 
         // Add run scores
-        writer.add_run_scores(ref_id, file_name, blib_score, scored.score, scored.q_value)?;
+        writer.add_run_scores(ref_id, file_name, blib_score, scored.score, scored.experiment_qvalue)?;
     }
 
     writer.finalize()?;
@@ -1783,7 +2147,7 @@ fn write_scored_report(
     for scored in scored_entries {
         let entry = &library[scored.lib_idx];
         let apex_rt = scored.rt_coef_pairs.iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(rt, _)| *rt)
             .unwrap_or(0.0);
 
@@ -1797,9 +2161,64 @@ fn write_scored_report(
             scored.features.peak_apex,
             scored.features.peak_area,
             scored.features.n_contributing_scans,
-            scored.q_value
+            scored.experiment_qvalue
         )?;
     }
+
+    Ok(())
+}
+
+/// Write scored entries to PIN file for Mokapot semi-supervised FDR control
+///
+/// Includes BOTH targets AND decoys, which is required for Mokapot's
+/// semi-supervised learning approach.
+fn write_pin_output(
+    pin_path: &std::path::Path,
+    library: &[LibraryEntry],
+    scored_entries: &[ScoredEntry],
+    file_name: &str,
+) -> Result<()> {
+    let mokapot_runner = MokapotRunner::new();
+
+    // Convert ScoredEntries to PsmFeatures for all entries (targets AND decoys)
+    let psm_features: Vec<PsmFeatures> = scored_entries
+        .iter()
+        .enumerate()
+        .map(|(idx, scored)| {
+            let entry = &library[scored.lib_idx];
+
+            // Find apex scan from coefficient series (highest coefficient)
+            let apex_scan = scored
+                .rt_coef_pairs
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                .map(|(scan_idx, _)| scan_idx as u32)
+                .unwrap_or(0);
+
+            PsmFeatures {
+                psm_id: format!("{}_{}", file_name, idx),
+                peptide: entry.modified_sequence.clone(),
+                proteins: entry.protein_ids.clone(),
+                scan_number: apex_scan,
+                file_name: file_name.to_string(),
+                charge: entry.charge,
+                is_decoy: scored.is_decoy,
+                features: scored.features.clone(),
+                initial_score: Some(scored.score),
+            }
+        })
+        .collect();
+
+    // Write PIN file
+    mokapot_runner.write_pin(&psm_features, pin_path)?;
+
+    log::info!(
+        "Wrote PIN file with {} PSMs ({} targets, {} decoys)",
+        psm_features.len(),
+        psm_features.iter().filter(|p| !p.is_decoy).count(),
+        psm_features.iter().filter(|p| p.is_decoy).count()
+    );
 
     Ok(())
 }
@@ -1868,7 +2287,7 @@ fn write_blib_output(
         // Find peak boundaries from coefficient time series
         // Simple approach: find region where coefficient is above threshold
         let mut sorted_pairs = rt_coef_pairs.clone();
-        sorted_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        sorted_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         let max_coef = sorted_pairs.iter().map(|(_, c)| *c).fold(0.0f64, f64::max);
         let threshold = max_coef * 0.1; // 10% of max
@@ -1885,7 +2304,7 @@ fn write_blib_output(
         let start_rt = above_threshold.first().map(|(rt, _)| *rt).unwrap_or(0.0);
         let end_rt = above_threshold.last().map(|(rt, _)| *rt).unwrap_or(0.0);
         let (apex_rt, apex_coef) = sorted_pairs.iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(rt, c)| (*rt, *c))
             .unwrap_or((0.0, 0.0));
 
@@ -2016,10 +2435,15 @@ fn process_spectrum_with_filter(
         }
     }
 
-    // Compute residual
+    // Compute residual and contextual metrics
     let predicted = design_matrix.dot(&coefficients);
     let residual = (&observed - &predicted).mapv(|x| x * x).sum();
     result.residual = residual;
+
+    // Contextual information for feature extraction
+    result.n_candidates = candidates.len() as u32;
+    result.coefficient_sum = coefficients.iter().sum();
+    result.observed_norm = observed.dot(&observed);
 
     Ok(result)
 }
@@ -2107,7 +2531,7 @@ fn select_candidates_with_calibration(
             } else {
                 (library[b].retention_time - spectrum.retention_time).abs()
             };
-            rt_a.partial_cmp(&rt_b).unwrap()
+            rt_a.total_cmp(&rt_b)
         });
         candidates.truncate(max_candidates);
     }
@@ -2313,33 +2737,38 @@ fn write_calibration_debug_csv(
     log::info!("Writing {} paired target-decoy results to debug CSV", paired.len());
 
     // Write header with paired columns
-    // Note: sorted by winning_libcosine descending to match FDR calculation order
+    // Note: sorted by winning_evalue ascending (best matches first, lower E-value = better)
     writeln!(
         writer,
         "target_entry_id,charge,target_sequence,decoy_sequence,\
-         winning_libcosine,target_libcosine,decoy_libcosine,\
+         winning_evalue,target_evalue,decoy_evalue,target_wins_evalue,\
          winning_xcorr,target_xcorr,decoy_xcorr,\
+         winning_libcosine,target_libcosine,decoy_libcosine,\
          target_isotope_score,decoy_isotope_score,\
          target_precursor_error_ppm,decoy_precursor_error_ppm,\
          target_rt,decoy_rt,library_rt,expected_rt,target_delta_rt,decoy_delta_rt,\
          target_matched_frags,decoy_matched_frags,target_wins"
     ).map_err(|e| OspreyError::OutputError(format!("Failed to write header: {}", e)))?;
 
-    // Write each paired result (already sorted by winning_libcosine descending)
+    // Write each paired result (sorted by winning_evalue ascending - best first)
     for p in &paired {
         writeln!(
             writer,
-            "{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.2},{:.2},{:.2},{},{:.2},{:.2},{},{},{}",
+            "{},{},{},{},{:.2e},{:.2e},{:.2e},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{:.2},{:.2},{:.2},{},{:.2},{:.2},{},{},{}",
             p.target_entry_id,
             p.charge,
             p.target_sequence,
             p.decoy_sequence,
-            p.winning_libcosine,
-            p.target_libcosine,
-            p.decoy_libcosine,
+            p.winning_evalue,
+            p.target_evalue,
+            p.decoy_evalue,
+            p.target_wins_evalue,
             p.winning_xcorr,
             p.target_xcorr,
             p.decoy_xcorr,
+            p.winning_libcosine,
+            p.target_libcosine,
+            p.decoy_libcosine,
             p.target_isotope_score.map(|v| format!("{:.4}", v)).unwrap_or_default(),
             p.decoy_isotope_score.map(|v| format!("{:.4}", v)).unwrap_or_default(),
             p.target_precursor_error_ppm.map(|v| format!("{:.2}", v)).unwrap_or_default(),
@@ -2430,8 +2859,10 @@ fn run_calibration_discovery_streaming(
     let max_rt = library_rts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let rt_range = max_rt - min_rt;
 
-    // Wide tolerance = fraction of RT range
-    let initial_tolerance = rt_range * rt_config.initial_tolerance_fraction;
+    // For streaming, use 20% RT tolerance (conservative default)
+    // We don't have mzML RT range until after streaming, so we assume similar scales
+    let tolerance_fraction = 0.2;
+    let initial_tolerance = rt_range * tolerance_fraction;
 
     let n_targets = library.iter().filter(|e| !e.is_decoy && !e.fragments.is_empty()).count();
     let n_decoys = library.iter().filter(|e| e.is_decoy && !e.fragments.is_empty()).count();
@@ -2444,21 +2875,12 @@ fn run_calibration_discovery_streaming(
         max_rt
     );
 
-    // Sample library for calibration if configured
-    let calibration_library = if rt_config.calibration_sample_size > 0 {
-        let sampled = sample_library_for_calibration(
-            library,
-            rt_config.calibration_sample_size,
-            42,
-        );
-        log::info!(
-            "Sampled {} entries for streaming calibration",
-            sampled.len()
-        );
-        sampled
-    } else {
-        library.to_vec()
-    };
+    // Use full library for calibration (XCorr via BLAS is fast enough)
+    let calibration_library: Vec<LibraryEntry> = library.to_vec();
+    log::info!(
+        "Using full library for streaming calibration ({} entries)",
+        calibration_library.len()
+    );
 
     // Configure streaming pipeline
     let pipeline_config = PipelineConfig {
@@ -2491,12 +2913,13 @@ fn run_calibration_discovery_streaming(
         n_decoy_matches
     );
 
-    // Run target-decoy competition
+    // Run target-decoy competition using E-value (Comet-style)
+    // Lower E-value is better, so we negate for FdrController which uses "higher is better"
     let calibration_fdr = 0.01;
     let fdr_controller = FdrController::new(calibration_fdr);
 
     let competition_input = matches.iter().map(|m| {
-        (m.clone(), m.score, m.is_decoy, m.entry_id)
+        (m.clone(), -m.evalue, m.is_decoy, m.entry_id)
     });
 
     let competition_result = fdr_controller.compete_and_filter(competition_input);
@@ -2558,6 +2981,7 @@ fn run_calibration_discovery_streaming(
             residual_sd: rt_stats.residual_std,
             n_points: rt_stats.n_points,
             r_squared: rt_stats.r_squared,
+            model_params: Some(rt_calibration.export_model_params()),
         },
     };
 

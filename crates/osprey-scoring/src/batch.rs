@@ -9,7 +9,7 @@
 //!
 //! The `LibCosineScorer` implements pyXcorrDIA-style library cosine scoring:
 //! - **NO binning** - direct ppm-based fragment matching
-//! - SMZ preprocessing: `sqrt(intensity) × mz²`
+//! - sqrt(intensity) preprocessing (down-weights dominant peaks)
 //! - L2 normalization and cosine angle calculation
 //! - Stores mass errors for matched fragments (for calibration)
 //!
@@ -66,12 +66,13 @@ pub struct FragmentMatchResult {
 /// For each library fragment, it finds the best matching experimental peak
 /// within the configured tolerance (ppm or Da).
 ///
-/// # SMZ Preprocessing
+/// # Intensity Preprocessing
 ///
-/// Both library and experimental intensities are preprocessed:
+/// Both library and experimental intensities are sqrt-transformed:
 /// ```text
-/// preprocessed_intensity = sqrt(intensity) × mz²
+/// preprocessed_intensity = sqrt(intensity)
 /// ```
+/// This down-weights dominant peaks and gives more influence to smaller peaks.
 ///
 /// # Scoring
 ///
@@ -195,19 +196,18 @@ impl LibCosineScorer {
             return 0.0;
         }
 
-        // Apply SMZ preprocessing: sqrt(intensity) × mz²
+        // Apply sqrt preprocessing: sqrt(intensity)
+        // This down-weights dominant peaks and gives more influence to smaller peaks
         let exp_preprocessed: Vec<f64> = match_result
             .matched_exp_intensities
             .iter()
-            .zip(match_result.matched_lib_mzs.iter())
-            .map(|(&int, &mz)| int.sqrt() * mz.powi(2))
+            .map(|&int| int.sqrt())
             .collect();
 
         let lib_preprocessed: Vec<f64> = match_result
             .matched_lib_intensities
             .iter()
-            .zip(match_result.matched_lib_mzs.iter())
-            .map(|(&int, &mz)| int.sqrt() * mz.powi(2))
+            .map(|&int| int.sqrt())
             .collect();
 
         // Calculate cosine angle
@@ -284,11 +284,12 @@ pub struct LibCosineMatch {
 ///
 /// Stores SMZ-preprocessed and L2-normalized vectors for each library entry
 /// as a single matrix for efficient BLAS operations.
+/// Uses f32 for memory efficiency - sufficient precision for normalized intensity values.
 #[derive(Debug, Clone)]
 pub struct PreprocessedLibrary {
     /// Matrix of preprocessed library vectors (n_entries × n_bins)
     /// Each row is an SMZ-preprocessed, L2-normalized spectrum
-    pub matrix: Array2<f64>,
+    pub matrix: Array2<f32>,
     /// Library entry IDs corresponding to each row
     pub entry_ids: Vec<u32>,
     /// Mapping from entry ID to matrix row index
@@ -331,7 +332,7 @@ impl PreprocessedLibrary {
         let n_entries = entries.len();
 
         // Preprocess all entries in parallel
-        let preprocessed: Vec<(u32, Array1<f64>)> = entries
+        let preprocessed: Vec<(u32, Array1<f32>)> = entries
             .par_iter()
             .filter(|e| !e.fragments.is_empty())
             .map(|entry| {
@@ -342,7 +343,7 @@ impl PreprocessedLibrary {
 
         // Build matrix and mappings
         let n_valid = preprocessed.len();
-        let mut matrix = Array2::zeros((n_valid, num_bins));
+        let mut matrix: Array2<f32> = Array2::zeros((n_valid, num_bins));
         let mut entry_ids = Vec::with_capacity(n_valid);
         let mut id_to_row = HashMap::with_capacity(n_valid);
 
@@ -382,27 +383,28 @@ impl PreprocessedLibrary {
     }
 
     /// Preprocess a single library entry (for internal use)
+    /// Uses f32 for memory efficiency - source intensities are already f32.
     fn preprocess_library_entry(
         entry: &LibraryEntry,
         num_bins: usize,
         min_mz: f64,
         bin_width: f64,
-    ) -> Array1<f64> {
-        let mut binned = Array1::zeros(num_bins);
+    ) -> Array1<f32> {
+        let mut binned: Array1<f32> = Array1::zeros(num_bins);
 
-        // Apply SMZ preprocessing: sqrt(intensity) × m/z²
+        // Apply sqrt preprocessing: sqrt(intensity)
         for frag in &entry.fragments {
             if frag.mz >= min_mz && frag.mz < min_mz + num_bins as f64 * bin_width {
                 let bin = ((frag.mz - min_mz) / bin_width) as usize;
                 if bin < num_bins {
-                    let smz = (frag.relative_intensity as f64).sqrt() * frag.mz.powi(2);
-                    binned[bin] += smz;
+                    let sqrt_int = frag.relative_intensity.sqrt();
+                    binned[bin] += sqrt_int;
                 }
             }
         }
 
         // L2 normalize
-        let norm: f64 = binned.mapv(|x: f64| x * x).sum();
+        let norm: f32 = binned.mapv(|x: f32| x * x).sum();
         let norm = norm.sqrt();
         if norm > 1e-10 {
             binned /= norm;
@@ -429,7 +431,7 @@ impl PreprocessedLibrary {
             .collect();
 
         let n_rows = rows.len();
-        let mut matrix = Array2::zeros((n_rows, self.num_bins));
+        let mut matrix: Array2<f32> = Array2::zeros((n_rows, self.num_bins));
         let mut new_entry_ids = Vec::with_capacity(n_rows);
         let mut new_id_to_row = HashMap::with_capacity(n_rows);
 
@@ -454,11 +456,12 @@ impl PreprocessedLibrary {
 /// Preprocessed spectra ready for batch scoring
 ///
 /// Stores preprocessed spectra as a matrix for efficient BLAS operations.
+/// Uses f32 for memory efficiency - sufficient precision for normalized intensity values.
 #[derive(Debug, Clone)]
 pub struct PreprocessedSpectra {
     /// Matrix of preprocessed spectra (n_spectra × n_bins)
     /// Each row is an SMZ-preprocessed, L2-normalized spectrum
-    pub matrix: Array2<f64>,
+    pub matrix: Array2<f32>,
     /// Spectrum indices corresponding to each row
     pub spectrum_indices: Vec<usize>,
     /// Retention times for each spectrum
@@ -500,7 +503,7 @@ impl PreprocessedSpectra {
         let n_spectra = spectra.len();
 
         // Preprocess all spectra in parallel
-        let preprocessed: Vec<(usize, f64, Array1<f64>)> = spectra
+        let preprocessed: Vec<(usize, f64, Array1<f32>)> = spectra
             .par_iter()
             .enumerate()
             .filter(|(_, s)| !s.mzs.is_empty())
@@ -512,7 +515,7 @@ impl PreprocessedSpectra {
 
         // Build matrix and mappings
         let n_valid = preprocessed.len();
-        let mut matrix = Array2::zeros((n_valid, num_bins));
+        let mut matrix: Array2<f32> = Array2::zeros((n_valid, num_bins));
         let mut spectrum_indices = Vec::with_capacity(n_valid);
         let mut retention_times = Vec::with_capacity(n_valid);
         let mut idx_to_row = HashMap::with_capacity(n_valid);
@@ -555,27 +558,28 @@ impl PreprocessedSpectra {
     }
 
     /// Preprocess a single spectrum with SMZ transformation and L2 normalization
+    /// Uses f32 for memory efficiency - source intensities are already f32.
     fn preprocess_spectrum(
         spectrum: &Spectrum,
         num_bins: usize,
         min_mz: f64,
         bin_width: f64,
-    ) -> Array1<f64> {
-        let mut binned = Array1::zeros(num_bins);
+    ) -> Array1<f32> {
+        let mut binned: Array1<f32> = Array1::zeros(num_bins);
 
-        // Apply SMZ preprocessing: sqrt(intensity) × m/z²
+        // Apply sqrt preprocessing: sqrt(intensity)
         for (&mz, &intensity) in spectrum.mzs.iter().zip(spectrum.intensities.iter()) {
             if mz >= min_mz && mz < min_mz + num_bins as f64 * bin_width {
                 let bin = ((mz - min_mz) / bin_width) as usize;
                 if bin < num_bins {
-                    let smz = (intensity as f64).sqrt() * mz.powi(2);
-                    binned[bin] += smz;
+                    let sqrt_int = intensity.sqrt();
+                    binned[bin] += sqrt_int;
                 }
             }
         }
 
         // L2 normalize
-        let norm: f64 = binned.mapv(|x: f64| x * x).sum();
+        let norm: f32 = binned.mapv(|x: f32| x * x).sum();
         let norm = norm.sqrt();
         if norm > 1e-10 {
             binned /= norm;
@@ -602,7 +606,7 @@ impl PreprocessedSpectra {
             .collect();
 
         let n_rows = rows.len();
-        let mut matrix = Array2::zeros((n_rows, self.num_bins));
+        let mut matrix: Array2<f32> = Array2::zeros((n_rows, self.num_bins));
         let mut new_indices = Vec::with_capacity(n_rows);
         let mut new_rts = Vec::with_capacity(n_rows);
         let mut new_idx_to_row = HashMap::with_capacity(n_rows);
@@ -708,14 +712,17 @@ impl BatchScorer {
     /// # Performance
     /// For 5000 library entries × 500 spectra, this is ~20× faster than
     /// computing each pair individually.
+    ///
+    /// Note: Internal computation uses f32 for memory efficiency, returns f64 for compatibility.
     pub fn score_all(
         &self,
         library: &PreprocessedLibrary,
         spectra: &PreprocessedSpectra,
     ) -> Array2<f64> {
         // Matrix multiplication: (n_library × n_bins) · (n_bins × n_spectra)
-        // Result: (n_library × n_spectra)
-        library.matrix.dot(&spectra.matrix.t())
+        // Result: (n_library × n_spectra) in f32, then convert to f64
+        let scores_f32 = library.matrix.dot(&spectra.matrix.t());
+        scores_f32.mapv(|x| x as f64)
     }
 
     /// Calculate LibCosine scores and return best match for each library entry
@@ -742,7 +749,7 @@ impl BatchScorer {
                 let (best_col, &best_score) = row
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+                    .max_by(|a, b| a.1.total_cmp(b.1))?;
 
                 if best_score > 0.0 {
                     let spec_idx = spectra.spectrum_indices[best_col];
@@ -826,7 +833,7 @@ impl BatchScorer {
             self.bin_width,
         );
 
-        // Score against all spectra
+        // Score against all spectra (f32 matrix multiplication)
         let scores = spectra.matrix.dot(&entry_vec);
 
         let mut results: Vec<(usize, f64, f64)> = scores
@@ -836,12 +843,12 @@ impl BatchScorer {
             .map(|(row, &score)| {
                 let spec_idx = spectra.spectrum_indices[row];
                 let rt = spectra.retention_times[row];
-                (spec_idx, score, rt)
+                (spec_idx, score as f64, rt)  // Cast f32 score to f64 for API compatibility
             })
             .collect();
 
         // Sort by score descending
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| b.1.total_cmp(&a.1));
         results
     }
 }
@@ -875,6 +882,9 @@ pub struct CalibrationMatch {
     pub n_library_fragments: usize,
     /// XCorr score (Comet-style cross-correlation)
     pub xcorr_score: f64,
+    /// Comet-style E-value (calculated from XCorr survival function)
+    /// Lower is better - represents expected number of random matches at this score
+    pub evalue: f64,
     /// Isotope cosine score (MS1 isotope envelope match)
     pub isotope_cosine_score: Option<f64>,
     /// Peptide sequence
@@ -883,6 +893,180 @@ pub struct CalibrationMatch {
     pub charge: u8,
     /// Best matching spectrum scan number
     pub scan_number: u32,
+}
+
+/// Calculate Comet-style E-value from XCorr scores
+///
+/// Fits a linear regression to the survival function of XCorr scores:
+/// log10(cumulative_count) = intercept + slope × xcorr
+///
+/// Then E-value = 10^(slope × best_xcorr + intercept)
+///
+/// This matches Comet's approach but operates per-peptide instead of per-spectrum:
+/// - Comet: one spectrum scored against many peptides → E-value per peptide
+/// - Osprey: one peptide scored against many spectra → E-value per peptide
+///
+/// # Arguments
+/// * `all_xcorr_scores` - All XCorr scores for this peptide against spectra in RT window
+/// * `best_xcorr` - The best XCorr score (what we want to evaluate)
+///
+/// # Returns
+/// E-value (lower is better, represents expected random matches at this score level)
+pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_xcorr: f64) -> f64 {
+    const BAD_EVALUE: f64 = 999.0;  // Comet's sentinel for bad fits
+    const HISTO_SIZE: usize = 152;  // Same as Comet
+    const MIN_POINTS_FOR_FIT: usize = 10;  // Need reasonable number for stable fit
+
+    // Need enough scores for a meaningful distribution
+    if all_xcorr_scores.len() < MIN_POINTS_FOR_FIT {
+        return BAD_EVALUE;
+    }
+
+    // Build histogram like Comet: bin_index = (int)(xcorr * 10.0 * 0.005 + 0.5) = (int)(xcorr * 0.05 + 0.5)
+    // This gives ~20 XCorr units per bin (bin 1 = XCorr 10-30, bin 2 = XCorr 30-50, etc.)
+    // For our typical XCorr range of 0-3, we need finer resolution
+    // Scale factor: bin_index = (int)(xcorr * 50.0 + 0.5), so 1 bin = 0.02 XCorr units
+    const SCALE: f64 = 50.0;
+    let mut histogram = [0i32; HISTO_SIZE];
+
+    for &score in all_xcorr_scores {
+        if score > 0.0 {
+            let bin = ((score * SCALE) + 0.5) as usize;
+            if bin < HISTO_SIZE {
+                histogram[bin] += 1;
+            } else {
+                histogram[HISTO_SIZE - 1] += 1;  // Cap at max bin
+            }
+        }
+    }
+
+    // Find maximum correlation score index (highest non-zero bin)
+    let mut max_corr = 0usize;
+    for i in (0..HISTO_SIZE - 1).rev() {
+        if histogram[i] > 0 {
+            max_corr = i;
+            break;
+        }
+    }
+
+    // Find the "next" correlation index - where we start seeing gaps in the histogram
+    // This helps exclude outlier scores from the fit (Comet's approach)
+    let mut next_corr = max_corr;
+    let mut found_first_nonzero = false;
+    for i in 0..max_corr {
+        if histogram[i] > 0 {
+            found_first_nonzero = true;
+        }
+        // Look for consecutive zeros after we've seen data
+        if histogram[i] == 0 && found_first_nonzero && i >= 5 {
+            if i + 1 < HISTO_SIZE && (histogram[i + 1] == 0 || i + 1 == max_corr) {
+                next_corr = if i > 0 { i - 1 } else { 0 };
+                break;
+            }
+        }
+    }
+
+    // If no gap found, use max_corr - 1 to exclude the outlier
+    if next_corr == max_corr && max_corr >= 5 {
+        for i in (max_corr.saturating_sub(5)..=max_corr).rev() {
+            if histogram[i] == 0 {
+                next_corr = i;
+                break;
+            }
+        }
+        if next_corr == max_corr {
+            next_corr = max_corr.saturating_sub(1);
+        }
+    }
+
+    // Build cumulative distribution from next_corr down
+    let mut cumulative = [0.0f64; HISTO_SIZE];
+    cumulative[next_corr] = histogram[next_corr] as f64;
+    for i in (0..next_corr).rev() {
+        cumulative[i] = cumulative[i + 1] + histogram[i] as f64;
+        // Zero out positions where histogram was zero (Comet's approach)
+        if histogram[i + 1] == 0 {
+            cumulative[i + 1] = 0.0;
+        }
+    }
+
+    // Convert to log10, handling zeros
+    let mut log_cumulative = [0.0f64; HISTO_SIZE];
+    for i in (0..=next_corr).rev() {
+        if cumulative[i] > 0.0 {
+            log_cumulative[i] = cumulative[i].log10();
+        } else if i + 1 < HISTO_SIZE && cumulative[i + 1] > 0.0 {
+            log_cumulative[i] = cumulative[i + 1].log10();
+        }
+    }
+
+    // Determine start point for regression (exclude low bins)
+    let mut start_corr = next_corr.saturating_sub(5);
+    // Count zeros in the fit range and adjust
+    let num_zeros: usize = (start_corr..=next_corr)
+        .filter(|&i| log_cumulative[i] == 0.0)
+        .count();
+    start_corr = start_corr.saturating_sub(num_zeros);
+
+    // Linear regression on log10(cumulative) vs bin index
+    // Fit: log10(cumulative) = a + b * bin_index
+    // We expect b < 0 (higher bin = higher XCorr = fewer matches = lower cumulative)
+    let mut sum_x = 0.0f64;
+    let mut sum_y = 0.0f64;
+    let mut n_points = 0usize;
+
+    for i in start_corr..=next_corr {
+        if histogram[i] > 0 {
+            sum_x += i as f64;
+            sum_y += log_cumulative[i];
+            n_points += 1;
+        }
+    }
+
+    if n_points < 3 {
+        return BAD_EVALUE;
+    }
+
+    let mean_x = sum_x / n_points as f64;
+    let mean_y = sum_y / n_points as f64;
+
+    // Calculate slope and intercept
+    let mut sx = 0.0f64;  // Sum of squared deviations
+    let mut sxy = 0.0f64; // Sum of cross products
+
+    for i in start_corr..=next_corr {
+        if log_cumulative[i] > 0.0 {
+            let dx = i as f64 - mean_x;
+            let dy = log_cumulative[i] - mean_y;
+            sx += dx * dx;
+            sxy += dx * dy;
+        }
+    }
+
+    if sx < 1e-10 {
+        return BAD_EVALUE;
+    }
+
+    let slope = sxy / sx;  // b in log10(cumulative) = a + b * bin_index
+    let intercept = mean_y - slope * mean_x;  // a
+
+    // Comet checks: if slope >= 0, the fit is bad (we expect negative slope)
+    // Higher bins should have fewer matches, so slope should be negative
+    if slope >= 0.0 {
+        return BAD_EVALUE;
+    }
+
+    // Convert best_xcorr to bin scale for the formula
+    // E-value = 10^(slope * bin_index + intercept)
+    // But we need to account for our SCALE factor
+    // bin_index = xcorr * SCALE, so: E-value = 10^(slope * SCALE * xcorr + intercept)
+    let log_evalue = slope * SCALE * best_xcorr + intercept;
+
+    // Clamp to reasonable range and compute E-value
+    let evalue = 10.0f64.powf(log_evalue.clamp(-10.0, 10.0));
+
+    // Clamp to Comet's range [1e-10, 999]
+    evalue.clamp(1e-10, BAD_EVALUE)
 }
 
 /// Paired target-decoy calibration result for debugging CSV
@@ -908,6 +1092,14 @@ pub struct PairedCalibrationResult {
     pub decoy_xcorr: f64,
     /// Winning XCorr score (max of target and decoy)
     pub winning_xcorr: f64,
+    /// Target E-value (Comet-style, calculated from XCorr)
+    pub target_evalue: f64,
+    /// Decoy E-value (Comet-style, calculated from XCorr)
+    pub decoy_evalue: f64,
+    /// Winning E-value (min of target and decoy - lower is better)
+    pub winning_evalue: f64,
+    /// True if target wins by E-value (target_evalue < decoy_evalue)
+    pub target_wins_evalue: bool,
     /// Target isotope cosine score
     pub target_isotope_score: Option<f64>,
     /// Decoy isotope cosine score
@@ -977,6 +1169,13 @@ pub fn pair_calibration_matches(
             let winning_libcosine = target_match.score.max(decoy_match.score);
             let winning_xcorr = target_match.xcorr_score.max(decoy_match.xcorr_score);
 
+            // Use E-values from CalibrationMatch (calculated from survival function)
+            // Lower E-value is better
+            let target_evalue = target_match.evalue;
+            let decoy_evalue = decoy_match.evalue;
+            let winning_evalue = target_evalue.min(decoy_evalue);
+            let target_wins_evalue = target_evalue < decoy_evalue;
+
             paired.push(PairedCalibrationResult {
                 target_entry_id: target_id,
                 charge: target_match.charge,
@@ -988,6 +1187,10 @@ pub fn pair_calibration_matches(
                 target_xcorr: target_match.xcorr_score,
                 decoy_xcorr: decoy_match.xcorr_score,
                 winning_xcorr,
+                target_evalue,
+                decoy_evalue,
+                winning_evalue,
+                target_wins_evalue,
                 target_isotope_score: target_match.isotope_cosine_score,
                 decoy_isotope_score: decoy_match.isotope_cosine_score,
                 target_precursor_error_ppm: target_match.ms1_ppm_error,
@@ -1005,8 +1208,8 @@ pub fn pair_calibration_matches(
         }
     }
 
-    // Sort by WINNING LibCosine score descending - this matches FDR calculation order
-    paired.sort_by(|a, b| b.winning_libcosine.partial_cmp(&a.winning_libcosine).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by WINNING E-value ascending (lower is better) - best matches first
+    paired.sort_by(|a, b| a.winning_evalue.total_cmp(&b.winning_evalue));
 
     paired
 }
@@ -1059,7 +1262,7 @@ pub fn sample_library_for_calibration(
     // This ensures we get good coverage across m/z range
     let mut sorted_targets = targets.clone();
     sorted_targets.sort_by(|a, b| {
-        a.precursor_mz.partial_cmp(&b.precursor_mz).unwrap_or(std::cmp::Ordering::Equal)
+        a.precursor_mz.total_cmp(&b.precursor_mz)
     });
 
     // Use seed to create a starting offset
@@ -1234,6 +1437,10 @@ pub fn run_windowed_calibration_scoring(
                         0
                     };
 
+                    // For binned BatchScorer, use simple E-value approximation
+                    // (we don't have the full XCorr distribution here)
+                    let evalue = (-score * 20.0).exp();
+
                     Some(CalibrationMatch {
                         entry_id,
                         is_decoy: entry.is_decoy,
@@ -1250,6 +1457,7 @@ pub fn run_windowed_calibration_scoring(
                         n_library_fragments: entry.fragments.len(),
                         // For binned BatchScorer, the score IS the XCorr-like score
                         xcorr_score: score,
+                        evalue,
                         isotope_cosine_score: None,
                         sequence: entry.sequence.clone(),
                         charge: entry.charge,
@@ -1277,7 +1485,7 @@ pub fn run_windowed_calibration_scoring(
 
     // Sort by score descending
     let mut results: Vec<CalibrationMatch> = best_matches.into_values().collect();
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     log::info!(
         "Windowed batch scoring complete: {} unique matches from {} windows",
@@ -1357,6 +1565,9 @@ pub fn run_calibration_scoring(
                 0
             };
 
+            // For binned BatchScorer, use simple E-value approximation
+            let evalue = (-score * 20.0).exp();
+
             Some(CalibrationMatch {
                 entry_id,
                 is_decoy: entry.is_decoy,
@@ -1373,6 +1584,7 @@ pub fn run_calibration_scoring(
                 n_library_fragments: entry.fragments.len(),
                 // For binned BatchScorer, the score IS the XCorr-like score
                 xcorr_score: score,
+                evalue,
                 isotope_cosine_score: None,
                 sequence: entry.sequence.clone(),
                 charge: entry.charge,
@@ -1382,7 +1594,7 @@ pub fn run_calibration_scoring(
         .collect();
 
     // Sort by score descending
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     log::info!("Batch scoring complete: {} matches found", results.len());
 
@@ -1420,14 +1632,17 @@ pub fn run_libcosine_calibration_scoring(
     }
 
     log::info!(
-        "LibCosine scoring: {} spectra in {} isolation windows ({} ppm tolerance)",
+        "[Legacy] LibCosine-first scoring: {} spectra in {} windows ({} tolerance)",
         spectra.len(),
         window_groups.len(),
         if fragment_tolerance.unit == ToleranceUnit::Ppm {
-            format!("{:.1}", fragment_tolerance.tolerance)
+            format!("{:.1} ppm", fragment_tolerance.tolerance)
         } else {
             format!("{:.3} Da", fragment_tolerance.tolerance)
         }
+    );
+    log::info!(
+        "  Note: This mode uses LibCosine for RT selection. Use 'with_ms1' for XCorr-first."
     );
 
     // Create the LibCosine scorer with configured tolerance
@@ -1461,14 +1676,14 @@ pub fn run_libcosine_calibration_scoring(
             }
 
             // === BATCH XCORR PREPROCESSING (pyXcorrDIA approach) ===
-            // Preprocess all spectra for XCorr ONCE per window
-            let spec_xcorr_preprocessed: Vec<Vec<f64>> = window_spectra
+            // Preprocess all spectra for XCorr ONCE per window (uses f32 for memory efficiency)
+            let spec_xcorr_preprocessed: Vec<Vec<f32>> = window_spectra
                 .iter()
                 .map(|spec| xcorr_scorer.preprocess_spectrum_for_xcorr(spec))
                 .collect();
 
-            // Preprocess all library entries for XCorr ONCE per window
-            let entry_xcorr_preprocessed: HashMap<u32, Vec<f64>> = window_entries
+            // Preprocess all library entries for XCorr ONCE per window (uses f32)
+            let entry_xcorr_preprocessed: HashMap<u32, Vec<f32>> = window_entries
                 .iter()
                 .map(|entry| (entry.id, xcorr_scorer.preprocess_library_for_xcorr(entry)))
                 .collect();
@@ -1531,6 +1746,9 @@ pub fn run_libcosine_calibration_scoring(
                         0.0
                     };
 
+                    // Use simple E-value approximation (no full distribution available)
+                    let evalue = (-xcorr_score * 20.0).exp();
+
                     window_matches.push(CalibrationMatch {
                         entry_id: entry.id,
                         is_decoy: entry.is_decoy,
@@ -1545,6 +1763,7 @@ pub fn run_libcosine_calibration_scoring(
                         n_matched_fragments: best_n_matched,
                         n_library_fragments: entry.fragments.len(),
                         xcorr_score,
+                        evalue,
                         isotope_cosine_score: None,
                         sequence: entry.sequence.clone(),
                         charge: entry.charge,
@@ -1574,13 +1793,13 @@ pub fn run_libcosine_calibration_scoring(
 
     // Sort by score descending
     let mut results: Vec<CalibrationMatch> = best_matches.into_values().collect();
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     // Log scoring statistics
     let total_ms2_errors: usize = results.iter().map(|m| m.ms2_mass_errors.len()).sum();
     let matched_count = results.iter().filter(|m| m.n_matched_fragments > 0).count();
     log::info!(
-        "LibCosine scoring complete: {} unique matches ({} with fragment matches, {} total MS2 errors)",
+        "[Legacy] Scoring complete: {} matches ({} with fragments, {} MS2 errors)",
         results.len(),
         matched_count,
         total_ms2_errors
@@ -1636,10 +1855,19 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
 
     let ms1_available = ms1_index.is_some();
     log::info!(
-        "LibCosine scoring with MS1 extraction: {} spectra in {} windows (MS1 available: {})",
+        "XCorr → LibCosine scoring: {} spectra in {} windows (MS1 available: {})",
         spectra.len(),
         window_groups.len(),
         ms1_available
+    );
+    log::info!(
+        "  - XCorr: calculated for ALL spectra in RT window to find best RT"
+    );
+    log::info!(
+        "  - LibCosine: calculated only at best XCorr spectrum per peptide"
+    );
+    log::info!(
+        "  - E-value: Comet-style survival function from XCorr distribution"
     );
 
     // Create the LibCosine scorer with configured tolerance
@@ -1678,14 +1906,14 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                 }
 
                 // === BATCH XCORR PREPROCESSING (pyXcorrDIA approach) ===
-                // Preprocess all spectra for XCorr ONCE per window
-                let spec_xcorr_preprocessed: Vec<Vec<f64>> = window_spectra
+                // Preprocess all spectra for XCorr ONCE per window (uses f32 for memory efficiency)
+                let spec_xcorr_preprocessed: Vec<Vec<f32>> = window_spectra
                     .iter()
                     .map(|spec| xcorr_scorer.preprocess_spectrum_for_xcorr(spec))
                     .collect();
 
-                // Preprocess all library entries for XCorr ONCE per window
-                let entry_xcorr_preprocessed: HashMap<u32, Vec<f64>> = window_entries
+                // Preprocess all library entries for XCorr ONCE per window (uses f32)
+                let entry_xcorr_preprocessed: HashMap<u32, Vec<f32>> = window_entries
                     .iter()
                     .map(|entry| (entry.id, xcorr_scorer.preprocess_library_for_xcorr(entry)))
                     .collect();
@@ -1700,8 +1928,9 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                         None => continue,
                     };
 
-                    // === FIND BEST RT USING XCORR (not LibCosine) ===
-                    // This tests whether XCorr is fundamentally better at RT selection
+                    // === COLLECT ALL XCORR SCORES FOR E-VALUE CALCULATION ===
+                    // Score against ALL spectra in RT tolerance window
+                    let mut all_xcorr_scores: Vec<f64> = Vec::new();
                     let mut best_xcorr = 0.0f64;
                     let mut best_local_idx = 0usize;  // Index into window_spectra
                     let mut best_spec_idx = 0usize;   // Index into global spectra
@@ -1718,6 +1947,9 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                             &spec_xcorr_preprocessed[local_idx],
                             entry_xcorr_vec,
                         );
+
+                        // Collect ALL scores for E-value calculation
+                        all_xcorr_scores.push(xcorr);
 
                         if xcorr > best_xcorr {
                             best_xcorr = xcorr;
@@ -1771,6 +2003,9 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                             None
                         };
 
+                        // Calculate Comet-style E-value from XCorr distribution
+                        let evalue = calculate_evalue_from_xcorr_distribution(&all_xcorr_scores, best_xcorr);
+
                         window_matches.push(CalibrationMatch {
                             entry_id: entry.id,
                             is_decoy: entry.is_decoy,
@@ -1785,6 +2020,7 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                             n_matched_fragments: n_matched,
                             n_library_fragments: entry.fragments.len(),
                             xcorr_score: best_xcorr,  // XCorr used for RT selection
+                            evalue,  // Comet-style E-value from survival function
                             isotope_cosine_score,
                             sequence: entry.sequence.clone(),
                             charge: entry.charge,
@@ -1820,14 +2056,14 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                 }
 
                 // === BATCH XCORR PREPROCESSING (pyXcorrDIA approach) ===
-                // Preprocess all spectra for XCorr ONCE per window
-                let spec_xcorr_preprocessed: Vec<Vec<f64>> = window_spectra
+                // Preprocess all spectra for XCorr ONCE per window (uses f32 for memory efficiency)
+                let spec_xcorr_preprocessed: Vec<Vec<f32>> = window_spectra
                     .iter()
                     .map(|spec| xcorr_scorer.preprocess_spectrum_for_xcorr(spec))
                     .collect();
 
-                // Preprocess all library entries for XCorr ONCE per window
-                let entry_xcorr_preprocessed: HashMap<u32, Vec<f64>> = window_entries
+                // Preprocess all library entries for XCorr ONCE per window (uses f32)
+                let entry_xcorr_preprocessed: HashMap<u32, Vec<f32>> = window_entries
                     .iter()
                     .map(|entry| (entry.id, xcorr_scorer.preprocess_library_for_xcorr(entry)))
                     .collect();
@@ -1841,7 +2077,8 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                         None => continue,
                     };
 
-                    // === FIND BEST RT USING XCORR (not LibCosine) ===
+                    // === COLLECT ALL XCORR SCORES FOR E-VALUE CALCULATION ===
+                    let mut all_xcorr_scores: Vec<f64> = Vec::new();
                     let mut best_xcorr = 0.0f64;
                     let mut best_local_idx = 0usize;
                     let mut best_spec_idx = 0usize;
@@ -1857,6 +2094,9 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                             &spec_xcorr_preprocessed[local_idx],
                             entry_xcorr_vec,
                         );
+
+                        // Collect ALL scores for E-value calculation
+                        all_xcorr_scores.push(xcorr);
 
                         if xcorr > best_xcorr {
                             best_xcorr = xcorr;
@@ -1883,6 +2123,9 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                             None
                         };
 
+                        // Calculate Comet-style E-value from XCorr distribution
+                        let evalue = calculate_evalue_from_xcorr_distribution(&all_xcorr_scores, best_xcorr);
+
                         window_matches.push(CalibrationMatch {
                             entry_id: entry.id,
                             is_decoy: entry.is_decoy,
@@ -1897,6 +2140,7 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                             n_matched_fragments: n_matched,
                             n_library_fragments: entry.fragments.len(),
                             xcorr_score: best_xcorr,  // XCorr used for RT selection
+                            evalue,  // Comet-style E-value from survival function
                             isotope_cosine_score: None,
                             sequence: entry.sequence.clone(),
                             charge: entry.charge,
@@ -1925,14 +2169,36 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
 
     // Sort by XCorr descending (since XCorr is used for RT selection)
     let mut results: Vec<CalibrationMatch> = best_matches.into_values().collect();
-    results.sort_by(|a, b| b.xcorr_score.partial_cmp(&a.xcorr_score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| b.xcorr_score.total_cmp(&a.xcorr_score));
 
     // Log scoring statistics
     let total_ms2_errors: usize = results.iter().map(|m| m.ms2_mass_errors.len()).sum();
     let ms1_calibrated = results.iter().filter(|m| m.ms1_ppm_error.is_some()).count();
+    let targets = results.iter().filter(|m| !m.is_decoy).count();
+    let decoys = results.iter().filter(|m| m.is_decoy).count();
+
+    // Calculate median XCorr and E-value for summary
+    let mut xcorrs: Vec<f64> = results.iter().map(|m| m.xcorr_score).collect();
+    xcorrs.sort_by(|a, b| a.total_cmp(b));
+    let median_xcorr = if xcorrs.is_empty() { 0.0 } else { xcorrs[xcorrs.len() / 2] };
+
+    let mut evalues: Vec<f64> = results.iter().map(|m| m.evalue).collect();
+    evalues.sort_by(|a, b| a.total_cmp(b));
+    let median_evalue = if evalues.is_empty() { 1.0 } else { evalues[evalues.len() / 2] };
+
     log::info!(
-        "LibCosine scoring complete: {} matches ({} with MS1 calibration, {} MS2 errors)",
+        "Scoring complete: {} matches ({} targets, {} decoys)",
         results.len(),
+        targets,
+        decoys
+    );
+    log::info!(
+        "  - Median XCorr: {:.3}, Median E-value: {:.2e}",
+        median_xcorr,
+        median_evalue
+    );
+    log::info!(
+        "  - MS1 calibrated: {}, Total MS2 fragment matches: {}",
         ms1_calibrated,
         total_ms2_errors
     );

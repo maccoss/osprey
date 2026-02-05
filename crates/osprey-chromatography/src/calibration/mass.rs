@@ -93,7 +93,7 @@ fn calculate_single_calibration(errors: &[f64]) -> MzCalibration {
 
     // Calculate median
     let mut sorted = errors.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let median = if sorted.len() % 2 == 0 {
         (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
     } else {

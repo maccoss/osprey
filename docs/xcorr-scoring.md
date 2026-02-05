@@ -253,12 +253,12 @@ This allows scoring thousands of peptide-spectrum pairs with a single BLAS call.
 
 | Aspect | XCorr | LibCosine |
 |--------|-------|-----------|
-| **Preprocessing** | Binning + windowing + flanking | SMZ: sqrt(int) × m/z² |
+| **Preprocessing** | Binning + windowing + flanking | sqrt(intensity) only |
 | **Normalization** | Window max=50 | L2 normalization |
 | **Matching** | Bin position lookup | ppm tolerance matching |
 | **Score range** | 0-10 typical | 0-1 (cosine similarity) |
-| **Best for** | Unit resolution | HRAM (ppm matching) |
-| **Library intensity** | Ignored (unit=1.0) | Used in SMZ |
+| **Best for** | RT selection (all spectra) | Fragment scoring (best RT) |
+| **Library intensity** | Ignored (unit=1.0) | sqrt-transformed |
 
 ## Example
 

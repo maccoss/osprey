@@ -476,8 +476,14 @@ pub struct RegressionResult {
     pub library_ids: Vec<u32>,
     /// Corresponding coefficients
     pub coefficients: Vec<f64>,
-    /// Unexplained intensity (residual)
+    /// Unexplained intensity (residual = ||Ax - b||²)
     pub residual: f64,
+    /// Total number of candidates considered in this spectrum
+    pub n_candidates: u32,
+    /// Sum of all coefficients (for relative_coefficient calculation)
+    pub coefficient_sum: f64,
+    /// Observed spectrum norm (||b||² for explained variance calculation)
+    pub observed_norm: f64,
 }
 
 impl RegressionResult {
@@ -489,6 +495,32 @@ impl RegressionResult {
             library_ids: Vec::new(),
             coefficients: Vec::new(),
             residual: 0.0,
+            n_candidates: 0,
+            coefficient_sum: 0.0,
+            observed_norm: 0.0,
+        }
+    }
+
+    /// Compute explained variance: 1 - residual / ||b||²
+    pub fn explained_variance(&self) -> f64 {
+        if self.observed_norm > 1e-10 {
+            1.0 - self.residual / self.observed_norm
+        } else {
+            0.0
+        }
+    }
+
+    /// Get relative coefficient for a given library ID
+    pub fn relative_coefficient(&self, lib_id: u32) -> f64 {
+        if self.coefficient_sum > 1e-10 {
+            self.library_ids
+                .iter()
+                .zip(self.coefficients.iter())
+                .find(|(id, _)| **id == lib_id)
+                .map(|(_, coef)| *coef / self.coefficient_sum)
+                .unwrap_or(0.0)
+        } else {
+            0.0
         }
     }
 }
@@ -587,12 +619,16 @@ pub struct FeatureSet {
     pub peak_prominence: f64,
 
     // Spectral features
-    /// X!Tandem-style hyperscore
+    /// X!Tandem-style hyperscore: log(n_b!) + log(n_y!) + Σlog(I_f+1)
     pub hyperscore: f64,
+    /// XCorr score (Comet-style cross-correlation)
+    pub xcorr: f64,
     /// Normalized spectral contrast angle
     pub spectral_contrast_angle: f64,
-    /// Dot product
+    /// Dot product (LibCosine with sqrt preprocessing)
     pub dot_product: f64,
+    /// LibCosine with sqrt(intensity)*mz² (SMZ) preprocessing
+    pub dot_product_smz: f64,
     /// Pearson intensity correlation
     pub pearson_correlation: f64,
     /// Spearman rank correlation

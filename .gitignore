@@ -43,6 +43,15 @@ tarpaulin-report.html
 Thumbs.db
 .DS_Store
 
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
 # Environment files (may contain secrets)
 .env
 .env.local
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc

@@ -137,6 +137,9 @@ mod tests {
             library_ids: vec![1, 2, 3],
             coefficients: vec![0.5, 0.0, 0.3],
             residual: 0.1,
+            n_candidates: 5,
+            coefficient_sum: 0.8,
+            observed_norm: 1.0,
         };
 
         writer.write_result(&result).unwrap();

@@ -49,11 +49,13 @@ use osprey_core::{
 use rayon::prelude::*;
 use std::collections::HashMap;
 
-/// Spectral similarity scorer implementing LibCosine and XCorr
+/// Spectral similarity scorer implementing LibCosine, XCorr, and Hyperscore
 ///
-/// Based on pyXcorrDIA scoring methods:
-/// - **LibCosine**: sqrt(intensity) × m/z² preprocessing with L2 normalization
+/// Scoring methods:
+/// - **LibCosine**: sqrt(intensity) preprocessing with L2 normalization
+/// - **LibCosine SMZ**: sqrt(intensity) × m/z² preprocessing with L2 normalization
 /// - **XCorr**: Comet-style windowing normalization with sliding window subtraction
+/// - **Hyperscore**: X!Tandem-style log(n_b!) + log(n_y!) + Σlog(I_f+1)
 #[derive(Debug, Clone)]
 pub struct SpectralScorer {
     /// Mass tolerance for matching fragments (Da)
@@ -106,8 +108,8 @@ impl SpectralScorer {
 
     /// Compute LibCosine score between observed spectrum and library entry
     ///
-    /// LibCosine uses SMZ preprocessing: sqrt(intensity) × m/z²
-    /// Then computes cosine similarity between normalized vectors.
+    /// LibCosine uses sqrt(intensity) preprocessing with L2 normalization,
+    /// then computes cosine similarity. Also computes SMZ variant and hyperscore.
     pub fn lib_cosine(&self, observed: &Spectrum, library: &LibraryEntry) -> SpectralScore {
         if library.fragments.is_empty() || observed.mzs.is_empty() {
             return SpectralScore::default();
@@ -129,13 +131,13 @@ impl SpectralScorer {
         let mut obs_intensities: Vec<f64> = Vec::with_capacity(matches.len());
 
         for m in &matches {
-            // Library: sqrt(relative_intensity) × m/z²
-            let lib_val = (m.lib_intensity as f64).sqrt() * m.lib_mz.powi(2);
+            // Library: sqrt(relative_intensity)
+            let lib_val = (m.lib_intensity as f64).sqrt();
             lib_preprocessed.push(lib_val);
             lib_intensities.push(m.lib_intensity as f64);
 
-            // Observed: sqrt(intensity) × m/z²
-            let obs_val = (m.obs_intensity as f64).sqrt() * m.obs_mz.powi(2);
+            // Observed: sqrt(intensity)
+            let obs_val = (m.obs_intensity as f64).sqrt();
             obs_preprocessed.push(obs_val);
             obs_intensities.push(m.obs_intensity as f64);
         }
@@ -194,9 +196,17 @@ impl SpectralScorer {
         // Compute top-3 matches
         let top3_matches = self.compute_top3_matches(library, &matches);
 
+        // Compute LibCosine with SMZ preprocessing (sqrt(intensity) * mz²)
+        let lib_cosine_smz = self.lib_cosine_smz(observed, library);
+
+        // Compute X!Tandem hyperscore
+        let (hyperscore_val, n_matched_b, n_matched_y) = self.hyperscore(observed, library);
+
         SpectralScore {
             lib_cosine: dot_product,
+            lib_cosine_smz,
             xcorr: 0.0, // Not computed in this method
+            hyperscore: hyperscore_val,
             dot_product,
             n_matched,
             n_library,
@@ -208,6 +218,8 @@ impl SpectralScorer {
             sequence_coverage,
             base_peak_rank,
             top3_matches,
+            n_matched_b,
+            n_matched_y,
         }
     }
 
@@ -259,7 +271,7 @@ impl SpectralScorer {
     fn get_ranks(values: &[f64]) -> Vec<f64> {
         let n = values.len();
         let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
-        indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         let mut ranks = vec![0.0; n];
         let mut i = 0;
@@ -390,7 +402,7 @@ impl SpectralScorer {
         let max_obs_idx = obs_intensities
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i);
 
         if let Some(obs_idx) = max_obs_idx {
@@ -417,7 +429,7 @@ impl SpectralScorer {
             .iter()
             .map(|f| (f.mz, f.relative_intensity as f64))
             .collect();
-        lib_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        lib_sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let top3: Vec<f64> = lib_sorted.iter().take(3).map(|(mz, _)| *mz).collect();
 
@@ -451,12 +463,12 @@ impl SpectralScorer {
 
         // Bin observed spectrum using Comet-style BIN macro
         // BIN(mass) = (int)(mass / bin_width + (1 - offset)) = (int)(mass / bin_width + 0.6)
-        let mut obs_binned = vec![0.0f64; self.num_bins];
+        let mut obs_binned = vec![0.0f32; self.num_bins];
         for (&mz, &intensity) in observed.mzs.iter().zip(observed.intensities.iter()) {
             let bin = ((mz / self.bin_width) + 0.6) as usize;
             if bin < self.num_bins {
                 // Apply sqrt transformation to experimental spectrum
-                obs_binned[bin] += (intensity as f64).sqrt();
+                obs_binned[bin] += intensity.sqrt();
             }
         }
 
@@ -469,7 +481,7 @@ impl SpectralScorer {
         // Bin library spectrum (theoretical) - use unit intensity like Comet
         // Comet BIN macro: BIN(mass) = (int)(mass / bin_width + (1 - offset))
         // With offset = 0.4: bin = (int)(mz / bin_width + 0.6)
-        let mut lib_binned = vec![0.0f64; self.num_bins];
+        let mut lib_binned = vec![0.0f32; self.num_bins];
         for frag in &library.fragments {
             // Comet-style binning: bin = (int)(mz / bin_width + 0.6)
             let bin = ((frag.mz / self.bin_width) + 0.6) as usize;
@@ -483,18 +495,20 @@ impl SpectralScorer {
 
         // XCorr = dot product with scaling (NO windowing on theoretical)
         // This matches Comet exactly: score = sum(experimental_preprocessed[frag_bins]) * 0.005
-        let xcorr_raw: f64 = lib_binned
+        let xcorr_raw: f32 = lib_binned
             .iter()
             .zip(xcorr_preprocessed.iter())
             .map(|(a, b)| a * b)
             .sum();
 
         // Scale XCorr (pyXcorrDIA uses 0.005 for spectrum-centric)
-        let xcorr_scaled = xcorr_raw * 0.005;
+        let xcorr_scaled = xcorr_raw * 0.005f32;
 
         SpectralScore {
             lib_cosine: lib_cosine_score.lib_cosine,
-            xcorr: xcorr_scaled,
+            lib_cosine_smz: lib_cosine_score.lib_cosine_smz,
+            xcorr: xcorr_scaled as f64,
+            hyperscore: lib_cosine_score.hyperscore,
             dot_product: lib_cosine_score.dot_product,
             n_matched: lib_cosine_score.n_matched,
             n_library: lib_cosine_score.n_library,
@@ -506,7 +520,107 @@ impl SpectralScorer {
             sequence_coverage: lib_cosine_score.sequence_coverage,
             base_peak_rank: lib_cosine_score.base_peak_rank,
             top3_matches: lib_cosine_score.top3_matches,
+            n_matched_b: lib_cosine_score.n_matched_b,
+            n_matched_y: lib_cosine_score.n_matched_y,
         }
+    }
+
+    /// Compute LibCosine score with sqrt(intensity) * mz² (SMZ) preprocessing
+    ///
+    /// This variant weights fragment matches by their m/z value squared,
+    /// giving more importance to higher m/z fragments which are more sequence-specific.
+    /// This is the original SMZ (Sqrt-Mz-squared) preprocessing from spectral library searching.
+    pub fn lib_cosine_smz(&self, observed: &Spectrum, library: &LibraryEntry) -> f64 {
+        if library.fragments.is_empty() || observed.mzs.is_empty() {
+            return 0.0;
+        }
+
+        let matches = self.match_fragments(observed, library);
+        if matches.is_empty() {
+            return 0.0;
+        }
+
+        let mut lib_preprocessed: Vec<f64> = Vec::with_capacity(matches.len());
+        let mut obs_preprocessed: Vec<f64> = Vec::with_capacity(matches.len());
+
+        for m in &matches {
+            let mz_sq = m.lib_mz * m.lib_mz;
+
+            // Library: sqrt(relative_intensity) * mz²
+            let lib_val = (m.lib_intensity as f64).sqrt() * mz_sq;
+            lib_preprocessed.push(lib_val);
+
+            // Observed: sqrt(intensity) * mz²
+            let obs_val = (m.obs_intensity as f64).sqrt() * mz_sq;
+            obs_preprocessed.push(obs_val);
+        }
+
+        // L2 normalize both vectors
+        let lib_norm = lib_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let obs_norm = obs_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
+
+        if lib_norm < 1e-10 || obs_norm < 1e-10 {
+            return 0.0;
+        }
+
+        for v in lib_preprocessed.iter_mut() {
+            *v /= lib_norm;
+        }
+        for v in obs_preprocessed.iter_mut() {
+            *v /= obs_norm;
+        }
+
+        // Cosine similarity (dot product of normalized vectors)
+        lib_preprocessed
+            .iter()
+            .zip(obs_preprocessed.iter())
+            .map(|(a, b)| a * b)
+            .sum()
+    }
+
+    /// Compute X!Tandem-style hyperscore
+    ///
+    /// The hyperscore combines the number of matched fragment ions with their
+    /// observed intensities, rewarding spectra with many matching fragments
+    /// of both b and y types.
+    ///
+    /// Formula: log(n_b!) + log(n_y!) + Σ log(I_f + 1)
+    ///
+    /// This score does NOT depend on predicted intensities, only on fragment
+    /// m/z positions and ion types.
+    pub fn hyperscore(&self, observed: &Spectrum, library: &LibraryEntry) -> (f64, u32, u32) {
+        if library.fragments.is_empty() || observed.mzs.is_empty() {
+            return (0.0, 0, 0);
+        }
+
+        let matches = self.match_fragments(observed, library);
+        if matches.is_empty() {
+            return (0.0, 0, 0);
+        }
+
+        // Count matched b and y ions
+        let mut n_b: u32 = 0;
+        let mut n_y: u32 = 0;
+        let mut sum_log_intensity: f64 = 0.0;
+
+        for m in &matches {
+            match m.ion_type {
+                IonType::B => n_b += 1,
+                IonType::Y => n_y += 1,
+                _ => {} // Other ion types don't contribute to factorial terms
+            }
+            // All matched fragments contribute to the intensity term
+            sum_log_intensity += (m.obs_intensity as f64 + 1.0).ln();
+        }
+
+        // hyperscore = log(n_b!) + log(n_y!) + Σ log(I_f + 1)
+        // Use ln_gamma(n+1) = log(n!) for efficient computation
+        let log_nb_factorial = ln_gamma(n_b as f64 + 1.0);
+        let log_ny_factorial = ln_gamma(n_y as f64 + 1.0);
+
+        let score = log_nb_factorial + log_ny_factorial + sum_log_intensity;
+
+        (score, n_b, n_y)
     }
 
     /// Match library fragments to observed peaks
@@ -534,12 +648,12 @@ impl SpectralScorer {
                 }
             }
 
-            if let Some((idx, obs_intensity)) = best_match {
+            if let Some((_idx, obs_intensity)) = best_match {
                 matches.push(FragmentMatch {
                     lib_mz: frag.mz,
                     lib_intensity: frag.relative_intensity,
-                    obs_mz: observed.mzs[idx],
                     obs_intensity: obs_intensity as f32,
+                    ion_type: frag.annotation.ion_type,
                 });
             }
         }
@@ -550,13 +664,13 @@ impl SpectralScorer {
     /// Apply Comet-style windowing normalization
     ///
     /// Divides spectrum into 10 windows and normalizes each to max=50.0
-    fn apply_windowing_normalization(&self, spectrum: &[f64]) -> Vec<f64> {
-        let mut result = vec![0.0f64; spectrum.len()];
+    fn apply_windowing_normalization(&self, spectrum: &[f32]) -> Vec<f32> {
+        let mut result = vec![0.0f32; spectrum.len()];
         let num_windows = 10;
         let window_size = (spectrum.len() / num_windows) + 1;
 
         // Find global max for threshold
-        let global_max = spectrum.iter().cloned().fold(0.0f64, f64::max);
+        let global_max = spectrum.iter().cloned().fold(0.0f32, f32::max);
         let threshold = global_max * 0.05;
 
         for window_idx in 0..num_windows {
@@ -564,7 +678,7 @@ impl SpectralScorer {
             let end = ((window_idx + 1) * window_size).min(spectrum.len());
 
             // Find max in this window
-            let mut window_max = 0.0f64;
+            let mut window_max = 0.0f32;
             for i in start..end {
                 if spectrum[i] > window_max {
                     window_max = spectrum[i];
@@ -588,17 +702,17 @@ impl SpectralScorer {
     /// Apply sliding window subtraction for fast XCorr
     ///
     /// Subtracts local average (excluding center) with offset=75
-    fn apply_sliding_window(&self, spectrum: &[f64]) -> Vec<f64> {
-        let mut result = vec![0.0f64; spectrum.len()];
+    fn apply_sliding_window(&self, spectrum: &[f32]) -> Vec<f32> {
+        let mut result = vec![0.0f32; spectrum.len()];
         let offset: i64 = 75;
         let window_range = 2 * offset + 1;
-        let norm_factor = 1.0 / (window_range - 1) as f64;
+        let norm_factor = 1.0f32 / (window_range - 1) as f32;
 
         let n = spectrum.len() as i64;
 
         for i in 0..spectrum.len() {
             let i64_i = i as i64;
-            let mut sum = 0.0;
+            let mut sum = 0.0f32;
 
             // Sum values in window, excluding center
             for j in (i64_i - offset)..=(i64_i + offset) {
@@ -624,13 +738,13 @@ impl SpectralScorer {
     /// Preprocessing: bin → sqrt → windowing → flanking subtraction
     ///
     /// This allows precomputing once per spectrum and reusing across library entries.
-    pub fn preprocess_spectrum_for_xcorr(&self, spectrum: &Spectrum) -> Vec<f64> {
+    pub fn preprocess_spectrum_for_xcorr(&self, spectrum: &Spectrum) -> Vec<f32> {
         // Bin observed spectrum with sqrt transformation
-        let mut binned = vec![0.0f64; self.num_bins];
+        let mut binned = vec![0.0f32; self.num_bins];
         for (&mz, &intensity) in spectrum.mzs.iter().zip(spectrum.intensities.iter()) {
             let bin = ((mz / self.bin_width) + 0.6) as usize;
             if bin < self.num_bins {
-                binned[bin] += (intensity as f64).sqrt();
+                binned[bin] += intensity.sqrt();
             }
         }
 
@@ -647,11 +761,11 @@ impl SpectralScorer {
     /// Preprocessing: bin with unit intensity → windowing (NO flanking subtraction)
     ///
     /// This allows precomputing once per library entry and reusing across spectra.
-    pub fn preprocess_library_for_xcorr(&self, entry: &LibraryEntry) -> Vec<f64> {
+    pub fn preprocess_library_for_xcorr(&self, entry: &LibraryEntry) -> Vec<f32> {
         // Bin library fragments with unit intensity
         // Comet-style: theoretical spectrum is NOT windowed, just unit intensities at fragment bins
         // The score is simply: sum(experimental_preprocessed[frag_bins]) * 0.005
-        let mut binned = vec![0.0f64; self.num_bins];
+        let mut binned = vec![0.0f32; self.num_bins];
         for frag in &entry.fragments {
             let bin = ((frag.mz / self.bin_width) + 0.6) as usize;
             if bin < self.num_bins {
@@ -669,17 +783,18 @@ impl SpectralScorer {
     /// Compute XCorr from preprocessed vectors
     ///
     /// This is a simple dot product with scaling, used after preprocessing.
+    /// Returns f64 for compatibility with scoring pipelines.
     #[inline]
-    pub fn xcorr_from_preprocessed(spectrum_preprocessed: &[f64], library_preprocessed: &[f64]) -> f64 {
+    pub fn xcorr_from_preprocessed(spectrum_preprocessed: &[f32], library_preprocessed: &[f32]) -> f64 {
         let min_len = spectrum_preprocessed.len().min(library_preprocessed.len());
-        let raw: f64 = spectrum_preprocessed[..min_len]
+        let raw: f32 = spectrum_preprocessed[..min_len]
             .iter()
             .zip(library_preprocessed[..min_len].iter())
             .map(|(s, l)| s * l)
             .sum();
 
         // Scale XCorr (pyXcorrDIA uses 0.005 for spectrum-centric)
-        raw * 0.005
+        (raw * 0.005f32) as f64
     }
 
     /// Get the number of bins used for XCorr
@@ -691,11 +806,15 @@ impl SpectralScorer {
 /// Result of spectral similarity scoring
 #[derive(Debug, Clone, Default)]
 pub struct SpectralScore {
-    /// LibCosine score (0-1, cosine similarity with SMZ preprocessing)
+    /// LibCosine score (0-1, cosine similarity with sqrt preprocessing)
     pub lib_cosine: f64,
+    /// LibCosine score with sqrt(intensity)*mz² (SMZ) preprocessing
+    pub lib_cosine_smz: f64,
     /// XCorr score (Comet-style cross-correlation)
     pub xcorr: f64,
-    /// Raw dot product
+    /// X!Tandem-style hyperscore: log(n_b!) + log(n_y!) + Σlog(I_f+1)
+    pub hyperscore: f64,
+    /// Raw dot product (same as lib_cosine for backward compat)
     pub dot_product: f64,
     /// Number of matched fragments
     pub n_matched: u32,
@@ -717,6 +836,10 @@ pub struct SpectralScore {
     pub base_peak_rank: u32,
     /// Number of top-3 library peaks that matched
     pub top3_matches: u32,
+    /// Number of matched b-ions (for hyperscore)
+    pub n_matched_b: u32,
+    /// Number of matched y-ions (for hyperscore)
+    pub n_matched_y: u32,
 }
 
 /// Internal struct for fragment matching
@@ -724,8 +847,9 @@ pub struct SpectralScore {
 struct FragmentMatch {
     lib_mz: f64,
     lib_intensity: f32,
-    obs_mz: f64,
     obs_intensity: f32,
+    /// Ion type of the matched fragment (for hyperscore b/y counting)
+    ion_type: IonType,
 }
 
 /// Spectrum aggregator for combining spectra across peak apex region
@@ -810,7 +934,7 @@ impl SpectrumAggregator {
         }
 
         // Sort by m/z
-        all_peaks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        all_peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         // Merge peaks within tolerance
         let mut merged_mzs: Vec<f64> = Vec::new();
@@ -927,7 +1051,7 @@ impl SpectrumAggregator {
         }
 
         // Sort by m/z
-        all_peaks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        all_peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         // Merge peaks within tolerance
         let mut merged_mzs: Vec<f64> = Vec::new();
@@ -965,6 +1089,73 @@ impl SpectrumAggregator {
             isolation_window: apex_spectrum.isolation_window,
             mzs: merged_mzs,
             intensities: merged_intensities,
+        }
+    }
+}
+
+/// Contextual information from regression results for a peptide
+///
+/// This aggregates information from multiple regression results (across spectra)
+/// to compute contextual features like n_competitors and relative_coefficient.
+#[derive(Debug, Clone, Default)]
+pub struct RegressionContext {
+    /// Average number of competitors per spectrum
+    pub avg_n_competitors: f64,
+    /// Maximum number of competitors seen
+    pub max_n_competitors: u32,
+    /// Average relative coefficient (this peptide / sum of all in spectrum)
+    pub avg_relative_coefficient: f64,
+    /// Maximum relative coefficient
+    pub max_relative_coefficient: f64,
+    /// Average regression residual
+    pub avg_residual: f64,
+    /// Average explained variance (1 - residual / ||b||²)
+    pub avg_explained_variance: f64,
+    /// Number of spectra this peptide appeared in
+    pub n_spectra: u32,
+    /// Spectral complexity estimate (average number of peaks)
+    pub avg_spectral_complexity: f64,
+}
+
+impl RegressionContext {
+    /// Build regression context from regression results for a specific peptide
+    pub fn from_results(
+        results: &[&osprey_core::RegressionResult],
+        lib_id: u32,
+    ) -> Self {
+        if results.is_empty() {
+            return Self::default();
+        }
+
+        let n = results.len() as f64;
+        let mut total_competitors = 0.0;
+        let mut max_competitors = 0u32;
+        let mut total_relative_coef = 0.0;
+        let mut max_relative_coef = 0.0f64;
+        let mut total_residual = 0.0;
+        let mut total_explained_var = 0.0;
+
+        for result in results {
+            total_competitors += result.n_candidates as f64;
+            max_competitors = max_competitors.max(result.n_candidates);
+
+            let rel_coef = result.relative_coefficient(lib_id);
+            total_relative_coef += rel_coef;
+            max_relative_coef = max_relative_coef.max(rel_coef);
+
+            total_residual += result.residual;
+            total_explained_var += result.explained_variance();
+        }
+
+        Self {
+            avg_n_competitors: total_competitors / n,
+            max_n_competitors: max_competitors,
+            avg_relative_coefficient: total_relative_coef / n,
+            max_relative_coefficient: max_relative_coef,
+            avg_residual: total_residual / n,
+            avg_explained_variance: total_explained_var / n,
+            n_spectra: results.len() as u32,
+            avg_spectral_complexity: 0.0, // Computed separately if needed
         }
     }
 }
@@ -1037,7 +1228,7 @@ impl FeatureExtractor {
         // Find apex RT from coefficient series
         let apex_rt = coefficient_series
             .iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(rt, _)| *rt)
             .unwrap_or(entry.retention_time);
 
@@ -1087,7 +1278,7 @@ impl FeatureExtractor {
             let (apex_idx, apex_value) = coefficient_series
                 .iter()
                 .enumerate()
-                .max_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
                 .map(|(i, (_, c))| (i, *c))
                 .unwrap_or((0, 0.0));
             features.peak_apex = apex_value;
@@ -1144,8 +1335,11 @@ impl FeatureExtractor {
             // Compute both LibCosine and XCorr scores
             let spectral_score = self.spectral_scorer.xcorr(spectrum, entry);
 
-            // FR-5.2.4: Dot product (LibCosine is our primary spectral score)
+            // FR-5.2.4: Dot product (LibCosine with sqrt preprocessing)
             features.dot_product = spectral_score.lib_cosine;
+
+            // LibCosine with sqrt(intensity)*mz² (SMZ) preprocessing
+            features.dot_product_smz = spectral_score.lib_cosine_smz;
 
             // FR-5.2.3: Normalized spectral contrast angle
             features.spectral_contrast_angle =
@@ -1157,8 +1351,11 @@ impl FeatureExtractor {
             // FR-5.2.12: Explained intensity fraction
             features.explained_intensity = spectral_score.explained_intensity;
 
-            // FR-5.2.2: Hyperscore (XCorr style)
-            features.hyperscore = spectral_score.xcorr;
+            // FR-5.2.2: X!Tandem Hyperscore: log(n_b!) + log(n_y!) + Σlog(I_f+1)
+            features.hyperscore = spectral_score.hyperscore;
+
+            // XCorr (Comet-style cross-correlation)
+            features.xcorr = spectral_score.xcorr;
 
             // FR-5.2.5: Pearson intensity correlation
             features.pearson_correlation = spectral_score.pearson_correlation;
@@ -1181,6 +1378,52 @@ impl FeatureExtractor {
 
         // Count modifications
         features.modification_count = entry.modifications.len() as u32;
+
+        features
+    }
+
+    /// Apply contextual features from regression context
+    ///
+    /// Call this after extract() or extract_with_expected_rt() to add
+    /// contextual features computed from regression results.
+    pub fn apply_regression_context(features: &mut FeatureSet, context: &RegressionContext) {
+        // FR-5.3.1: Number of competing candidates
+        features.n_competitors = context.max_n_competitors;
+
+        // FR-5.3.2: Relative coefficient (our coefficient / sum of all)
+        features.relative_coefficient = context.max_relative_coefficient;
+
+        // FR-5.3.3: Local peptide density (using avg competitors as proxy)
+        features.local_peptide_density = context.avg_n_competitors;
+
+        // FR-5.3.4: Spectral complexity
+        features.spectral_complexity = context.avg_spectral_complexity;
+
+        // FR-5.3.5: Regression residual (average across contributing spectra)
+        features.regression_residual = context.avg_residual;
+    }
+
+    /// Extract features with full context (chromatographic, spectral, and contextual)
+    ///
+    /// This is the recommended method when regression context is available.
+    pub fn extract_full(
+        &self,
+        entry: &LibraryEntry,
+        coefficient_series: &[(f64, f64)],
+        apex_spectrum: Option<&Spectrum>,
+        expected_rt: Option<f64>,
+        context: Option<&RegressionContext>,
+    ) -> FeatureSet {
+        let mut features = self.extract_with_expected_rt(
+            entry,
+            coefficient_series,
+            apex_spectrum,
+            expected_rt,
+        );
+
+        if let Some(ctx) = context {
+            Self::apply_regression_context(&mut features, ctx);
+        }
 
         features
     }
@@ -1329,6 +1572,46 @@ impl FeatureExtractor {
             0.5 // Default if we can't measure
         }
     }
+}
+
+/// Compute ln(Gamma(x)) = ln((x-1)!) for positive integers
+///
+/// Uses Stirling's approximation for large values and lookup table for small values.
+/// For X!Tandem hyperscore, this computes log(n!) efficiently.
+fn ln_gamma(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x <= 1.0 {
+        return 0.0; // ln(Gamma(1)) = ln(0!) = 0
+    }
+    if x <= 2.0 {
+        return 0.0; // ln(Gamma(2)) = ln(1!) = 0
+    }
+
+    // Use Lanczos approximation (accurate for all positive values)
+    // Coefficients from Numerical Recipes
+    let g = 7.0;
+    let c = [
+        0.99999999999980993,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.32342877765313,
+        -176.61502916214059,
+        12.507343278686905,
+        -0.13857109526572012,
+        9.9843695780195716e-6,
+        1.5056327351493116e-7,
+    ];
+
+    let x_adj = x - 1.0;
+    let mut sum = c[0];
+    for (i, &coeff) in c[1..].iter().enumerate() {
+        sum += coeff / (x_adj + i as f64 + 1.0);
+    }
+
+    let t = x_adj + g + 0.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (t.ln() * (x_adj + 0.5)) - t + sum.ln()
 }
 
 /// Decoy generator using enzyme-aware sequence reversal

@@ -393,32 +393,97 @@ impl SparseRidgeSolver {
         y
     }
 
-    /// Solve with non-negativity constraint
+    /// Solve with non-negativity constraint using projected gradient descent
+    ///
+    /// Returns coefficient vector x ≥ 0 that minimizes:
+    ///   ‖Ax - b‖² + λ‖x‖²
+    ///
+    /// Uses projected gradient descent which is well-suited for dense solutions.
     pub fn solve_nonnegative(
         &self,
         a: &CsMat<f64>,
         b: &Array1<f64>,
         lambda: Option<f64>,
     ) -> Result<Array1<f64>> {
-        // First solve unconstrained
-        let mut x = self.solve(a, b, lambda)?;
+        let lambda = lambda.unwrap_or(self.default_lambda);
+        let n_cols = a.cols();
 
-        // Simple projection method
-        let max_iter = 50;
-        for _ in 0..max_iter {
-            let mut changed = false;
-            for i in 0..x.len() {
-                if x[i] < 0.0 {
-                    x[i] = 0.0;
-                    changed = true;
-                }
-            }
-            if !changed {
+        if n_cols == 0 {
+            return Ok(Array1::zeros(0));
+        }
+
+        // First solve unconstrained to get initial solution
+        let mut x = self.solve(a, b, Some(lambda))?;
+
+        // Check if unconstrained solution is already non-negative
+        let all_positive = x.iter().all(|&v| v >= 0.0);
+        if all_positive {
+            return Ok(x);
+        }
+
+        // Project initial solution to non-negative
+        x.mapv_inplace(|v| v.max(0.0));
+
+        // Compute A'b (needed for gradient computation)
+        let atb = self.sparse_transpose_vec_mult(a, b);
+
+        // Projected gradient descent parameters
+        let max_iter = 1000;
+        let tol = 1e-8;
+
+        // Estimate Lipschitz constant from sparse matrix
+        // L = largest eigenvalue of A'A + λI
+        // Use sum of squared column norms as upper bound
+        let lipschitz = self.estimate_lipschitz_sparse(a, lambda);
+        let step_size = 1.0 / lipschitz;
+
+        for _iter in 0..max_iter {
+            // Gradient: ∇f(x) = (A'A + λI)x - A'b
+            let gradient = self.apply_normal_equations(a, &x, lambda) - &atb;
+
+            // Gradient step: x_new = x - step_size * gradient
+            let x_new: Array1<f64> = &x - step_size * &gradient;
+
+            // Project to non-negative orthant
+            let x_new = x_new.mapv(|v| v.max(0.0));
+
+            // Check convergence: ||x_new - x||₂ < tol
+            let diff = &x_new - &x;
+            let change = diff.dot(&diff).sqrt();
+
+            x = x_new;
+
+            if change < tol {
                 break;
             }
         }
 
         Ok(x)
+    }
+
+    /// Estimate Lipschitz constant for sparse matrix
+    ///
+    /// Uses sum of squared column norms as an upper bound for the spectral norm.
+    fn estimate_lipschitz_sparse(&self, a: &CsMat<f64>, lambda: f64) -> f64 {
+        // For sparse matrices, estimate ||A'A + λI||
+        // Upper bound: sum of squared column 2-norms + lambda
+        let mut max_col_norm_sq = 0.0f64;
+
+        for col in a.outer_iterator() {
+            let mut col_norm_sq = 0.0;
+            for (_, &val) in col.iter() {
+                col_norm_sq += val * val;
+            }
+            max_col_norm_sq = max_col_norm_sq.max(col_norm_sq);
+        }
+
+        // Rough upper bound: sum of max column norm squared times number of columns
+        // This is conservative but guarantees convergence
+        let n_cols = a.cols() as f64;
+        let estimate = n_cols * max_col_norm_sq + lambda;
+
+        // Ensure we don't divide by zero
+        estimate.max(1e-10)
     }
 
     /// Compute residual norm ‖Ax - b‖²
@@ -622,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_solver_nonnegative() {
+    fn test_sparse_solver_nonnegative_simple() {
         let solver = SparseRidgeSolver::new(0.1);
 
         // Setup where unconstrained solution would be negative
@@ -638,6 +703,67 @@ mod tests {
         // All coefficients should be non-negative
         for &val in x.iter() {
             assert!(val >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_sparse_solver_nonnegative_non_trivial() {
+        // Test with correlated columns requiring proper NNLS iteration
+        let solver = SparseRidgeSolver::new(0.1);
+
+        // Create a matrix with overlapping patterns (like overlapping spectra)
+        let mut triplets = TriMat::new((4, 3));
+        // Column 0: peaks at rows 0, 1
+        triplets.add_triplet(0, 0, 1.0);
+        triplets.add_triplet(1, 0, 0.5);
+        // Column 1: peaks at rows 1, 2 (overlaps with col 0)
+        triplets.add_triplet(1, 1, 0.5);
+        triplets.add_triplet(2, 1, 1.0);
+        // Column 2: peaks at rows 2, 3 (overlaps with col 1)
+        triplets.add_triplet(2, 2, 0.3);
+        triplets.add_triplet(3, 2, 1.0);
+
+        let a: CsMat<f64> = triplets.to_csc();
+        let b = Array1::from_vec(vec![0.8, 0.2, 0.9, 0.7]);
+
+        let x = solver.solve_nonnegative(&a, &b, None).unwrap();
+
+        // All coefficients should be non-negative
+        for (i, &val) in x.iter().enumerate() {
+            assert!(val >= 0.0, "Coefficient {} is negative: {}", i, val);
+        }
+
+        // Verify solution quality
+        let residual = solver.residual(&a, &x, &b);
+        assert!(residual < 1.0, "Residual too high: {}", residual);
+    }
+
+    #[test]
+    fn test_sparse_solver_nonnegative_all_positive() {
+        // When unconstrained solution is already all positive,
+        // NNLS should return the same result
+        let solver = SparseRidgeSolver::new(0.1);
+
+        let mut triplets = TriMat::new((3, 3));
+        triplets.add_triplet(0, 0, 1.0);
+        triplets.add_triplet(1, 1, 1.0);
+        triplets.add_triplet(2, 2, 1.0);
+
+        let a: CsMat<f64> = triplets.to_csc();
+        let b = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+
+        let x_unconstrained = solver.solve(&a, &b, None).unwrap();
+        let x_nnls = solver.solve_nonnegative(&a, &b, None).unwrap();
+
+        // Should be the same (or very close)
+        for i in 0..3 {
+            assert!(
+                (x_unconstrained[i] - x_nnls[i]).abs() < 1e-6,
+                "Mismatch at {}: {} vs {}",
+                i,
+                x_unconstrained[i],
+                x_nnls[i]
+            );
         }
     }
 }
