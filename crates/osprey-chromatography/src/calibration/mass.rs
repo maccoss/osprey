@@ -1,86 +1,107 @@
 //! m/z calibration for MS1 and MS2 measurements
 //!
-//! Corrects systematic mass measurement errors using mean PPM offset
+//! Corrects systematic mass measurement errors using mean offset
 //! and provides adaptive tolerance based on measurement variability.
+//!
+//! Supports both ppm-based calibration (HRAM) and absolute m/z (Th) calibration
+//! (unit resolution).
 
 use super::{MzCalibration, MzHistogram};
+use osprey_core::{Spectrum, ToleranceUnit};
 
 /// QC data for m/z calibration
-#[derive(Debug, Clone, Default)]
+///
+/// For unit resolution instruments (e.g., Stellar), both MS1 and MS2
+/// errors are measured in Th (Thomson). For HRAM instruments, both
+/// are measured in ppm.
+#[derive(Debug, Clone)]
 pub struct MzQCData {
-    /// MS1 m/z errors in PPM
-    pub ms1_errors_ppm: Vec<f64>,
+    /// MS1 m/z errors (in configured unit - ppm or Th)
+    pub ms1_errors: Vec<f64>,
 
-    /// MS2 m/z errors in PPM
-    pub ms2_errors_ppm: Vec<f64>,
+    /// MS2 m/z errors (in configured unit - ppm or Th)
+    pub ms2_errors: Vec<f64>,
+
+    /// Unit for mass errors (same for both MS1 and MS2)
+    pub unit: ToleranceUnit,
+}
+
+impl Default for MzQCData {
+    fn default() -> Self {
+        Self {
+            ms1_errors: Vec::new(),
+            ms2_errors: Vec::new(),
+            unit: ToleranceUnit::Ppm,
+        }
+    }
 }
 
 impl MzQCData {
-    /// Create new empty QC data
-    pub fn new() -> Self {
-        Self::default()
+    /// Create new empty QC data with specified unit
+    ///
+    /// The unit applies to both MS1 and MS2 errors:
+    /// - `ToleranceUnit::Ppm` for HRAM instruments
+    /// - `ToleranceUnit::Mz` (Th) for unit resolution instruments
+    pub fn new(unit: ToleranceUnit) -> Self {
+        Self {
+            ms1_errors: Vec::new(),
+            ms2_errors: Vec::new(),
+            unit,
+        }
     }
 
-    /// Add MS1 error measurement
-    pub fn add_ms1_error(&mut self, error_ppm: f64) {
-        self.ms1_errors_ppm.push(error_ppm);
+    /// Add MS1 error measurement (in configured unit)
+    pub fn add_ms1_error(&mut self, error: f64) {
+        self.ms1_errors.push(error);
     }
 
-    /// Add MS2 error measurement
-    pub fn add_ms2_error(&mut self, error_ppm: f64) {
-        self.ms2_errors_ppm.push(error_ppm);
+    /// Add MS2 error measurement (in configured unit)
+    pub fn add_ms2_error(&mut self, error: f64) {
+        self.ms2_errors.push(error);
     }
 
     /// Number of MS1 observations
     pub fn n_ms1(&self) -> usize {
-        self.ms1_errors_ppm.len()
+        self.ms1_errors.len()
     }
 
     /// Number of MS2 observations
     pub fn n_ms2(&self) -> usize {
-        self.ms2_errors_ppm.len()
+        self.ms2_errors.len()
     }
 }
 
 /// Calculate m/z calibration parameters from QC data
 ///
-/// Uses mean PPM offset to correct systematic mass measurement errors,
-/// and calculates adaptive tolerance as mean + 3*SD.
+/// Uses mean offset to correct systematic mass measurement errors,
+/// and calculates adaptive tolerance as |mean| + 3*SD.
 ///
 /// # Arguments
 /// * `qc_data` - QC data from confident calibration matches
 ///
 /// # Returns
-/// Calibration parameters for MS1 and MS2
-///
-/// # Example
-/// ```
-/// use osprey_chromatography::calibration::mass::{calculate_mz_calibration, MzQCData};
-///
-/// let qc_data = MzQCData {
-///     ms1_errors_ppm: vec![-2.5, -2.3, -2.7, -2.4],
-///     ms2_errors_ppm: vec![1.2, 1.1, 1.3, 1.0],
-/// };
-///
-/// let (ms1_cal, ms2_cal) = calculate_mz_calibration(&qc_data);
-/// println!("MS1 offset: {:.2} ppm (SD: {:.2})", ms1_cal.mean, ms1_cal.sd);
-/// println!("MS2 offset: {:.2} ppm (SD: {:.2})", ms2_cal.mean, ms2_cal.sd);
-/// ```
+/// Calibration parameters for MS1 and MS2 (both use same unit from qc_data)
 pub fn calculate_mz_calibration(qc_data: &MzQCData) -> (MzCalibration, MzCalibration) {
-    let ms1_calibration = calculate_single_calibration(&qc_data.ms1_errors_ppm);
-    let ms2_calibration = calculate_single_calibration(&qc_data.ms2_errors_ppm);
+    // Both MS1 and MS2 use the same unit (ppm for HRAM, Th for unit resolution)
+    let ms1_calibration = calculate_single_calibration(&qc_data.ms1_errors, qc_data.unit);
+    let ms2_calibration = calculate_single_calibration(&qc_data.ms2_errors, qc_data.unit);
     (ms1_calibration, ms2_calibration)
 }
 
 /// Calculate calibration parameters for a single error vector
-fn calculate_single_calibration(errors: &[f64]) -> MzCalibration {
+fn calculate_single_calibration(errors: &[f64], unit: ToleranceUnit) -> MzCalibration {
+    let unit_str = match unit {
+        ToleranceUnit::Ppm => "ppm",
+        ToleranceUnit::Mz => "Th",
+    };
+
     if errors.is_empty() {
         return MzCalibration {
             mean: 0.0,
             median: 0.0,
             sd: 0.0,
             count: 0,
-            unit: "ppm".to_string(),
+            unit: unit_str.to_string(),
             adjusted_tolerance: None,
             window_halfwidth_multiplier: None,
             histogram: None,
@@ -110,15 +131,20 @@ fn calculate_single_calibration(errors: &[f64]) -> MzCalibration {
     };
     let sd = variance.sqrt();
 
-    // Generate histogram with 1 ppm bins
-    let histogram = generate_histogram(&sorted, 1.0);
+    // Generate histogram with appropriate bin width
+    // ppm: 1.0 bins, Th: 0.01 bins
+    let bin_width = match unit {
+        ToleranceUnit::Ppm => 1.0,
+        ToleranceUnit::Mz => 0.01,
+    };
+    let histogram = generate_histogram(&sorted, bin_width);
 
     MzCalibration {
         mean,
         median,
         sd,
         count: errors.len(),
-        unit: "ppm".to_string(),
+        unit: unit_str.to_string(),
         adjusted_tolerance: Some(mean.abs() + 3.0 * sd),
         window_halfwidth_multiplier: Some(3.0),
         histogram: Some(histogram),
@@ -176,36 +202,121 @@ fn generate_histogram(sorted_values: &[f64], bin_width: f64) -> MzHistogram {
 /// # Returns
 /// Corrected m/z value
 ///
-/// # Example
-/// ```
-/// use osprey_chromatography::calibration::{MzCalibration, mass::apply_mz_calibration};
-///
-/// let calibration = MzCalibration {
-///     mean: -2.5,  // Systematic error of -2.5 ppm
-///     median: -2.5,
-///     sd: 0.5,
-///     count: 100,
-///     unit: "ppm".to_string(),
-///     adjusted_tolerance: Some(3.0),
-///     window_halfwidth_multiplier: Some(3.0),
-///     histogram: None,
-///     calibrated: true,
-/// };
-///
-/// let observed = 500.0;
-/// let corrected = apply_mz_calibration(observed, &calibration);
-///
-/// // Correction: 500.0 - (500.0 * -2.5 / 1e6) = 500.00125
-/// assert!((corrected - 500.00125).abs() < 0.00001);
-/// ```
+/// # Unit-aware correction
+/// - For ppm: `corrected = observed - observed * mean / 1e6`
+/// - For Th: `corrected = observed - mean`
 pub fn apply_mz_calibration(observed_mz: f64, calibration: &MzCalibration) -> f64 {
     if !calibration.calibrated {
         return observed_mz;
     }
 
     // Correct for systematic offset using mean
-    let correction_da = observed_mz * calibration.mean / 1e6;
-    observed_mz - correction_da
+    // Unit is determined by calibration.unit field
+    if calibration.unit == "Th" {
+        // Absolute m/z correction (unit resolution)
+        observed_mz - calibration.mean
+    } else {
+        // PPM correction (HRAM)
+        let correction_da = observed_mz * calibration.mean / 1e6;
+        observed_mz - correction_da
+    }
+}
+
+/// Apply m/z calibration to all peaks in a spectrum
+///
+/// Creates a new spectrum with corrected m/z values. This shifts all
+/// measured m/z values by the systematic offset determined during calibration.
+///
+/// # Arguments
+/// * `spectrum` - Observed spectrum with uncorrected m/z values
+/// * `calibration` - MS2 calibration parameters
+///
+/// # Returns
+/// New spectrum with calibration-corrected m/z values
+pub fn apply_spectrum_calibration(spectrum: &Spectrum, calibration: &MzCalibration) -> Spectrum {
+    if !calibration.calibrated {
+        return spectrum.clone();
+    }
+
+    // Correct each m/z value
+    let corrected_mzs: Vec<f64> = spectrum.mzs
+        .iter()
+        .map(|&mz| apply_mz_calibration(mz, calibration))
+        .collect();
+
+    Spectrum {
+        scan_number: spectrum.scan_number,
+        retention_time: spectrum.retention_time,
+        precursor_mz: spectrum.precursor_mz,
+        isolation_window: spectrum.isolation_window.clone(),
+        mzs: corrected_mzs,
+        intensities: spectrum.intensities.clone(),
+    }
+}
+
+/// Get calibrated tolerance for fragment matching
+///
+/// Returns 3×SD from calibration if calibrated, otherwise returns base tolerance.
+/// This provides the appropriate tolerance for ppm-based fragment matching
+/// after calibration has been applied.
+///
+/// # Arguments
+/// * `calibration` - MS2 calibration parameters
+/// * `base_tolerance_ppm` - Default tolerance to use if not calibrated
+///
+/// # Returns
+/// Tolerance in ppm to use for fragment matching
+pub fn calibrated_tolerance_ppm(calibration: &MzCalibration, base_tolerance_ppm: f64) -> f64 {
+    if calibration.calibrated {
+        // Use 3×SD as the tolerance (mean offset is already corrected)
+        let tolerance_3sd = 3.0 * calibration.sd;
+        // Ensure we have at least a minimum tolerance
+        tolerance_3sd.max(1.0)
+    } else {
+        base_tolerance_ppm
+    }
+}
+
+/// Get calibrated tolerance for fragment matching (unit-aware)
+///
+/// Returns 3×SD from calibration in the appropriate unit (ppm or Th).
+/// This is the preferred function for unit resolution data where calibration
+/// is done in Th instead of ppm.
+///
+/// # Arguments
+/// * `calibration` - MS2 calibration parameters (with unit in `calibration.unit`)
+/// * `base_tolerance` - Default tolerance to use if not calibrated
+/// * `base_unit` - Unit for the base tolerance
+///
+/// # Returns
+/// Tuple of (tolerance value, unit) for fragment matching
+pub fn calibrated_tolerance(
+    calibration: &MzCalibration,
+    base_tolerance: f64,
+    base_unit: ToleranceUnit,
+) -> (f64, ToleranceUnit) {
+    if calibration.calibrated {
+        // Use 3×SD as the tolerance (mean offset is already corrected)
+        let tolerance_3sd = 3.0 * calibration.sd;
+
+        // Determine unit from calibration
+        let unit = if calibration.unit == "Th" {
+            ToleranceUnit::Mz
+        } else {
+            ToleranceUnit::Ppm
+        };
+
+        // Apply appropriate minimum based on unit
+        let min_tolerance = if unit == ToleranceUnit::Mz {
+            0.05 // Minimum 0.05 Th for unit resolution
+        } else {
+            1.0 // Minimum 1.0 ppm for HRAM
+        };
+
+        (tolerance_3sd.max(min_tolerance), unit)
+    } else {
+        (base_tolerance, base_unit)
+    }
 }
 
 /// Calculate m/z error in PPM
@@ -304,10 +415,13 @@ mod tests {
 
     #[test]
     fn test_calculate_mz_calibration() {
-        let qc_data = MzQCData {
-            ms1_errors_ppm: vec![-2.5, -2.3, -2.7, -2.4, -2.6],
-            ms2_errors_ppm: vec![1.2, 1.1, 1.3, 1.0, 1.4],
-        };
+        let mut qc_data = MzQCData::new(ToleranceUnit::Ppm);
+        for &e in &[-2.5, -2.3, -2.7, -2.4, -2.6] {
+            qc_data.add_ms1_error(e);
+        }
+        for &e in &[1.2, 1.1, 1.3, 1.0, 1.4] {
+            qc_data.add_ms2_error(e);
+        }
 
         let (ms1_cal, ms2_cal) = calculate_mz_calibration(&qc_data);
 
@@ -318,6 +432,7 @@ mod tests {
         assert_eq!(ms1_cal.count, 5);
         assert!(ms1_cal.calibrated);
         assert!(ms1_cal.histogram.is_some());
+        assert_eq!(ms1_cal.unit, "ppm");
 
         // MS2 mean should be 1.2, median should be 1.2
         assert!((ms2_cal.mean - 1.2).abs() < 0.01);
@@ -326,14 +441,12 @@ mod tests {
         assert_eq!(ms2_cal.count, 5);
         assert!(ms2_cal.calibrated);
         assert!(ms2_cal.histogram.is_some());
+        assert_eq!(ms2_cal.unit, "ppm");
     }
 
     #[test]
     fn test_empty_qc_data() {
-        let qc_data = MzQCData {
-            ms1_errors_ppm: vec![],
-            ms2_errors_ppm: vec![],
-        };
+        let qc_data = MzQCData::new(ToleranceUnit::Ppm);
 
         let (ms1_cal, ms2_cal) = calculate_mz_calibration(&qc_data);
 
@@ -395,10 +508,10 @@ mod tests {
 
     #[test]
     fn test_histogram_generation() {
-        let qc_data = MzQCData {
-            ms1_errors_ppm: vec![-2.5, -2.3, -2.7, -1.8, -3.2, 0.5, -2.1],
-            ms2_errors_ppm: vec![],
-        };
+        let mut qc_data = MzQCData::new(ToleranceUnit::Ppm);
+        for &e in &[-2.5, -2.3, -2.7, -1.8, -3.2, 0.5, -2.1] {
+            qc_data.add_ms1_error(e);
+        }
 
         let (ms1_cal, _) = calculate_mz_calibration(&qc_data);
         let hist = ms1_cal.histogram.unwrap();
@@ -416,19 +529,39 @@ mod tests {
     #[test]
     fn test_median_calculation() {
         // Odd number of elements
-        let qc_data = MzQCData {
-            ms1_errors_ppm: vec![1.0, 2.0, 3.0, 4.0, 5.0],
-            ms2_errors_ppm: vec![],
-        };
+        let mut qc_data = MzQCData::new(ToleranceUnit::Ppm);
+        for &e in &[1.0, 2.0, 3.0, 4.0, 5.0] {
+            qc_data.add_ms1_error(e);
+        }
         let (ms1_cal, _) = calculate_mz_calibration(&qc_data);
         assert!((ms1_cal.median - 3.0).abs() < 0.001);
 
         // Even number of elements
-        let qc_data = MzQCData {
-            ms1_errors_ppm: vec![1.0, 2.0, 3.0, 4.0],
-            ms2_errors_ppm: vec![],
-        };
+        let mut qc_data = MzQCData::new(ToleranceUnit::Ppm);
+        for &e in &[1.0, 2.0, 3.0, 4.0] {
+            qc_data.add_ms1_error(e);
+        }
         let (ms1_cal, _) = calculate_mz_calibration(&qc_data);
         assert!((ms1_cal.median - 2.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_unit_resolution_calibration() {
+        // Test with Th units for unit resolution instruments
+        let mut qc_data = MzQCData::new(ToleranceUnit::Mz);
+        for &e in &[-0.01, 0.02, -0.005, 0.015, 0.0] {
+            qc_data.add_ms1_error(e);
+            qc_data.add_ms2_error(e * 1.1); // Slightly different for MS2
+        }
+
+        let (ms1_cal, ms2_cal) = calculate_mz_calibration(&qc_data);
+
+        // Both should be in Th units
+        assert_eq!(ms1_cal.unit, "Th");
+        assert_eq!(ms2_cal.unit, "Th");
+
+        // Both should be calibrated
+        assert!(ms1_cal.calibrated);
+        assert!(ms2_cal.calibrated);
     }
 }

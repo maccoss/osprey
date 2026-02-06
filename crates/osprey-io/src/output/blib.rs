@@ -17,19 +17,67 @@ const SCORE_TYPE_OSPREY: i32 = 100; // Custom score type for Osprey
 /// blib file writer
 pub struct BlibWriter {
     conn: Connection,
+    in_transaction: bool,
 }
 
 impl BlibWriter {
     /// Create a new blib file at the given path
+    ///
+    /// If the file already exists, it will be removed and recreated.
     pub fn create<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(path.as_ref()).map_err(|e| {
+        let path = path.as_ref();
+
+        // Remove existing file if it exists to ensure a fresh database
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| {
+                OspreyError::SqliteError(format!(
+                    "Failed to remove existing blib file '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        }
+
+        let conn = Connection::open(path).map_err(|e| {
             OspreyError::SqliteError(format!("Failed to create blib file: {}", e))
         })?;
 
-        let writer = Self { conn };
+        // Enable WAL mode for better write performance
+        conn.pragma_update(None, "journal_mode", "WAL").ok();
+        // Reduce sync frequency (still safe with WAL)
+        conn.pragma_update(None, "synchronous", "NORMAL").ok();
+
+        let writer = Self { conn, in_transaction: false };
         writer.create_schema()?;
 
         Ok(writer)
+    }
+
+    /// Begin a batch transaction for faster writes
+    ///
+    /// Call this before writing multiple spectra, then call `commit()` when done.
+    /// All writes between `begin_batch()` and `commit()` will be in a single transaction.
+    pub fn begin_batch(&mut self) -> Result<()> {
+        if self.in_transaction {
+            return Ok(()); // Already in a transaction
+        }
+        self.conn.execute("BEGIN TRANSACTION", []).map_err(|e| {
+            OspreyError::SqliteError(format!("Failed to begin transaction: {}", e))
+        })?;
+        self.in_transaction = true;
+        Ok(())
+    }
+
+    /// Commit the batch transaction
+    pub fn commit(&mut self) -> Result<()> {
+        if !self.in_transaction {
+            return Ok(()); // Nothing to commit
+        }
+        self.conn.execute("COMMIT", []).map_err(|e| {
+            OspreyError::SqliteError(format!("Failed to commit transaction: {}", e))
+        })?;
+        self.in_transaction = false;
+        Ok(())
     }
 
     /// Create the blib schema tables
@@ -341,6 +389,24 @@ impl BlibWriter {
         Ok(())
     }
 
+    /// Add experiment-level scores (one per RefSpectra entry)
+    pub fn add_experiment_scores(
+        &self,
+        ref_id: i64,
+        experiment_q_value: f64,
+        n_runs_detected: i32,
+        n_runs_searched: i32,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO OspreyExperimentScores (
+                RefSpectraID, ExperimentQValue, NRunsDetected, NRunsSearched
+            ) VALUES (?, ?, ?, ?)"#,
+            params![ref_id, experiment_q_value, n_runs_detected, n_runs_searched],
+        ).map_err(|e| OspreyError::SqliteError(format!("Failed to add experiment scores: {}", e)))?;
+
+        Ok(())
+    }
+
     /// Add coefficient time series point
     pub fn add_coefficient(
         &self,
@@ -378,6 +444,15 @@ impl BlibWriter {
         ).map_err(|e| OspreyError::SqliteError(format!("Failed to update LibInfo: {}", e)))?;
 
         Ok(())
+    }
+}
+
+impl Drop for BlibWriter {
+    fn drop(&mut self) {
+        // Rollback any uncommitted transaction on drop
+        if self.in_transaction {
+            let _ = self.conn.execute("ROLLBACK", []);
+        }
     }
 }
 

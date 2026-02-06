@@ -618,7 +618,7 @@ pub struct FeatureSet {
     /// Peak prominence (apex / baseline)
     pub peak_prominence: f64,
 
-    // Spectral features
+    // Spectral features (from mixed/observed spectrum at apex)
     /// X!Tandem-style hyperscore: log(n_b!) + log(n_y!) + Σlog(I_f+1)
     pub hyperscore: f64,
     /// XCorr score (Comet-style cross-correlation)
@@ -645,6 +645,26 @@ pub struct FeatureSet {
     pub top3_matches: u32,
     /// Fraction of observed intensity explained
     pub explained_intensity: f64,
+
+    // Deconvoluted spectral features (from summed deconvoluted signal, apex ± 2 scans)
+    // These compare the deconvoluted (coefficient-scaled) contribution to the library,
+    // removing interference from co-eluting peptides.
+    /// Hyperscore from deconvoluted spectrum (apex ± 2 scans)
+    pub hyperscore_deconv: f64,
+    /// XCorr from deconvoluted spectrum
+    pub xcorr_deconv: f64,
+    /// Dot product from deconvoluted spectrum
+    pub dot_product_deconv: f64,
+    /// Dot product SMZ from deconvoluted spectrum
+    pub dot_product_smz_deconv: f64,
+    /// Fragment coverage from deconvoluted spectrum
+    pub fragment_coverage_deconv: f64,
+    /// Sequence coverage from deconvoluted spectrum
+    pub sequence_coverage_deconv: f64,
+    /// Consecutive ions from deconvoluted spectrum
+    pub consecutive_ions_deconv: u32,
+    /// Top-3 matches from deconvoluted spectrum
+    pub top3_matches_deconv: u32,
 
     // Contextual features
     /// Number of competing candidates

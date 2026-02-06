@@ -16,7 +16,7 @@ use osprey_core::{PeakBoundaries, PeakQuality, Result};
 pub use calibration::{
     // Core types
     CalibrationParams, CalibrationMetadata, MzCalibration, RTCalibrationParams, RTCalibrationMethod,
-    RTModelParams,
+    RTModelParams, IsolationScheme,
     // RT calibration
     RTCalibration, RTCalibrationStats, RTCalibrator, RTCalibratorConfig, RTStratifiedSampler,
     // Mass calibration

@@ -54,7 +54,7 @@ pub struct FragmentMatchResult {
     pub matched_lib_intensities: Vec<f64>,
     /// Matched library m/z values
     pub matched_lib_mzs: Vec<f64>,
-    /// Mass errors for matched fragments (in configured unit: ppm or Da)
+    /// Mass errors for matched fragments (in configured unit: ppm or Th)
     pub mass_errors: Vec<f64>,
     /// Number of fragments that matched (non-zero experimental intensity)
     pub n_matched: usize,
@@ -162,7 +162,7 @@ impl LibCosineScorer {
             matched_lib.push(lib_intensity);
             matched_mzs.push(lib_mz);
 
-            // Calculate mass error if matched
+            // Calculate mass error in configured unit (ppm or Th)
             if let Some(obs_mz) = best_mz {
                 mass_errors.push(self.tolerance.mass_error(lib_mz, obs_mz));
                 n_matched += 1;
@@ -866,13 +866,13 @@ pub struct CalibrationMatch {
     pub measured_rt: f64,
     /// LibCosine score
     pub score: f64,
-    /// MS1 (precursor) m/z error in PPM (observed - theoretical)
-    pub ms1_ppm_error: Option<f64>,
+    /// MS1 (precursor) m/z error (in configured unit: ppm or Th)
+    pub ms1_error: Option<f64>,
     /// Library precursor m/z (theoretical)
     pub library_precursor_mz: f64,
     /// Observed precursor m/z (from spectrum isolation window center)
     pub observed_precursor_mz: Option<f64>,
-    /// MS2 fragment mass errors (in configured unit: ppm or Da)
+    /// MS2 fragment mass errors (in configured unit: ppm or Th)
     pub ms2_mass_errors: Vec<f64>,
     /// Average MS2 mass error (only for matched fragments)
     pub avg_ms2_error: Option<f64>,
@@ -1193,8 +1193,8 @@ pub fn pair_calibration_matches(
                 target_wins_evalue,
                 target_isotope_score: target_match.isotope_cosine_score,
                 decoy_isotope_score: decoy_match.isotope_cosine_score,
-                target_precursor_error_ppm: target_match.ms1_ppm_error,
-                decoy_precursor_error_ppm: decoy_match.ms1_ppm_error,
+                target_precursor_error_ppm: target_match.ms1_error,
+                decoy_precursor_error_ppm: decoy_match.ms1_error,
                 target_rt: target_match.measured_rt,
                 decoy_rt: decoy_match.measured_rt,
                 library_rt: target_match.library_rt,
@@ -1340,6 +1340,7 @@ pub fn group_spectra_by_isolation_window(spectra: &[Spectrum]) -> Vec<((f64, f64
 /// # Arguments
 /// * `library` - Full library (targets + decoys)
 /// * `spectra` - All MS2 spectra
+/// * `fragment_tolerance` - Fragment m/z tolerance (for computing MS1 error in correct unit)
 /// * `rt_tolerance` - RT tolerance for matching
 ///
 /// # Returns
@@ -1347,6 +1348,7 @@ pub fn group_spectra_by_isolation_window(spectra: &[Spectrum]) -> Vec<((f64, f64
 pub fn run_windowed_calibration_scoring(
     library: &[LibraryEntry],
     spectra: &[Spectrum],
+    fragment_tolerance: FragmentToleranceConfig,
     rt_tolerance: f64,
 ) -> Vec<CalibrationMatch> {
     // Group spectra by isolation window
@@ -1412,7 +1414,7 @@ pub fn run_windowed_calibration_scoring(
                 rt_tolerance,
             );
 
-            // Convert to CalibrationMatch with MS1 PPM error
+            // Convert to CalibrationMatch with MS1 error (in configured unit)
             matches
                 .into_iter()
                 .filter_map(|(entry_id, spec_idx, score, measured_rt)| {
@@ -1425,9 +1427,9 @@ pub fn run_windowed_calibration_scoring(
                         None
                     };
 
-                    // Calculate MS1 PPM error if we have observed m/z
-                    let ms1_ppm_error = observed_precursor_mz.map(|obs_mz| {
-                        ((obs_mz - entry.precursor_mz) / entry.precursor_mz) * 1e6
+                    // Calculate MS1 error in configured unit (ppm for HRAM, Th for unit resolution)
+                    let ms1_error = observed_precursor_mz.map(|obs_mz| {
+                        fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
                     });
 
                     // Get scan number from spectrum
@@ -1447,7 +1449,7 @@ pub fn run_windowed_calibration_scoring(
                         library_rt: entry.retention_time,
                         measured_rt,
                         score,
-                        ms1_ppm_error,
+                        ms1_error,
                         library_precursor_mz: entry.precursor_mz,
                         observed_precursor_mz,
                         // Binned BatchScorer doesn't compute MS2 errors
@@ -1505,6 +1507,7 @@ pub fn run_windowed_calibration_scoring(
 pub fn run_calibration_scoring(
     library: &[LibraryEntry],
     spectra: &[Spectrum],
+    fragment_tolerance: FragmentToleranceConfig,
     rt_tolerance: f64,
 ) -> Vec<CalibrationMatch> {
     let scorer = BatchScorer::new();
@@ -1553,9 +1556,9 @@ pub fn run_calibration_scoring(
                 None
             };
 
-            // Calculate MS1 PPM error if we have observed m/z
-            let ms1_ppm_error = observed_precursor_mz.map(|obs_mz| {
-                ((obs_mz - entry.precursor_mz) / entry.precursor_mz) * 1e6
+            // Calculate MS1 error in configured unit (ppm for HRAM, Th for unit resolution)
+            let ms1_error = observed_precursor_mz.map(|obs_mz| {
+                fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
             });
 
             // Get scan number from spectrum
@@ -1574,7 +1577,7 @@ pub fn run_calibration_scoring(
                 library_rt: entry.retention_time,
                 measured_rt,
                 score,
-                ms1_ppm_error,
+                ms1_error,
                 library_precursor_mz: entry.precursor_mz,
                 observed_precursor_mz,
                 // Binned BatchScorer doesn't compute MS2 errors
@@ -1723,9 +1726,9 @@ pub fn run_libcosine_calibration_scoring(
                     // Get observed precursor m/z from best spectrum
                     let observed_precursor_mz = Some(spectra[best_spec_idx].isolation_window.center);
 
-                    // Calculate MS1 PPM error
-                    let ms1_ppm_error = observed_precursor_mz.map(|obs_mz| {
-                        ((obs_mz - entry.precursor_mz) / entry.precursor_mz) * 1e6
+                    // Calculate MS1 error in configured unit (ppm for HRAM, Th for unit resolution)
+                    let ms1_error = observed_precursor_mz.map(|obs_mz| {
+                        fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
                     });
 
                     // Calculate average MS2 error
@@ -1755,7 +1758,7 @@ pub fn run_libcosine_calibration_scoring(
                         library_rt: entry.retention_time,
                         measured_rt: best_measured_rt,
                         score: best_score,
-                        ms1_ppm_error,
+                        ms1_error,
                         library_precursor_mz: entry.precursor_mz,
                         observed_precursor_mz,
                         ms2_mass_errors: best_ms2_errors,
@@ -1966,7 +1969,7 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                         let n_matched = ms2_errors.len();
 
                         // Extract M+0 from MS1 spectrum (pyXcorrDIA approach)
-                        let (ms1_ppm_error, observed_precursor_mz, isotope_cosine_score) = if let Some(ms1_spec) = ms1.find_nearest(best_measured_rt) {
+                        let (ms1_error, observed_precursor_mz, isotope_cosine_score) = if let Some(ms1_spec) = ms1.find_nearest(best_measured_rt) {
                             // Extract isotope envelope from MS1
                             let envelope = IsotopeEnvelope::extract(
                                 ms1_spec,
@@ -1979,9 +1982,12 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                                 // Calculate isotope cosine score using exact elemental composition
                                 let isotope_score = peptide_isotope_cosine(&entry.sequence, &envelope.intensities);
 
-                                // Use actual M+0 peak for calibration
+                                // Use actual M+0 peak for calibration (unit-aware: ppm or Th)
+                                let error = envelope.m0_observed_mz.map(|obs_mz| {
+                                    fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
+                                });
                                 (
-                                    envelope.m0_ppm_error(entry.precursor_mz),
+                                    error,
                                     envelope.m0_observed_mz,
                                     isotope_score,
                                 )
@@ -1992,8 +1998,8 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                         } else {
                             // No MS1 spectrum found - fall back to isolation window (not accurate)
                             let iso_center = spectra[best_spec_idx].isolation_window.center;
-                            let ppm = ((iso_center - entry.precursor_mz) / entry.precursor_mz) * 1e6;
-                            (Some(ppm), Some(iso_center), None)
+                            let error = fragment_tolerance.mass_error(entry.precursor_mz, iso_center);
+                            (Some(error), Some(iso_center), None)
                         };
 
                         // Calculate average MS2 error
@@ -2012,7 +2018,7 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                             library_rt: entry.retention_time,
                             measured_rt: best_measured_rt,
                             score: libcosine_score,  // LibCosine at XCorr-selected RT
-                            ms1_ppm_error,
+                            ms1_error,
                             library_precursor_mz: entry.precursor_mz,
                             observed_precursor_mz,
                             ms2_mass_errors: ms2_errors,
@@ -2113,8 +2119,9 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                         let n_matched = ms2_errors.len();
 
                         let observed_precursor_mz = Some(spectra[best_spec_idx].isolation_window.center);
-                        let ms1_ppm_error = observed_precursor_mz.map(|obs_mz| {
-                            ((obs_mz - entry.precursor_mz) / entry.precursor_mz) * 1e6
+                        // Calculate MS1 error in configured unit (ppm for HRAM, Th for unit resolution)
+                        let ms1_error = observed_precursor_mz.map(|obs_mz| {
+                            fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
                         });
 
                         let avg_ms2_error = if !ms2_errors.is_empty() {
@@ -2132,7 +2139,7 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
                             library_rt: entry.retention_time,
                             measured_rt: best_measured_rt,
                             score: libcosine_score,  // LibCosine at XCorr-selected RT
-                            ms1_ppm_error,
+                            ms1_error,
                             library_precursor_mz: entry.precursor_mz,
                             observed_precursor_mz,
                             ms2_mass_errors: ms2_errors,
@@ -2173,7 +2180,7 @@ pub fn run_libcosine_calibration_scoring_with_ms1<M: MS1SpectrumLookup>(
 
     // Log scoring statistics
     let total_ms2_errors: usize = results.iter().map(|m| m.ms2_mass_errors.len()).sum();
-    let ms1_calibrated = results.iter().filter(|m| m.ms1_ppm_error.is_some()).count();
+    let ms1_calibrated = results.iter().filter(|m| m.ms1_error.is_some()).count();
     let targets = results.iter().filter(|m| !m.is_decoy).count();
     let decoys = results.iter().filter(|m| m.is_decoy).count();
 

@@ -39,6 +39,7 @@ impl CalibrationParams {
                 num_sampled_precursors: 0,
                 calibration_successful: false,
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                isolation_scheme: None,
             },
             ms1_calibration: MzCalibration::uncalibrated(),
             ms2_calibration: MzCalibration::uncalibrated(),
@@ -60,17 +61,23 @@ impl CalibrationParams {
             self.metadata.num_sampled_precursors
         );
         log::info!(
-            "MS1 calibration: mean={:.2} ppm, median={:.2} ppm, SD={:.2} ppm (n={})",
+            "MS1 calibration: mean={:.2} {}, median={:.2} {}, SD={:.2} {} (n={})",
             self.ms1_calibration.mean,
+            self.ms1_calibration.unit,
             self.ms1_calibration.median,
+            self.ms1_calibration.unit,
             self.ms1_calibration.sd,
+            self.ms1_calibration.unit,
             self.ms1_calibration.count
         );
         log::info!(
-            "MS2 calibration: mean={:.2} ppm, median={:.2} ppm, SD={:.2} ppm (n={})",
+            "MS2 calibration: mean={:.4} {}, median={:.4} {}, SD={:.4} {} (n={})",
             self.ms2_calibration.mean,
+            self.ms2_calibration.unit,
             self.ms2_calibration.median,
+            self.ms2_calibration.unit,
             self.ms2_calibration.sd,
+            self.ms2_calibration.unit,
             self.ms2_calibration.count
         );
         log::info!(
@@ -101,6 +108,26 @@ pub struct CalibrationMetadata {
     pub calibration_successful: bool,
     /// Timestamp when calibration was performed
     pub timestamp: String,
+    /// DIA isolation window scheme (from first cycle of MS2 spectra)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation_scheme: Option<IsolationScheme>,
+}
+
+/// DIA isolation window scheme extracted from mzML
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IsolationScheme {
+    /// Number of isolation windows per cycle
+    pub num_windows: usize,
+    /// Minimum isolation window center m/z
+    pub mz_min: f64,
+    /// Maximum isolation window center m/z
+    pub mz_max: f64,
+    /// Typical isolation window width (Da) - may vary across range
+    pub typical_width: f64,
+    /// Whether all windows have the same width
+    pub uniform_width: bool,
+    /// Individual windows: (center, width) for each window in cycle
+    pub windows: Vec<(f64, f64)>,
 }
 
 /// m/z calibration parameters
@@ -178,11 +205,14 @@ impl MzCalibration {
     /// Log ASCII histogram of mass errors
     pub fn log_histogram(&self, label: &str) {
         if let Some(ref hist) = self.histogram {
-            log::info!("--- {} Mass Error Histogram (ppm) ---", label);
+            log::info!("--- {} Mass Error Histogram ({}) ---", label, self.unit);
 
             // Find max count for scaling
             let max_count = hist.counts.iter().max().copied().unwrap_or(1);
             let max_bar_width = 40;
+
+            // Use appropriate format precision based on unit
+            let is_th = self.unit == "Th";
 
             for (i, &count) in hist.counts.iter().enumerate() {
                 let bin_start = hist.bin_edges[i];
@@ -197,20 +227,41 @@ impl MzCalibration {
                 };
 
                 let bar: String = "█".repeat(bar_width);
+                if is_th {
+                    log::info!(
+                        "{:>7.3} | {:6} | {}",
+                        bin_center,
+                        count,
+                        bar
+                    );
+                } else {
+                    log::info!(
+                        "{:>7.1} | {:6} | {}",
+                        bin_center,
+                        count,
+                        bar
+                    );
+                }
+            }
+            if is_th {
                 log::info!(
-                    "{:>7.1} | {:6} | {}",
-                    bin_center,
-                    count,
-                    bar
+                    "        | mean={:.4}, median={:.4}, SD={:.4} {} (n={})",
+                    self.mean,
+                    self.median,
+                    self.sd,
+                    self.unit,
+                    self.count
+                );
+            } else {
+                log::info!(
+                    "        | mean={:.2}, median={:.2}, SD={:.2} {} (n={})",
+                    self.mean,
+                    self.median,
+                    self.sd,
+                    self.unit,
+                    self.count
                 );
             }
-            log::info!(
-                "        | mean={:.2}, median={:.2}, SD={:.2} (n={})",
-                self.mean,
-                self.median,
-                self.sd,
-                self.count
-            );
         }
     }
 }
@@ -241,6 +292,10 @@ pub struct RTModelParams {
     pub library_rts: Vec<f64>,
     /// Fitted measured retention times (corresponding to library_rts)
     pub fitted_rts: Vec<f64>,
+    /// Absolute residuals at each calibration point (for local RT tolerance)
+    /// This field is optional for backwards compatibility with older calibration files
+    #[serde(default)]
+    pub abs_residuals: Vec<f64>,
 }
 
 impl RTCalibrationParams {
@@ -280,7 +335,7 @@ pub enum RTCalibrationMethod {
 }
 
 // Re-export key types and functions from submodules
-pub use mass::{calculate_mz_calibration, apply_mz_calibration, calculate_ppm_error, MzQCData};
+pub use mass::{calculate_mz_calibration, apply_mz_calibration, apply_spectrum_calibration, calibrated_tolerance_ppm, calibrated_tolerance, calculate_ppm_error, MzQCData};
 pub use rt::{RTCalibration, RTCalibrationStats, RTCalibrator, RTCalibratorConfig, RTStratifiedSampler};
 pub use io::{save_calibration, load_calibration, calibration_filename, calibration_filename_for_input, calibration_path_for_input};
 
@@ -324,6 +379,7 @@ mod tests {
                 num_sampled_precursors: 1000,
                 calibration_successful: true,
                 timestamp: "2024-01-15T10:30:00Z".to_string(),
+                isolation_scheme: None,
             },
             ms1_calibration: MzCalibration {
                 mean: -2.5,
@@ -359,6 +415,7 @@ mod tests {
                 model_params: Some(RTModelParams {
                     library_rts: vec![0.0, 10.0, 20.0, 30.0],
                     fitted_rts: vec![1.0, 11.0, 21.0, 31.0],
+                    abs_residuals: vec![0.1, 0.2, 0.3, 0.4],
                 }),
             },
         };

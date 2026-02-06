@@ -6,6 +6,7 @@
 //! where A is the design matrix, b is the observed spectrum,
 //! x is the coefficient vector, and λ is the regularization parameter.
 
+use crate::cd_nnls::{solve_cd_nnls_f64, CdNnlsParams};
 use ndarray::{Array1, Array2};
 use osprey_core::{OspreyError, Result};
 
@@ -14,12 +15,25 @@ use osprey_core::{OspreyError, Result};
 pub struct RidgeSolver {
     /// Default regularization parameter
     default_lambda: f64,
+    /// Coordinate descent parameters for NNLS
+    cd_params: CdNnlsParams,
 }
 
 impl RidgeSolver {
     /// Create a new ridge solver with the given default lambda
     pub fn new(default_lambda: f64) -> Self {
-        Self { default_lambda }
+        Self {
+            default_lambda,
+            cd_params: CdNnlsParams::default(),
+        }
+    }
+
+    /// Create a new ridge solver with custom CD parameters
+    pub fn with_params(default_lambda: f64, cd_params: CdNnlsParams) -> Self {
+        Self {
+            default_lambda,
+            cd_params,
+        }
     }
 
     /// Solve the ridge regression problem
@@ -118,14 +132,13 @@ impl RidgeSolver {
         Ok(x)
     }
 
-    /// Solve with non-negativity constraint using projected gradient descent
+    /// Solve with non-negativity constraint using coordinate descent
     ///
     /// Returns coefficient vector x ≥ 0 that minimizes:
     ///   ‖Ax - b‖² + λ‖x‖²
     ///
-    /// Uses projected gradient descent which is well-suited for dense solutions
-    /// (many non-zero coefficients), as expected with unit resolution binning
-    /// where many precursor→product ion collisions occur.
+    /// Uses coordinate descent with active set acceleration for O(m*k) per sweep
+    /// instead of O(k³) for Cholesky decomposition.
     pub fn solve_nonnegative(
         &self,
         a: &Array2<f64>,
@@ -133,87 +146,7 @@ impl RidgeSolver {
         lambda: Option<f64>,
     ) -> Result<Array1<f64>> {
         let lambda = lambda.unwrap_or(self.default_lambda);
-
-        // Check dimensions
-        if a.nrows() != b.len() {
-            return Err(OspreyError::RegressionError(format!(
-                "Dimension mismatch: A has {} rows but b has {} elements",
-                a.nrows(),
-                b.len()
-            )));
-        }
-
-        let k = a.ncols();
-
-        // Handle empty case
-        if k == 0 {
-            return Ok(Array1::zeros(0));
-        }
-
-        // Precompute A'A + λI and A'b (reused every iteration)
-        let mut ata_reg = a.t().dot(a);
-        for i in 0..k {
-            ata_reg[[i, i]] += lambda;
-        }
-        let atb = a.t().dot(b);
-
-        // Initialize with unconstrained solution
-        let mut x = self.solve_cholesky(&ata_reg, &atb)?;
-
-        // Check if unconstrained solution is already non-negative
-        let all_positive = x.iter().all(|&v| v >= 0.0);
-        if all_positive {
-            return Ok(x);
-        }
-
-        // Project initial solution to non-negative
-        x.mapv_inplace(|v| v.max(0.0));
-
-        // Projected gradient descent parameters
-        let max_iter = 1000;
-        let tol = 1e-8;
-
-        // Step size: use 1/L where L is the Lipschitz constant of the gradient
-        // L = largest eigenvalue of A'A + λI
-        // We use Frobenius norm as a conservative upper bound
-        let lipschitz = self.estimate_lipschitz(&ata_reg);
-        let step_size = 1.0 / lipschitz;
-
-        for _iter in 0..max_iter {
-            // Gradient: ∇f(x) = (A'A + λI)x - A'b
-            let gradient = ata_reg.dot(&x) - &atb;
-
-            // Gradient step: x_new = x - step_size * gradient
-            let x_new: Array1<f64> = &x - step_size * &gradient;
-
-            // Project to non-negative orthant: x_new = max(x_new, 0)
-            let x_new = x_new.mapv(|v| v.max(0.0));
-
-            // Check convergence: ||x_new - x||₂ < tol
-            let diff = &x_new - &x;
-            let change = diff.dot(&diff).sqrt();
-
-            x = x_new;
-
-            if change < tol {
-                break;
-            }
-        }
-
-        Ok(x)
-    }
-
-    /// Estimate the Lipschitz constant of the gradient
-    ///
-    /// Uses Frobenius norm as an upper bound for the spectral norm (largest eigenvalue).
-    /// This gives a conservative step size that guarantees convergence.
-    fn estimate_lipschitz(&self, ata_reg: &Array2<f64>) -> f64 {
-        let mut sum = 0.0;
-        for val in ata_reg.iter() {
-            sum += val * val;
-        }
-        // Add small epsilon to avoid division by zero
-        sum.sqrt().max(1e-10)
+        solve_cd_nnls_f64(a, b, lambda, &self.cd_params)
     }
 
     /// Compute the residual norm ‖Ax - b‖²
@@ -226,7 +159,10 @@ impl RidgeSolver {
 
 impl Default for RidgeSolver {
     fn default() -> Self {
-        Self::new(1.0)
+        Self {
+            default_lambda: 1.0,
+            cd_params: CdNnlsParams::default(),
+        }
     }
 }
 

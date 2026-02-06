@@ -7,7 +7,8 @@
 //! with ppm tolerance. This creates a sparse "match matrix" where each column
 //! represents a candidate peptide's contribution to matched peaks.
 
-use ndarray::Array1;
+use crate::cd_nnls::{solve_cd_nnls_f64, CdNnlsParams};
+use ndarray::{Array1, Array2};
 use osprey_core::{LibraryEntry, OspreyError, Result, Spectrum};
 use sprs::{CsMat, CsMatI, TriMat};
 
@@ -208,6 +209,8 @@ pub struct SparseRidgeSolver {
     max_iter: usize,
     /// Convergence tolerance
     tolerance: f64,
+    /// Coordinate descent parameters for NNLS
+    cd_params: CdNnlsParams,
 }
 
 impl SparseRidgeSolver {
@@ -217,6 +220,17 @@ impl SparseRidgeSolver {
             default_lambda,
             max_iter: 100,
             tolerance: 1e-8,
+            cd_params: CdNnlsParams::default(),
+        }
+    }
+
+    /// Create a new sparse ridge solver with custom CD parameters
+    pub fn with_params(default_lambda: f64, cd_params: CdNnlsParams) -> Self {
+        Self {
+            default_lambda,
+            max_iter: 100,
+            tolerance: 1e-8,
+            cd_params,
         }
     }
 
@@ -393,12 +407,13 @@ impl SparseRidgeSolver {
         y
     }
 
-    /// Solve with non-negativity constraint using projected gradient descent
+    /// Solve with non-negativity constraint using coordinate descent
     ///
     /// Returns coefficient vector x ≥ 0 that minimizes:
     ///   ‖Ax - b‖² + λ‖x‖²
     ///
-    /// Uses projected gradient descent which is well-suited for dense solutions.
+    /// Uses coordinate descent for k ≤ 1000 (converts to dense), otherwise
+    /// falls back to projected gradient descent on sparse representation.
     pub fn solve_nonnegative(
         &self,
         a: &CsMat<f64>,
@@ -406,11 +421,47 @@ impl SparseRidgeSolver {
         lambda: Option<f64>,
     ) -> Result<Array1<f64>> {
         let lambda = lambda.unwrap_or(self.default_lambda);
+        let n_rows = a.rows();
         let n_cols = a.cols();
 
         if n_cols == 0 {
             return Ok(Array1::zeros(0));
         }
+
+        // For small to medium problems, convert to dense and use CD
+        // This is faster due to CD's O(m*k) scaling vs CG's O(k³) for setup
+        if n_cols <= 1000 {
+            // Convert sparse to dense matrix
+            let dense = self.sparse_to_dense(a, n_rows, n_cols);
+            return solve_cd_nnls_f64(&dense, b, lambda, &self.cd_params);
+        }
+
+        // For very large problems, use projected gradient descent
+        self.solve_nonnegative_pgd(a, b, lambda)
+    }
+
+    /// Convert sparse matrix to dense (for use with CD solver)
+    fn sparse_to_dense(&self, a: &CsMat<f64>, n_rows: usize, n_cols: usize) -> Array2<f64> {
+        let mut dense = Array2::<f64>::zeros((n_rows, n_cols));
+
+        // CSC format: iterate over columns
+        for (col_idx, col) in a.outer_iterator().enumerate() {
+            for (row_idx, &val) in col.iter() {
+                dense[[row_idx, col_idx]] = val;
+            }
+        }
+
+        dense
+    }
+
+    /// Fallback projected gradient descent for very large problems
+    fn solve_nonnegative_pgd(
+        &self,
+        a: &CsMat<f64>,
+        b: &Array1<f64>,
+        lambda: f64,
+    ) -> Result<Array1<f64>> {
+        let n_cols = a.cols();
 
         // First solve unconstrained to get initial solution
         let mut x = self.solve(a, b, Some(lambda))?;
@@ -432,9 +483,7 @@ impl SparseRidgeSolver {
         let tol = 1e-8;
 
         // Estimate Lipschitz constant from sparse matrix
-        // L = largest eigenvalue of A'A + λI
-        // Use sum of squared column norms as upper bound
-        let lipschitz = self.estimate_lipschitz_sparse(a, lambda);
+        let lipschitz = self.estimate_lipschitz_sparse(a, lambda, n_cols);
         let step_size = 1.0 / lipschitz;
 
         for _iter in 0..max_iter {
@@ -464,7 +513,7 @@ impl SparseRidgeSolver {
     /// Estimate Lipschitz constant for sparse matrix
     ///
     /// Uses sum of squared column norms as an upper bound for the spectral norm.
-    fn estimate_lipschitz_sparse(&self, a: &CsMat<f64>, lambda: f64) -> f64 {
+    fn estimate_lipschitz_sparse(&self, a: &CsMat<f64>, lambda: f64, n_cols: usize) -> f64 {
         // For sparse matrices, estimate ||A'A + λI||
         // Upper bound: sum of squared column 2-norms + lambda
         let mut max_col_norm_sq = 0.0f64;
@@ -479,8 +528,7 @@ impl SparseRidgeSolver {
 
         // Rough upper bound: sum of max column norm squared times number of columns
         // This is conservative but guarantees convergence
-        let n_cols = a.cols() as f64;
-        let estimate = n_cols * max_col_norm_sq + lambda;
+        let estimate = (n_cols as f64) * max_col_norm_sq + lambda;
 
         // Ensure we don't divide by zero
         estimate.max(1e-10)
@@ -496,7 +544,12 @@ impl SparseRidgeSolver {
 
 impl Default for SparseRidgeSolver {
     fn default() -> Self {
-        Self::new(1.0)
+        Self {
+            default_lambda: 1.0,
+            max_iter: 100,
+            tolerance: 1e-8,
+            cd_params: CdNnlsParams::default(),
+        }
     }
 }
 

@@ -1382,6 +1382,78 @@ impl FeatureExtractor {
         features
     }
 
+    /// Extract features with both mixed (apex) and deconvoluted (aggregated) scoring
+    ///
+    /// This computes spectral features twice:
+    /// - Mixed: from the raw observed spectrum at apex (includes interference)
+    /// - Deconvoluted: from coefficient-weighted aggregated spectrum (apex ± 2 scans)
+    ///
+    /// The deconvoluted features weight each scan's contribution by its regression
+    /// coefficient, emphasizing where this peptide is actually contributing.
+    ///
+    /// Parameters:
+    /// - `entry`: The library entry being scored
+    /// - `coefficient_series`: Vec of (retention_time, coefficient) pairs
+    /// - `spectra`: Full set of spectra for aggregation
+    /// - `expected_rt`: Optional expected retention time
+    pub fn extract_with_deconvolution(
+        &self,
+        entry: &LibraryEntry,
+        coefficient_series: &[(f64, f64)],
+        spectra: &[Spectrum],
+        expected_rt: Option<f64>,
+    ) -> FeatureSet {
+        // Find apex RT and spectrum
+        let apex_rt = coefficient_series
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(rt, _)| *rt)
+            .unwrap_or(entry.retention_time);
+
+        // Find apex spectrum index
+        let apex_spectrum = spectra
+            .iter()
+            .min_by(|a, b| {
+                (a.retention_time - apex_rt)
+                    .abs()
+                    .partial_cmp(&(b.retention_time - apex_rt).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+        // First, extract features with mixed (apex) spectrum
+        let mut features = self.extract_with_expected_rt(
+            entry,
+            coefficient_series,
+            apex_spectrum,
+            expected_rt,
+        );
+
+        // Now compute deconvoluted features from coefficient-weighted aggregated spectrum
+        if !spectra.is_empty() && !coefficient_series.is_empty() {
+            // Aggregate spectra weighted by coefficients (apex ± 2 scans)
+            let deconv_spectrum = self.spectrum_aggregator.aggregate_weighted(
+                spectra,
+                coefficient_series,
+                apex_rt,
+            );
+
+            // Compute spectral scores on the deconvoluted spectrum
+            let deconv_score = self.spectral_scorer.xcorr(&deconv_spectrum, entry);
+
+            // Populate deconvoluted features
+            features.hyperscore_deconv = deconv_score.hyperscore;
+            features.xcorr_deconv = deconv_score.xcorr;
+            features.dot_product_deconv = deconv_score.lib_cosine;
+            features.dot_product_smz_deconv = deconv_score.lib_cosine_smz;
+            features.fragment_coverage_deconv = deconv_score.fragment_coverage;
+            features.sequence_coverage_deconv = deconv_score.sequence_coverage;
+            features.consecutive_ions_deconv = deconv_score.consecutive_ions;
+            features.top3_matches_deconv = deconv_score.top3_matches;
+        }
+
+        features
+    }
+
     /// Apply contextual features from regression context
     ///
     /// Call this after extract() or extract_with_expected_rt() to add

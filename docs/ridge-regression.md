@@ -164,69 +164,167 @@ def cross_validate_lambda(A, b, lambdas=[0.01, 0.1, 1.0, 10.0]):
 
 Scale λ based on matrix condition number or spectrum complexity.
 
-## Non-Negative Constraints
+## Non-Negative Constraints and Iterative Solver
 
-Peptide abundances can't be negative. Osprey enforces this with:
+Peptide abundances can't be negative. Osprey solves this using **Coordinate Descent Non-Negative Least Squares (CD-NNLS)**, an iterative algorithm that:
 
-### Active Set Method
+1. Enforces non-negativity at each step (no post-hoc clipping)
+2. Avoids forming the expensive normal equations (AᵀA)
+3. Uses active set acceleration to skip zero coefficients
+
+### The CD-NNLS Algorithm
+
+The algorithm solves:
+```
+minimize: ‖Ax - b‖² + λ‖x‖²  subject to x ≥ 0
+```
+
+**Key insight**: For a single variable xⱼ, holding all other variables fixed, the optimal update has a closed-form solution:
+
+```
+xⱼ* = max(0, (aⱼ · residual + xⱼ · ‖aⱼ‖²) / (‖aⱼ‖² + λ))
+
+where:
+  aⱼ = column j of design matrix A (the j-th library spectrum)
+  residual = b - Ax (what's left unexplained)
+  ‖aⱼ‖² = sum of squared intensities in library spectrum j
+```
+
+### Detailed Pseudocode
 
 ```python
-def solve_nonnegative(A, b, lambda_):
-    x = ridge_solve(A, b, lambda_)  # Initial solution
+def solve_cd_nnls(A, b, lambda_, max_sweeps=50, tol=1e-6):
+    """
+    Coordinate Descent NNLS for ridge regression with non-negativity.
 
-    while any(x < 0):
-        # Remove candidates with negative coefficients
-        positive_mask = x >= 0
-        A_reduced = A[:, positive_mask]
-        x_reduced = ridge_solve(A_reduced, b, lambda_)
+    Args:
+        A: Design matrix (m bins × k candidates), each column is a binned library spectrum
+        b: Observed spectrum (m bins)
+        lambda_: Regularization parameter
+        max_sweeps: Maximum full passes over all variables
+        tol: Convergence tolerance (max coefficient change)
 
-        x = zeros(n)
-        x[positive_mask] = x_reduced
+    Returns:
+        x: Coefficient vector (k × 1) with all x ≥ 0
+    """
+    m, k = A.shape  # m bins, k candidates
 
-    return x
-```
+    # Precompute column norms: ‖aⱼ‖² + λ for each candidate
+    col_norm_sq = [sum(A[:, j]**2) + lambda_ for j in range(k)]
 
-## Solving the System
+    # Initialize: all coefficients zero, residual = observed spectrum
+    x = zeros(k)
+    residual = b.copy()  # residual = b - Ax = b (since x=0)
+    active = [True] * k  # All candidates active initially
 
-### Small Problems (< 200 candidates)
+    for sweep in range(max_sweeps):
+        max_change = 0
 
-Use Cholesky decomposition:
+        # Use active set after warmup (first 3 sweeps)
+        use_active_set = (sweep >= 3)
 
-```
-(AᵀA + λI) x = Aᵀb
+        for j in range(k):
+            # Skip inactive variables (those at zero) after warmup
+            if use_active_set and not active[j]:
+                continue
 
-1. Compute C = AᵀA + λI
-2. Cholesky: C = LLᵀ
-3. Forward solve: Ly = Aᵀb
-4. Backward solve: Lᵀx = y
-```
+            old_xj = x[j]
 
-### Large Problems (≥ 200 candidates)
+            # Step 1: Compute correlation between library spectrum j and residual
+            # This tells us "how much does candidate j explain the unexplained signal?"
+            corr = dot(A[:, j], residual)
 
-Use Conjugate Gradient (CG) solver:
+            # Step 2: Compute unconstrained optimal update
+            # The closed-form solution for coordinate j, holding others fixed:
+            #   xⱼ* = (aⱼ·(b - A₋ⱼx₋ⱼ)) / (‖aⱼ‖² + λ)
+            #       = (aⱼ·residual + xⱼ·‖aⱼ‖²) / (‖aⱼ‖² + λ)
+            col_norm_only = col_norm_sq[j] - lambda_  # ‖aⱼ‖²
+            unconstrained = (corr + old_xj * col_norm_only) / col_norm_sq[j]
 
-```python
-def cg_solve(A, b, lambda_, tol=1e-6, max_iter=1000):
-    # Solve (AᵀA + λI)x = Aᵀb iteratively
-    x = zeros(n)
-    r = A.T @ b - (A.T @ A + lambda_ * I) @ x
-    p = r.copy()
+            # Step 3: Apply non-negativity constraint
+            new_xj = max(0, unconstrained)
 
-    for i in range(max_iter):
-        Ap = A.T @ (A @ p) + lambda_ * p
-        alpha = (r @ r) / (p @ Ap)
-        x = x + alpha * p
-        r_new = r - alpha * Ap
+            # Step 4: Update residual incrementally
+            # residual_new = residual - (new_xj - old_xj) × aⱼ
+            delta = new_xj - old_xj
+            if abs(delta) > 1e-12:
+                residual -= delta * A[:, j]  # O(m) operation
+                x[j] = new_xj
 
-        if norm(r_new) < tol:
+            max_change = max(max_change, abs(delta))
+
+        # Update active set: candidates at zero become inactive
+        if use_active_set:
+            for j in range(k):
+                active[j] = (x[j] > 0)
+
+            # Every 5 sweeps: check if inactive variables want to become positive
+            if sweep % 5 == 0:
+                for j in range(k):
+                    if not active[j]:
+                        # Gradient at xⱼ=0: if negative, variable wants to increase
+                        grad = -dot(A[:, j], residual)
+                        if grad < -tol:
+                            active[j] = True  # Re-activate
+
+        # Check convergence
+        if max_change < tol:
             break
 
-        beta = (r_new @ r_new) / (r @ r)
-        p = r_new + beta * p
-        r = r_new
+    # Final validation: check all inactive variables one more time
+    for j in range(k):
+        if not active[j]:
+            corr = dot(A[:, j], residual)
+            if corr / col_norm_sq[j] > tol:
+                # This variable should be positive
+                new_xj = max(0, corr / col_norm_sq[j])
+                residual -= new_xj * A[:, j]
+                x[j] = new_xj
 
     return x
 ```
+
+### Why Coordinate Descent?
+
+| Approach | Complexity | Notes |
+|----------|------------|-------|
+| Direct solve (AᵀA + λI)⁻¹Aᵀb | O(mk² + k³) | Must form AᵀA, then factor |
+| Coordinate Descent | O(mk) per sweep | Never forms AᵀA, ~10-20 sweeps typical |
+
+For 500 candidates and 1800 bins:
+- Direct: 500² × 1800 = 450M ops to form AᵀA, plus O(500³) = 125M to factor
+- CD: 500 × 1800 × 15 sweeps = 13.5M ops total
+
+### Active Set Acceleration
+
+The key optimization is **skipping zero coefficients**:
+
+1. **Warmup phase** (sweeps 0-2): Update all candidates to get initial solution
+2. **Active set phase** (sweeps 3+): Only update candidates with x > 0
+3. **Reactivation checks**: Every 5 sweeps, check if any inactive candidate should become positive (gradient test)
+4. **Final validation**: One last check of all inactive candidates
+
+In practice, only 10-50 candidates have non-zero coefficients per spectrum, so active set acceleration provides 10-50× speedup after warmup.
+
+### Convergence
+
+The algorithm converges when the maximum coefficient change in a sweep is below the tolerance:
+
+```
+Typical convergence: 10-20 sweeps for tol=1e-6
+Fast cases (few active): 5-10 sweeps
+Slow cases (many correlated candidates): 30-50 sweeps
+```
+
+### Residual Maintenance
+
+The residual `r = b - Ax` is maintained incrementally:
+```
+When xⱼ changes by Δ:
+  r_new = r - Δ × aⱼ
+```
+
+This is O(m) per update instead of O(mk) to recompute from scratch.
 
 ## Interpreting Coefficients
 
@@ -286,23 +384,31 @@ Interpretation:
 ## Configuration
 
 ```yaml
-regularization_lambda: CrossValidated
-# Options:
-#   CrossValidated - automatic selection
-#   Adaptive - scale by matrix properties
-#   Fixed: 0.5 - use specific value
+regularization_lambda:
+  Fixed: 1.0   # Default lambda value
 
-max_candidates_per_spectrum: 200
-max_iterations: 1000
-convergence_threshold: 1e-6
+max_candidates_per_spectrum: 500  # Limit candidates per spectrum
 ```
+
+### CD-NNLS Solver Parameters
+
+The solver uses these defaults (in `CdNnlsParams`):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_sweeps` | 50 | Maximum full passes over variables |
+| `tolerance` | 1e-6 | Convergence threshold (max coefficient change) |
+| `relative_tolerance` | 1e-4 | Relative convergence threshold |
+| `warmup_sweeps` | 3 | Sweeps before activating active set |
+| `reactivation_interval` | 5 | How often to check inactive variables |
 
 ## Implementation
 
 Key files:
-- `crates/osprey-regression/src/ridge.rs` - RidgeSolver
-- `crates/osprey-regression/src/matrix.rs` - DesignMatrixBuilder
+- `crates/osprey-regression/src/cd_nnls.rs` - **Coordinate Descent NNLS solver** (main algorithm)
+- `crates/osprey-regression/src/optimized.rs` - Optimized f32 solver wrapper
 - `crates/osprey-regression/src/binning.rs` - Binner for unit resolution
+- `crates/osprey-regression/src/matrix.rs` - DesignMatrixBuilder
 - `crates/osprey-regression/src/sparse.rs` - Sparse solver for HRAM
 - `crates/osprey/src/pipeline.rs` - Integration in analysis pipeline
 
@@ -310,7 +416,8 @@ Key files:
 
 | Factor | Impact | Mitigation |
 |--------|--------|------------|
-| Many candidates | Slow matrix operations | Limit max_candidates |
-| High resolution | Sparse matrices | Use CSC format, CG solver |
+| Many candidates | More iterations, memory | Limit max_candidates to 500 |
+| Active set efficiency | 10-50× speedup | Most candidates converge to zero |
+| High resolution | Sparse matrices | Use CSC format |
 | Many spectra | Linear scaling | Parallel processing (rayon) |
-| Large design matrix | Memory | Process spectra in batches |
+| f32 vs f64 | 2× memory, ~1.5× speed | Use f32 for production |

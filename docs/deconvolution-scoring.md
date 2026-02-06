@@ -268,7 +268,7 @@ Step 3: Calculate score
 
 **Requires library**: Yes (expected RT from calibration)
 **Implementation status**: Done
-**FeatureSet field**: `rt_deviation` (minutes), `rt_deviation_normalized` (dimensionless)
+**FeatureSet field**: `rt_deviation` (minutes)
 
 The difference between the observed apex RT and the predicted RT from the LOESS calibration curve.
 
@@ -280,13 +280,155 @@ Step 1: Get predicted RT from calibration
 
 Step 2: Compute deviation
   rt_deviation = observed_apex_rt - predicted_rt    (in minutes)
-  rt_deviation_normalized = rt_deviation / FWHM     (dimensionless)
 ```
 
 #### Why it matters
 - Peptides eluting far from their predicted RT are less likely to be correct
-- The normalized version accounts for gradient steepness (wider peaks → more tolerance)
 - Strong feature for Mokapot to discriminate targets from decoys
+
+### 6. Fragment Coverage
+
+**Requires library**: Yes (predicted fragment m/z positions)
+**Implementation status**: Done
+**FeatureSet field**: `fragment_coverage`
+
+The fraction of predicted library fragments that were matched in the observed spectrum.
+
+#### Formula
+
+```
+fragment_coverage = n_matched_fragments / n_predicted_fragments
+```
+
+Where:
+- `n_matched_fragments` = count of library fragments with a matching observed peak (within tolerance)
+- `n_predicted_fragments` = total fragments in the library spectrum
+
+#### Score range: 0 to 1 (1 = all predicted fragments found)
+
+### 7. Sequence Coverage
+
+**Requires library**: Yes (ion series positions)
+**Implementation status**: Done
+**FeatureSet field**: `sequence_coverage`
+
+The fraction of backbone cleavage sites covered by at least one matched ion (b or y).
+
+#### Formula
+
+```
+For a peptide of length L:
+  n_cleavage_sites = L - 1  (positions between each amino acid)
+
+For each site i (1 to L-1):
+  covered[i] = True if b_i OR y_{L-i} is matched
+
+sequence_coverage = sum(covered) / n_cleavage_sites
+```
+
+#### Example
+```
+Peptide: PEPTIDE (7 AA, 6 cleavage sites)
+
+Matched ions: b2, b3, y4, y5
+  Site 1: b1? NO, y6? NO  → not covered
+  Site 2: b2? YES         → covered
+  Site 3: b3? YES         → covered
+  Site 4: b4? NO, y3? NO  → not covered
+  Site 5: b5? NO, y2? NO  → not covered
+  Site 6: b6? NO, y1? NO  → not covered
+
+Wait, let's recalculate with y4, y5:
+  y4 covers site 7-4=3, y5 covers site 7-5=2
+
+sequence_coverage = 2/6 = 0.33
+```
+
+### 8. Top-3 Matches
+
+**Requires library**: Yes (fragment intensities to identify top-3)
+**Implementation status**: Done
+**FeatureSet field**: `top3_matches`
+
+The number of the 3 most intense predicted fragments that were matched.
+
+#### Formula
+
+```
+Step 1: Rank library fragments by predicted intensity (descending)
+Step 2: Take top 3 most intense fragments
+Step 3: Count how many of these are matched in observed spectrum
+
+top3_matches ∈ {0, 1, 2, 3}
+```
+
+#### Why it matters
+- The most intense predicted fragments are most likely to be visible
+- Missing all top-3 fragments suggests a poor match or wrong peptide
+- Simple, interpretable feature
+
+### 9. Explained Intensity
+
+**Requires library**: Yes (fragment m/z positions)
+**Implementation status**: Done
+**FeatureSet field**: `explained_intensity`
+
+The fraction of observed intensity that is explained by matched library fragments.
+
+#### Formula
+
+```
+matched_intensity = Σ intensity of observed peaks that match a library fragment
+total_intensity = Σ intensity of all observed peaks (above threshold)
+
+explained_intensity = matched_intensity / total_intensity
+```
+
+#### Score range: 0 to 1 (1 = all signal comes from predicted fragments)
+
+---
+
+## Deconvoluted Spectral Features
+
+In addition to scoring the raw observed spectrum at the apex, Osprey computes a second set of spectral scores from a **deconvoluted spectrum**. This helps discriminate true peptides from false matches caused by co-eluting interference.
+
+### What is Deconvolution?
+
+The deconvoluted spectrum represents what the observed signal would look like if only this peptide were present, based on the regression coefficients.
+
+```
+For each scan near the apex (±2 scans):
+  deconv_contribution[scan] = coefficient[scan] × library_spectrum
+
+Aggregate across scans:
+  deconvoluted_spectrum = Σ deconv_contribution[scan] (weighted by coefficient)
+```
+
+### Deconvoluted Features
+
+These features use the same scoring algorithms as the "mixed" spectral features, but applied to the deconvoluted (cleaned) spectrum:
+
+| Feature | Field | Description |
+|---------|-------|-------------|
+| Hyperscore (deconv) | `hyperscore_deconv` | X!Tandem hyperscore on deconvoluted spectrum |
+| XCorr (deconv) | `xcorr_deconv` | Cross-correlation on deconvoluted spectrum |
+| Dot product (deconv) | `dot_product_deconv` | LibCosine on deconvoluted spectrum |
+| Dot product SMZ (deconv) | `dot_product_smz_deconv` | LibCosine with m/z² weighting on deconvoluted spectrum |
+| Fragment coverage (deconv) | `fragment_coverage_deconv` | Fraction of fragments matched in deconvoluted spectrum |
+| Sequence coverage (deconv) | `sequence_coverage_deconv` | Backbone coverage in deconvoluted spectrum |
+| Consecutive ions (deconv) | `consecutive_ions_deconv` | Longest b/y run in deconvoluted spectrum |
+| Top-3 matches (deconv) | `top3_matches_deconv` | Top-3 predicted fragments matched in deconvoluted spectrum |
+
+### Why Both Mixed and Deconvoluted Scores?
+
+| Scenario | Mixed Score | Deconvoluted Score |
+|----------|-------------|-------------------|
+| True peptide, no interference | High | High |
+| True peptide, with interference | Medium (diluted) | High (cleaned) |
+| False positive (interference attributed) | High | Low (doesn't match library) |
+| Noise | Low | Low |
+
+The combination of both score types helps Mokapot identify cases where a peptide appears to match the mixed spectrum but doesn't actually contribute to the signal.
 
 ---
 
@@ -294,29 +436,27 @@ Step 2: Compute deviation
 
 These features describe the shape and quality of the deconvoluted chromatographic peak.
 
-| Feature | Field | Formula | Description |
-|---------|-------|---------|-------------|
-| Peak apex | `peak_apex` | max(coefficient[t]) | Maximum coefficient value |
-| Peak area | `peak_area` | Σ coefficient[t] | Integrated AUC of coefficients |
-| Peak width | `peak_width` | RT(right_half_max) - RT(left_half_max) | FWHM in minutes |
-| Peak symmetry | `peak_symmetry` | leading_width / trailing_width | Ratio at half-max (1.0 = symmetric) |
-| Contributing scans | `n_contributing_scans` | count(coefficient[t] > 0) | Non-zero coefficients |
-| Coefficient stability | `coefficient_stability` | var(coefficients near apex) | Variance in top quartile |
-| Peak sharpness | `peak_sharpness` | rise_rate at boundaries | Rate of coefficient change |
-| Peak prominence | `peak_prominence` | apex / baseline_estimate | Signal above baseline |
-| EMG fit quality | `emg_fit_quality` | estimated from symmetry | Proxy for exponentially modified Gaussian fit |
+**Features sent to Mokapot (6 features):**
 
-## Contextual Features (from Regression)
+| Feature | Field | Description |
+|---------|-------|-------------|
+| Peak apex | `peak_apex` | Maximum coefficient value across the elution profile |
+| Peak area | `peak_area` | Integrated area under the coefficient curve |
+| Peak width | `peak_width` | Full width at half maximum (FWHM) in minutes |
+| Contributing scans | `n_contributing_scans` | Number of scans with non-zero coefficient |
+| Coefficient stability | `coefficient_stability` | Variance of coefficients near apex (lower = more stable) |
+| Relative coefficient | `relative_coefficient` | This peptide's coefficient / sum of all coefficients in spectrum |
 
-These features describe the regression environment at the time of deconvolution.
+**Additional features in FeatureSet (not currently sent to Mokapot):**
 
-| Feature | Field | Formula | Description |
-|---------|-------|---------|-------------|
-| Competitors | `n_competitors` | max candidates per spectrum | How many peptides compete in the same spectrum |
-| Relative coefficient | `relative_coefficient` | this_coef / Σ all_coefs | Fraction of total signal assigned to this peptide |
-| Peptide density | `local_peptide_density` | avg competitors across spectra | Average crowding across the elution profile |
-| Spectral complexity | `spectral_complexity` | estimated from regression | How complex the underlying spectra are |
-| Regression residual | `regression_residual` | avg ‖Ax - b‖² | Average unexplained signal |
+| Feature | Field | Description |
+|---------|-------|-------------|
+| Peak symmetry | `peak_symmetry` | Leading width / trailing width at half-max |
+| Peak sharpness | `peak_sharpness` | Rate of coefficient change at boundaries |
+| Peak prominence | `peak_prominence` | Apex / baseline estimate |
+| EMG fit quality | `emg_fit_quality` | Proxy for exponentially modified Gaussian fit |
+
+---
 
 ## Complete Scoring Flow in Code
 
@@ -364,33 +504,105 @@ score_run() in crates/osprey/src/pipeline.rs
        → Written to PIN file for Mokapot
 ```
 
-## Score Summary Table
+## Mokapot PIN Feature Summary (24 Features)
 
-| Score | Field | Requires Library Intensities | Range | Status |
-|-------|-------|------------------------------|-------|--------|
-| LibCosine (sqrt) | `dot_product` | Yes | 0-1 | Done |
-| LibCosine (sqrt*mz²) | `dot_product_smz` | Yes | 0-1 | Done |
-| XCorr | `xcorr` | No (unit intensity) | -0.5 to 2.0 | Done |
-| X!Tandem Hyperscore | `hyperscore` | No (fragment types only) | 0-50 | Done |
-| Delta RT | `rt_deviation` | Yes (calibrated RT) | minutes | Done |
-| Delta RT (normalized) | `rt_deviation_normalized` | Yes | dimensionless | Done |
-| Fragment coverage | `fragment_coverage` | Yes | 0-1 | Done |
-| Explained intensity | `explained_intensity` | Yes (fragment m/z) | 0-1 | Done |
-| Pearson correlation | `pearson_correlation` | Yes | -1 to 1 | Done |
-| Spearman correlation | `spearman_correlation` | Yes | -1 to 1 | Done |
-| Consecutive ions | `consecutive_ions` | Yes (ion types) | 0-N | Done |
+The following 24 features are written to the PIN file for Mokapot:
+
+### Chromatographic Features (7)
+
+| # | Field | Description | Range |
+|---|-------|-------------|-------|
+| 1 | `peak_apex` | Maximum coefficient value | 0+ |
+| 2 | `peak_area` | Integrated coefficient area | 0+ |
+| 3 | `peak_width` | FWHM in minutes | 0+ |
+| 4 | `n_contributing_scans` | Scans with non-zero coefficient | 0-N |
+| 5 | `coefficient_stability` | Variance near apex | 0+ |
+| 6 | `relative_coefficient` | Fraction of total signal | 0-1 |
+| 7 | `explained_intensity` | Fraction of observed intensity matched | 0-1 |
+
+### Spectral Features - Mixed/Observed Spectrum (8)
+
+| # | Field | Requires Library Intensities | Range |
+|---|-------|------------------------------|-------|
+| 8 | `hyperscore` | No (fragment types only) | 0-50 |
+| 9 | `xcorr` | No (unit intensity) | -0.5 to 2.0 |
+| 10 | `dot_product` | Yes | 0-1 |
+| 11 | `dot_product_smz` | Yes | 0-1 |
+| 12 | `fragment_coverage` | Yes (fragment m/z) | 0-1 |
+| 13 | `sequence_coverage` | Yes (ion types) | 0-1 |
+| 14 | `consecutive_ions` | Yes (ion types) | 0-N |
+| 15 | `top3_matches` | Yes | 0-3 |
+
+### Spectral Features - Deconvoluted Spectrum (8)
+
+| # | Field | Requires Library Intensities | Range |
+|---|-------|------------------------------|-------|
+| 16 | `hyperscore_deconv` | No | 0-50 |
+| 17 | `xcorr_deconv` | No | -0.5 to 2.0 |
+| 18 | `dot_product_deconv` | Yes | 0-1 |
+| 19 | `dot_product_smz_deconv` | Yes | 0-1 |
+| 20 | `fragment_coverage_deconv` | Yes | 0-1 |
+| 21 | `sequence_coverage_deconv` | Yes | 0-1 |
+| 22 | `consecutive_ions_deconv` | Yes | 0-N |
+| 23 | `top3_matches_deconv` | Yes | 0-3 |
+
+### Derived Features (1)
+
+| # | Field | Description | Range |
+|---|-------|-------------|-------|
+| 24 | `rt_deviation` | Observed apex RT - predicted RT | minutes |
+
+---
+
+## Features in FeatureSet Not Sent to Mokapot
+
+These features are computed and stored in `FeatureSet` but are NOT currently included in the PIN file:
+
+| Field | Description | Reason Not Included |
+|-------|-------------|---------------------|
+| `emg_fit_quality` | EMG fit R² | Not yet implemented |
+| `peak_symmetry` | Leading/trailing width ratio | Low discrimination power |
+| `peak_sharpness` | Boundary slope | Redundant with peak_width |
+| `peak_prominence` | Apex / baseline | Redundant with peak_apex |
+| `rt_deviation_normalized` | RT deviation / FWHM | Redundant with rt_deviation |
+| `spectral_contrast_angle` | Angle-based similarity | Redundant with dot_product |
+| `pearson_correlation` | Intensity correlation | Redundant with dot_product |
+| `spearman_correlation` | Rank correlation | Low discrimination power |
+| `base_peak_rank` | Rank of base peak | Low discrimination power |
+| `n_competitors` | Candidates per spectrum | Context feature, may add later |
+| `local_peptide_density` | Average competitors | Context feature, may add later |
+| `spectral_complexity` | Regression complexity | Context feature, may add later |
+| `regression_residual` | Unexplained signal | Context feature, may add later |
+| `precursor_intensity` | MS1 intensity | Optional, not always available |
+| `modification_count` | Number of modifications | May add for PTM analysis |
 
 ## Implementation Files
 
 | File | Purpose |
 |------|---------|
-| `crates/osprey-scoring/src/lib.rs` | SpectralScorer (LibCosine, LibCosine SMZ, XCorr, Hyperscore), FeatureExtractor |
+| `crates/osprey-scoring/src/lib.rs` | SpectralScorer (LibCosine, XCorr, Hyperscore), FeatureExtractor |
 | `crates/osprey-scoring/src/batch.rs` | BLAS-accelerated batch scoring (calibration phase) |
 | `crates/osprey/src/pipeline.rs` | score_run() - orchestrates scoring after regression |
-| `crates/osprey-core/src/types.rs` | FeatureSet struct (all 30 features) |
-| `crates/osprey-fdr/src/mokapot.rs` | PIN file output for Mokapot |
+| `crates/osprey-core/src/types.rs` | FeatureSet struct (all available features) |
+| `crates/osprey-fdr/src/mokapot.rs` | PIN file output (24 features), Mokapot runner |
+
+## Feature Weight Analysis
+
+Use `scripts/inspect_mokapot_weights.py` to see which features Mokapot finds most discriminative:
+
+```bash
+python scripts/inspect_mokapot_weights.py mokapot.model.pkl
+```
+
+This helps identify:
+
+- Which features contribute most to target/decoy discrimination
+- Features with near-zero weights (candidates for removal to speed up processing)
+- Unexpected feature importance patterns
 
 ## TODO
 
 1. **Consider apex refinement**: Score top-N coefficient spectra and pick best spectral match
-2. **EMG peak fitting**: Replace symmetry-based heuristic with true EMG fit
+2. **EMG peak fitting**: Replace symmetry-based heuristic with true Levenberg-Marquardt EMG fit
+3. **Feature reduction**: Use Mokapot weights to identify and remove low-value features
+4. **Context features**: Evaluate adding n_competitors, regression_residual to PIN file

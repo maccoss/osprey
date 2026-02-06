@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use osprey::{run_analysis, ConfigOverrides, OspreyConfig, ResolutionMode};
+use osprey::{run_analysis, ConfigOverrides, OspreyConfig, ResolutionMode, ToleranceUnit};
 use std::path::PathBuf;
 
 /// Osprey: Peptide-centric DIA analysis tool
@@ -55,6 +55,14 @@ struct Args {
     #[arg(long, default_value = "auto")]
     resolution: String,
 
+    /// Fragment m/z tolerance (e.g., 10 for 10 ppm, or 0.3 for 0.3 Th)
+    #[arg(long)]
+    fragment_tolerance: Option<f64>,
+
+    /// Fragment tolerance unit: ppm, mz (Thompson)
+    #[arg(long)]
+    fragment_unit: Option<String>,
+
     /// RT tolerance in minutes (fallback when calibration disabled)
     #[arg(long, default_value_t = 2.0)]
     rt_tolerance: f64,
@@ -68,7 +76,7 @@ struct Args {
     lambda: Option<f64>,
 
     /// Maximum candidates per spectrum
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 500)]
     max_candidates: usize,
 
     /// Run-level FDR threshold
@@ -122,6 +130,18 @@ fn main() -> Result<()> {
         OspreyConfig::default()
     };
 
+    // Parse fragment unit if provided
+    let fragment_unit = args.fragment_unit.as_ref().map(|s| {
+        match s.to_lowercase().as_str() {
+            "ppm" => ToleranceUnit::Ppm,
+            "mz" | "th" | "da" => ToleranceUnit::Mz,
+            _ => {
+                log::warn!("Unknown fragment unit '{}', defaulting to ppm", s);
+                ToleranceUnit::Ppm
+            }
+        }
+    });
+
     // Create overrides from CLI args (these take precedence over config file)
     let overrides = ConfigOverrides {
         input_files: args.input,
@@ -135,6 +155,8 @@ fn main() -> Result<()> {
         verbose: args.verbose,
         disable_rt_calibration: args.no_rt_calibration,
         streaming: args.streaming,
+        fragment_tolerance: args.fragment_tolerance,
+        fragment_unit,
     };
 
     // Apply CLI overrides
@@ -147,6 +169,22 @@ fn main() -> Result<()> {
         "auto" | _ => config.resolution_mode,
     };
     config.resolution_mode = resolution_mode;
+
+    // If resolution mode is unit and fragment unit wasn't explicitly specified,
+    // default to Th (Mz) instead of ppm for both MS1 and MS2 calibration
+    if resolution_mode == ResolutionMode::UnitResolution && args.fragment_unit.is_none() {
+        config.fragment_tolerance.unit = ToleranceUnit::Mz;
+        config.precursor_tolerance.unit = ToleranceUnit::Mz;
+        // Also set default tolerance if not specified (0.5 Th is typical for unit resolution)
+        if args.fragment_tolerance.is_none() {
+            config.fragment_tolerance.tolerance = 0.5;
+        }
+        // Set precursor tolerance to match (0.5 Th is reasonable for MS1 on unit resolution)
+        config.precursor_tolerance.tolerance = 0.5;
+        log::info!("Unit resolution mode: using Th units for mass calibration (MS1: {:.2} Th, MS2: {:.2} Th)",
+            config.precursor_tolerance.tolerance,
+            config.fragment_tolerance.tolerance);
+    }
 
     // Set max candidates
     config.max_candidates_per_spectrum = args.max_candidates;

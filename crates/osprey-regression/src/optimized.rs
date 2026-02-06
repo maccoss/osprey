@@ -6,9 +6,10 @@
 //! 3. Cache binned observed spectra (reuse between calibration and main search)
 //! 4. Thread-local buffer reuse (avoid allocation churn)
 
+use crate::cd_nnls::{solve_cd_nnls_f32, CdNnlsParams};
 use crate::Binner;
 use ndarray::{Array1, Array2};
-use osprey_core::{LibraryEntry, OspreyError, Result, Spectrum};
+use osprey_core::{LibraryEntry, Result, Spectrum};
 use std::collections::HashMap;
 
 /// Pre-binned library for efficient regression
@@ -241,25 +242,42 @@ impl BinnedSpectraCache {
 ///
 /// Key optimizations:
 /// - Uses f32 instead of f64 (faster BLAS, less memory)
-/// - Reuses thread-local buffers to avoid allocation
+/// - Coordinate descent NNLS solver (O(m*k) per sweep vs O(k³) for Cholesky)
+/// - Active set acceleration (skip variables at zero)
 /// - Works with pre-binned library (BinnedLibrary)
 #[derive(Debug, Clone)]
 pub struct OptimizedSolver {
     /// Default regularization parameter
     default_lambda: f32,
+    /// Coordinate descent parameters
+    cd_params: CdNnlsParams,
 }
 
 impl OptimizedSolver {
-    /// Create a new optimized solver
+    /// Create a new optimized solver with default CD parameters
     pub fn new(default_lambda: f32) -> Self {
-        Self { default_lambda }
+        Self {
+            default_lambda,
+            cd_params: CdNnlsParams::default(),
+        }
     }
 
-    /// Solve the NNLS ridge regression problem
+    /// Create a new optimized solver with custom CD parameters
+    pub fn with_params(default_lambda: f32, cd_params: CdNnlsParams) -> Self {
+        Self {
+            default_lambda,
+            cd_params,
+        }
+    }
+
+    /// Solve the NNLS ridge regression problem using coordinate descent
     ///
     /// Given design matrix A (m × k) and observed vector b (m × 1),
     /// returns coefficient vector x (k × 1) that minimizes:
     ///   ‖Ax - b‖² + λ‖x‖² subject to x ≥ 0
+    ///
+    /// Uses coordinate descent with active set acceleration for O(m*k) per sweep
+    /// instead of O(k³) for Cholesky decomposition.
     pub fn solve_nonnegative(
         &self,
         a: &Array2<f32>,
@@ -267,129 +285,7 @@ impl OptimizedSolver {
         lambda: Option<f32>,
     ) -> Result<Array1<f32>> {
         let lambda = lambda.unwrap_or(self.default_lambda);
-
-        // Check dimensions
-        if a.nrows() != b.len() {
-            return Err(OspreyError::RegressionError(format!(
-                "Dimension mismatch: A has {} rows but b has {} elements",
-                a.nrows(),
-                b.len()
-            )));
-        }
-
-        let k = a.ncols();
-
-        // Handle empty case
-        if k == 0 {
-            return Ok(Array1::zeros(0));
-        }
-
-        // Compute A'A + λI
-        let mut ata = a.t().dot(a);
-        for i in 0..k {
-            ata[[i, i]] += lambda;
-        }
-
-        // Compute A'b
-        let atb = a.t().dot(b);
-
-        // Try unconstrained solution first (Cholesky)
-        let x_unconstrained = self.solve_cholesky(&ata, &atb)?;
-
-        // Check if already non-negative
-        if x_unconstrained.iter().all(|&v| v >= 0.0) {
-            return Ok(x_unconstrained);
-        }
-
-        // Project and run gradient descent
-        let mut x = x_unconstrained.mapv(|v| v.max(0.0));
-
-        // Projected gradient descent
-        let max_iter = 500; // Reduced from 1000 for speed
-        let tol = 1e-6_f32;
-
-        // Step size from Frobenius norm
-        let lipschitz = self.estimate_lipschitz(&ata);
-        let step_size = 1.0 / lipschitz;
-
-        for _ in 0..max_iter {
-            // Gradient: (A'A + λI)x - A'b
-            let gradient = ata.dot(&x) - &atb;
-
-            // Gradient step with projection
-            let x_new = (&x - step_size * &gradient).mapv(|v| v.max(0.0));
-
-            // Check convergence
-            let diff = &x_new - &x;
-            let change = diff.dot(&diff).sqrt();
-
-            x = x_new;
-
-            if change < tol {
-                break;
-            }
-        }
-
-        Ok(x)
-    }
-
-    /// Solve via Cholesky decomposition (unconstrained)
-    fn solve_cholesky(&self, ata: &Array2<f32>, atb: &Array1<f32>) -> Result<Array1<f32>> {
-        let n = ata.nrows();
-
-        // Cholesky: A = L * L'
-        let mut l = Array2::<f32>::zeros((n, n));
-
-        for i in 0..n {
-            for j in 0..=i {
-                let mut sum = ata[[i, j]];
-                for k in 0..j {
-                    sum -= l[[i, k]] * l[[j, k]];
-                }
-
-                if i == j {
-                    if sum <= 0.0 {
-                        return Err(OspreyError::RegressionError(
-                            "Matrix is not positive definite".into()
-                        ));
-                    }
-                    l[[i, j]] = sum.sqrt();
-                } else {
-                    l[[i, j]] = sum / l[[j, j]];
-                }
-            }
-        }
-
-        // Forward substitution: L * y = atb
-        let mut y = Array1::<f32>::zeros(n);
-        for i in 0..n {
-            let mut sum = atb[i];
-            for j in 0..i {
-                sum -= l[[i, j]] * y[j];
-            }
-            y[i] = sum / l[[i, i]];
-        }
-
-        // Back substitution: L' * x = y
-        let mut x = Array1::<f32>::zeros(n);
-        for i in (0..n).rev() {
-            let mut sum = y[i];
-            for j in (i + 1)..n {
-                sum -= l[[j, i]] * x[j];
-            }
-            x[i] = sum / l[[i, i]];
-        }
-
-        Ok(x)
-    }
-
-    /// Estimate Lipschitz constant from Frobenius norm
-    fn estimate_lipschitz(&self, ata: &Array2<f32>) -> f32 {
-        let mut sum = 0.0_f32;
-        for val in ata.iter() {
-            sum += val * val;
-        }
-        sum.sqrt().max(1e-10)
+        solve_cd_nnls_f32(a, b, lambda, &self.cd_params)
     }
 
     /// Compute residual norm ‖Ax - b‖²
@@ -402,7 +298,10 @@ impl OptimizedSolver {
 
 impl Default for OptimizedSolver {
     fn default() -> Self {
-        Self::new(1.0)
+        Self {
+            default_lambda: 1.0,
+            cd_params: CdNnlsParams::default(),
+        }
     }
 }
 

@@ -37,7 +37,7 @@ use osprey_chromatography::{
     PeakDetector, RTCalibration, RTCalibrator, RTCalibratorConfig,
     // Full calibration types
     CalibrationParams, CalibrationMetadata, MzCalibration, RTCalibrationParams, RTCalibrationMethod,
-    MzQCData, calculate_mz_calibration, save_calibration, load_calibration,
+    IsolationScheme, MzQCData, calculate_mz_calibration, save_calibration, load_calibration,
     calibration_path_for_input,
 };
 use osprey_core::{
@@ -45,7 +45,7 @@ use osprey_core::{
     MS1Spectrum, OspreyConfig, OspreyError, RegressionResult, ResolutionMode, Result, Spectrum,
 };
 use osprey_fdr::{FdrController, MokapotRunner, PsmFeatures};
-use osprey_io::{load_library, load_all_spectra, BlibWriter, MS1Index, MzmlReader};
+use osprey_io::{load_library, load_all_spectra, BlibWriter, MS1Index};
 use osprey_regression::{Binner, BinnedLibrary, BinnedSpectraCache, DesignMatrixBuilder, OptimizedSolver, RidgeSolver};
 use osprey_scoring::{
     batch::{
@@ -71,6 +71,59 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use osprey_scoring::batch::{CalibrationMatch, pair_calibration_matches};
+
+/// Extract isolation window scheme from the first cycle of MS2 spectra
+///
+/// Returns an IsolationScheme describing the DIA windows used in the acquisition.
+fn extract_isolation_scheme(spectra: &[Spectrum]) -> Option<IsolationScheme> {
+    if spectra.is_empty() {
+        return None;
+    }
+
+    // Find the first complete cycle by looking for repeated window centers
+    let mut first_cycle_windows: Vec<(f64, f64)> = Vec::new();
+    let mut seen_centers: std::collections::HashSet<i32> = std::collections::HashSet::new();
+
+    for spectrum in spectra {
+        let center = spectrum.isolation_window.center;
+        let width = spectrum.isolation_window.width();
+
+        // Round center to integer to detect repeats (handles slight variations)
+        let center_key = (center * 10.0).round() as i32;
+
+        if seen_centers.contains(&center_key) {
+            // We've completed a cycle
+            break;
+        }
+
+        seen_centers.insert(center_key);
+        first_cycle_windows.push((center, width));
+    }
+
+    if first_cycle_windows.is_empty() {
+        return None;
+    }
+
+    // Sort windows by center m/z
+    first_cycle_windows.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mz_min = first_cycle_windows.first().map(|(c, _)| *c).unwrap_or(0.0);
+    let mz_max = first_cycle_windows.last().map(|(c, _)| *c).unwrap_or(0.0);
+
+    // Calculate typical width and check uniformity
+    let widths: Vec<f64> = first_cycle_windows.iter().map(|(_, w)| *w).collect();
+    let typical_width = widths.iter().sum::<f64>() / widths.len() as f64;
+    let uniform_width = widths.iter().all(|w| (w - typical_width).abs() < 0.5);
+
+    Some(IsolationScheme {
+        num_windows: first_cycle_windows.len(),
+        mz_min,
+        mz_max,
+        typical_width,
+        uniform_width,
+        windows: first_cycle_windows,
+    })
+}
 
 /// Run the complete Osprey analysis pipeline
 pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
@@ -201,7 +254,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
     let mut all_spectra = Vec::new();
     // Cached preprocessed spectra for potential reuse in future scoring passes
     let mut _all_preprocessed_spectra: Option<PreprocessedSpectra> = None;
-    let mut shared_calibration: Option<(RTCalibration, f64)> = None; // (calibration, tolerance)
+    let mut shared_calibration: Option<(RTCalibration, f64, CalibrationParams)> = None; // (rt_calibration, tolerance, full_params)
 
     for (file_idx, input_file) in config.input_files.iter().enumerate() {
         log::info!(
@@ -228,12 +281,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
 
         // Store calibration from first file for subsequent files
         if file_idx == 0 {
-            if let Some((cal, tol)) = calibration_result {
+            if let Some((cal, tol, cal_params)) = calibration_result {
                 log::info!(
                     "Storing calibration from first file for subsequent files (tolerance: {:.2} min)",
                     tol
                 );
-                shared_calibration = Some((cal, tol));
+                shared_calibration = Some((cal, tol, cal_params));
             }
             // Store preprocessed spectra from first file for potential reuse
             _all_preprocessed_spectra = file_preprocessed_spectra;
@@ -264,7 +317,9 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         .to_string();
 
     log::info!("Scoring peptides and extracting features...");
-    let scored_entries = score_run(&library, &all_results, &all_spectra, &combined_file_name)?;
+    // Extract CalibrationParams for m/z correction during scoring
+    let calibration_params = shared_calibration.as_ref().map(|(_, _, params)| params);
+    let scored_entries = score_run(&library, &all_results, &all_spectra, &combined_file_name, calibration_params)?;
     per_file_scored.push((combined_file_name, scored_entries));
 
     // Run two-level FDR control (run-level + experiment-level)
@@ -285,7 +340,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         .collect();
 
     log::info!(
-        "Final results: {} peptides passing {}% experiment-level FDR",
+        "Final results: {} precursors passing {}% experiment-level FDR",
         passing_entries.len(),
         config.run_fdr * 100.0
     );
@@ -328,7 +383,7 @@ fn process_file_with_calibration(
     binner: &Binner,
     optimized_solver: &OptimizedSolver,
     config: &OspreyConfig,
-    existing_calibration: Option<&(RTCalibration, f64)>,
+    existing_calibration: Option<&(RTCalibration, f64, CalibrationParams)>,
     preprocessed_library: Option<&PreprocessedLibrary>,
     batch_scorer: &BatchScorer,
     use_windowed_scoring: bool,
@@ -336,7 +391,7 @@ fn process_file_with_calibration(
     Vec<RegressionResult>,
     Vec<Spectrum>,
     Option<PreprocessedSpectra>,
-    Option<(RTCalibration, f64)>,
+    Option<(RTCalibration, f64, CalibrationParams)>,
 )> {
     // Load both MS1 and MS2 spectra in a single pass (more efficient than reading twice)
     let (spectra, ms1_index) = load_all_spectra(path)?;
@@ -366,7 +421,7 @@ fn process_file_with_calibration(
     }
 
     // Check if we have an existing calibration from a previous file
-    if let Some((cal, tol)) = existing_calibration {
+    if let Some((cal, tol, _cal_params)) = existing_calibration {
         log::info!(
             "Using calibration from first file (tolerance: {:.2} min)",
             tol
@@ -431,7 +486,7 @@ fn process_file_with_calibration(
                                     Some(&rt_cal),
                                 )?;
 
-                                return Ok((results, spectra, None, Some((rt_cal, tolerance))));
+                                return Ok((results, spectra, None, Some((rt_cal, tolerance, cal_params))));
                             }
                             Err(e) => {
                                 log::warn!("Failed to reconstruct calibration from cached file: {}. Re-running calibration.", e);
@@ -549,7 +604,10 @@ fn process_file_with_calibration(
 
     // Return calibration for first file to be reused
     // Note: preprocessed_spectra is only available when not using windowed scoring
-    let calibration_to_share = calibration_opt.map(|cal| (cal, rt_tolerance));
+    let calibration_to_share = match (calibration_opt, calibration_params_opt) {
+        (Some(rt_cal), Some(cal_params)) => Some((rt_cal, rt_tolerance, cal_params)),
+        _ => None,
+    };
     Ok((results, spectra, None, calibration_to_share))
 }
 
@@ -890,7 +948,7 @@ fn run_calibration_discovery_windowed(
         config.fragment_tolerance.tolerance,
         match config.fragment_tolerance.unit {
             osprey_core::ToleranceUnit::Ppm => "ppm",
-            osprey_core::ToleranceUnit::Da => "Da",
+            osprey_core::ToleranceUnit::Mz => "Th",
         }
     );
 
@@ -947,7 +1005,7 @@ fn run_calibration_discovery_windowed(
 
     // Log MS1 (precursor) coverage (how many matches have M+0 peaks)
     // NOTE: Actual MS1 calibration statistics are computed AFTER FDR filtering
-    let ms1_count_all = matches.iter().filter(|m| m.ms1_ppm_error.is_some()).count();
+    let ms1_count_all = matches.iter().filter(|m| m.ms1_error.is_some()).count();
     log::info!(
         "MS1 extraction: {} of {} matches have M+0 peak (before FDR)",
         ms1_count_all,
@@ -1019,14 +1077,14 @@ fn run_calibration_discovery_windowed(
     // Extract calibration points + mass errors from passing targets
     let mut library_rts_detected: Vec<f64> = Vec::new();
     let mut measured_rts_detected: Vec<f64> = Vec::new();
-    let mut mz_qc_data = MzQCData::new();
+    let mut mz_qc_data = MzQCData::new(config.fragment_tolerance.unit);
 
     for m in &competition_result.passing_targets {
         library_rts_detected.push(m.library_rt);
         measured_rts_detected.push(m.measured_rt);
 
-        // Collect MS1 PPM error for mass calibration
-        if let Some(ms1_error) = m.ms1_ppm_error {
+        // Collect MS1 error for mass calibration (ppm or Th depending on resolution)
+        if let Some(ms1_error) = m.ms1_error {
             mz_qc_data.add_ms1_error(ms1_error);
         }
 
@@ -1069,11 +1127,16 @@ fn run_calibration_discovery_windowed(
     let (ms1_calibration, ms2_calibration) = calculate_mz_calibration(&mz_qc_data);
 
     log::info!(
-        "MS1 calibration: mean={:.2} ppm, SD={:.2} ppm (from {} observations)",
+        "MS1 calibration: mean={:.2} {}, SD={:.2} {} (from {} observations)",
         ms1_calibration.mean,
+        ms1_calibration.unit,
         ms1_calibration.sd,
+        ms1_calibration.unit,
         mz_qc_data.n_ms1()
     );
+
+    // Extract isolation window scheme from spectra
+    let isolation_scheme = extract_isolation_scheme(spectra);
 
     // Build full CalibrationParams
     let calibration_params = CalibrationParams {
@@ -1082,6 +1145,7 @@ fn run_calibration_discovery_windowed(
             num_sampled_precursors: matches.len(),
             calibration_successful: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            isolation_scheme,
         },
         ms1_calibration,
         ms2_calibration,
@@ -1307,6 +1371,7 @@ fn run_calibration_discovery_with_cache(
             num_sampled_precursors,
             calibration_successful: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            isolation_scheme: None,
         },
         ms1_calibration: MzCalibration::uncalibrated(),
         ms2_calibration: MzCalibration::uncalibrated(),
@@ -1328,60 +1393,6 @@ fn run_calibration_discovery_with_cache(
     log::warn!("Note: Mass calibration not available in cached preprocessing path");
 
     Ok((rt_calibration, calibration_params))
-}
-
-/// Process spectra with optional RT calibration
-fn process_spectra(
-    spectra: &[Spectrum],
-    library: &[LibraryEntry],
-    library_by_mz: &HashMap<i32, Vec<usize>>,
-    matrix_builder: &DesignMatrixBuilder,
-    solver: &RidgeSolver,
-    rt_tolerance: f64,
-    max_candidates: usize,
-    calibration: Option<&RTCalibration>,
-) -> Result<Vec<RegressionResult>> {
-    // Set up progress bar
-    let pb = ProgressBar::new(spectra.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} spectra",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    // Process spectra in parallel
-    let results: Vec<RegressionResult> = spectra
-        .par_iter()
-        .map(|spectrum| {
-            let result = process_spectrum_with_filter(
-                spectrum,
-                library,
-                library_by_mz,
-                matrix_builder,
-                solver,
-                rt_tolerance,
-                max_candidates,
-                None, // No library filter
-                calibration,
-            );
-            pb.inc(1);
-            result
-        })
-        .filter_map(|r| r.ok())
-        .filter(|r| !r.coefficients.is_empty())
-        .collect();
-
-    pb.finish_with_message("Done");
-
-    log::info!(
-        "Generated {} regression results with non-zero coefficients",
-        results.len()
-    );
-
-    Ok(results)
 }
 
 /// Optimized process_spectra using pre-binned library and f32 operations
@@ -1504,6 +1515,7 @@ struct ScoredEntry {
     /// PSM identifier (for matching with Mokapot results)
     psm_id: String,
     /// Source file name
+    #[allow(dead_code)]
     file_name: String,
     /// Coefficient time series
     rt_coef_pairs: Vec<(f64, f64)>,
@@ -1523,6 +1535,7 @@ struct ScoredEntry {
 
 /// Results from processing a single run (mzML file)
 #[derive(Debug)]
+#[allow(dead_code)]
 struct RunLevelResults {
     /// File name
     file_name: String,
@@ -1534,6 +1547,7 @@ struct RunLevelResults {
 
 /// Experiment-level aggregated result (best PSM per peptide across runs)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ExperimentPsm {
     /// Modified peptide sequence (unique identifier)
     peptide: String,
@@ -1547,13 +1561,19 @@ struct ExperimentPsm {
 ///
 /// Uses spectral similarity scoring (LibCosine) as the primary score.
 /// Returns all scored entries (targets + decoys) for subsequent FDR computation.
+///
+/// If calibration is provided, applies m/z correction to spectra and uses
+/// calibrated tolerance (3×SD) for fragment matching.
 fn score_run(
     library: &[LibraryEntry],
     results: &[RegressionResult],
     spectra: &[Spectrum],
     file_name: &str,
+    calibration: Option<&CalibrationParams>,
 ) -> Result<Vec<ScoredEntry>> {
     use osprey_scoring::{RegressionContext, SpectralScorer};
+    use osprey_chromatography::calibration::{apply_spectrum_calibration, calibrated_tolerance};
+    use osprey_core::ToleranceUnit;
 
     // Build ID-to-index map
     let id_to_index: HashMap<u32, usize> = library
@@ -1581,13 +1601,50 @@ fn score_run(
 
     // Extract features and create scored entries (parallelized)
     let feature_extractor = FeatureExtractor::new();
-    let spectral_scorer = SpectralScorer::new();
+
+    // Configure SpectralScorer with calibrated tolerance if available
+    // Use 3×SD from MS2 calibration as the tolerance for fragment matching
+    // This is unit-aware: uses Th for unit resolution, ppm for HRAM
+    let spectral_scorer = if let Some(cal) = calibration {
+        // Get calibrated tolerance in the appropriate unit
+        let (tol_value, tol_unit) = calibrated_tolerance(
+            &cal.ms2_calibration,
+            20.0,  // default 20 ppm for HRAM
+            ToleranceUnit::Ppm,
+        );
+
+        match tol_unit {
+            ToleranceUnit::Mz => {
+                log::debug!("Using calibrated fragment tolerance: {:.4} Th (3×SD)", tol_value);
+                SpectralScorer::new().with_tolerance_da(tol_value)
+            }
+            ToleranceUnit::Ppm => {
+                log::debug!("Using calibrated fragment tolerance: {:.2} ppm (3×SD)", tol_value);
+                SpectralScorer::new().with_tolerance_ppm(tol_value)
+            }
+        }
+    } else {
+        SpectralScorer::new()
+    };
+
+    // Pre-calibrate all spectra once upfront (if calibration available)
+    // This avoids cloning/calibrating spectra inside the per-peptide loop
+    let calibrated_spectra: Vec<Spectrum> = if let Some(cal) = calibration {
+        log::debug!("Pre-calibrating {} spectra with MS2 calibration", spectra.len());
+        spectra
+            .iter()
+            .map(|s| apply_spectrum_calibration(s, &cal.ms2_calibration))
+            .collect()
+    } else {
+        spectra.to_vec()
+    };
+
     let peak_detector = PeakDetector::new().with_min_height(0.05);
 
     // Collect library IDs for parallel iteration
     let lib_ids: Vec<u32> = entry_data.keys().copied().collect();
 
-    let mut scored_entries: Vec<ScoredEntry> = lib_ids
+    let scored_entries: Vec<ScoredEntry> = lib_ids
         .par_iter()
         .filter_map(|lib_id| {
             let data_points = entry_data.get(lib_id)?;
@@ -1622,10 +1679,12 @@ fn score_run(
             let rt_min = rt_coef_pairs.iter().map(|(rt, _)| *rt).fold(f64::INFINITY, f64::min);
             let rt_max = rt_coef_pairs.iter().map(|(rt, _)| *rt).fold(f64::NEG_INFINITY, f64::max);
 
-            // Filter spectra to those in the peak region:
+            // Filter pre-calibrated spectra to those in the peak region:
             // 1. Isolation window contains the peptide's precursor m/z
             // 2. RT is within the coefficient series range
-            let peak_region_spectra: Vec<Spectrum> = spectra
+            // Note: We clone filtered spectra here, but the expensive calibration
+            // was done once upfront, so this is just a cheap memory copy
+            let peak_region_spectra: Vec<Spectrum> = calibrated_spectra
                 .iter()
                 .filter(|s| {
                     s.contains_precursor(entry.precursor_mz)
@@ -1644,9 +1703,10 @@ fn score_run(
                     RegressionContext::from_results(&result_refs, *lib_id)
                 });
 
-            // Extract features using spectrum aggregation (FR-5.2.1)
-            // This aggregates all spectra in the peak region weighted by coefficients
-            let mut features = feature_extractor.extract_with_aggregation(
+            // Extract features with both mixed and deconvoluted scoring
+            // - Mixed: spectral scores from raw observed spectrum at apex
+            // - Deconvoluted: spectral scores from coefficient-weighted aggregated spectrum (apex ± 2)
+            let mut features = feature_extractor.extract_with_deconvolution(
                 entry,
                 &rt_coef_pairs,
                 &peak_region_spectra,
@@ -1747,15 +1807,17 @@ fn compute_fdr_with_mokapot(
         .enumerate()
         .map(|(idx, entry)| {
             let lib_entry = &library[entry.lib_idx];
+
+            // Use library index as scan_number for mokapot fold splitting
+            // In DIA/Osprey, each PSM represents a peptide detection across a chromatographic
+            // peak (many spectra), not a single spectrum. The library index uniquely identifies
+            // each precursor (peptide + charge), ensuring fold splitting groups by precursor
+            // to avoid data leakage during cross-validation.
             PsmFeatures {
                 psm_id: format!("{}_{}", file_name, idx),
                 peptide: lib_entry.modified_sequence.clone(),
                 proteins: lib_entry.protein_ids.clone(),
-                scan_number: entry.rt_coef_pairs
-                    .iter()
-                    .max_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(_, _)| 0u32)
-                    .unwrap_or(0),
+                scan_number: entry.lib_idx as u32,
                 file_name: file_name.to_string(),
                 charge: lib_entry.charge,
                 is_decoy: entry.is_decoy,
@@ -1773,7 +1835,7 @@ fn compute_fdr_with_mokapot(
     let pin_file = mokapot_dir.join(format!("{}.pin", file_name));
     mokapot.write_pin(&psm_features, &pin_file)?;
 
-    log::info!("Wrote {} PSMs to PIN file for mokapot", psm_features.len());
+    log::info!("Wrote {} precursors to PIN file for mokapot", psm_features.len());
 
     // Run mokapot
     let results = mokapot.run(&pin_file, &mokapot_dir)?;
@@ -1848,10 +1910,22 @@ fn run_two_level_fdr(
 
         // Report per-file statistics
         let passing = entries.iter().filter(|e| !e.is_decoy && e.run_qvalue <= run_fdr).count();
-        log::info!("  {}: {} targets passing {}% run-level FDR", file_name, passing, run_fdr * 100.0);
+        log::info!("  {}: {} precursors passing {}% run-level FDR", file_name, passing, run_fdr * 100.0);
     }
 
     // ========== STEP 2: Experiment-level FDR ==========
+    // Skip experiment-level FDR if only one replicate - just use run-level results
+    if per_file_results.len() == 1 {
+        log::info!("Single replicate - skipping experiment-level FDR (using run-level results)");
+        let (_, entries) = per_file_results.iter().next().unwrap();
+        let mut experiment_entries: Vec<ScoredEntry> = entries.clone();
+        // Copy run-level q-values to experiment-level
+        for entry in experiment_entries.iter_mut() {
+            entry.experiment_qvalue = entry.run_qvalue;
+        }
+        return Ok(experiment_entries);
+    }
+
     log::info!("Step 2: Experiment-level FDR control at {}%", experiment_fdr * 100.0);
 
     // Collect all entries across files
@@ -1860,12 +1934,14 @@ fn run_two_level_fdr(
         .flat_map(|(_, entries)| entries.iter().cloned())
         .collect();
 
-    // Aggregate: keep best PSM per peptide (by score)
-    let mut best_per_peptide: HashMap<String, ScoredEntry> = HashMap::new();
+    // Aggregate: keep best PSM per precursor (peptide + charge) by score
+    let mut best_per_precursor: HashMap<String, ScoredEntry> = HashMap::new();
     for entry in all_entries.iter() {
-        let peptide_key = library[entry.lib_idx].modified_sequence.clone();
-        best_per_peptide
-            .entry(peptide_key)
+        let lib_entry = &library[entry.lib_idx];
+        // Use peptide + charge as the precursor key
+        let precursor_key = format!("{}_{}", lib_entry.modified_sequence, lib_entry.charge);
+        best_per_precursor
+            .entry(precursor_key)
             .and_modify(|existing| {
                 if entry.score > existing.score {
                     *existing = entry.clone();
@@ -1874,9 +1950,9 @@ fn run_two_level_fdr(
             .or_insert_with(|| entry.clone());
     }
 
-    let mut experiment_entries: Vec<ScoredEntry> = best_per_peptide.into_values().collect();
+    let mut experiment_entries: Vec<ScoredEntry> = best_per_precursor.into_values().collect();
     log::info!(
-        "Aggregated to {} unique peptides ({} targets, {} decoys)",
+        "Aggregated to {} unique precursors ({} targets, {} decoys)",
         experiment_entries.len(),
         experiment_entries.iter().filter(|e| !e.is_decoy).count(),
         experiment_entries.iter().filter(|e| e.is_decoy).count()
@@ -1900,7 +1976,7 @@ fn run_two_level_fdr(
         .filter(|e| !e.is_decoy && e.experiment_qvalue <= experiment_fdr)
         .count();
     log::info!(
-        "Experiment-level: {} peptides passing {}% FDR",
+        "Experiment-level: {} precursors passing {}% FDR",
         passing,
         experiment_fdr * 100.0
     );
@@ -2035,7 +2111,7 @@ fn write_blib_output_with_scores(
     scored_entries: &[ScoredEntry],
     input_files: &[std::path::PathBuf],
 ) -> Result<()> {
-    let writer = BlibWriter::create(&config.output_blib)?;
+    let mut writer = BlibWriter::create(&config.output_blib)?;
 
     // Add metadata
     writer.add_metadata("osprey_version", env!("CARGO_PKG_VERSION"))?;
@@ -2043,15 +2119,18 @@ fn write_blib_output_with_scores(
     writer.add_metadata("run_fdr", &config.run_fdr.to_string())?;
     writer.add_metadata("fdr_method", "target_decoy_competition")?;
 
-    // Add source files
-    let mut file_ids = std::collections::HashMap::new();
+    // Add source files - build lookup by filename string for matching with ScoredEntry.file_name
+    let mut file_name_to_id: HashMap<String, i64> = HashMap::new();
     for input_file in input_files {
         let file_name = input_file.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
         let file_id = writer.add_source_file(file_name)?;
-        file_ids.insert(input_file.clone(), file_id);
+        file_name_to_id.insert(file_name.to_string(), file_id);
     }
+
+    // Begin batch transaction for much faster writes
+    writer.begin_batch()?;
 
     // Write spectra for passing entries
     for scored in scored_entries {
@@ -2076,7 +2155,8 @@ fn write_blib_output_with_scores(
             .map(|(rt, c)| (*rt, *c))
             .unwrap_or((0.0, 0.0));
 
-        let file_id = *file_ids.values().next().unwrap_or(&1);
+        // Look up file_id from the entry's file_name
+        let file_id = *file_name_to_id.get(&scored.file_name).unwrap_or(&1);
 
         // Get fragment peaks from library entry
         let mzs: Vec<f64> = entry.fragments.iter().map(|f| f.mz).collect();
@@ -2099,7 +2179,7 @@ fn write_blib_output_with_scores(
             file_id,
         )?;
 
-        // Add peak boundaries
+        // Add peak boundaries - use file_name from the scored entry
         let boundaries = osprey_core::PeakBoundaries {
             start_rt,
             end_rt,
@@ -2109,17 +2189,33 @@ fn write_blib_output_with_scores(
             peak_quality: osprey_core::PeakQuality::default(),
         };
 
-        let file_name = input_files.first()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
+        writer.add_peak_boundaries(ref_id, &scored.file_name, &boundaries)?;
 
-        writer.add_peak_boundaries(ref_id, file_name, &boundaries)?;
+        // Add run scores - use run_qvalue for per-file q-value, not experiment q-value
+        // run_qvalue: per-file FDR control result
+        // experiment_qvalue: experiment-level FDR (used for filtering what goes in blib)
+        // blib_score: 1 - experiment_qvalue (used as RefSpectra.score)
+        writer.add_run_scores(
+            ref_id,
+            &scored.file_name,
+            scored.run_qvalue,      // Run-level q-value
+            scored.score,           // Discriminant score
+            scored.pep,             // Posterior error probability
+        )?;
 
-        // Add run scores
-        writer.add_run_scores(ref_id, file_name, blib_score, scored.score, scored.experiment_qvalue)?;
+        // Add experiment-level scores
+        // For now, n_runs_detected = 1 since we only have the detection from one file
+        // TODO: Track detections across files when multi-file per-file tracking is implemented
+        writer.add_experiment_scores(
+            ref_id,
+            scored.experiment_qvalue,
+            1,                      // n_runs_detected (currently always 1)
+            input_files.len() as i32, // n_runs_searched
+        )?;
     }
 
+    // Commit the batch transaction
+    writer.commit()?;
     writer.finalize()?;
 
     log::info!("Wrote {} spectra to blib", scored_entries.len());
@@ -2172,6 +2268,7 @@ fn write_scored_report(
 ///
 /// Includes BOTH targets AND decoys, which is required for Mokapot's
 /// semi-supervised learning approach.
+#[allow(dead_code)]
 fn write_pin_output(
     pin_path: &std::path::Path,
     library: &[LibraryEntry],
@@ -2214,7 +2311,7 @@ fn write_pin_output(
     mokapot_runner.write_pin(&psm_features, pin_path)?;
 
     log::info!(
-        "Wrote PIN file with {} PSMs ({} targets, {} decoys)",
+        "Wrote PIN file with {} precursors ({} targets, {} decoys)",
         psm_features.len(),
         psm_features.iter().filter(|p| !p.is_decoy).count(),
         psm_features.iter().filter(|p| p.is_decoy).count()
@@ -2231,7 +2328,7 @@ fn write_blib_output(
     results: &[RegressionResult],
     input_files: &[std::path::PathBuf],
 ) -> Result<()> {
-    let writer = BlibWriter::create(&config.output_blib)?;
+    let mut writer = BlibWriter::create(&config.output_blib)?;
 
     // Add metadata
     writer.add_metadata("osprey_version", env!("CARGO_PKG_VERSION"))?;
@@ -2249,6 +2346,9 @@ fn write_blib_output(
         let file_id = writer.add_source_file(file_name)?;
         file_ids.insert(input_file.clone(), file_id);
     }
+
+    // Begin batch transaction for much faster writes
+    writer.begin_batch()?;
 
     // Build ID-to-index map for looking up library entries
     let id_to_index: HashMap<u32, usize> = library
@@ -2363,6 +2463,8 @@ fn write_blib_output(
         }
     }
 
+    // Commit the batch transaction
+    writer.commit()?;
     writer.finalize()?;
 
     log::info!("Wrote {} spectra to blib", entry_coefficients.len());
@@ -2384,68 +2486,6 @@ fn build_mz_index(library: &[LibraryEntry]) -> HashMap<i32, Vec<usize>> {
     }
 
     index
-}
-
-/// Process a single spectrum with optional library filtering and RT calibration
-fn process_spectrum_with_filter(
-    spectrum: &Spectrum,
-    library: &[LibraryEntry],
-    library_by_mz: &HashMap<i32, Vec<usize>>,
-    matrix_builder: &DesignMatrixBuilder,
-    solver: &RidgeSolver,
-    rt_tolerance: f64,
-    max_candidates: usize,
-    library_filter: Option<&std::collections::HashSet<usize>>,
-    calibration: Option<&RTCalibration>,
-) -> Result<RegressionResult> {
-    // Select candidates based on isolation window and RT
-    let candidates = select_candidates_with_calibration(
-        spectrum,
-        library,
-        library_by_mz,
-        rt_tolerance,
-        max_candidates,
-        library_filter,
-        calibration,
-    );
-
-    if candidates.is_empty() {
-        return Ok(RegressionResult::new(
-            spectrum.scan_number,
-            spectrum.retention_time,
-        ));
-    }
-
-    // Build design matrix
-    let candidate_refs: Vec<&LibraryEntry> = candidates.iter().map(|&i| &library[i]).collect();
-    let (design_matrix, library_ids) = matrix_builder.build_with_indices(&candidate_refs);
-
-    // Bin observed spectrum
-    let observed = matrix_builder.bin_observed(spectrum);
-
-    // Solve regression
-    let coefficients = solver.solve_nonnegative(&design_matrix, &observed, None)?;
-
-    // Filter to non-zero coefficients
-    let mut result = RegressionResult::new(spectrum.scan_number, spectrum.retention_time);
-    for (id, coef) in library_ids.iter().zip(coefficients.iter()) {
-        if *coef > 1e-6 {
-            result.library_ids.push(*id);
-            result.coefficients.push(*coef);
-        }
-    }
-
-    // Compute residual and contextual metrics
-    let predicted = design_matrix.dot(&coefficients);
-    let residual = (&observed - &predicted).mapv(|x| x * x).sum();
-    result.residual = residual;
-
-    // Contextual information for feature extraction
-    result.n_candidates = candidates.len() as u32;
-    result.coefficient_sum = coefficients.iter().sum();
-    result.observed_norm = observed.dot(&observed);
-
-    Ok(result)
 }
 
 /// Select candidate library entries for a spectrum
@@ -2509,7 +2549,17 @@ fn select_candidates_with_calibration(
                     entry.retention_time
                 };
 
-                if (expected_rt - spectrum.retention_time).abs() > rt_tolerance {
+                // Use local tolerance if calibration available, otherwise global
+                let effective_tolerance = if let Some(cal) = calibration {
+                    // rt_tolerance = global_residual_sd * factor
+                    // Recover factor to apply to local residual: factor = rt_tolerance / global_residual_sd
+                    let factor = rt_tolerance / cal.residual_std().max(0.001);
+                    cal.local_tolerance(entry.retention_time, factor, 0.25)
+                } else {
+                    rt_tolerance
+                };
+
+                if (expected_rt - spectrum.retention_time).abs() > effective_tolerance {
                     continue;
                 }
 
@@ -2537,161 +2587,6 @@ fn select_candidates_with_calibration(
     }
 
     candidates
-}
-
-/// Filter library to only include peptides found in any file
-///
-/// Creates a filtered library containing only the union of peptides
-/// that passed FDR in any of the input files.
-#[allow(dead_code)]
-fn filter_library_by_detections(
-    library: &[LibraryEntry],
-    detected_lib_indices: &[usize],
-) -> Vec<LibraryEntry> {
-    // Create unique set of detected indices
-    let detected_set: std::collections::HashSet<usize> = detected_lib_indices.iter().copied().collect();
-
-    // Filter library
-    library
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| detected_set.contains(idx))
-        .map(|(_, entry)| entry.clone())
-        .collect()
-}
-
-/// Run refinement search with filtered library
-///
-/// This is Step 6 of the workflow:
-/// Repeat the search (without RT calibration) on the library filtered
-/// by the union of peptides found from the per-file analysis.
-///
-/// Benefits:
-/// - Faster because library is smaller
-/// - May improve detection in files with poor initial results
-/// - Can improve quantification by searching with focused candidates
-#[allow(dead_code)]
-fn run_refinement_search(
-    input_files: &[std::path::PathBuf],
-    filtered_library: &[LibraryEntry],
-    config: &OspreyConfig,
-) -> Result<Vec<RegressionResult>> {
-    log::info!(
-        "Starting refinement search with {} peptides (filtered library)",
-        filtered_library.len()
-    );
-
-    if filtered_library.is_empty() {
-        log::warn!("Filtered library is empty, skipping refinement search");
-        return Ok(Vec::new());
-    }
-
-    // Set up binning based on resolution mode
-    let bin_config = match config.resolution_mode {
-        ResolutionMode::UnitResolution => BinConfig::unit_resolution(),
-        ResolutionMode::HRAM => BinConfig::hram(),
-        ResolutionMode::Auto => BinConfig::unit_resolution(),
-    };
-    let binner = Binner::new(bin_config);
-    let matrix_builder = DesignMatrixBuilder::new(binner.clone());
-
-    // Get regularization lambda
-    let lambda = match &config.regularization_lambda {
-        osprey_core::RegularizationSetting::Fixed(l) => *l,
-        _ => 1.0,
-    };
-    let solver = RidgeSolver::new(lambda);
-
-    // Build filtered library index
-    let library_by_mz = build_mz_index(filtered_library);
-
-    // Get RT tolerance from config (fixed, no calibration in refinement)
-    let rt_tolerance = config.rt_calibration.rt_tolerance_factor * 2.0; // Use wider tolerance
-
-    let mut all_results: Vec<RegressionResult> = Vec::new();
-
-    // Process each file
-    for path in input_files {
-        let file_name = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-
-        log::info!("Refinement search: processing {}", file_name);
-
-        // Open mzML file
-        let reader = MzmlReader::open(path)?;
-        let spectra: Vec<Spectrum> = reader.filter_map(|r| r.ok()).collect();
-
-        if spectra.is_empty() {
-            continue;
-        }
-
-        // Process spectra with fixed RT tolerance (no calibration)
-        let results = process_spectra(
-            &spectra,
-            filtered_library,
-            &library_by_mz,
-            &matrix_builder,
-            &solver,
-            rt_tolerance,
-            config.max_candidates_per_spectrum,
-            None, // No calibration for refinement
-        )?;
-
-        log::info!(
-            "Refinement search {}: {} results from {} spectra",
-            file_name,
-            results.len(),
-            spectra.len()
-        );
-
-        all_results.extend(results);
-    }
-
-    log::info!(
-        "Refinement search complete: {} total results",
-        all_results.len()
-    );
-
-    Ok(all_results)
-}
-
-/// Get detected library indices from scored entries
-#[allow(dead_code)]
-fn get_detected_indices(scored_entries: &[ScoredEntry]) -> Vec<usize> {
-    scored_entries.iter().map(|e| e.lib_idx).collect()
-}
-
-/// Run complete two-pass analysis with optional refinement
-///
-/// This implements the full workflow:
-/// 1. Initial search with RT calibration
-/// 2. FDR control (per-file and experiment-level)
-/// 3. Optional refinement search with filtered library
-#[allow(dead_code)]
-fn run_analysis_with_refinement(
-    config: &OspreyConfig,
-    enable_refinement: bool,
-) -> Result<Vec<RegressionResult>> {
-    // Run initial analysis
-    let initial_results = run_analysis(config.clone())?;
-
-    if !enable_refinement {
-        return Ok(initial_results);
-    }
-
-    // To do refinement, we need the scored entries
-    // For now, log that refinement would happen
-    log::info!("Refinement search is enabled but requires scored entries from initial pass");
-    log::info!("Future: refinement would filter library and re-search");
-
-    // The full refinement workflow would be:
-    // 1. Get detected indices from scored_entries
-    // 2. Filter library by detected peptides
-    // 3. Run refinement search on filtered library
-    // 4. Merge results and re-compute FDR
-
-    Ok(initial_results)
 }
 
 /// Select candidate library entries for a spectrum (simple version for tests)
@@ -2973,6 +2868,7 @@ fn run_calibration_discovery_streaming(
             num_sampled_precursors: matches.len(),
             calibration_successful: true,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            isolation_scheme: None,
         },
         ms1_calibration: MzCalibration::uncalibrated(),
         ms2_calibration: MzCalibration::uncalibrated(),

@@ -24,6 +24,7 @@ import csv
 import sys
 import os
 from pathlib import Path
+import multiprocessing  # For cpu_count() if needed in future
 
 try:
     import plotly.graph_objects as go
@@ -180,6 +181,18 @@ def make_mass_accuracy_histogram(cal, level, field, color, fig, row, col, n_cols
     counts = hist["counts"]
     centers = [(edges[i] + edges[i + 1]) / 2 for i in range(len(counts))]
 
+    # Get unit from calibration (ppm or Th)
+    unit = mz_cal.get("unit", "ppm")
+    is_th = unit == "Th"
+
+    # Adjust format precision based on unit
+    if is_th:
+        hover_fmt = "%{x:.4f} Th: %{y} observations<extra></extra>"
+        val_fmt = ".4f"
+    else:
+        hover_fmt = "%{x:.2f} ppm: %{y} observations<extra></extra>"
+        val_fmt = ".3f"
+
     fig.add_trace(
         go.Bar(
             x=centers,
@@ -187,7 +200,7 @@ def make_mass_accuracy_histogram(cal, level, field, color, fig, row, col, n_cols
             marker_color=color,
             name=f"{level} Mass Error",
             showlegend=False,
-            hovertemplate="%{x:.2f} ppm: %{y} observations<extra></extra>",
+            hovertemplate=hover_fmt,
         ),
         row=row, col=col,
     )
@@ -209,17 +222,25 @@ def make_mass_accuracy_histogram(cal, level, field, color, fig, row, col, n_cols
 
     # Stats annotation box in top-right corner of the subplot
     ax = _axis_name(row, col, n_cols)
-    stats_text = (
-        f"<span style='color:red'>--- Mean: {mean_val:+.3f} ppm</span><br>"
-        f"<span style='color:green'>··· Median: {median_val:+.3f} ppm</span><br>"
-        f"SD: {sd_val:.3f} ppm<br>"
-        f"n = {count_val:,}"
-    )
+    if is_th:
+        stats_text = (
+            f"<span style='color:red'>--- Mean: {mean_val:+.4f} {unit}</span><br>"
+            f"<span style='color:green'>··· Median: {median_val:+.4f} {unit}</span><br>"
+            f"SD: {sd_val:.4f} {unit}<br>"
+            f"n = {count_val:,}"
+        )
+    else:
+        stats_text = (
+            f"<span style='color:red'>--- Mean: {mean_val:+.3f} {unit}</span><br>"
+            f"<span style='color:green'>··· Median: {median_val:+.3f} {unit}</span><br>"
+            f"SD: {sd_val:.3f} {unit}<br>"
+            f"n = {count_val:,}"
+        )
     fig.add_annotation(
         text=stats_text,
         xref=f"x{ax} domain", yref=f"y{ax} domain",
-        x=0.97, y=0.95,
-        xanchor="right", yanchor="top",
+        x=0.03, y=0.95,
+        xanchor="left", yanchor="top",
         showarrow=False,
         font=dict(size=11),
         bgcolor="rgba(255,255,255,0.9)",
@@ -228,7 +249,7 @@ def make_mass_accuracy_histogram(cal, level, field, color, fig, row, col, n_cols
         align="left",
     )
 
-    fig.update_xaxes(title_text="Mass Error (ppm)", row=row, col=col)
+    fig.update_xaxes(title_text=f"Mass Error ({unit})", row=row, col=col)
     fig.update_yaxes(title_text="Count", row=row, col=col)
 
 
@@ -397,6 +418,70 @@ def make_rt_residual_plot(cal, fig, row, col, n_cols):
     fig.update_yaxes(title_text="RT Shift (fitted \u2212 library, min)", row=row, col=col)
 
 
+def _compute_density_for_mz_bin(args):
+    """Worker function to compute candidate density for a single m/z bin.
+
+    This is a module-level function so it can be pickled for multiprocessing.
+    """
+    mz_idx, mz_center, half_iso, rt_centers, rt_tolerance, prec_mzs, prec_cal_rts = args
+
+    window_lower = mz_center - half_iso
+    window_upper = mz_center + half_iso
+
+    # Find precursors in this m/z window (vectorized)
+    in_window = (prec_mzs >= window_lower) & (prec_mzs <= window_upper)
+    window_rts = prec_cal_rts[in_window]
+
+    # For each RT bin, count candidates
+    row_counts = np.zeros(len(rt_centers), dtype=np.int32)
+    for rt_idx, spectrum_rt in enumerate(rt_centers):
+        row_counts[rt_idx] = np.sum(np.abs(window_rts - spectrum_rt) <= rt_tolerance)
+
+    return mz_idx, row_counts
+
+
+def _compute_density_vectorized(mz_centers, rt_centers, half_iso, rt_tolerance, prec_mzs, prec_cal_rts, sort_idx):
+    """Compute density matrix using sorted m/z values and binary search.
+
+    This is more efficient than the parallel approach for most cases because it
+    avoids the multiprocessing overhead and uses O(log n) binary search.
+    """
+    n_mz_bins = len(mz_centers)
+    n_rt_bins = len(rt_centers)
+    density = np.zeros((n_mz_bins, n_rt_bins), dtype=np.int32)
+
+    # Sort precursors by m/z for binary search
+    sorted_mzs = prec_mzs[sort_idx]
+    sorted_rts = prec_cal_rts[sort_idx]
+
+    for mz_idx in range(n_mz_bins):
+        mz_center = mz_centers[mz_idx]
+        window_lower = mz_center - half_iso
+        window_upper = mz_center + half_iso
+
+        # Binary search to find precursors in m/z window
+        left = np.searchsorted(sorted_mzs, window_lower, side='left')
+        right = np.searchsorted(sorted_mzs, window_upper, side='right')
+
+        if left >= right:
+            continue  # No precursors in this window
+
+        window_rts = sorted_rts[left:right]
+
+        # Vectorized RT counting for all RT bins at once
+        # Shape: (n_window_precursors, n_rt_bins)
+        rt_diffs = np.abs(window_rts[:, np.newaxis] - rt_centers[np.newaxis, :])
+        density[mz_idx, :] = np.sum(rt_diffs <= rt_tolerance, axis=0)
+
+        # Progress update
+        if (mz_idx + 1) % 10 == 0 or mz_idx == n_mz_bins - 1:
+            pct = 100.0 * (mz_idx + 1) / n_mz_bins
+            print(f"    Progress: {mz_idx + 1}/{n_mz_bins} m/z bins ({pct:.0f}%) - window {mz_center:.1f} m/z    ", end='\r')
+            sys.stdout.flush()
+
+    return density
+
+
 def make_candidate_density_heatmap(cal, precursors, isolation_width, fig, row, col, n_cols):
     """Create heatmap: RT (x) vs precursor m/z (y), color = candidate count.
 
@@ -434,52 +519,56 @@ def make_candidate_density_heatmap(cal, precursors, isolation_width, fig, row, c
     mz_centers = (mz_edges[:-1] + mz_edges[1:]) / 2
 
     # For each precursor, compute calibrated RT
-    calibrated_rts = []
-    for mz, lib_rt, charge in precursors:
-        cal_rt = predict_rt(model, lib_rt)
-        calibrated_rts.append((mz, cal_rt))
+    print(f"  Computing calibrated RTs for {len(precursors):,} precursors...")
+    sys.stdout.flush()
+    prec_mzs = np.array([p[0] for p in precursors])
+    prec_cal_rts = np.array([predict_rt(model, p[1]) for p in precursors])
 
-    # Build density matrix
-    density = np.zeros((n_mz_bins, n_rt_bins), dtype=np.int32)
+    # Sort precursors by m/z for efficient binary search
+    sort_idx = np.argsort(prec_mzs)
 
-    for rt_idx in range(n_rt_bins):
-        spectrum_rt = rt_centers[rt_idx]
-        for mz_idx in range(n_mz_bins):
-            window_lower = mz_centers[mz_idx] - half_iso
-            window_upper = mz_centers[mz_idx] + half_iso
+    # Compute density matrix using vectorized approach with binary search
+    mz_range_str = f"{mz_centers[0]:.1f}-{mz_centers[-1]:.1f} m/z"
+    print(f"  Computing density for {n_mz_bins} m/z bins ({mz_range_str})...")
+    sys.stdout.flush()
 
-            count = 0
-            for prec_mz, prec_cal_rt in calibrated_rts:
-                if window_lower <= prec_mz <= window_upper:
-                    if abs(prec_cal_rt - spectrum_rt) <= rt_tolerance:
-                        count += 1
-            density[mz_idx, rt_idx] = count
+    density = _compute_density_vectorized(
+        mz_centers, rt_centers, half_iso, rt_tolerance,
+        prec_mzs, prec_cal_rts, sort_idx
+    )
+
+    print(f"    Completed: {n_mz_bins} m/z bins                                        ")
 
     # Compute summary stats
     median_candidates = int(np.median(density[density > 0])) if np.any(density > 0) else 0
     mean_candidates = float(np.mean(density[density > 0])) if np.any(density > 0) else 0
     max_candidates = int(np.max(density))
 
+    # Apply sqrt scaling for better visualization (gentler than log2)
+    density_scaled = np.sqrt(density)
+
     ax = _axis_name(row, col, n_cols)
 
+    # Create custom hover text showing actual counts
+    hover_text = [[f"RT: {rt_centers[j]:.1f} min<br>m/z center: {mz_centers[i]:.1f}<br>Candidates: {density[i, j]}"
+                   for j in range(len(rt_centers))] for i in range(len(mz_centers))]
+
+    # Use Turbo colorscale for better color differentiation across the range
     fig.add_trace(
         go.Heatmap(
             x=np.round(rt_centers, 2).tolist(),
             y=np.round(mz_centers, 1).tolist(),
-            z=density.tolist(),
-            colorscale="Viridis",
+            z=density_scaled.tolist(),
+            colorscale="Turbo",
             colorbar=dict(
-                title="Candidates",
+                title="√count",
                 len=0.4,
                 thickness=15,
                 yanchor="bottom",
                 y=0.0,
             ),
-            hovertemplate=(
-                "RT: %{x:.1f} min<br>"
-                "m/z center: %{y:.1f}<br>"
-                "Candidates: %{z}<extra></extra>"
-            ),
+            text=hover_text,
+            hovertemplate="%{text}<extra></extra>",
         ),
         row=row, col=col,
     )
@@ -489,7 +578,8 @@ def make_candidate_density_heatmap(cal, precursors, isolation_width, fig, row, c
         f"RT tolerance: \u00b1{rt_tolerance:.2f} min<br>"
         f"Median candidates: {median_candidates}<br>"
         f"Mean candidates: {mean_candidates:.0f}<br>"
-        f"Max candidates: {max_candidates}"
+        f"Max candidates: {max_candidates}<br>"
+        f"<i>(color: √ scale)</i>"
     )
     fig.add_annotation(
         text=stats_text,
@@ -518,6 +608,7 @@ def format_metrics_table(cal):
     ms1 = cal.get("ms1_calibration", {})
     ms2 = cal.get("ms2_calibration", {})
     rt = cal.get("rt_calibration", {})
+    scheme = meta.get("isolation_scheme")
 
     rt_tolerance = max(rt.get("residual_sd", 0) * 3.0, 0.5) if rt.get("residual_sd", 0) > 0 else "N/A"
 
@@ -528,27 +619,80 @@ def format_metrics_table(cal):
         ("Confident Peptides", f"{meta.get('num_confident_peptides', 0):,}"),
         ("Sampled Precursors", f"{meta.get('num_sampled_precursors', 0):,}"),
         ("", ""),
-        ("<b>MS1 Mass Calibration</b>", ""),
-        ("Mean Error (ppm)", f"{ms1.get('mean', 0):.3f}"),
-        ("Median Error (ppm)", f"{ms1.get('median', 0):.3f}"),
-        ("SD (ppm)", f"{ms1.get('sd', 0):.3f}"),
-        ("Observations", f"{ms1.get('count', 0):,}"),
-        ("Adjusted Tolerance (ppm)", f"{ms1.get('adjusted_tolerance', 'N/A')}"),
-        ("", ""),
-        ("<b>MS2 Mass Calibration</b>", ""),
-        ("Mean Error (ppm)", f"{ms2.get('mean', 0):.3f}"),
-        ("Median Error (ppm)", f"{ms2.get('median', 0):.3f}"),
-        ("SD (ppm)", f"{ms2.get('sd', 0):.3f}"),
-        ("Observations", f"{ms2.get('count', 0):,}"),
-        ("Adjusted Tolerance (ppm)", f"{ms2.get('adjusted_tolerance', 'N/A')}"),
-        ("", ""),
+    ]
+
+    # Add isolation scheme if available
+    if scheme:
+        rows.extend([
+            ("<b>DIA Isolation Scheme</b>", ""),
+            ("Number of Windows", f"{scheme.get('num_windows', 'N/A')}"),
+            ("m/z Range", f"{scheme.get('mz_min', 0):.1f} - {scheme.get('mz_max', 0):.1f}"),
+            ("Typical Width (Da)", f"{scheme.get('typical_width', 0):.1f}"),
+            ("Uniform Width", "Yes" if scheme.get("uniform_width", False) else "No"),
+            ("", ""),
+        ])
+
+    # MS1 can be in ppm (HRAM) or Th (unit resolution)
+    ms1_unit = ms1.get("unit", "ppm")
+    ms1_is_th = ms1_unit == "Th"
+    if ms1_is_th:
+        # Th units - use 4 decimal places
+        rows.extend([
+            ("<b>MS1 Mass Calibration (Unit Resolution)</b>", ""),
+            (f"Mean Error ({ms1_unit})", f"{ms1.get('mean', 0):.4f}"),
+            (f"Median Error ({ms1_unit})", f"{ms1.get('median', 0):.4f}"),
+            (f"SD ({ms1_unit})", f"{ms1.get('sd', 0):.4f}"),
+            ("Observations", f"{ms1.get('count', 0):,}"),
+            (f"Adjusted Tolerance ({ms1_unit})", f"{ms1.get('adjusted_tolerance', 'N/A'):.4f}" if ms1.get('adjusted_tolerance') else "N/A"),
+            ("", ""),
+        ])
+    else:
+        # ppm units - use 3 decimal places
+        rows.extend([
+            ("<b>MS1 Mass Calibration</b>", ""),
+            (f"Mean Error ({ms1_unit})", f"{ms1.get('mean', 0):.3f}"),
+            (f"Median Error ({ms1_unit})", f"{ms1.get('median', 0):.3f}"),
+            (f"SD ({ms1_unit})", f"{ms1.get('sd', 0):.3f}"),
+            ("Observations", f"{ms1.get('count', 0):,}"),
+            (f"Adjusted Tolerance ({ms1_unit})", f"{ms1.get('adjusted_tolerance', 'N/A')}"),
+            ("", ""),
+        ])
+
+    # MS2 can be in ppm (HRAM) or Th (unit resolution)
+    ms2_unit = ms2.get("unit", "ppm")
+    is_th = ms2_unit == "Th"
+    if is_th:
+        # Th units - use 4 decimal places
+        rows.extend([
+            ("<b>MS2 Mass Calibration (Unit Resolution)</b>", ""),
+            (f"Mean Error ({ms2_unit})", f"{ms2.get('mean', 0):.4f}"),
+            (f"Median Error ({ms2_unit})", f"{ms2.get('median', 0):.4f}"),
+            (f"SD ({ms2_unit})", f"{ms2.get('sd', 0):.4f}"),
+            ("Observations", f"{ms2.get('count', 0):,}"),
+            (f"Adjusted Tolerance ({ms2_unit})", f"{ms2.get('adjusted_tolerance', 'N/A'):.4f}" if ms2.get('adjusted_tolerance') else "N/A"),
+            ("", ""),
+        ])
+    else:
+        # ppm units - use 3 decimal places
+        rows.extend([
+            ("<b>MS2 Mass Calibration</b>", ""),
+            (f"Mean Error ({ms2_unit})", f"{ms2.get('mean', 0):.3f}"),
+            (f"Median Error ({ms2_unit})", f"{ms2.get('median', 0):.3f}"),
+            (f"SD ({ms2_unit})", f"{ms2.get('sd', 0):.3f}"),
+            ("Observations", f"{ms2.get('count', 0):,}"),
+            (f"Adjusted Tolerance ({ms2_unit})", f"{ms2.get('adjusted_tolerance', 'N/A')}"),
+            ("", ""),
+        ])
+
+    # RT Calibration
+    rows.extend([
         ("<b>RT Calibration</b>", ""),
         ("Method", rt.get("method", "N/A")),
         ("Calibration Points", f"{rt.get('n_points', 0):,}"),
         ("R-squared", f"{rt.get('r_squared', 0):.6f}"),
         ("Residual SD (min)", f"{rt.get('residual_sd', 0):.4f}"),
         ("RT Tolerance (3x SD, min)", f"{rt_tolerance:.4f}" if isinstance(rt_tolerance, float) else rt_tolerance),
-    ]
+    ])
 
     html = '<table class="metrics-table">\n'
     for label, value in rows:
@@ -824,8 +968,8 @@ Examples:
     parser.add_argument(
         "--isolation-width",
         type=float,
-        default=8.0,
-        help="DIA isolation window width in Da (default: 8)",
+        default=None,
+        help="DIA isolation window width in Da (auto-detected from calibration if available)",
     )
     parser.add_argument(
         "--output", "-o",
@@ -865,8 +1009,26 @@ Examples:
             except Exception as e:
                 print(f"Warning: Failed to load library: {e}", file=sys.stderr)
 
-    generate_report(calibrations, precursors, args.isolation_width, args.output)
+    # Determine isolation width: use calibration file if available, else CLI arg, else default
+    isolation_width = args.isolation_width
+    if isolation_width is None:
+        # Try to get from first calibration file
+        for cal in calibrations:
+            scheme = cal.get("metadata", {}).get("isolation_scheme")
+            if scheme:
+                isolation_width = scheme.get("typical_width", 8.0)
+                print(f"Using isolation width from calibration: {isolation_width:.1f} Da "
+                      f"({scheme.get('num_windows', '?')} windows, "
+                      f"{scheme.get('mz_min', 0):.0f}-{scheme.get('mz_max', 0):.0f} m/z)")
+                break
+        if isolation_width is None:
+            isolation_width = 8.0
+            print(f"Warning: No isolation scheme in calibration file, using default {isolation_width} Da")
+
+    generate_report(calibrations, precursors, isolation_width, args.output)
 
 
 if __name__ == "__main__":
+    # Required for Windows multiprocessing support
+    multiprocessing.freeze_support()
     main()

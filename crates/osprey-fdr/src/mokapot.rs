@@ -59,17 +59,26 @@ pub struct MokapotRunner {
     max_iter: u32,
     /// Random seed
     seed: u64,
+    /// Number of parallel workers for cross-validation
+    num_workers: u32,
 }
 
 impl MokapotRunner {
     /// Create a new mokapot runner with default settings
     pub fn new() -> Self {
+        // Default to number of CPUs, capped at 8 to avoid memory issues
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(4);
+        let num_workers = num_cpus.min(8);
+
         Self {
             mokapot_path: "mokapot".to_string(),
             train_fdr: 0.01,
             test_fdr: 0.01,
             max_iter: 10,
             seed: 42,
+            num_workers,
         }
     }
 
@@ -88,6 +97,18 @@ impl MokapotRunner {
     /// Set test FDR threshold
     pub fn with_test_fdr(mut self, fdr: f64) -> Self {
         self.test_fdr = fdr;
+        self
+    }
+
+    /// Set number of parallel workers
+    pub fn with_num_workers(mut self, n: u32) -> Self {
+        self.num_workers = n;
+        self
+    }
+
+    /// Set maximum iterations
+    pub fn with_max_iter(mut self, n: u32) -> Self {
+        self.max_iter = n;
         self
     }
 
@@ -156,7 +177,13 @@ impl MokapotRunner {
         })?;
 
         // Build mokapot command
-        let output = Command::new(&self.mokapot_path)
+        log::info!(
+            "Running mokapot with {} workers, {} max iterations",
+            self.num_workers, self.max_iter
+        );
+
+        // Use spawn() to stream output instead of output() which blocks
+        let mut child = Command::new(&self.mokapot_path)
             .arg(pin_path)
             .arg("--dest_dir")
             .arg(out_path)
@@ -168,7 +195,14 @@ impl MokapotRunner {
             .arg(self.max_iter.to_string())
             .arg("--seed")
             .arg(self.seed.to_string())
-            .output()
+            .arg("--max_workers")
+            .arg(self.num_workers.to_string())
+            .arg("--verbosity")
+            .arg("1")
+            .arg("--save_models")  // Save model weights to inspect feature importance
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| {
                 OspreyError::ExternalToolError(format!(
                     "Failed to run mokapot: {}. Is mokapot installed? Try: pip install mokapot",
@@ -176,12 +210,39 @@ impl MokapotRunner {
                 ))
             })?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // Stream stderr (mokapot writes progress to stderr)
+        if let Some(stderr) = child.stderr.take() {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    // Log mokapot output so user can see progress
+                    if line.contains("INFO") || line.contains("iter") || line.contains("Iteration") {
+                        log::info!("[mokapot] {}", line);
+                    } else if !line.trim().is_empty() {
+                        log::debug!("[mokapot] {}", line);
+                    }
+                }
+            }
+        }
+
+        let status = child.wait().map_err(|e| {
+            OspreyError::ExternalToolError(format!("Failed to wait for mokapot: {}", e))
+        })?;
+
+        if !status.success() {
             return Err(OspreyError::ExternalToolError(format!(
-                "Mokapot failed: {}",
-                stderr
+                "Mokapot failed with exit code: {:?}",
+                status.code()
             )));
+        }
+
+        // Log model weights file location
+        let model_file = out_path.join("mokapot.model.pkl");
+        if model_file.exists() {
+            log::info!(
+                "Mokapot model saved to: {} (use scripts/inspect_mokapot_weights.py to view feature weights)",
+                model_file.display()
+            );
         }
 
         // Parse results
@@ -276,6 +337,7 @@ results, models = mokapot.brew(
     test_fdr={test_fdr},
     max_iter={max_iter},
     rng={seed},
+    n_jobs={num_workers},
 )
 
 # Write results
@@ -287,6 +349,7 @@ print("SUCCESS")
             test_fdr = self.test_fdr,
             max_iter = self.max_iter,
             seed = self.seed,
+            num_workers = self.num_workers,
             output_dir = out_path.display(),
         );
 
@@ -320,38 +383,44 @@ impl Default for MokapotRunner {
 }
 
 /// Get the feature header for PIN format
+///
+/// Features are grouped by source:
+/// - Ridge regression (chromatographic): peak_apex, peak_area, peak_width,
+///   n_contributing_scans, coefficient_stability, relative_coefficient, explained_intensity
+/// - Spectral matching (mixed, at apex): hyperscore, xcorr, dot_product, dot_product_smz,
+///   fragment_coverage, sequence_coverage, consecutive_ions, top3_matches
+/// - Spectral matching (deconvoluted, apex ± 2): *_deconv versions
+/// - Derived: rt_deviation
 fn get_feature_header() -> String {
     [
+        // Ridge regression features (chromatographic profile)
         "peak_apex",
         "peak_area",
-        "emg_fit_quality",
         "peak_width",
-        "peak_symmetry",
-        "rt_deviation",
-        "rt_deviation_normalized",
         "n_contributing_scans",
         "coefficient_stability",
-        "peak_sharpness",
-        "peak_prominence",
+        "relative_coefficient",
+        "explained_intensity",
+        // Spectral matching features (mixed/observed at apex spectrum)
         "hyperscore",
         "xcorr",
-        "spectral_contrast_angle",
         "dot_product",
         "dot_product_smz",
-        "pearson_correlation",
-        "spearman_correlation",
         "fragment_coverage",
         "sequence_coverage",
         "consecutive_ions",
-        "base_peak_rank",
         "top3_matches",
-        "explained_intensity",
-        "n_competitors",
-        "relative_coefficient",
-        "local_peptide_density",
-        "spectral_complexity",
-        "regression_residual",
-        "modification_count",
+        // Spectral matching features (deconvoluted, coefficient-weighted apex ± 2 scans)
+        "hyperscore_deconv",
+        "xcorr_deconv",
+        "dot_product_deconv",
+        "dot_product_smz_deconv",
+        "fragment_coverage_deconv",
+        "sequence_coverage_deconv",
+        "consecutive_ions_deconv",
+        "top3_matches_deconv",
+        // Derived features
+        "rt_deviation",
     ]
     .join("\t")
 }
@@ -359,37 +428,35 @@ fn get_feature_header() -> String {
 /// Format features for PIN output
 fn format_features(features: &FeatureSet) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        // Ridge regression features (chromatographic profile)
         features.peak_apex,
         features.peak_area,
-        features.emg_fit_quality,
         features.peak_width,
-        features.peak_symmetry,
-        features.rt_deviation,
-        features.rt_deviation_normalized,
         features.n_contributing_scans,
         features.coefficient_stability,
-        features.peak_sharpness,
-        features.peak_prominence,
+        features.relative_coefficient,
+        features.explained_intensity,
+        // Spectral matching features (mixed/observed at apex spectrum)
         features.hyperscore,
         features.xcorr,
-        features.spectral_contrast_angle,
         features.dot_product,
         features.dot_product_smz,
-        features.pearson_correlation,
-        features.spearman_correlation,
         features.fragment_coverage,
         features.sequence_coverage,
         features.consecutive_ions,
-        features.base_peak_rank,
         features.top3_matches,
-        features.explained_intensity,
-        features.n_competitors,
-        features.relative_coefficient,
-        features.local_peptide_density,
-        features.spectral_complexity,
-        features.regression_residual,
-        features.modification_count,
+        // Spectral matching features (deconvoluted, coefficient-weighted apex ± 2 scans)
+        features.hyperscore_deconv,
+        features.xcorr_deconv,
+        features.dot_product_deconv,
+        features.dot_product_smz_deconv,
+        features.fragment_coverage_deconv,
+        features.sequence_coverage_deconv,
+        features.consecutive_ions_deconv,
+        features.top3_matches_deconv,
+        // Derived features
+        features.rt_deviation,
     )
 }
 

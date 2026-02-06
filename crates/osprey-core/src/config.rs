@@ -97,7 +97,7 @@ impl Default for OspreyConfig {
             custom_bin_width: None,
             fragment_tolerance: FragmentToleranceConfig::default(), // 10 ppm for HRAM
             precursor_tolerance: FragmentToleranceConfig::hram(10.0), // 10 ppm for precursor
-            max_candidates_per_spectrum: 200,
+            max_candidates_per_spectrum: 500,
             rt_calibration: RTCalibrationConfig::default(),
             regularization_lambda: RegularizationSetting::CrossValidated,
             max_iterations: 1000,
@@ -218,7 +218,7 @@ precursor_tolerance:
   unit: Ppm
 
 # Candidate selection (precursor filtering uses isolation window from mzML)
-max_candidates_per_spectrum: 200
+max_candidates_per_spectrum: 500
 
 # RT Calibration
 # Samples a subset of peptides for fast calibration
@@ -305,6 +305,12 @@ streaming: false  # Use streaming mode for memory-efficient processing (requires
         if args.streaming {
             self.streaming = true;
         }
+        if let Some(tol) = args.fragment_tolerance {
+            self.fragment_tolerance.tolerance = tol;
+        }
+        if let Some(unit) = args.fragment_unit {
+            self.fragment_tolerance.unit = unit;
+        }
     }
 }
 
@@ -322,6 +328,8 @@ pub struct ConfigOverrides {
     pub verbose: bool,
     pub disable_rt_calibration: bool,
     pub streaming: bool,
+    pub fragment_tolerance: Option<f64>,
+    pub fragment_unit: Option<ToleranceUnit>,
 }
 
 /// Two-step search configuration
@@ -520,7 +528,7 @@ impl FragmentToleranceConfig {
     pub fn unit_resolution(da: f64) -> Self {
         Self {
             tolerance: da,
-            unit: ToleranceUnit::Da,
+            unit: ToleranceUnit::Mz,
         }
     }
 
@@ -528,7 +536,7 @@ impl FragmentToleranceConfig {
     pub fn tolerance_da(&self, mz: f64) -> f64 {
         match self.unit {
             ToleranceUnit::Ppm => mz * self.tolerance / 1e6,
-            ToleranceUnit::Da => self.tolerance,
+            ToleranceUnit::Mz => self.tolerance,
         }
     }
 
@@ -540,7 +548,7 @@ impl FragmentToleranceConfig {
                 let ppm_error = delta / lib_mz * 1e6;
                 ppm_error <= self.tolerance
             }
-            ToleranceUnit::Da => delta <= self.tolerance,
+            ToleranceUnit::Mz => delta <= self.tolerance,
         }
     }
 
@@ -549,7 +557,7 @@ impl FragmentToleranceConfig {
         let delta = obs_mz - lib_mz;
         match self.unit {
             ToleranceUnit::Ppm => delta / lib_mz * 1e6,
-            ToleranceUnit::Da => delta,
+            ToleranceUnit::Mz => delta,
         }
     }
 }
@@ -557,10 +565,11 @@ impl FragmentToleranceConfig {
 /// Tolerance unit for m/z matching
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToleranceUnit {
-    /// Parts per million
+    /// Parts per million (relative to m/z)
     Ppm,
-    /// Daltons (m/z units)
-    Da,
+    /// m/z units (Thomson, Th) - absolute tolerance in mass-to-charge
+    #[serde(alias = "Da")]  // Accept "Da" for backwards compatibility
+    Mz,
 }
 
 /// Spectral library source
@@ -797,7 +806,7 @@ mod tests {
     fn test_fragment_tolerance_da() {
         let config = FragmentToleranceConfig::unit_resolution(0.3);
         assert_eq!(config.tolerance, 0.3);
-        assert_eq!(config.unit, ToleranceUnit::Da);
+        assert_eq!(config.unit, ToleranceUnit::Mz);
 
         // Test tolerance_da (should be constant)
         assert!((config.tolerance_da(500.0) - 0.3).abs() < 1e-10);

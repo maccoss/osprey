@@ -2,6 +2,20 @@
 
 This folder contains detailed documentation of the algorithms used in Osprey, a peptide-centric DIA analysis tool that uses ridge regression to deconvolute mixed MS/MS spectra.
 
+## Current Status (Working Prototype)
+
+Osprey has a **working prototype** that can:
+- Parse mzML files with DIA data
+- Load spectral libraries (DIA-NN TSV, EncyclopeDIA elib, BiblioSpec blib)
+- Generate enzyme-aware decoys
+- Run auto-calibration with target-decoy FDR control
+- Perform ridge regression spectrum deconvolution
+- Extract 30 features per precursor
+- Run Mokapot semi-supervised FDR control
+- Output BiblioSpec .blib files for Skyline
+
+**Recent test run**: 76,169 precursors at 1% FDR from a single Astral file.
+
 ## Algorithm Documentation
 
 | Document | Description |
@@ -14,6 +28,7 @@ This folder contains detailed documentation of the algorithms used in Osprey, a 
 | [Ridge Regression](ridge-regression.md) | NNLS ridge regression for spectrum deconvolution |
 | [Peak Detection](peak-detection.md) | Chromatographic peak detection in coefficient time series |
 | [Decoy Generation](decoy-generation.md) | Enzyme-aware sequence reversal for FDR control |
+| [FDR Control](fdr-control.md) | Two-level FDR with Mokapot integration |
 
 ---
 
@@ -53,25 +68,95 @@ PHASE 3: RIDGE REGRESSION (all files, per spectrum)
   └─ Output: coefficients per candidate per spectrum
   │
   ▼
-PHASE 4: POST-REGRESSION SCORING (per peptide)
-  ├─ Aggregate coefficients into time series per peptide
+PHASE 4: POST-REGRESSION SCORING (per precursor)
+  ├─ Aggregate coefficients into time series per precursor
   ├─ Peak detection → apex RT, boundaries
-  ├─ Score at apex (all features computed here):
-  │     ├─ LibCosine (sqrt preprocessing)
-  │     ├─ LibCosine SMZ (sqrt × mz² preprocessing)
-  │     ├─ XCorr (Comet-style)
-  │     ├─ X!Tandem Hyperscore
-  │     ├─ Delta RT (observed - predicted)
-  │     ├─ Chromatographic features (peak shape)
-  │     └─ Contextual features (regression quality)
+  ├─ Score at apex (all 30 features computed here):
+  │     ├─ Spectral scores (dot_product, xcorr, hyperscore, etc.)
+  │     ├─ Chromatographic features (peak shape, width, symmetry)
+  │     └─ Contextual features (competitors, regression quality)
   ├─ Write PIN file (targets + decoys, 30 features)
   └─ Mokapot semi-supervised FDR → q-values
   │
   ▼
 OUTPUT
   ├─ BiblioSpec (.blib) for Skyline
-  └─ TSV report
+  ├─ Mokapot model weights (.pkl) for feature analysis
+  └─ TSV report (optional)
 ```
+
+---
+
+## Feature Set (30 Features for Mokapot)
+
+Osprey extracts 30 features per precursor for semi-supervised FDR control:
+
+### Chromatographic Features (12)
+| Feature | Description |
+|---------|-------------|
+| `peak_apex` | Peak apex coefficient (maximum deconvolution value) |
+| `peak_area` | Integrated peak area (AUC of coefficients) |
+| `emg_fit_quality` | EMG fit quality (R²) |
+| `peak_width` | Peak width (FWHM in minutes) |
+| `peak_symmetry` | Peak symmetry (leading/trailing ratio) |
+| `rt_deviation` | RT deviation from prediction (minutes) |
+| `rt_deviation_normalized` | Normalized RT deviation |
+| `n_contributing_scans` | Number of scans contributing to peak |
+| `coefficient_stability` | Coefficient variance near apex |
+| `peak_sharpness` | Peak boundary sharpness |
+| `peak_prominence` | Peak prominence (apex / baseline) |
+| `modification_count` | Number of modifications |
+
+### Spectral Features (13)
+| Feature | Description |
+|---------|-------------|
+| `hyperscore` | X!Tandem-style: log(n_b!) + log(n_y!) + Σlog(I+1) |
+| `xcorr` | Comet-style cross-correlation |
+| `spectral_contrast_angle` | Normalized spectral contrast angle |
+| `dot_product` | LibCosine with sqrt preprocessing |
+| `dot_product_smz` | LibCosine with sqrt×mz² (SMZ) preprocessing |
+| `pearson_correlation` | Pearson intensity correlation |
+| `spearman_correlation` | Spearman rank correlation |
+| `fragment_coverage` | Fraction of predicted fragments detected |
+| `sequence_coverage` | Backbone coverage |
+| `consecutive_ions` | Longest consecutive b/y ion run |
+| `base_peak_rank` | Rank of base peak in predicted |
+| `top3_matches` | Number of top-3 predicted fragments matched |
+| `explained_intensity` | Fraction of observed intensity explained |
+
+### Contextual Features (5)
+| Feature | Description |
+|---------|-------------|
+| `n_competitors` | Number of competing candidates in regression |
+| `relative_coefficient` | Coefficient relative to sum of all |
+| `local_peptide_density` | Local peptide density (candidates per window) |
+| `spectral_complexity` | Spectral complexity estimate |
+| `regression_residual` | Regression residual (unexplained signal) |
+
+---
+
+## FDR Control
+
+Osprey uses **two-level FDR control** via Mokapot:
+
+### Run-Level FDR (Step 1)
+- Per-file target-decoy competition
+- All 30 features passed to Mokapot
+- Mokapot trains linear SVM to combine features
+- Q-values assigned per precursor
+
+### Experiment-Level FDR (Step 2)
+- Aggregate best precursor across replicates
+- Only runs if multiple replicates provided
+- Single replicate skips to run-level results
+- Precursor = peptide + charge (not just peptide)
+
+### Mokapot Integration
+- PIN file format with 30 features
+- `--save_models` flag saves feature weights
+- Use `scripts/inspect_mokapot_weights.py` to view feature importance
+- Parallel workers (auto-detected, capped at 8)
+- Progress streaming to console
 
 ---
 
@@ -96,6 +181,7 @@ See: [Spectral Scoring](spectral-scoring.md), [XCorr Scoring](xcorr-scoring.md)
 - **RT calibration curve** (LOESS): Maps library RT → expected measured RT
 - **RT tolerance**: Residual SD × 3 (typically 0.5-2 min)
 - **Mass calibration**: Mean/median PPM error for MS1 and MS2
+- **Isolation scheme**: DIA window widths extracted from mzML
 
 See: [RT Calibration](rt-calibration.md), [Mass Calibration](mass-calibration.md)
 
@@ -126,7 +212,7 @@ See: [Ridge Regression](ridge-regression.md)
 
 ## Phase 4: Post-Regression Scoring
 
-After ridge regression assigns coefficients to all peptides across all spectra, Osprey aggregates these into coefficient time series per peptide and computes scoring features. **All scores are computed at the apex** -- the RT where the deconvoluted signal is strongest.
+After ridge regression assigns coefficients to all precursors across all spectra, Osprey aggregates these into coefficient time series per precursor and computes scoring features. **All scores are computed at the apex** -- the RT where the deconvoluted signal is strongest.
 
 ### Step 1: Coefficient Time Series
 
@@ -167,7 +253,9 @@ All 30 features for both targets and decoys are written to a PIN file. Mokapot p
 
 **Two-level FDR**:
 1. **Run-level**: Per-file FDR control
-2. **Experiment-level**: Best PSM per peptide across all files
+2. **Experiment-level**: Best precursor per peptide+charge across all files
+
+See: [FDR Control](fdr-control.md)
 
 ---
 
@@ -177,12 +265,12 @@ All 30 features for both targets and decoys are written to a PIN file. Mokapot p
 |--------|----------------------|---------------------------|
 | **Purpose** | Establish RT/mass calibration | Determine peptide detections |
 | **Uses regression?** | No | Yes (scores the deconvoluted result) |
-| **Primary score** | LibCosine (with XCorr for RT) | All 5 spectral scores + features |
+| **Primary score** | LibCosine (with XCorr for RT) | All 30 features |
 | **Fragment matching** | ppm-based (pyXcorrDIA-style) | ppm-based at apex spectrum |
 | **FDR method** | Simple target-decoy (1% for calibration) | Mokapot semi-supervised ML |
 | **Output** | RT curve + mass calibration | Peptide detections with q-values |
 | **Scope** | First file only, wide tolerance | All files, tight calibrated tolerance |
-| **Speed** | BLAS-accelerated batch scoring | Per-peptide feature extraction |
+| **Speed** | BLAS-accelerated batch scoring | Per-precursor feature extraction |
 
 ---
 
@@ -246,6 +334,36 @@ osprey/
     ├── main.rs               # CLI entry point
     └── pipeline.rs           # Analysis pipeline orchestration
 ```
+
+## Utility Scripts
+
+```
+scripts/
+├── evaluate_calibration.py      # Generate HTML report from calibration JSON
+├── inspect_mokapot_weights.py   # Display Mokapot feature weights/importance
+└── ...
+```
+
+### evaluate_calibration.py
+
+Generates an interactive HTML report visualizing calibration quality:
+- RT calibration curve with residuals
+- MS1/MS2 mass error histograms
+- Candidate density heatmap (RT × m/z)
+
+```bash
+python scripts/evaluate_calibration.py calibration.json --output report.html
+```
+
+### inspect_mokapot_weights.py
+
+Displays feature weights from trained Mokapot models to identify important features:
+
+```bash
+python scripts/inspect_mokapot_weights.py mokapot.model.pkl
+```
+
+---
 
 ## Configuration
 

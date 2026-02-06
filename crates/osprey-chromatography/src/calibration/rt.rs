@@ -143,18 +143,20 @@ impl RTCalibrator {
             final_fitted = self.loess_fit(&x, &y, Some(&weights))?;
         }
 
-        // Compute residual standard deviation
+        // Compute residuals and absolute residuals
         let residuals: Vec<f64> = y
             .iter()
             .zip(final_fitted.iter())
             .map(|(obs, pred)| obs - pred)
             .collect();
+        let abs_residuals: Vec<f64> = residuals.iter().map(|r| r.abs()).collect();
         let residual_std = std_dev(&residuals);
 
         Ok(RTCalibration {
             library_rts: x,
             measured_rts: y,
             fitted_values: final_fitted,
+            abs_residuals,
             bandwidth: self.config.bandwidth,
             degree: self.config.degree,
             residual_std,
@@ -320,6 +322,8 @@ pub struct RTCalibration {
     measured_rts: Vec<f64>,
     /// Fitted values at training points
     fitted_values: Vec<f64>,
+    /// Absolute residuals at each calibration point (for local tolerance)
+    abs_residuals: Vec<f64>,
     /// Bandwidth used for fitting (stored for stats/debugging)
     #[allow(dead_code)]
     bandwidth: f64,
@@ -382,6 +386,67 @@ impl RTCalibration {
     /// This can be used to set adaptive RT tolerance (e.g., 3× residual_std)
     pub fn residual_std(&self) -> f64 {
         self.residual_std
+    }
+
+    /// Get local RT tolerance at a given library RT
+    ///
+    /// Interpolates absolute residuals from calibration points and applies
+    /// smoothing to reduce noise from individual outliers.
+    ///
+    /// # Arguments
+    /// * `library_rt` - The library retention time to query
+    /// * `factor` - Multiplier for the local residual (typically 3.0)
+    /// * `min_tolerance` - Minimum tolerance floor in minutes
+    ///
+    /// # Returns
+    /// The local RT tolerance in minutes
+    pub fn local_tolerance(&self, library_rt: f64, factor: f64, min_tolerance: f64) -> f64 {
+        let local_residual = self.interpolate_abs_residual(library_rt);
+        (local_residual * factor).max(min_tolerance)
+    }
+
+    /// Interpolate absolute residual at a query library RT
+    ///
+    /// Uses the same interpolation logic as predict(), but operates on
+    /// smoothed absolute residuals instead of fitted values.
+    fn interpolate_abs_residual(&self, library_rt: f64) -> f64 {
+        let n = self.library_rts.len();
+        if n == 0 {
+            return self.residual_std;
+        }
+
+        // Find position in sorted array
+        let idx = self
+            .library_rts
+            .binary_search_by(|&x| x.total_cmp(&library_rt))
+            .unwrap_or_else(|i| i);
+
+        if idx == 0 {
+            // Extrapolate below range - use smoothed residual at first point
+            self.smoothed_abs_residual(0)
+        } else if idx >= n {
+            // Extrapolate above range - use smoothed residual at last point
+            self.smoothed_abs_residual(n - 1)
+        } else {
+            // Interpolate between idx-1 and idx using smoothed residuals
+            let x0 = self.library_rts[idx - 1];
+            let x1 = self.library_rts[idx];
+            let r0 = self.smoothed_abs_residual(idx - 1);
+            let r1 = self.smoothed_abs_residual(idx);
+
+            let t = (library_rt - x0) / (x1 - x0);
+            r0 + t * (r1 - r0)
+        }
+    }
+
+    /// Get smoothed absolute residual at a given index
+    ///
+    /// Averages residuals over ±2 neighbors to reduce noise from outliers.
+    fn smoothed_abs_residual(&self, idx: usize) -> f64 {
+        let start = idx.saturating_sub(2);
+        let end = (idx + 3).min(self.abs_residuals.len());
+        let sum: f64 = self.abs_residuals[start..end].iter().sum();
+        sum / (end - start) as f64
     }
 
     /// Get the range of library RTs used for calibration
@@ -448,12 +513,13 @@ impl RTCalibration {
 
     /// Export model parameters for serialization
     ///
-    /// Returns the library RTs and fitted values which can be used
-    /// to reconstruct the calibration curve via interpolation.
+    /// Returns the library RTs, fitted values, and absolute residuals which
+    /// can be used to reconstruct the calibration curve via interpolation.
     pub fn export_model_params(&self) -> RTModelParams {
         RTModelParams {
             library_rts: self.library_rts.clone(),
             fitted_rts: self.fitted_values.clone(),
+            abs_residuals: self.abs_residuals.clone(),
         }
     }
 
@@ -494,11 +560,20 @@ impl RTCalibration {
             ));
         }
 
+        // Handle backwards compatibility: if abs_residuals not present or wrong length,
+        // use uniform residual_std as fallback
+        let abs_residuals = if params.abs_residuals.len() == params.library_rts.len() {
+            params.abs_residuals.clone()
+        } else {
+            vec![residual_std; params.library_rts.len()]
+        };
+
         Ok(Self {
             library_rts: params.library_rts.clone(),
             // measured_rts not available from params, use fitted values as placeholder
             measured_rts: params.fitted_rts.clone(),
             fitted_values: params.fitted_rts.clone(),
+            abs_residuals,
             bandwidth: 0.3, // Default value, not used for prediction
             degree: 1,      // Default value, not used for prediction
             residual_std,
@@ -743,5 +818,100 @@ mod tests {
         let vals = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
         let sd = std_dev(&vals);
         assert!((sd - 2.138).abs() < 0.01, "std dev should be ~2.138, got {}", sd);
+    }
+
+    #[test]
+    fn test_local_tolerance_varies_with_rt() {
+        // Create calibration with varying residuals: small at early RT, large at late RT
+        // Simulate a case where early RTs have better prediction accuracy
+        let library_rts: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        // Add noise that increases with RT
+        let measured_rts: Vec<f64> = library_rts.iter()
+            .map(|&x| x + 0.1 * (x / 10.0).sin() * (x / 50.0 + 0.1))
+            .collect();
+
+        let calibrator = RTCalibrator::new().with_bandwidth(0.3);
+        let calibration = calibrator.fit(&library_rts, &measured_rts).unwrap();
+
+        // Check that local tolerances are computed
+        let tol_early = calibration.local_tolerance(5.0, 3.0, 0.25);
+        let tol_late = calibration.local_tolerance(45.0, 3.0, 0.25);
+
+        // Both should be at least the minimum floor
+        assert!(tol_early >= 0.25, "Early tolerance should be at least 0.25");
+        assert!(tol_late >= 0.25, "Late tolerance should be at least 0.25");
+    }
+
+    #[test]
+    fn test_local_tolerance_minimum_floor() {
+        // Create calibration with very small residuals
+        let library_rts: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        // Nearly perfect fit - almost no residuals
+        let measured_rts: Vec<f64> = library_rts.iter().map(|&x| x + 0.001).collect();
+
+        let calibrator = RTCalibrator::new().with_bandwidth(0.3);
+        let calibration = calibrator.fit(&library_rts, &measured_rts).unwrap();
+
+        // Local tolerance should respect minimum floor
+        let tol = calibration.local_tolerance(25.0, 3.0, 0.25);
+        assert!((tol - 0.25).abs() < 0.01, "Tolerance should be at minimum floor 0.25, got {}", tol);
+    }
+
+    #[test]
+    fn test_local_tolerance_extrapolation() {
+        // Test extrapolation outside calibration range
+        let library_rts: Vec<f64> = (10..40).map(|i| i as f64).collect();
+        let measured_rts: Vec<f64> = library_rts.iter().map(|&x| x + 0.5).collect();
+
+        let calibrator = RTCalibrator::new().with_bandwidth(0.3);
+        let calibration = calibrator.fit(&library_rts, &measured_rts).unwrap();
+
+        // Query outside range - should use endpoint residual
+        let tol_below = calibration.local_tolerance(5.0, 3.0, 0.25);
+        let tol_above = calibration.local_tolerance(50.0, 3.0, 0.25);
+
+        // Both should be valid (at least minimum floor)
+        assert!(tol_below >= 0.25, "Below-range tolerance should be at least 0.25");
+        assert!(tol_above >= 0.25, "Above-range tolerance should be at least 0.25");
+    }
+
+    #[test]
+    fn test_model_params_roundtrip_with_abs_residuals() {
+        // Test that abs_residuals are preserved through export/import
+        let library_rts: Vec<f64> = (0..30).map(|i| i as f64).collect();
+        let measured_rts: Vec<f64> = library_rts.iter().map(|&x| x + 0.3 * (x / 15.0).sin()).collect();
+
+        let calibrator = RTCalibrator::new().with_bandwidth(0.3);
+        let calibration = calibrator.fit(&library_rts, &measured_rts).unwrap();
+
+        // Export model params
+        let params = calibration.export_model_params();
+        assert_eq!(params.abs_residuals.len(), params.library_rts.len(), "abs_residuals should have same length as library_rts");
+
+        // Reconstruct calibration
+        let reconstructed = RTCalibration::from_model_params(&params, calibration.residual_std()).unwrap();
+
+        // Check that local_tolerance works on reconstructed calibration
+        let orig_tol = calibration.local_tolerance(15.0, 3.0, 0.25);
+        let recon_tol = reconstructed.local_tolerance(15.0, 3.0, 0.25);
+        assert!((orig_tol - recon_tol).abs() < 0.01, "Reconstructed calibration should give same local tolerance");
+    }
+
+    #[test]
+    fn test_backwards_compatibility_no_abs_residuals() {
+        // Test loading old model params without abs_residuals
+        let params = RTModelParams {
+            library_rts: vec![0.0, 10.0, 20.0, 30.0],
+            fitted_rts: vec![1.0, 11.0, 21.0, 31.0],
+            abs_residuals: vec![], // Empty - simulating old format
+        };
+
+        let residual_std = 0.5;
+        let calibration = RTCalibration::from_model_params(&params, residual_std).unwrap();
+
+        // Should fall back to uniform residual_std for local tolerance
+        let tol = calibration.local_tolerance(15.0, 3.0, 0.25);
+        // Expected: residual_std * factor = 0.5 * 3.0 = 1.5
+        assert!((tol - 1.5).abs() < 0.01, "Should use uniform residual_std when abs_residuals empty, got {}", tol);
     }
 }
