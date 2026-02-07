@@ -160,10 +160,13 @@ The primary output is a SQLite database in BiblioSpec format, compatible with Sk
 
 - **RefSpectra**: Detected peptides with consensus spectra
 - **RefSpectraPeaks**: Fragment m/z and intensities
+- **Modifications**: Modification positions and masses
+- **Proteins/RefSpectraProteins**: Protein accessions and mappings
 - **OspreyPeakBoundaries**: Peak boundaries (StartRT, EndRT, ApexRT) per run
 - **OspreyRunScores**: Run-level q-values and scores
+- **OspreyExperimentScores**: Experiment-level q-values
 
-Import directly into Skyline for quantification.
+Import directly into Skyline for quantification. See [BiblioSpec Output Schema](docs/blib-output-schema.md) for complete schema documentation.
 
 ### TSV Report
 

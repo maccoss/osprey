@@ -97,7 +97,7 @@ impl Default for OspreyConfig {
             custom_bin_width: None,
             fragment_tolerance: FragmentToleranceConfig::default(), // 10 ppm for HRAM
             precursor_tolerance: FragmentToleranceConfig::hram(10.0), // 10 ppm for precursor
-            max_candidates_per_spectrum: 500,
+            max_candidates_per_spectrum: 5250,
             rt_calibration: RTCalibrationConfig::default(),
             regularization_lambda: RegularizationSetting::CrossValidated,
             max_iterations: 1000,
@@ -399,12 +399,20 @@ pub struct RTCalibrationConfig {
     pub rt_tolerance_factor: f64,
     /// Fallback RT tolerance (minutes) if calibration fails
     pub fallback_rt_tolerance: f64,
+    /// Minimum RT tolerance (minutes) floor for local tolerance calculation
+    /// This prevents over-filtering in regions with very tight calibration
+    #[serde(default = "default_min_rt_tolerance")]
+    pub min_rt_tolerance: f64,
     /// Initial tolerance as fraction of library RT range for first file calibration (default: 1.0 = 100%)
     /// Set to 1.0 to match pyXcorrDIA's approach of no RT filtering during calibration
     pub initial_tolerance_fraction: f64,
     /// Number of peptides to sample for calibration (default: 2000, like pyXcorrDIA)
     /// Set to 0 to use all library entries (slower but more comprehensive)
     pub calibration_sample_size: usize,
+}
+
+fn default_min_rt_tolerance() -> f64 {
+    0.1
 }
 
 impl Default for RTCalibrationConfig {
@@ -415,6 +423,7 @@ impl Default for RTCalibrationConfig {
             min_calibration_points: 50,
             rt_tolerance_factor: 3.0,
             fallback_rt_tolerance: 2.0,
+            min_rt_tolerance: 0.1, // 6 seconds minimum (was 0.25 = 15 sec)
             initial_tolerance_fraction: 1.0, // 100% of RT range (no RT filtering, like pyXcorrDIA)
             calibration_sample_size: 10000, // Sample 10000 peptides (Rust is faster than pyXcorrDIA's 2000)
         }

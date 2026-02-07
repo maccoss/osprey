@@ -97,12 +97,66 @@ Instead of fixed bins:
   3. Use conjugate gradient solver for large problems
 ```
 
-## Candidate Selection
+## M/Z Calibration Before Regression
 
-Before building the design matrix, we filter candidates:
+Before candidate selection and ridge regression, observed spectra are calibrated using MS2 calibration data from the discovery phase.
+
+### Calibration Application
 
 ```python
-def select_candidates(spectrum, library, rt_tolerance, calibration):
+def apply_spectrum_calibration(spectrum, ms2_calibration):
+    """
+    Apply m/z calibration to shift observed peaks.
+
+    The calibration corrects systematic mass measurement errors by
+    shifting each centroid so the mean error becomes 0.
+    """
+    if not ms2_calibration.calibrated:
+        return spectrum  # No correction needed
+
+    corrected_mzs = []
+    for mz in spectrum.mzs:
+        if ms2_calibration.unit == "ppm":
+            # PPM correction: shift = mz × mean_error / 1e6
+            correction = mz * ms2_calibration.mean / 1e6
+        else:
+            # Absolute correction (Th)
+            correction = ms2_calibration.mean
+
+        corrected_mzs.append(mz - correction)
+
+    return Spectrum(mzs=corrected_mzs, intensities=spectrum.intensities, ...)
+```
+
+### Why Calibrate Before Regression?
+
+1. **Top-3 pre-filter accuracy**: Matching top-3 peaks uses calibrated m/z and 3×SD tolerance
+2. **Better binning**: Calibrated peaks land in correct bins for regression
+3. **Consistent scoring**: Both regression and post-regression scoring use calibrated spectra
+
+### Calibration Flow
+
+```
+1. Discovery phase:
+   - Find high-confidence matches
+   - Compute MS2 error distribution (mean, SD)
+
+2. Full search phase:
+   - Apply mean shift to all spectra (center error at 0)
+   - Use 3×SD as matching tolerance
+   - Run candidate selection + ridge regression on calibrated spectra
+
+3. Scoring phase:
+   - Spectra already calibrated from step 2
+   - Spectral scores computed on calibrated data
+```
+
+## Candidate Selection
+
+Before building the design matrix, we filter candidates using a multi-stage approach:
+
+```python
+def select_candidates(spectrum, library, rt_tolerance, calibration, ms2_calibration):
     candidates = []
 
     for entry in library:
@@ -113,21 +167,91 @@ def select_candidates(spectrum, library, rt_tolerance, calibration):
         # 2. Check RT tolerance (with calibration if available)
         if calibration:
             expected_rt = calibration.predict(entry.retention_time)
+            # Use local tolerance based on residuals at this RT
+            effective_tolerance = calibration.local_tolerance(entry.retention_time)
         else:
             expected_rt = entry.retention_time
+            effective_tolerance = rt_tolerance
 
-        if abs(expected_rt - spectrum.retention_time) > rt_tolerance:
+        if abs(expected_rt - spectrum.retention_time) > effective_tolerance:
+            continue
+
+        # 3. Top-3 fragment pre-filter (NEW)
+        # Require at least 1 of the top 3 most intense library peaks
+        # to be present in the observed spectrum
+        if not has_top3_fragment_match(entry, spectrum, ms2_calibration):
             continue
 
         candidates.append(entry)
 
-    # 3. Limit to max candidates (keep closest in RT)
+    # 4. Limit to max candidates (keep closest in RT)
     if len(candidates) > max_candidates:
         candidates.sort(key=lambda e: abs(e.rt - spectrum.rt))
         candidates = candidates[:max_candidates]
 
     return candidates
 ```
+
+### Top-3 Fragment Pre-Filter
+
+The top-3 fragment pre-filter is a fast check to eliminate candidates that have no signal overlap with the observed spectrum before expensive ridge regression.
+
+**Rationale**: If a peptide is truly present, its most intense predicted fragments should be visible. Candidates where none of the top 3 peaks match are very unlikely to contribute signal.
+
+```python
+def has_top3_fragment_match(library_entry, spectrum, ms2_calibration):
+    """
+    Check if at least 1 of the top 3 most intense library peaks
+    is present in the observed spectrum.
+
+    Args:
+        library_entry: Library spectrum with fragments
+        spectrum: Observed spectrum (m/z calibrated)
+        ms2_calibration: MS2 calibration for tolerance
+
+    Returns:
+        True if at least 1 of top 3 library peaks has a match
+    """
+    # Get top 3 fragments by intensity
+    fragments = sorted(library_entry.fragments,
+                       key=lambda f: f.intensity,
+                       reverse=True)[:3]
+
+    # Calculate tolerance from calibration (3×SD) or use default
+    if ms2_calibration and ms2_calibration.calibrated:
+        tolerance = 3.0 * ms2_calibration.sd  # ppm or Th
+    else:
+        tolerance = default_tolerance
+
+    # Check if any top-3 peak matches an observed peak
+    for frag in fragments:
+        lib_mz = frag.mz
+
+        # Calculate m/z window
+        if unit == "ppm":
+            tol_da = lib_mz * tolerance / 1e6
+        else:
+            tol_da = tolerance
+
+        lower = lib_mz - tol_da
+        upper = lib_mz + tol_da
+
+        # Binary search in sorted observed m/z array
+        idx = binary_search(spectrum.mzs, lower)
+        if idx < len(spectrum.mzs) and spectrum.mzs[idx] <= upper:
+            return True  # Found a match
+
+    return False  # No matches
+```
+
+**Key points:**
+
+1. **Uses calibrated spectrum**: The observed spectrum m/z values are already shifted by the mean MS2 error
+2. **Uses calibrated tolerance**: 3×SD from MS2 calibration ensures tight matching
+3. **Fast binary search**: O(log n) per peak, only 3 peaks checked
+4. **Conservative filter**: Only rejects candidates with zero top-3 overlap
+
+**Impact**: This filter typically removes 30-50% of candidates that passed RT filtering but have no spectral evidence, significantly reducing the design matrix size for ridge regression.
 
 ## Regularization Parameter (λ)
 

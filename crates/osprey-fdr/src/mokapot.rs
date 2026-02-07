@@ -2,13 +2,24 @@
 //!
 //! Mokapot is a Python tool for semi-supervised learning in proteomics.
 //! This module provides:
-//! - PIN file generation
-//! - Mokapot execution
+//! - PIN file generation (single or per-file)
+//! - Mokapot CLI execution with multi-file support
 //! - Result parsing
+//!
+//! ## Two-step analysis for multiple files
+//!
+//! When analyzing multiple files, Osprey uses a two-step approach:
+//!
+//! 1. **Run-level FDR**: Run mokapot WITHOUT `--aggregate` + WITH `--save_models`
+//!    Trains a joint model on all files, reports per-file q-values.
+//!
+//! 2. **Experiment-level FDR**: Run mokapot WITH `--aggregate` + WITH `--load_models`
+//!    Reuses the model from Step 1, reports experiment-wide q-values.
 
 use osprey_core::{FeatureSet, OspreyError, Result};
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// PSM (Peptide-Spectrum Match) with features for mokapot
@@ -39,6 +50,8 @@ pub struct PsmFeatures {
 pub struct MokapotResult {
     /// PSM identifier
     pub psm_id: String,
+    /// Peptide sequence (for counting unique peptides)
+    pub peptide: String,
     /// Mokapot score
     pub score: f64,
     /// Q-value
@@ -47,7 +60,7 @@ pub struct MokapotResult {
     pub pep: f64,
 }
 
-/// Mokapot integration
+/// Mokapot integration using the mokapot CLI
 pub struct MokapotRunner {
     /// Path to mokapot executable (or "mokapot" if in PATH)
     mokapot_path: String,
@@ -61,6 +74,9 @@ pub struct MokapotRunner {
     seed: u64,
     /// Number of parallel workers for cross-validation
     num_workers: u32,
+    /// Maximum number of PSMs to use for training (memory-aware)
+    /// If None, will be calculated based on available memory
+    subset_max_train: Option<usize>,
 }
 
 impl MokapotRunner {
@@ -79,7 +95,65 @@ impl MokapotRunner {
             max_iter: 10,
             seed: 42,
             num_workers,
+            subset_max_train: None, // Will be calculated based on available memory
         }
+    }
+
+    /// Calculate training subset size based on available system memory
+    ///
+    /// Mokapot's memory usage scales with the number of PSMs used for training.
+    /// This function estimates a safe subset size based on available memory.
+    ///
+    /// # Memory estimation
+    /// - ~50 KB per PSM in training (features, labels, internal structures)
+    /// - Reserve 2 GB for system overhead and other processes
+    /// - Use 70% of remaining available memory for safety margin
+    ///
+    /// # Returns
+    /// A subset size that should fit in available memory, or None if no limit needed
+    pub fn calculate_subset_from_memory() -> Option<usize> {
+        use sysinfo::System;
+
+        let mut sys = System::new();
+        sys.refresh_memory();
+
+        let available_bytes = sys.available_memory();
+        let total_bytes = sys.total_memory();
+
+        // Reserve 2 GB for system overhead
+        const RESERVED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+        // Estimated memory per PSM in training (conservative estimate)
+        // This accounts for: feature matrix, labels, SVM internals, cross-validation folds
+        const BYTES_PER_PSM: u64 = 50 * 1024; // 50 KB
+
+        // Use 70% of available memory after reservation
+        let usable_bytes = available_bytes.saturating_sub(RESERVED_BYTES);
+        let safe_bytes = (usable_bytes as f64 * 0.7) as u64;
+
+        let max_psms = safe_bytes / BYTES_PER_PSM;
+
+        log::info!(
+            "Memory-aware training: {:.1} GB available / {:.1} GB total → max {} PSMs for training",
+            available_bytes as f64 / 1e9,
+            total_bytes as f64 / 1e9,
+            max_psms
+        );
+
+        // Only apply limit if it's restrictive (< 1 million PSMs)
+        // Above this, mokapot should handle it fine
+        if max_psms < 1_000_000 {
+            Some(max_psms as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Get the effective subset_max_train value
+    ///
+    /// Returns the configured value if set, otherwise calculates from available memory.
+    fn effective_subset_max_train(&self) -> Option<usize> {
+        self.subset_max_train.or_else(Self::calculate_subset_from_memory)
     }
 
     /// Set the mokapot executable path
@@ -112,6 +186,15 @@ impl MokapotRunner {
         self
     }
 
+    /// Set maximum training subset size
+    ///
+    /// If not set, will be automatically calculated based on available memory.
+    /// Set to Some(0) to disable subsetting entirely.
+    pub fn with_subset_max_train(mut self, n: Option<usize>) -> Self {
+        self.subset_max_train = n;
+        self
+    }
+
     /// Check if mokapot is available
     pub fn is_available(&self) -> bool {
         Command::new(&self.mokapot_path)
@@ -124,13 +207,18 @@ impl MokapotRunner {
 
     /// Write PSMs to a PIN file
     pub fn write_pin<P: AsRef<Path>>(&self, psms: &[PsmFeatures], path: P) -> Result<()> {
-        let mut file = std::fs::File::create(path.as_ref()).map_err(|e| {
+        use std::io::BufWriter;
+
+        let file = std::fs::File::create(path.as_ref()).map_err(|e| {
             OspreyError::OutputError(format!("Failed to create PIN file: {}", e))
         })?;
 
+        // Use buffered writer for much faster I/O (avoids syscall per line)
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file); // 1MB buffer
+
         // Write header
         writeln!(
-            file,
+            writer,
             "SpecId\tLabel\tScanNr\tChargeState\t{}\tPeptide\tProteins",
             get_feature_header()
         )
@@ -146,7 +234,7 @@ impl MokapotRunner {
             };
 
             writeln!(
-                file,
+                writer,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 psm.psm_id,
                 label,
@@ -159,7 +247,94 @@ impl MokapotRunner {
             .map_err(|e| OspreyError::OutputError(format!("Failed to write PSM: {}", e)))?;
         }
 
+        // Ensure all data is flushed to disk
+        writer.flush().map_err(|e| {
+            OspreyError::OutputError(format!("Failed to flush PIN file: {}", e))
+        })?;
+
         Ok(())
+    }
+
+    /// Write a single file's PSMs to a PIN file
+    ///
+    /// This is used for memory-efficient processing where each file's PIN
+    /// is written immediately after scoring, rather than accumulating all data.
+    ///
+    /// # Arguments
+    /// * `file_name` - Name of the source file (used for PIN file naming)
+    /// * `psms` - PSM features to write
+    /// * `output_dir` - Directory to write the PIN file
+    ///
+    /// # Returns
+    /// Path to the written PIN file
+    pub fn write_single_pin_file<P: AsRef<Path>>(
+        &self,
+        file_name: &str,
+        psms: &[PsmFeatures],
+        output_dir: P,
+    ) -> Result<PathBuf> {
+        use std::io::BufWriter;
+
+        let out_dir = output_dir.as_ref();
+        std::fs::create_dir_all(out_dir).map_err(|e| {
+            OspreyError::OutputError(format!("Failed to create output directory: {}", e))
+        })?;
+
+        // Sanitize file name for use as PIN file name
+        let safe_name = file_name
+            .replace('/', "_")
+            .replace('\\', "_")
+            .replace(' ', "_");
+        let pin_path = out_dir.join(format!("{}.pin", safe_name));
+
+        let file = std::fs::File::create(&pin_path).map_err(|e| {
+            OspreyError::OutputError(format!("Failed to create PIN file: {}", e))
+        })?;
+
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+
+        // Write header
+        writeln!(
+            writer,
+            "SpecId\tLabel\tScanNr\tChargeState\t{}\tPeptide\tProteins",
+            get_feature_header()
+        )
+        .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
+
+        // Write PSMs
+        for psm in psms {
+            let label = if psm.is_decoy { -1 } else { 1 };
+            let proteins = if psm.proteins.is_empty() {
+                "UNKNOWN".to_string()
+            } else {
+                psm.proteins.join(",")
+            };
+
+            writeln!(
+                writer,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                psm.psm_id,
+                label,
+                psm.scan_number,
+                psm.charge,
+                format_features(&psm.features),
+                format_peptide(&psm.peptide),
+                proteins
+            )
+            .map_err(|e| OspreyError::OutputError(format!("Failed to write PSM: {}", e)))?;
+        }
+
+        writer.flush().map_err(|e| {
+            OspreyError::OutputError(format!("Failed to flush PIN file: {}", e))
+        })?;
+
+        log::info!(
+            "Wrote {} PSMs to PIN file: {}",
+            psms.len(),
+            pin_path.display()
+        );
+
+        Ok(pin_path)
     }
 
     /// Run mokapot on a PIN file
@@ -211,6 +386,8 @@ impl MokapotRunner {
             })?;
 
         // Stream stderr (mokapot writes progress to stderr)
+        // Also capture error messages to include in failure report
+        let mut error_lines: Vec<String> = Vec::new();
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
@@ -218,8 +395,22 @@ impl MokapotRunner {
                     // Log mokapot output so user can see progress
                     if line.contains("INFO") || line.contains("iter") || line.contains("Iteration") {
                         log::info!("[mokapot] {}", line);
+                    } else if line.contains("ERROR")
+                        || line.contains("Error")
+                        || line.contains("error:")
+                        || line.contains("Exception")
+                        || line.contains("Traceback")
+                        || line.contains("Warning")
+                        || line.contains("failed")
+                        || line.contains("CRITICAL")
+                    {
+                        // Log errors/warnings at warn level so they're visible
+                        log::warn!("[mokapot] {}", line);
+                        error_lines.push(line);
                     } else if !line.trim().is_empty() {
                         log::debug!("[mokapot] {}", line);
+                        // Capture all non-empty lines in case they're part of a traceback
+                        error_lines.push(line);
                     }
                 }
             }
@@ -230,9 +421,18 @@ impl MokapotRunner {
         })?;
 
         if !status.success() {
+            // Include the last few error lines for context
+            let error_context = if error_lines.is_empty() {
+                "No error output captured".to_string()
+            } else {
+                // Take last 20 lines for context (may include traceback)
+                let start = error_lines.len().saturating_sub(20);
+                error_lines[start..].join("\n")
+            };
             return Err(OspreyError::ExternalToolError(format!(
-                "Mokapot failed with exit code: {:?}",
-                status.code()
+                "Mokapot failed with exit code: {:?}\n\nMokapot output:\n{}",
+                status.code(),
+                error_context
             )));
         }
 
@@ -260,6 +460,7 @@ impl MokapotRunner {
         let mut results = Vec::new();
         let mut header_parsed = false;
         let mut psm_id_idx = 0;
+        let mut peptide_idx = 0;
         let mut score_idx = 0;
         let mut qvalue_idx = 0;
         let mut pep_idx = 0;
@@ -276,6 +477,7 @@ impl MokapotRunner {
                 for (i, field) in fields.iter().enumerate() {
                     match field.to_lowercase().as_str() {
                         "specid" | "psm_id" | "psmid" => psm_id_idx = i,
+                        "peptide" => peptide_idx = i,
                         "score" | "mokapot_score" | "mokapot score" => score_idx = i,
                         "q-value" | "qvalue" | "mokapot_qvalue" | "mokapot q-value" => qvalue_idx = i,
                         "posterior_error_prob" | "pep" | "mokapot_pep" => pep_idx = i,
@@ -291,12 +493,14 @@ impl MokapotRunner {
             }
 
             let psm_id = fields[psm_id_idx].to_string();
+            let peptide = fields.get(peptide_idx).map(|s| s.to_string()).unwrap_or_default();
             let score = fields[score_idx].parse::<f64>().unwrap_or(0.0);
             let q_value = fields[qvalue_idx].parse::<f64>().unwrap_or(1.0);
             let pep = fields.get(pep_idx).and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0);
 
             results.push(MokapotResult {
                 psm_id,
+                peptide,
                 score,
                 q_value,
                 pep,
@@ -333,11 +537,9 @@ psms = mokapot.read_pin("{pin_file}")
 # Configure and run mokapot
 results, models = mokapot.brew(
     psms,
-    train_fdr={train_fdr},
     test_fdr={test_fdr},
-    max_iter={max_iter},
+    max_workers={max_workers},
     rng={seed},
-    n_jobs={num_workers},
 )
 
 # Write results
@@ -345,11 +547,9 @@ results.to_txt("{output_dir}")
 print("SUCCESS")
 "#,
             pin_file = pin_path.display(),
-            train_fdr = self.train_fdr,
             test_fdr = self.test_fdr,
-            max_iter = self.max_iter,
+            max_workers = self.num_workers,
             seed = self.seed,
-            num_workers = self.num_workers,
             output_dir = out_path.display(),
         );
 
@@ -374,12 +574,468 @@ print("SUCCESS")
         let results_file = out_path.join("mokapot.psms.txt");
         self.parse_results(&results_file)
     }
+
+    /// Write separate PIN files for each file in the input
+    ///
+    /// Returns a HashMap mapping file_name to the PIN file path.
+    pub fn write_pin_files<P: AsRef<Path>>(
+        &self,
+        psms_by_file: &HashMap<String, Vec<PsmFeatures>>,
+        output_dir: P,
+    ) -> Result<HashMap<String, PathBuf>> {
+        use std::io::BufWriter;
+
+        let out_dir = output_dir.as_ref();
+        std::fs::create_dir_all(out_dir).map_err(|e| {
+            OspreyError::OutputError(format!("Failed to create output directory: {}", e))
+        })?;
+
+        let mut pin_files = HashMap::new();
+
+        for (file_name, psms) in psms_by_file {
+            // Sanitize file name for use as PIN file name
+            let safe_name = file_name
+                .replace('/', "_")
+                .replace('\\', "_")
+                .replace(' ', "_");
+            let pin_path = out_dir.join(format!("{}.pin", safe_name));
+
+            let file = std::fs::File::create(&pin_path).map_err(|e| {
+                OspreyError::OutputError(format!("Failed to create PIN file: {}", e))
+            })?;
+
+            let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+
+            // Write header
+            writeln!(
+                writer,
+                "SpecId\tLabel\tScanNr\tChargeState\t{}\tPeptide\tProteins",
+                get_feature_header()
+            )
+            .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
+
+            // Write PSMs
+            for psm in psms {
+                let label = if psm.is_decoy { -1 } else { 1 };
+                let proteins = if psm.proteins.is_empty() {
+                    "UNKNOWN".to_string()
+                } else {
+                    psm.proteins.join(",")
+                };
+
+                writeln!(
+                    writer,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    psm.psm_id,
+                    label,
+                    psm.scan_number,
+                    psm.charge,
+                    format_features(&psm.features),
+                    format_peptide(&psm.peptide),
+                    proteins
+                )
+                .map_err(|e| OspreyError::OutputError(format!("Failed to write PSM: {}", e)))?;
+            }
+
+            writer.flush().map_err(|e| {
+                OspreyError::OutputError(format!("Failed to flush PIN file: {}", e))
+            })?;
+
+            log::info!(
+                "Wrote {} PSMs to PIN file: {}",
+                psms.len(),
+                pin_path.display()
+            );
+
+            pin_files.insert(file_name.clone(), pin_path);
+        }
+
+        Ok(pin_files)
+    }
+
+    /// Run two-step mokapot analysis using CLI
+    ///
+    /// For a single file: just runs mokapot once with --save_models
+    /// For multiple files:
+    /// - Step 1: Run mokapot WITHOUT --aggregate + WITH --save_models → per-file results
+    /// - Step 2: Run mokapot WITH --aggregate + WITH --load_models → experiment-level results
+    ///
+    /// # Arguments
+    /// * `pin_files` - HashMap mapping file_name to PIN file path
+    /// * `output_dir` - Output directory for results
+    ///
+    /// # Returns
+    /// Tuple of (per_file_results, experiment_results)
+    /// - per_file_results: HashMap mapping file_name to Vec<MokapotResult>
+    /// - experiment_results: Vec<MokapotResult> for experiment-level (empty for single file)
+    pub fn run_two_step_analysis<P: AsRef<Path>>(
+        &self,
+        pin_files: &HashMap<String, PathBuf>,
+        output_dir: P,
+    ) -> Result<(HashMap<String, Vec<MokapotResult>>, Vec<MokapotResult>)> {
+        let out_path = output_dir.as_ref();
+
+        std::fs::create_dir_all(out_path).map_err(|e| {
+            OspreyError::OutputError(format!("Failed to create output directory: {}", e))
+        })?;
+
+        // Canonicalize output path to ensure absolute paths are passed to mokapot
+        let out_path = out_path.canonicalize().map_err(|e| {
+            OspreyError::OutputError(format!("Failed to canonicalize output directory: {}", e))
+        })?;
+
+        // Build ordered list of PIN file paths to maintain consistent ordering
+        // Also canonicalize PIN file paths
+        let mut ordered_files: Vec<(String, PathBuf)> = pin_files
+            .iter()
+            .filter_map(|(name, path)| {
+                path.canonicalize().ok().map(|abs_path| (name.clone(), abs_path))
+            })
+            .collect();
+        ordered_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        if ordered_files.is_empty() {
+            return Err(OspreyError::ConfigError(
+                "No valid PIN files found for mokapot".to_string()
+            ));
+        }
+
+        let file_names: Vec<String> = ordered_files.iter().map(|(n, _)| n.clone()).collect();
+        let pin_paths: Vec<&PathBuf> = ordered_files.iter().map(|(_, p)| p).collect();
+
+        // Create subdirectories for step outputs
+        let step1_dir = out_path.join("run_level");
+        let step2_dir = out_path.join("experiment_level");
+        std::fs::create_dir_all(&step1_dir).map_err(|e| {
+            OspreyError::OutputError(format!("Failed to create step1 directory: {}", e))
+        })?;
+
+        if pin_files.len() == 1 {
+            // Single file case: just run mokapot once
+            log::info!("Running mokapot on single file...");
+
+            let pin_path = pin_paths[0];
+            self.run_mokapot_cli(
+                &[pin_path],
+                &step1_dir,
+                false, // no aggregate
+                true,  // save models
+                None,  // no load models
+            )?;
+
+            // Parse single-file results
+            let results_file = step1_dir.join("mokapot.psms.txt");
+            let results = self.parse_results(&results_file)?;
+            let file_name = &file_names[0];
+
+            // Log single-file statistics
+            let precursor_count = results.len();
+            let unique_peptides: HashSet<&str> = results.iter()
+                .map(|r| r.peptide.as_str())
+                .collect();
+            let peptide_count = unique_peptides.len();
+
+            log::info!("");
+            log::info!("=== Results ({}% FDR) ===", (self.test_fdr * 100.0) as u32);
+            log::info!(
+                "  {}: {} precursors, {} peptides",
+                file_name,
+                precursor_count,
+                peptide_count
+            );
+
+            let mut per_file_results = HashMap::new();
+            per_file_results.insert(file_name.clone(), results);
+
+            // For single file, experiment-level is the same as run-level
+            // Return empty experiment results since there's no meaningful aggregation
+            Ok((per_file_results, Vec::new()))
+        } else {
+            // Multiple files: two-step analysis
+            log::info!(
+                "Step 1: Training joint model on {} files (run-level FDR)...",
+                pin_files.len()
+            );
+
+            // Step 1: Run mokapot WITHOUT --aggregate + WITH --save_models
+            // This trains one model on all files but reports results per file
+            self.run_mokapot_cli(
+                &pin_paths,
+                &step1_dir,
+                false, // no aggregate
+                true,  // save models
+                None,  // no load models
+            )?;
+
+            // Parse per-file results from Step 1
+            // When run without --aggregate, mokapot creates separate output per input file
+            log::info!("");
+            log::info!("=== Per-file results (run-level FDR at {}%) ===", (self.test_fdr * 100.0) as u32);
+            let mut per_file_results = HashMap::new();
+            let mut total_precursors = 0usize;
+            let mut total_peptides_set: HashSet<String> = HashSet::new();
+
+            for (file_name, pin_path) in &ordered_files {
+                // mokapot names output files based on PIN file stem
+                let pin_stem = pin_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                let results_file = step1_dir.join(format!("{}.mokapot.psms.txt", pin_stem));
+
+                if results_file.exists() {
+                    let results = self.parse_results(&results_file)?;
+
+                    // Count precursors and unique peptides for this file
+                    let precursor_count = results.len();
+                    let unique_peptides: HashSet<&str> = results.iter()
+                        .map(|r| r.peptide.as_str())
+                        .collect();
+                    let peptide_count = unique_peptides.len();
+
+                    // Update totals for summary
+                    total_precursors += precursor_count;
+                    for pep in &unique_peptides {
+                        total_peptides_set.insert((*pep).to_string());
+                    }
+
+                    log::info!(
+                        "  {}: {} precursors, {} peptides",
+                        file_name,
+                        precursor_count,
+                        peptide_count
+                    );
+
+                    per_file_results.insert(file_name.clone(), results);
+                } else {
+                    log::warn!(
+                        "  {}: No results file found: {}",
+                        file_name,
+                        results_file.display()
+                    );
+                }
+            }
+
+            log::info!("");
+            log::info!(
+                "Step 1 total: {} precursors, {} unique peptides across {} files",
+                total_precursors,
+                total_peptides_set.len(),
+                per_file_results.len()
+            );
+
+            // Check if model file was created by Step 1
+            // Mokapot may use different naming conventions depending on version
+            let model_file = find_mokapot_model(&step1_dir)?;
+            log::info!("Found saved model: {}", model_file.display());
+
+            log::info!(
+                "Step 2: Computing experiment-level FDR using saved model..."
+            );
+
+            // Create step2 directory
+            std::fs::create_dir_all(&step2_dir).map_err(|e| {
+                OspreyError::OutputError(format!("Failed to create step2 directory: {}", e))
+            })?;
+
+            // Step 2: Run mokapot WITH --aggregate + WITH --load_models
+            // This reuses the model from Step 1 and reports combined experiment-level results
+            self.run_mokapot_cli(
+                &pin_paths,
+                &step2_dir,
+                true,             // aggregate
+                false,            // don't save models (already have one)
+                Some(&model_file), // load models from Step 1
+            )?;
+
+            // Parse experiment-level results from Step 2
+            let experiment_results_file = step2_dir.join("mokapot.psms.txt");
+            let experiment_results = self.parse_results(&experiment_results_file)?;
+
+            // Log experiment-level statistics
+            let exp_precursor_count = experiment_results.len();
+            let exp_unique_peptides: HashSet<&str> = experiment_results.iter()
+                .map(|r| r.peptide.as_str())
+                .collect();
+            let exp_peptide_count = exp_unique_peptides.len();
+
+            log::info!("");
+            log::info!("=== Experiment-level results ({}% FDR) ===", (self.test_fdr * 100.0) as u32);
+            log::info!(
+                "  Experiment: {} precursors, {} peptides",
+                exp_precursor_count,
+                exp_peptide_count
+            );
+
+            Ok((per_file_results, experiment_results))
+        }
+    }
+
+    /// Run mokapot CLI with specified options
+    fn run_mokapot_cli(
+        &self,
+        pin_files: &[&PathBuf],
+        output_dir: &Path,
+        aggregate: bool,
+        save_models: bool,
+        load_models: Option<&Path>,
+    ) -> Result<()> {
+        let mut cmd = Command::new(&self.mokapot_path);
+
+        // Add PIN files
+        for pin_file in pin_files {
+            cmd.arg(pin_file);
+        }
+
+        // Output directory
+        cmd.arg("--dest_dir").arg(output_dir);
+
+        // FDR thresholds
+        cmd.arg("--train_fdr").arg(self.train_fdr.to_string());
+        cmd.arg("--test_fdr").arg(self.test_fdr.to_string());
+
+        // Training parameters
+        cmd.arg("--max_iter").arg(self.max_iter.to_string());
+        cmd.arg("--seed").arg(self.seed.to_string());
+        cmd.arg("--max_workers").arg(self.num_workers.to_string());
+
+        // Memory-aware training subset (only for training step, not when loading models)
+        if load_models.is_none() {
+            if let Some(subset_size) = self.effective_subset_max_train() {
+                log::info!(
+                    "Using --subset_max_train {} to limit memory usage",
+                    subset_size
+                );
+                cmd.arg("--subset_max_train").arg(subset_size.to_string());
+            }
+        }
+
+        // Aggregate mode (combine all files for experiment-level FDR)
+        if aggregate {
+            cmd.arg("--aggregate");
+        }
+
+        // Model persistence
+        if save_models {
+            cmd.arg("--save_models");
+        }
+        if let Some(model_path) = load_models {
+            cmd.arg("--load_models").arg(model_path);
+        }
+
+        // Verbosity
+        cmd.arg("--verbosity").arg("1");
+
+        log::debug!("Running mokapot command: {:?}", cmd);
+
+        // Spawn with piped output
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                OspreyError::ExternalToolError(format!(
+                    "Failed to run mokapot: {}. Is mokapot installed? Try: pip install mokapot",
+                    e
+                ))
+            })?;
+
+        // Stream stderr for progress
+        let mut error_lines: Vec<String> = Vec::new();
+        if let Some(stderr) = child.stderr.take() {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if line.contains("INFO") || line.contains("iter") || line.contains("Iteration") {
+                        log::info!("[mokapot] {}", line);
+                    } else if line.contains("ERROR")
+                        || line.contains("Error")
+                        || line.contains("error:")
+                        || line.contains("Exception")
+                        || line.contains("Traceback")
+                        || line.contains("Warning")
+                        || line.contains("failed")
+                        || line.contains("CRITICAL")
+                    {
+                        log::warn!("[mokapot] {}", line);
+                        error_lines.push(line);
+                    } else if !line.trim().is_empty() {
+                        log::debug!("[mokapot] {}", line);
+                        error_lines.push(line);
+                    }
+                }
+            }
+        }
+
+        let status = child.wait().map_err(|e| {
+            OspreyError::ExternalToolError(format!("Failed to wait for mokapot: {}", e))
+        })?;
+
+        if !status.success() {
+            let error_context = if error_lines.is_empty() {
+                "No error output captured".to_string()
+            } else {
+                let start = error_lines.len().saturating_sub(20);
+                error_lines[start..].join("\n")
+            };
+            return Err(OspreyError::ExternalToolError(format!(
+                "Mokapot failed with exit code: {:?}\n\nMokapot output:\n{}",
+                status.code(),
+                error_context
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for MokapotRunner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Find the mokapot model file in a directory
+///
+/// Mokapot may use different naming conventions depending on version:
+/// - `mokapot.model` (current standard)
+/// - `mokapot.weights.csv` (older versions)
+/// - `mokapot.model.pkl` (pickle format in some versions)
+///
+/// Returns an error if no model file is found.
+fn find_mokapot_model(dir: &Path) -> Result<PathBuf> {
+    // Try different possible model file names
+    let candidates = [
+        "mokapot.model",
+        "mokapot.weights.csv",
+        "mokapot.model.pkl",
+        "mokapot.weights",
+    ];
+
+    for name in &candidates {
+        let path = dir.join(name);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // List what files ARE in the directory to help with debugging
+    let files_in_dir: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Err(OspreyError::ExternalToolError(format!(
+        "Mokapot model file not found in {}. \
+         Expected one of: {:?}. \
+         Files in directory: {:?}",
+        dir.display(),
+        candidates,
+        files_in_dir
+    )))
 }
 
 /// Get the feature header for PIN format

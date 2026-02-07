@@ -3,7 +3,7 @@
 //! Writes Osprey detection results to SQLite blib format for Skyline integration.
 //! Follows the BiblioSpec schema with Osprey-specific extension tables.
 
-use osprey_core::{OspreyError, PeakBoundaries, Result};
+use osprey_core::{Modification, OspreyError, PeakBoundaries, Result};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
@@ -12,7 +12,8 @@ const BLIB_MAJOR_VERSION: i32 = 1;
 const BLIB_MINOR_VERSION: i32 = 10;
 
 /// Score type for Osprey detections
-const SCORE_TYPE_OSPREY: i32 = 100; // Custom score type for Osprey
+/// Using PERCOLATOR QVALUE (14) which Skyline recognizes as a q-value
+const SCORE_TYPE_PERCOLATOR_QVALUE: i32 = 14;
 
 /// blib file writer
 pub struct BlibWriter {
@@ -155,6 +156,23 @@ impl BlibWriter {
                 FOREIGN KEY (RefSpectraID) REFERENCES RefSpectra(id)
             );
 
+            -- Peak annotations (required by Skyline BlibBuild)
+            CREATE TABLE RefSpectraPeakAnnotations (
+                id INTEGER PRIMARY KEY,
+                RefSpectraID INTEGER,
+                peakIndex INTEGER,
+                name TEXT,
+                formula TEXT,
+                inchiKey TEXT,
+                otherKeys TEXT,
+                charge INTEGER,
+                adduct TEXT,
+                comment TEXT,
+                mzTheoretical REAL,
+                mzObserved REAL,
+                FOREIGN KEY (RefSpectraID) REFERENCES RefSpectra(id)
+            );
+
             -- Modifications
             CREATE TABLE Modifications (
                 id INTEGER PRIMARY KEY,
@@ -252,10 +270,10 @@ impl BlibWriter {
             ],
         ).map_err(|e| OspreyError::SqliteError(format!("Failed to insert LibInfo: {}", e)))?;
 
-        // Insert score types
+        // Insert score types - use PERCOLATOR QVALUE which Skyline recognizes
         self.conn.execute(
             "INSERT INTO ScoreTypes (id, scoreType) VALUES (?, ?)",
-            params![SCORE_TYPE_OSPREY, "OSPREY q-value"],
+            params![SCORE_TYPE_PERCOLATOR_QVALUE, "PERCOLATOR QVALUE"],
         ).map_err(|e| OspreyError::SqliteError(format!("Failed to insert ScoreTypes: {}", e)))?;
 
         // Insert ion mobility types
@@ -299,6 +317,13 @@ impl BlibWriter {
         score: f64,
         file_id: i64,
     ) -> Result<i64> {
+        // Clean sequences - strip flanking characters (underscores, periods, dashes)
+        // that are used in some library formats for flanking amino acids
+        let clean_seq = strip_flanking_chars(peptide_seq);
+        // Also convert UniMod notation (e.g., [UniMod:4]) to mass notation (e.g., [+57.0215])
+        // because Skyline expects mass values, not UniMod references
+        let clean_mod_seq = convert_unimod_to_mass(&strip_flanking_chars(peptide_mod_seq));
+
         // Convert peaks to blobs
         let mz_blob = f64_vec_to_blob(mzs);
         let int_blob = f32_vec_to_blob(intensities);
@@ -320,17 +345,17 @@ impl BlibWriter {
                 ?, NULL, ?, ?
             )"#,
             params![
-                peptide_seq,
+                clean_seq,
                 precursor_mz,
                 precursor_charge,
-                peptide_mod_seq,
+                clean_mod_seq,
                 mzs.len() as i32,
                 retention_time,
                 start_time,
                 end_time,
                 file_id,
                 score,
-                SCORE_TYPE_OSPREY
+                SCORE_TYPE_PERCOLATOR_QVALUE
             ],
         ).map_err(|e| OspreyError::SqliteError(format!("Failed to add spectrum: {}", e)))?;
 
@@ -343,6 +368,59 @@ impl BlibWriter {
         ).map_err(|e| OspreyError::SqliteError(format!("Failed to add peaks: {}", e)))?;
 
         Ok(ref_id)
+    }
+
+    /// Add modifications for a spectrum
+    ///
+    /// Writes modification positions and masses to the Modifications table.
+    /// This is important for Skyline to display modification positions correctly.
+    pub fn add_modifications(&self, ref_id: i64, modifications: &[Modification]) -> Result<()> {
+        for modif in modifications {
+            self.conn.execute(
+                "INSERT INTO Modifications (RefSpectraID, position, mass) VALUES (?, ?, ?)",
+                params![ref_id, modif.position as i32, modif.mass_delta],
+            ).map_err(|e| OspreyError::SqliteError(format!("Failed to add modification: {}", e)))?;
+        }
+        Ok(())
+    }
+
+    /// Add protein mapping for a spectrum
+    ///
+    /// Writes protein accessions to the Proteins table and creates the mapping
+    /// in RefSpectraProteins. This allows Skyline to show protein groupings.
+    pub fn add_protein_mapping(&self, ref_id: i64, protein_ids: &[String]) -> Result<()> {
+        for accession in protein_ids {
+            if accession.is_empty() {
+                continue;
+            }
+
+            // Check if protein already exists
+            let existing_id: Option<i64> = self.conn
+                .query_row(
+                    "SELECT id FROM Proteins WHERE accession = ?",
+                    params![accession],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            let protein_id = if let Some(id) = existing_id {
+                id
+            } else {
+                // Insert new protein
+                self.conn.execute(
+                    "INSERT INTO Proteins (accession) VALUES (?)",
+                    params![accession],
+                ).map_err(|e| OspreyError::SqliteError(format!("Failed to add protein: {}", e)))?;
+                self.conn.last_insert_rowid()
+            };
+
+            // Create mapping
+            self.conn.execute(
+                "INSERT INTO RefSpectraProteins (RefSpectraID, ProteinID) VALUES (?, ?)",
+                params![ref_id, protein_id],
+            ).map_err(|e| OspreyError::SqliteError(format!("Failed to add protein mapping: {}", e)))?;
+        }
+        Ok(())
     }
 
     /// Add peak boundaries for a detection
@@ -484,6 +562,103 @@ fn uuid_simple() -> String {
     format!("{:032x}", now)
 }
 
+/// Strip flanking characters from peptide sequences
+///
+/// Some library formats (DIA-NN, Prosit) use formats like "_.PEPTIDE._" or "_PEPTIDE_"
+/// where underscores/periods represent flanking amino acids or N/C-terminal markers.
+/// BiblioSpec expects clean peptide sequences without these flanking characters.
+fn strip_flanking_chars(seq: &str) -> String {
+    let trimmed = seq.trim_matches(|c| c == '_' || c == '.' || c == '-');
+
+    // Also handle internal patterns like "K.PEPTIDE.R" -> "PEPTIDE"
+    if let Some(start) = trimmed.find('.') {
+        if let Some(end) = trimmed.rfind('.') {
+            if start < end {
+                // Extract the middle part between the first and last dots
+                return trimmed[start + 1..end].to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+/// Convert UniMod notation to mass notation in modified sequences
+///
+/// Skyline expects mass notation like `PEPTC[+57.021]IDE` but some libraries
+/// use UniMod notation like `PEPTC[UniMod:4]IDE`. This function converts
+/// UniMod references to their corresponding mass shifts.
+fn convert_unimod_to_mass(seq: &str) -> String {
+    use std::collections::HashMap;
+
+    // Common UniMod IDs and their monoisotopic masses
+    let unimod_masses: HashMap<u32, f64> = [
+        (1, 42.010565),    // Acetyl
+        (4, 57.021464),    // Carbamidomethyl
+        (5, 43.005814),    // Carbamyl
+        (7, 0.984016),     // Deamidated
+        (21, 79.966331),   // Phospho
+        (28, -18.010565),  // Glu->pyro-Glu (loss of water)
+        (34, 14.015650),   // Methyl
+        (35, 15.994915),   // Oxidation
+        (36, 28.031300),   // Dimethyl
+        (37, 42.046950),   // Trimethyl
+        (121, 114.042927), // Ubiquitin (GlyGly)
+        (122, 383.228102), // SUMO
+        (214, 44.985078),  // Nitro
+        (312, -17.026549), // Ammonia loss (Gln->pyro-Glu)
+        (385, 229.162932), // TMT6plex
+        (737, 229.162932), // TMT6plex (alternate ID)
+        (747, 304.207146), // TMTpro
+    ].into_iter().collect();
+
+    let mut result = String::with_capacity(seq.len());
+    let mut chars = seq.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            // Look for UniMod pattern
+            let mut bracket_content = String::new();
+            while let Some(&next) = chars.peek() {
+                if next == ']' {
+                    chars.next();
+                    break;
+                }
+                bracket_content.push(chars.next().unwrap());
+            }
+
+            // Check if this is a UniMod reference
+            if bracket_content.starts_with("UniMod:") || bracket_content.starts_with("UNIMOD:") {
+                let id_str = bracket_content
+                    .trim_start_matches("UniMod:")
+                    .trim_start_matches("UNIMOD:");
+                if let Ok(id) = id_str.parse::<u32>() {
+                    if let Some(&mass) = unimod_masses.get(&id) {
+                        // Convert to mass notation
+                        result.push('[');
+                        if mass >= 0.0 {
+                            result.push_str(&format!("+{:.4}", mass));
+                        } else {
+                            result.push_str(&format!("{:.4}", mass));
+                        }
+                        result.push(']');
+                        continue;
+                    }
+                }
+            }
+
+            // Not a recognized UniMod, keep as-is
+            result.push('[');
+            result.push_str(&bracket_content);
+            result.push(']');
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +716,63 @@ mod tests {
         let float_values = vec![1.0f32, 2.0, 3.0];
         let float_blob = f32_vec_to_blob(&float_values);
         assert_eq!(float_blob.len(), 12); // 3 * 4 bytes
+    }
+
+    #[test]
+    fn test_strip_flanking_chars() {
+        // Simple case - no flanking chars
+        assert_eq!(strip_flanking_chars("PEPTIDE"), "PEPTIDE");
+
+        // Underscores at start/end (DIA-NN format)
+        assert_eq!(strip_flanking_chars("_PEPTIDE_"), "PEPTIDE");
+
+        // Periods/underscores (Prosit format)
+        assert_eq!(strip_flanking_chars("_.PEPTIDE._"), "PEPTIDE");
+
+        // Flanking amino acids with periods (standard notation)
+        assert_eq!(strip_flanking_chars("K.PEPTIDE.R"), "PEPTIDE");
+
+        // Just leading/trailing periods
+        assert_eq!(strip_flanking_chars(".PEPTIDE."), "PEPTIDE");
+
+        // Modified sequence with flanking chars
+        assert_eq!(strip_flanking_chars("_PEPTC[+57.021]IDE_"), "PEPTC[+57.021]IDE");
+
+        // Dashes at ends
+        assert_eq!(strip_flanking_chars("-PEPTIDE-"), "PEPTIDE");
+    }
+
+    #[test]
+    fn test_convert_unimod_to_mass() {
+        // No modifications
+        assert_eq!(convert_unimod_to_mass("PEPTIDE"), "PEPTIDE");
+
+        // Already mass notation - should be unchanged
+        assert_eq!(convert_unimod_to_mass("PEPTC[+57.021]IDE"), "PEPTC[+57.021]IDE");
+
+        // UniMod:4 (Carbamidomethyl)
+        let result = convert_unimod_to_mass("PEPTC[UniMod:4]IDE");
+        assert!(result.starts_with("PEPTC[+57."));
+        assert!(result.ends_with("]IDE"));
+
+        // UniMod:35 (Oxidation)
+        let result = convert_unimod_to_mass("PEPTM[UniMod:35]IDE");
+        assert!(result.starts_with("PEPTM[+15."));
+        assert!(result.ends_with("]IDE"));
+
+        // Multiple modifications
+        let result = convert_unimod_to_mass("PEPTC[UniMod:4]M[UniMod:35]IDE");
+        assert!(result.contains("[+57."));
+        assert!(result.contains("[+15."));
+
+        // Unknown UniMod - should be kept as-is
+        assert_eq!(
+            convert_unimod_to_mass("PEPTX[UniMod:99999]IDE"),
+            "PEPTX[UniMod:99999]IDE"
+        );
+
+        // Case insensitive UNIMOD
+        let result = convert_unimod_to_mass("PEPTC[UNIMOD:4]IDE");
+        assert!(result.starts_with("PEPTC[+57."));
     }
 }

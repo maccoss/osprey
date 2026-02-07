@@ -75,8 +75,8 @@ struct Args {
     #[arg(long)]
     lambda: Option<f64>,
 
-    /// Maximum candidates per spectrum
-    #[arg(long, default_value_t = 500)]
+    /// Maximum candidates per spectrum (use 0 for unlimited)
+    #[arg(long, default_value_t = 5250)]
     max_candidates: usize,
 
     /// Run-level FDR threshold

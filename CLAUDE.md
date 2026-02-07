@@ -61,9 +61,11 @@ cargo install --path crates/osprey
 
 - `docs/README.md` - Pipeline overview and algorithm documentation
 - `docs/fdr-control.md` - Two-level FDR with Mokapot
+- `docs/blib-output-schema.md` - BiblioSpec output format and Skyline integration
 - `crates/osprey/src/pipeline.rs` - Main analysis pipeline
 - `crates/osprey/src/main.rs` - CLI entry point
 - `crates/osprey-fdr/src/mokapot.rs` - Mokapot integration
+- `crates/osprey-io/src/output/blib.rs` - BiblioSpec blib writer
 - `crates/osprey-core/src/types.rs` - FeatureSet (30 features)
 - `crates/osprey-chromatography/src/calibration/` - RT and mass calibration
 

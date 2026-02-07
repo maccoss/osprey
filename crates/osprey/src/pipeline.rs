@@ -41,8 +41,9 @@ use osprey_chromatography::{
     calibration_path_for_input,
 };
 use osprey_core::{
-    BinConfig, DecoyMethod as CoreDecoyMethod, FeatureSet, LibraryEntry,
-    MS1Spectrum, OspreyConfig, OspreyError, RegressionResult, ResolutionMode, Result, Spectrum,
+    BinConfig, DecoyMethod as CoreDecoyMethod, FeatureSet, FragmentToleranceConfig, LibraryEntry,
+    LibraryFragment, MS1Spectrum, OspreyConfig, OspreyError, RegressionResult, ResolutionMode,
+    Result, Spectrum, ToleranceUnit,
 };
 use osprey_fdr::{FdrController, MokapotRunner, PsmFeatures};
 use osprey_io::{load_library, load_all_spectra, BlibWriter, MS1Index};
@@ -250,11 +251,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
     // Process each input file with multi-file calibration strategy:
     // - First file: calibrate with ALL peptides using wide tolerance
     // - Subsequent files: reuse calibration from first file
-    let mut all_results = Vec::new();
-    let mut all_spectra = Vec::new();
-    // Cached preprocessed spectra for potential reuse in future scoring passes
-    let mut _all_preprocessed_spectra: Option<PreprocessedSpectra> = None;
-    let mut shared_calibration: Option<(RTCalibration, f64, CalibrationParams)> = None; // (rt_calibration, tolerance, full_params)
+    //
+    // MEMORY-EFFICIENT DESIGN:
+    // - Score immediately after each file's regression
+    // - Write PIN file immediately after scoring
+    // - Keep only scored entries in memory (small, ~5MB per file)
+    // - Free regression results and spectra after each file
+    let mut per_file_scored: Vec<(String, Vec<ScoredEntry>)> = Vec::new();
+    let mut pin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
+    let mut shared_calibration: Option<(RTCalibration, f64, CalibrationParams)> = None;
+
+    // Create mokapot output directory upfront
+    let output_dir = config.output_blib.parent().unwrap_or(std::path::Path::new("."));
+    let mokapot_dir = output_dir.join("mokapot");
+    std::fs::create_dir_all(&mokapot_dir)?;
+
+    // Build mokapot runner for PIN file writing
+    let mokapot = MokapotRunner::new().with_test_fdr(config.run_fdr);
 
     for (file_idx, input_file) in config.input_files.iter().enumerate() {
         log::info!(
@@ -264,7 +277,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
             input_file.display()
         );
 
-        let (file_results, file_spectra, file_preprocessed_spectra, calibration_result) =
+        // Extract file name for identification
+        let file_name = input_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Run regression for this file
+        let (file_results, file_spectra, _file_preprocessed_spectra, calibration_result) =
             process_file_with_calibration(
                 input_file,
                 &library,
@@ -288,48 +309,63 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
                 );
                 shared_calibration = Some((cal, tol, cal_params));
             }
-            // Store preprocessed spectra from first file for potential reuse
-            _all_preprocessed_spectra = file_preprocessed_spectra;
         }
 
-        all_results.extend(file_results);
-        all_spectra.extend(file_spectra);
+        // Extract CalibrationParams for m/z correction during scoring
+        let calibration_params = shared_calibration.as_ref().map(|(_, _, params)| params);
+
+        // === SCORE IMMEDIATELY after regression ===
+        // This avoids keeping regression results in memory across all files
+        let scored_entries = score_run(
+            &library,
+            &file_results,
+            &file_spectra,
+            &file_name,
+            calibration_params,
+        )?;
+
+        log::info!(
+            "Scored {} entries ({} targets, {} decoys) for {}",
+            scored_entries.len(),
+            scored_entries.iter().filter(|e| !e.is_decoy).count(),
+            scored_entries.iter().filter(|e| e.is_decoy).count(),
+            file_name
+        );
+
+        // === WRITE PIN FILE IMMEDIATELY ===
+        // Create PSM features and write to disk, freeing memory
+        let psm_features = create_psm_features_for_file(&file_name, &scored_entries, &library);
+        let pin_path = mokapot.write_single_pin_file(&file_name, &psm_features, &mokapot_dir)?;
+        pin_files.insert(file_name.clone(), pin_path);
+
+        // Keep only scored entries (small) for FDR update later
+        // Regression results and spectra are dropped here, freeing ~150MB per file
+        per_file_scored.push((file_name, scored_entries));
+
+        log::info!(
+            "Completed file {}/{} - freed regression results and spectra from memory",
+            file_idx + 1,
+            config.input_files.len()
+        );
     }
 
+    // Calculate total results for logging
+    let total_scored: usize = per_file_scored.iter().map(|(_, s)| s.len()).sum();
     log::info!(
-        "Analysis complete. {} total regression results across {} files",
-        all_results.len(),
+        "Analysis complete. {} total scored entries across {} files",
+        total_scored,
         config.input_files.len()
     );
 
-    // ========== Score each file and run two-level FDR ==========
-
-    // Score each file's results
-    let mut per_file_scored: Vec<(String, Vec<ScoredEntry>)> = Vec::new();
-
-    // Group results and spectra by file for per-file scoring
-    // For now, treat all results as coming from a combined analysis
-    // TODO: Track which results came from which file for proper per-file FDR
-    let combined_file_name = config.input_files.first()
-        .and_then(|p| p.file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("osprey")
-        .to_string();
-
-    log::info!("Scoring peptides and extracting features...");
-    // Extract CalibrationParams for m/z correction during scoring
-    let calibration_params = shared_calibration.as_ref().map(|(_, _, params)| params);
-    let scored_entries = score_run(&library, &all_results, &all_spectra, &combined_file_name, calibration_params)?;
-    per_file_scored.push((combined_file_name, scored_entries));
-
     // Run two-level FDR control (run-level + experiment-level)
-    let output_dir = config.output_blib.parent().unwrap_or(std::path::Path::new("."));
+    // PIN files are already written, pass them to avoid regeneration
     let experiment_entries = run_two_level_fdr(
         &mut per_file_scored,
         &library,
         config.run_fdr,
-        config.run_fdr, // Use same FDR for experiment level for now
+        config.experiment_fdr,
         output_dir,
+        Some(pin_files),
     )?;
 
     // Filter to passing entries for blib output
@@ -359,7 +395,10 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         write_scored_report(report_path, &library, &passing_entries)?;
     }
 
-    Ok(all_results)
+    // Note: With memory-efficient processing, regression results are freed after scoring each file.
+    // The primary output is the blib file; return empty vec for backward compatibility.
+    // Callers needing raw regression results should process files individually.
+    Ok(Vec::new())
 }
 
 /// Process a single mzML file with RT calibration
@@ -415,13 +454,16 @@ fn process_file_with_calibration(
             optimized_solver,
             config.rt_calibration.fallback_rt_tolerance,
             config.max_candidates_per_spectrum,
+            config.rt_calibration.min_rt_tolerance,
             None,
+            None, // No MS2 calibration when RT calibration is disabled
+            config.fragment_tolerance.clone(),
         )?;
         return Ok((results, spectra, None, None));
     }
 
     // Check if we have an existing calibration from a previous file
-    if let Some((cal, tol, _cal_params)) = existing_calibration {
+    if let Some((cal, tol, cal_params)) = existing_calibration {
         log::info!(
             "Using calibration from first file (tolerance: {:.2} min)",
             tol
@@ -436,7 +478,10 @@ fn process_file_with_calibration(
             optimized_solver,
             *tol,
             config.max_candidates_per_spectrum,
+            config.rt_calibration.min_rt_tolerance,
             Some(cal),
+            Some(&cal_params.ms2_calibration), // Use MS2 calibration from first file
+            config.fragment_tolerance.clone(),
         )?;
         return Ok((results, spectra, None, None)); // Don't return calibration/preprocessing for subsequent files
     }
@@ -461,7 +506,7 @@ fn process_file_with_calibration(
                         match RTCalibration::from_model_params(model_params, cal_params.rt_calibration.residual_sd) {
                             Ok(rt_cal) => {
                                 let tolerance = cal_params.rt_calibration.residual_sd * config.rt_calibration.rt_tolerance_factor;
-                                let tolerance = tolerance.max(0.5);
+                                let tolerance = tolerance.max(config.rt_calibration.min_rt_tolerance);
 
                                 log::info!(
                                     "Using cached calibration: {} points, R²={:.4}, tolerance={:.2} min",
@@ -473,7 +518,7 @@ fn process_file_with_calibration(
                                 // Log calibration summary
                                 cal_params.log_summary();
 
-                                // Run full search with cached calibration
+                                // Run full search with cached calibration (using calibrated MS2 m/z)
                                 let results = process_spectra_optimized(
                                     &spectra,
                                     library,
@@ -483,7 +528,10 @@ fn process_file_with_calibration(
                                     optimized_solver,
                                     tolerance,
                                     config.max_candidates_per_spectrum,
+                                    config.rt_calibration.min_rt_tolerance,
                                     Some(&rt_cal),
+                                    Some(&cal_params.ms2_calibration),
+                                    config.fragment_tolerance.clone(),
                                 )?;
 
                                 return Ok((results, spectra, None, Some((rt_cal, tolerance, cal_params))));
@@ -553,7 +601,7 @@ fn process_file_with_calibration(
         Ok((rt_cal, cal_params)) => {
             // Use calibration residual SD × factor as tolerance
             let tolerance = cal_params.rt_calibration.residual_sd * config.rt_calibration.rt_tolerance_factor;
-            let tolerance = tolerance.max(0.5); // Minimum 0.5 min tolerance
+            let tolerance = tolerance.max(config.rt_calibration.min_rt_tolerance);
             log::info!(
                 "Using calibrated RT tolerance: {:.2} min ({}× residual SD)",
                 tolerance,
@@ -587,8 +635,11 @@ fn process_file_with_calibration(
         params.log_summary();
     }
 
-    // Calibrated full search
+    // Calibrated full search (using calibrated MS2 m/z)
     log::info!("Calibrated Full Search");
+
+    // Get MS2 calibration if available
+    let ms2_cal_ref = calibration_params_opt.as_ref().map(|p| &p.ms2_calibration);
 
     let results = process_spectra_optimized(
         &spectra,
@@ -599,7 +650,10 @@ fn process_file_with_calibration(
         optimized_solver,
         rt_tolerance,
         config.max_candidates_per_spectrum,
+        config.rt_calibration.min_rt_tolerance,
         calibration_opt.as_ref(),
+        ms2_cal_ref,
+        config.fragment_tolerance.clone(),
     )?;
 
     // Return calibration for first file to be reused
@@ -1401,6 +1455,7 @@ fn run_calibration_discovery_with_cache(
 /// - Uses pre-binned library (avoids redundant binning)
 /// - Uses f32 instead of f64 (faster BLAS, less memory)
 /// - Caches binned observed spectra
+/// - Applies MS2 calibration to spectra before binning (if available)
 fn process_spectra_optimized(
     spectra: &[Spectrum],
     library: &[LibraryEntry],
@@ -1410,15 +1465,69 @@ fn process_spectra_optimized(
     solver: &OptimizedSolver,
     rt_tolerance: f64,
     max_candidates: usize,
+    min_rt_tolerance: f64,
     calibration: Option<&RTCalibration>,
+    ms2_calibration: Option<&MzCalibration>,
+    base_fragment_tolerance: FragmentToleranceConfig,
 ) -> Result<Vec<RegressionResult>> {
-    // Pre-bin all observed spectra once
-    log::info!("Pre-binning {} observed spectra...", spectra.len());
-    let mut spectra_cache = BinnedSpectraCache::with_capacity(binner.n_bins(), spectra.len());
-    spectra_cache.populate(spectra, binner);
+    use osprey_chromatography::calibration::apply_spectrum_calibration;
+
+    // Apply MS2 m/z calibration to spectra if available
+    // This shifts each centroid by the mean offset so the error distribution is centered at 0
+    let calibrated_spectra: Vec<Spectrum> = if let Some(ms2_cal) = ms2_calibration {
+        if ms2_cal.calibrated {
+            // Correction is: corrected = observed - mean
+            // So if mean = -0.007, we add 0.007 to shift peaks UP
+            log::info!(
+                "Applying MS2 calibration: mean error = {:.4} {} → correcting by {:+.4} {} (using 3×SD = {:.3} {} tolerance)",
+                ms2_cal.mean,
+                ms2_cal.unit,
+                -ms2_cal.mean,  // Show actual correction applied
+                ms2_cal.unit,
+                3.0 * ms2_cal.sd,
+                ms2_cal.unit
+            );
+            spectra
+                .iter()
+                .map(|s| apply_spectrum_calibration(s, ms2_cal))
+                .collect()
+        } else {
+            spectra.to_vec()
+        }
+    } else {
+        spectra.to_vec()
+    };
+
+    // Determine fragment tolerance for top-3 pre-filter
+    // Use calibrated 3×SD when available, otherwise use base tolerance
+    let effective_fragment_tolerance = if let Some(ms2_cal) = ms2_calibration {
+        if ms2_cal.calibrated {
+            let tol_3sd = 3.0 * ms2_cal.sd;
+            let unit = if ms2_cal.unit == "Th" {
+                ToleranceUnit::Mz
+            } else {
+                ToleranceUnit::Ppm
+            };
+            // Apply minimum tolerance floor
+            let min_tol = if unit == ToleranceUnit::Mz { 0.05 } else { 1.0 };
+            FragmentToleranceConfig {
+                tolerance: tol_3sd.max(min_tol),
+                unit,
+            }
+        } else {
+            base_fragment_tolerance.clone()
+        }
+    } else {
+        base_fragment_tolerance.clone()
+    };
+
+    // Pre-bin all observed spectra once (using calibrated m/z values)
+    log::info!("Pre-binning {} observed spectra...", calibrated_spectra.len());
+    let mut spectra_cache = BinnedSpectraCache::with_capacity(binner.n_bins(), calibrated_spectra.len());
+    spectra_cache.populate(&calibrated_spectra, binner);
 
     // Set up progress bar
-    let pb = ProgressBar::new(spectra.len() as u64);
+    let pb = ProgressBar::new(calibrated_spectra.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
@@ -1428,20 +1537,22 @@ fn process_spectra_optimized(
             .progress_chars("#>-"),
     );
 
-    // Process spectra in parallel
+    // Process spectra in parallel (using calibrated m/z values)
     // Note: We can't mutate spectra_cache in parallel, so we use get() which is immutable
-    let results: Vec<RegressionResult> = spectra
+    let results: Vec<RegressionResult> = calibrated_spectra
         .par_iter()
         .filter_map(|spectrum| {
-            // Select candidates
+            // Select candidates using calibrated spectrum and calibrated tolerance
             let candidates = select_candidates_with_calibration(
                 spectrum,
                 library,
                 library_by_mz,
                 rt_tolerance,
                 max_candidates,
+                min_rt_tolerance,
                 None,
                 calibration,
+                Some(effective_fragment_tolerance.clone()),
             );
 
             if candidates.is_empty() {
@@ -1764,14 +1875,6 @@ fn score_run(
         })
         .collect();
 
-    log::info!(
-        "Scored {} entries ({} targets, {} decoys) for {}",
-        scored_entries.len(),
-        scored_entries.iter().filter(|e| !e.is_decoy).count(),
-        scored_entries.iter().filter(|e| e.is_decoy).count(),
-        file_name
-    );
-
     // Return ALL entries (targets + decoys) for subsequent Mokapot FDR
     Ok(scored_entries)
 }
@@ -1827,18 +1930,19 @@ fn compute_fdr_with_mokapot(
         })
         .collect();
 
-    // Create output directory for mokapot
-    let mokapot_dir = output_dir.join("mokapot");
-    std::fs::create_dir_all(&mokapot_dir)?;
+    // Create replicate-specific output directory for mokapot
+    // Structure: mokapot/replicate_{file_name}/
+    let replicate_dir = output_dir.join(format!("replicate_{}", file_name));
+    std::fs::create_dir_all(&replicate_dir)?;
 
     // Write PIN file
-    let pin_file = mokapot_dir.join(format!("{}.pin", file_name));
+    let pin_file = replicate_dir.join(format!("{}.pin", file_name));
     mokapot.write_pin(&psm_features, &pin_file)?;
 
-    log::info!("Wrote {} precursors to PIN file for mokapot", psm_features.len());
+    log::info!("Wrote {} precursors to PIN file: {}", psm_features.len(), pin_file.display());
 
-    // Run mokapot
-    let results = mokapot.run(&pin_file, &mokapot_dir)?;
+    // Run mokapot (outputs go to replicate subfolder)
+    let results = mokapot.run(&pin_file, &replicate_dir)?;
 
     // Build lookup from psm_id to mokapot results
     let result_map: std::collections::HashMap<String, (f64, f64)> = results
@@ -1861,11 +1965,21 @@ fn compute_fdr_with_mokapot(
     Ok(())
 }
 
-/// Run two-level FDR control using Mokapot
+/// Run two-level FDR control using Mokapot with multi-file support
 ///
-/// This implements the two-level FDR strategy:
-/// 1. Run-level FDR: Run Mokapot on each file independently → run_qvalue, pep
-/// 2. Experiment-level FDR: Keep best PSM per peptide, run Mokapot again → experiment_qvalue
+/// This implements the two-level FDR strategy using mokapot CLI:
+/// 1. Run-level FDR: mokapot WITHOUT --aggregate + WITH --save_models
+///    → trains ONE model from all files, reports per-file results
+/// 2. Experiment-level FDR: mokapot WITH --aggregate + WITH --load_models
+///    → reuses model from Step 1, reports combined experiment results
+///
+/// # Arguments
+/// * `per_file_results` - Per-file scored entries (will be updated with q-values)
+/// * `library` - Full library for reference
+/// * `run_fdr` - Run-level FDR threshold
+/// * `experiment_fdr` - Experiment-level FDR threshold
+/// * `output_dir` - Output directory for mokapot files
+/// * `pin_files` - Optional pre-written PIN file paths. If provided, skips PIN file generation.
 ///
 /// Returns all entries with both run-level and experiment-level q-values populated.
 fn run_two_level_fdr(
@@ -1874,9 +1988,10 @@ fn run_two_level_fdr(
     run_fdr: f64,
     experiment_fdr: f64,
     output_dir: &std::path::Path,
+    pin_files: Option<HashMap<String, std::path::PathBuf>>,
 ) -> Result<Vec<ScoredEntry>> {
+    // Build mokapot runner
     let mokapot = MokapotRunner::new()
-        .with_train_fdr(run_fdr)
         .with_test_fdr(run_fdr);
 
     let mokapot_available = mokapot.is_available();
@@ -1889,12 +2004,11 @@ fn run_two_level_fdr(
     let mokapot_dir = output_dir.join("mokapot");
     std::fs::create_dir_all(&mokapot_dir)?;
 
-    // ========== STEP 1: Run-level FDR ==========
-    log::info!("Step 1: Run-level FDR control at {}%", run_fdr * 100.0);
+    // For single file, use simpler approach
+    if per_file_results.len() == 1 {
+        let (file_name, entries) = per_file_results.iter_mut().next().unwrap();
 
-    for (file_name, entries) in per_file_results.iter_mut() {
         if mokapot_available {
-            // Run Mokapot for this file
             compute_fdr_with_mokapot(
                 library,
                 entries,
@@ -1904,142 +2018,216 @@ fn run_two_level_fdr(
                 run_fdr,
             )?;
         } else {
-            // Fallback: simple target-decoy competition
             apply_simple_fdr(entries, run_fdr)?;
         }
 
-        // Report per-file statistics
-        let passing = entries.iter().filter(|e| !e.is_decoy && e.run_qvalue <= run_fdr).count();
-        log::info!("  {}: {} precursors passing {}% run-level FDR", file_name, passing, run_fdr * 100.0);
-    }
+        // Report single file statistics
+        report_file_statistics(file_name, entries, library, run_fdr);
 
-    // ========== STEP 2: Experiment-level FDR ==========
-    // Skip experiment-level FDR if only one replicate - just use run-level results
-    if per_file_results.len() == 1 {
-        log::info!("Single replicate - skipping experiment-level FDR (using run-level results)");
-        let (_, entries) = per_file_results.iter().next().unwrap();
+        // Copy run-level to experiment-level for single file
+        log::info!("Single file - using run-level results as experiment-level");
         let mut experiment_entries: Vec<ScoredEntry> = entries.clone();
-        // Copy run-level q-values to experiment-level
         for entry in experiment_entries.iter_mut() {
             entry.experiment_qvalue = entry.run_qvalue;
         }
         return Ok(experiment_entries);
     }
 
-    log::info!("Step 2: Experiment-level FDR control at {}%", experiment_fdr * 100.0);
+    // ========== Multi-file analysis with two-step mokapot ==========
+    if !mokapot_available {
+        // Fallback: simple target-decoy competition
+        log::info!("Running simple target-decoy competition (mokapot not available)");
 
-    // Collect all entries across files
-    let all_entries: Vec<ScoredEntry> = per_file_results
-        .iter()
-        .flat_map(|(_, entries)| entries.iter().cloned())
-        .collect();
+        for (file_name, entries) in per_file_results.iter_mut() {
+            apply_simple_fdr(entries, run_fdr)?;
+            report_file_statistics(file_name, entries, library, run_fdr);
+        }
 
-    // Aggregate: keep best PSM per precursor (peptide + charge) by score
-    let mut best_per_precursor: HashMap<String, ScoredEntry> = HashMap::new();
-    for entry in all_entries.iter() {
-        let lib_entry = &library[entry.lib_idx];
-        // Use peptide + charge as the precursor key
-        let precursor_key = format!("{}_{}", lib_entry.modified_sequence, lib_entry.charge);
-        best_per_precursor
-            .entry(precursor_key)
-            .and_modify(|existing| {
-                if entry.score > existing.score {
-                    *existing = entry.clone();
-                }
-            })
-            .or_insert_with(|| entry.clone());
+        // Combine for experiment level
+        let mut experiment_entries: Vec<ScoredEntry> = Vec::new();
+        for (file_idx, (_, entries)) in per_file_results.iter().enumerate() {
+            for entry in entries.iter() {
+                let mut entry_copy = entry.clone();
+                entry_copy.psm_id = format!("{}_{}", file_idx, entry.psm_id);
+                experiment_entries.push(entry_copy);
+            }
+        }
+        apply_simple_fdr_experiment(&mut experiment_entries, experiment_fdr)?;
+        report_experiment_statistics(&experiment_entries, library, experiment_fdr);
+        return Ok(experiment_entries);
     }
 
-    let mut experiment_entries: Vec<ScoredEntry> = best_per_precursor.into_values().collect();
-    log::info!(
-        "Aggregated to {} unique precursors ({} targets, {} decoys)",
-        experiment_entries.len(),
-        experiment_entries.iter().filter(|e| !e.is_decoy).count(),
-        experiment_entries.iter().filter(|e| e.is_decoy).count()
-    );
+    // ========== Run two-step mokapot analysis ==========
+    log::info!("Running two-step mokapot analysis on {} files", per_file_results.len());
 
-    if mokapot_available {
-        // Run experiment-level Mokapot
-        run_experiment_level_mokapot(
-            &mut experiment_entries,
-            library,
-            &mokapot_dir,
-            experiment_fdr,
-        )?;
+    // Use pre-written PIN files if provided, otherwise generate them
+    let pin_files = if let Some(files) = pin_files {
+        log::info!("Using {} pre-written PIN files", files.len());
+        files
     } else {
-        // Fallback: simple target-decoy competition for experiment level
-        apply_simple_fdr_experiment(&mut experiment_entries, experiment_fdr)?;
+        // Fallback: collect PSM features and write PIN files
+        log::info!("Generating PIN files from scored entries...");
+        let psms_by_file = collect_psm_features_by_file(per_file_results, library);
+        let files = mokapot.write_pin_files(&psms_by_file, &mokapot_dir)?;
+        log::info!("Wrote {} PIN files", files.len());
+        files
+    };
+
+    // Run two-step analysis: trains ONE model, gets both per-file and experiment results
+    let (per_file_mokapot_results, experiment_mokapot_results) =
+        mokapot.run_two_step_analysis(&pin_files, &mokapot_dir)?;
+
+    // ========== Update per-file entries with Step 1 results ==========
+    log::info!("");
+    log::info!("=== Per-file results ({}% FDR) ===", run_fdr * 100.0);
+
+    for (file_name, entries) in per_file_results.iter_mut() {
+        if let Some(results) = per_file_mokapot_results.get(file_name) {
+            let result_map: HashMap<String, (f64, f64)> = results
+                .iter()
+                .map(|r| (r.psm_id.clone(), (r.q_value, r.pep)))
+                .collect();
+
+            for entry in entries.iter_mut() {
+                if let Some(&(q_value, pep)) = result_map.get(&entry.psm_id) {
+                    entry.run_qvalue = q_value;
+                    entry.pep = pep;
+                }
+            }
+        }
+
+        // Report per-file statistics
+        report_file_statistics(file_name, entries, library, run_fdr);
+    }
+
+    // ========== Build experiment entries with Step 2 results ==========
+    log::info!("");
+    log::info!("=== Experiment-level results ({}% FDR) ===", experiment_fdr * 100.0);
+
+    // Build PSM ID to q-value map from experiment results
+    let experiment_result_map: HashMap<String, (f64, f64)> = experiment_mokapot_results
+        .iter()
+        .map(|r| (r.psm_id.clone(), (r.q_value, r.pep)))
+        .collect();
+
+    // Collect all entries with experiment-level q-values
+    let mut experiment_entries: Vec<ScoredEntry> = Vec::new();
+    for (file_idx, (_, entries)) in per_file_results.iter().enumerate() {
+        for entry in entries.iter() {
+            let mut entry_copy = entry.clone();
+            // PSM IDs in experiment results have format: file_name_idx
+            let exp_psm_id = format!("{}_{}", file_idx, entry.psm_id);
+
+            if let Some(&(q_value, _pep)) = experiment_result_map.get(&entry.psm_id) {
+                entry_copy.experiment_qvalue = q_value;
+            } else if let Some(&(q_value, _pep)) = experiment_result_map.get(&exp_psm_id) {
+                entry_copy.experiment_qvalue = q_value;
+            } else {
+                // Fallback: use run-level q-value
+                entry_copy.experiment_qvalue = entry.run_qvalue;
+            }
+
+            entry_copy.psm_id = exp_psm_id;
+            experiment_entries.push(entry_copy);
+        }
     }
 
     // Report experiment-level statistics
-    let passing = experiment_entries.iter()
-        .filter(|e| !e.is_decoy && e.experiment_qvalue <= experiment_fdr)
-        .count();
-    log::info!(
-        "Experiment-level: {} precursors passing {}% FDR",
-        passing,
-        experiment_fdr * 100.0
-    );
+    report_experiment_statistics(&experiment_entries, library, experiment_fdr);
 
     Ok(experiment_entries)
 }
 
-/// Run Mokapot at experiment level (on aggregated best PSMs)
-fn run_experiment_level_mokapot(
-    entries: &mut [ScoredEntry],
+/// Report per-file statistics (precursors and peptides)
+fn report_file_statistics(
+    file_name: &str,
+    entries: &[ScoredEntry],
     library: &[LibraryEntry],
-    output_dir: &std::path::Path,
     fdr: f64,
-) -> Result<()> {
-    let mokapot = MokapotRunner::new()
-        .with_train_fdr(fdr)
-        .with_test_fdr(fdr);
+) {
+    let passing_entries: Vec<_> = entries.iter()
+        .filter(|e| !e.is_decoy && e.run_qvalue <= fdr)
+        .collect();
 
-    // Convert to PSM features with experiment-level IDs
-    let psm_features: Vec<PsmFeatures> = entries
+    let precursor_count = passing_entries.len();
+
+    let unique_peptides: std::collections::HashSet<_> = passing_entries.iter()
+        .map(|e| &library[e.lib_idx].modified_sequence)
+        .collect();
+    let peptide_count = unique_peptides.len();
+
+    log::info!(
+        "  {}: {} precursors, {} peptides",
+        file_name, precursor_count, peptide_count
+    );
+}
+
+/// Report experiment-level statistics (precursors and peptides)
+fn report_experiment_statistics(
+    entries: &[ScoredEntry],
+    library: &[LibraryEntry],
+    fdr: f64,
+) {
+    let passing_entries: Vec<_> = entries.iter()
+        .filter(|e| !e.is_decoy && e.experiment_qvalue <= fdr)
+        .collect();
+
+    let precursor_count = passing_entries.len();
+
+    let unique_peptides: std::collections::HashSet<_> = passing_entries.iter()
+        .map(|e| &library[e.lib_idx].modified_sequence)
+        .collect();
+    let peptide_count = unique_peptides.len();
+
+    log::info!(
+        "  Experiment: {} precursors, {} peptides",
+        precursor_count, peptide_count
+    );
+}
+
+/// Create PSM features for a single file
+///
+/// This is used for memory-efficient processing where each file's PSM features
+/// are created immediately after scoring and written to a PIN file.
+fn create_psm_features_for_file(
+    file_name: &str,
+    entries: &[ScoredEntry],
+    library: &[LibraryEntry],
+) -> Vec<PsmFeatures> {
+    entries
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(idx, entry)| {
             let lib_entry = &library[entry.lib_idx];
             PsmFeatures {
-                psm_id: format!("exp_{}", entry.psm_id),
+                psm_id: format!("{}_{}", file_name, idx),
                 peptide: lib_entry.modified_sequence.clone(),
                 proteins: lib_entry.protein_ids.clone(),
-                scan_number: 0, // Not relevant for experiment level
-                file_name: "experiment".to_string(),
+                scan_number: entry.lib_idx as u32,
+                file_name: file_name.to_string(),
                 charge: lib_entry.charge,
                 is_decoy: entry.is_decoy,
                 features: entry.features.clone(),
                 initial_score: Some(entry.score),
             }
         })
-        .collect();
+        .collect()
+}
 
-    // Write experiment-level PIN file
-    let pin_file = output_dir.join("experiment.pin");
-    mokapot.write_pin(&psm_features, &pin_file)?;
-    log::info!("Wrote experiment-level PIN file: {}", pin_file.display());
+/// Collect PSM features by file for multi-file mokapot (legacy - used when PIN files not pre-written)
+#[allow(dead_code)]
+fn collect_psm_features_by_file(
+    per_file_results: &[(String, Vec<ScoredEntry>)],
+    library: &[LibraryEntry],
+) -> HashMap<String, Vec<PsmFeatures>> {
+    let mut psms_by_file = HashMap::new();
 
-    // Run Mokapot
-    let results = mokapot.run(&pin_file, &output_dir.to_path_buf())?;
-
-    // Build lookup from psm_id to results
-    let result_map: HashMap<String, (f64, f64)> = results
-        .into_iter()
-        .map(|r| (r.psm_id, (r.q_value, r.pep)))
-        .collect();
-
-    // Update experiment-level q-values
-    let mut updated = 0;
-    for entry in entries.iter_mut() {
-        let exp_psm_id = format!("exp_{}", entry.psm_id);
-        if let Some(&(q_value, _pep)) = result_map.get(&exp_psm_id) {
-            entry.experiment_qvalue = q_value;
-            updated += 1;
-        }
+    for (file_name, entries) in per_file_results.iter() {
+        let psm_features = create_psm_features_for_file(file_name, entries, library);
+        psms_by_file.insert(file_name.clone(), psm_features);
     }
 
-    log::info!("Updated {} entries with experiment-level Mokapot results", updated);
-    Ok(())
+    psms_by_file
 }
 
 /// Fallback: Apply simple target-decoy FDR to run-level q-values
@@ -2120,12 +2308,23 @@ fn write_blib_output_with_scores(
     writer.add_metadata("fdr_method", "target_decoy_competition")?;
 
     // Add source files - build lookup by filename string for matching with ScoredEntry.file_name
+    // Use relative paths from blib location for cross-platform compatibility (WSL2 → Windows)
+    let blib_dir = config.output_blib.parent();
     let mut file_name_to_id: HashMap<String, i64> = HashMap::new();
     for input_file in input_files {
         let file_name = input_file.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
-        let file_id = writer.add_source_file(file_name)?;
+        // Compute relative path from blib directory to mzML file
+        // Falls back to just filename if relative path can't be computed
+        let source_path = if let Some(blib_parent) = blib_dir {
+            pathdiff::diff_paths(input_file, blib_parent)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| file_name.to_string())
+        } else {
+            file_name.to_string()
+        };
+        let file_id = writer.add_source_file(&source_path)?;
         file_name_to_id.insert(file_name.to_string(), file_id);
     }
 
@@ -2178,6 +2377,16 @@ fn write_blib_output_with_scores(
             blib_score,
             file_id,
         )?;
+
+        // Add modifications if present
+        if !entry.modifications.is_empty() {
+            writer.add_modifications(ref_id, &entry.modifications)?;
+        }
+
+        // Add protein mappings if present
+        if !entry.protein_ids.is_empty() {
+            writer.add_protein_mapping(ref_id, &entry.protein_ids)?;
+        }
 
         // Add peak boundaries - use file_name from the scored entry
         let boundaries = osprey_core::PeakBoundaries {
@@ -2337,13 +2546,22 @@ fn write_blib_output(
     writer.add_metadata("fallback_rt_tolerance", &config.rt_calibration.fallback_rt_tolerance.to_string())?;
     writer.add_metadata("run_fdr", &config.run_fdr.to_string())?;
 
-    // Add source files
+    // Add source files - use relative path for cross-platform compatibility (WSL2 → Windows)
+    let blib_dir = config.output_blib.parent();
     let mut file_ids = std::collections::HashMap::new();
     for input_file in input_files {
         let file_name = input_file.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
-        let file_id = writer.add_source_file(file_name)?;
+        // Compute relative path from blib directory to mzML file
+        let source_path = if let Some(blib_parent) = blib_dir {
+            pathdiff::diff_paths(input_file, blib_parent)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| file_name.to_string())
+        } else {
+            file_name.to_string()
+        };
+        let file_id = writer.add_source_file(&source_path)?;
         file_ids.insert(input_file.clone(), file_id);
     }
 
@@ -2433,6 +2651,16 @@ fn write_blib_output(
             file_id,
         )?;
 
+        // Add modifications if present
+        if !entry.modifications.is_empty() {
+            writer.add_modifications(ref_id, &entry.modifications)?;
+        }
+
+        // Add protein mappings if present
+        if !entry.protein_ids.is_empty() {
+            writer.add_protein_mapping(ref_id, &entry.protein_ids)?;
+        }
+
         // Add peak boundaries
         let boundaries = osprey_core::PeakBoundaries {
             start_rt,
@@ -2488,6 +2716,69 @@ fn build_mz_index(library: &[LibraryEntry]) -> HashMap<i32, Vec<usize>> {
     index
 }
 
+/// Check if at least one of the top 3 library peaks matches an observed spectrum peak
+///
+/// This is a fast pre-filter to eliminate candidates that have no signal overlap
+/// with the observed spectrum before expensive ridge regression.
+///
+/// # Arguments
+/// * `library_fragments` - Library fragment ions for a candidate entry
+/// * `spectrum_mzs` - Sorted observed m/z values from the spectrum
+/// * `tolerance` - Fragment tolerance value
+/// * `unit` - Tolerance unit (ppm or Th)
+///
+/// # Returns
+/// `true` if at least 1 of the top 3 library peaks has a matching observed peak
+fn has_top3_fragment_match(
+    library_fragments: &[LibraryFragment],
+    spectrum_mzs: &[f64],
+    tolerance: f64,
+    unit: ToleranceUnit,
+) -> bool {
+    if library_fragments.is_empty() || spectrum_mzs.is_empty() {
+        return true; // Be conservative - don't filter if no data
+    }
+
+    // Get indices of top 3 fragments by intensity
+    // Use partial sort for efficiency when there are many fragments
+    let mut top3_indices: Vec<usize> = (0..library_fragments.len().min(3)).collect();
+
+    if library_fragments.len() > 3 {
+        // Find top 3 by intensity using partial selection
+        let mut indexed: Vec<(usize, f32)> = library_fragments
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.relative_intensity))
+            .collect();
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1)); // Sort descending by intensity
+        top3_indices = indexed.iter().take(3).map(|(i, _)| *i).collect();
+    }
+
+    // Check if any of the top 3 library peaks match an observed peak
+    for &idx in &top3_indices {
+        let lib_mz = library_fragments[idx].mz;
+
+        // Calculate tolerance window based on unit
+        let tol_da = match unit {
+            ToleranceUnit::Ppm => lib_mz * tolerance / 1e6,
+            ToleranceUnit::Mz => tolerance,
+        };
+
+        let lower = lib_mz - tol_da;
+        let upper = lib_mz + tol_da;
+
+        // Binary search for first m/z >= lower bound
+        let start_idx = spectrum_mzs.partition_point(|&mz| mz < lower);
+
+        // Check if any peak is within the tolerance window
+        if start_idx < spectrum_mzs.len() && spectrum_mzs[start_idx] <= upper {
+            return true; // Found a match
+        }
+    }
+
+    false // No matches found
+}
+
 /// Select candidate library entries for a spectrum
 ///
 /// Candidate selection uses:
@@ -2495,6 +2786,7 @@ fn build_mz_index(library: &[LibraryEntry]) -> HashMap<i32, Vec<usize>> {
 /// 2. RT tolerance (calibrated or fallback)
 /// 3. Optional library filter (for calibration discovery phase)
 /// 4. Optional RT calibration (converts library RT to expected measured RT)
+/// 5. Optional top-3 fragment pre-filter (requires at least 1 of top 3 peaks in spectrum)
 ///
 /// Note: The isolation window check is sufficient for precursor filtering.
 /// No additional precursor m/z tolerance is applied.
@@ -2504,8 +2796,10 @@ fn select_candidates_with_calibration(
     library_by_mz: &HashMap<i32, Vec<usize>>,
     rt_tolerance: f64,
     max_candidates: usize,
+    min_rt_tolerance: f64,
     library_filter: Option<&std::collections::HashSet<usize>>,
     calibration: Option<&RTCalibration>,
+    fragment_tolerance: Option<FragmentToleranceConfig>,
 ) -> Vec<usize> {
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -2554,13 +2848,26 @@ fn select_candidates_with_calibration(
                     // rt_tolerance = global_residual_sd * factor
                     // Recover factor to apply to local residual: factor = rt_tolerance / global_residual_sd
                     let factor = rt_tolerance / cal.residual_std().max(0.001);
-                    cal.local_tolerance(entry.retention_time, factor, 0.25)
+                    cal.local_tolerance(entry.retention_time, factor, min_rt_tolerance)
                 } else {
                     rt_tolerance
                 };
 
                 if (expected_rt - spectrum.retention_time).abs() > effective_tolerance {
                     continue;
+                }
+
+                // Apply top-3 fragment pre-filter if enabled
+                // Skip candidates where none of the top 3 library peaks match the observed spectrum
+                if let Some(ref frag_tol) = fragment_tolerance {
+                    if !has_top3_fragment_match(
+                        &entry.fragments,
+                        &spectrum.mzs,
+                        frag_tol.tolerance,
+                        frag_tol.unit,
+                    ) {
+                        continue;
+                    }
                 }
 
                 candidates.push(idx);
@@ -2604,8 +2911,10 @@ fn select_candidates(
         library_by_mz,
         rt_tolerance,
         max_candidates,
+        0.1, // Default min_rt_tolerance for tests
         None,
         None,
+        None, // No fragment pre-filter for tests
     )
 }
 

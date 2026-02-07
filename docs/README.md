@@ -29,6 +29,7 @@ Osprey has a **working prototype** that can:
 | [Peak Detection](peak-detection.md) | Chromatographic peak detection in coefficient time series |
 | [Decoy Generation](decoy-generation.md) | Enzyme-aware sequence reversal for FDR control |
 | [FDR Control](fdr-control.md) | Two-level FDR with Mokapot integration |
+| [BiblioSpec Output Schema](blib-output-schema.md) | blib output format and Skyline integration |
 
 ---
 

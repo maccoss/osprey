@@ -6,13 +6,12 @@ Osprey uses two-level FDR (False Discovery Rate) control to ensure high-quality 
 
 ```
 FDR Control Workflow:
-  1. Extract 30 features per precursor (targets + decoys)
-  2. Write PIN file (Percolator/Mokapot input format)
-  3. Run Mokapot with semi-supervised learning
-  4. Two-level FDR:
-     - Run-level: Per-file FDR control
-     - Experiment-level: Aggregate best precursor across replicates
-  5. Output: q-values per precursor
+  1. Extract 24 features per precursor (targets + decoys)
+  2. Write PIN files (one per mzML file)
+  3. Run Mokapot CLI with two-step analysis:
+     - Step 1: Train joint model, report per-file q-values
+     - Step 2: Reuse model, report experiment-level q-values
+  4. Output: run-level and experiment-level q-values per precursor
 ```
 
 ## Key Terminology
@@ -28,53 +27,60 @@ FDR Control Workflow:
 
 ## Two-Level FDR Strategy
 
-### Step 1: Run-Level FDR
+Osprey uses Mokapot's CLI with `--save_models` and `--load_models` for efficient two-step analysis:
 
-Each mzML file is processed independently:
+### Step 1: Run-Level FDR (Joint Model Training)
 
-1. **Ridge regression** produces coefficients for all candidate precursors
-2. **Peak detection** finds the apex for each precursor's coefficient time series
-3. **Feature extraction** computes 30 features at the apex spectrum
-4. **Mokapot** combines features via linear SVM and computes run-level q-values
+All mzML files are processed together to train a single joint model:
 
-```
-Per-file processing:
-  ┌─────────────────────────────────────────────┐
-  │ file1.mzML                                  │
-  │   ├─ Ridge regression → coefficients        │
-  │   ├─ Peak detection → apex RTs              │
-  │   ├─ Feature extraction → 30 features       │
-  │   └─ Mokapot → run_qvalue per precursor     │
-  └─────────────────────────────────────────────┘
+```bash
+mokapot file1.pin file2.pin file3.pin \
+  --dest_dir mokapot/run_level/ \
+  --save_models \
+  --train_fdr 0.01 \
+  --test_fdr 0.01
 ```
 
-### Step 2: Experiment-Level FDR
-
-If multiple replicates are provided, Osprey aggregates results:
-
-1. **Aggregate by precursor** (peptide + charge, not just peptide)
-2. **Keep best score** per precursor across all replicates
-3. **Re-run Mokapot** on the aggregated set
-4. **Assign experiment-level q-values**
+**Without `--aggregate`**, Mokapot:
+- Trains ONE model on PSMs from all files
+- Reports separate results for each file
+- Saves the trained model for reuse
 
 ```
-Experiment-level aggregation:
-  ┌─────────────────────────────────────────────┐
-  │ Best precursor per peptide+charge:          │
-  │   PEPTIDEK+2: file1 score=0.95 (best)       │
-  │   PEPTIDEK+3: file2 score=0.87 (best)       │
-  │   ANOTHERK+2: file1 score=0.91 (best)       │
-  │   ...                                       │
-  │                                             │
-  │ Re-run Mokapot → experiment_qvalue          │
-  └─────────────────────────────────────────────┘
+mokapot/run_level/
+├── file1.mokapot.psms.txt    # Run-level q-values for file1
+├── file2.mokapot.psms.txt    # Run-level q-values for file2
+├── file3.mokapot.psms.txt    # Run-level q-values for file3
+└── mokapot.model             # Trained model for Step 2
 ```
 
-### Single Replicate Handling
+### Step 2: Experiment-Level FDR (Model Reuse)
 
-When only one file is provided, Step 2 is **skipped**:
-- Run-level q-values are copied to experiment-level q-values
-- No redundant Mokapot run
+The saved model is reused with `--aggregate` for experiment-level results:
+
+```bash
+mokapot file1.pin file2.pin file3.pin \
+  --dest_dir mokapot/experiment_level/ \
+  --load_models mokapot/run_level/mokapot.model \
+  --aggregate \
+  --test_fdr 0.01
+```
+
+**With `--aggregate`**, Mokapot:
+- Loads the model from Step 1 (no retraining)
+- Combines all files for experiment-level FDR
+- Reports a single combined result
+
+```
+mokapot/experiment_level/
+└── mokapot.psms.txt    # Experiment-level q-values
+```
+
+### Single File Handling
+
+When only one mzML file is provided:
+- Only Step 1 runs (no aggregation needed)
+- Run-level q-values are used as experiment-level q-values
 - Faster processing
 
 ## Mokapot Integration
@@ -88,7 +94,7 @@ Mokapot is a Python tool for semi-supervised learning in proteomics FDR control.
 
 ### PIN File Format
 
-Osprey writes a PIN (Percolator INput) file with 30 features:
+Osprey writes one PIN file per mzML file with 24 features:
 
 ```
 SpecId  Label  ScanNr  ChargeState  peak_apex  peak_area  ...  Peptide  Proteins
@@ -97,41 +103,46 @@ psm_002   -1    1234           2       0.12       1.1  ...  -.KEDITPEP.-  DECOY_
 ```
 
 - `Label`: 1 for target, -1 for decoy
-- `SpecId`: Unique identifier (file_precursorId)
-- 30 feature columns (see Feature Set below)
+- `SpecId`: Unique identifier for the PSM
+- 24 feature columns (see Feature Set below)
 - `Peptide`: Flanking.SEQUENCE.Flanking format
 - `Proteins`: Protein accessions
 
-### Mokapot Command
+### Mokapot CLI Options
 
-Osprey runs Mokapot with these settings:
-
-```bash
-mokapot input.pin \
-  --dest_dir output/ \
-  --train_fdr 0.01 \
-  --test_fdr 0.01 \
-  --max_iter 10 \
-  --seed 42 \
-  --num_workers 8 \
-  --verbosity 1 \
-  --save_models
-```
+Osprey uses these CLI options:
 
 | Flag | Description |
 |------|-------------|
-| `--train_fdr` | FDR threshold for training set |
-| `--test_fdr` | FDR threshold for test set |
-| `--max_iter` | Maximum SVM iterations |
-| `--num_workers` | Parallel cross-validation workers (auto-detected, max 8) |
-| `--save_models` | Save trained model for feature weight inspection |
+| `--dest_dir` | Output directory for results |
+| `--train_fdr` | FDR threshold for training set (default: 0.01) |
+| `--test_fdr` | FDR threshold for test set (default: 0.01) |
+| `--max_iter` | Maximum SVM iterations (default: 10) |
+| `--seed` | Random seed for reproducibility (default: 42) |
+| `--max_workers` | Parallel cross-validation workers (auto-detected, max 8) |
+| `--subset_max_train` | Max PSMs for training (memory-aware, auto-calculated) |
+| `--save_models` | Save trained model for reuse |
+| `--load_models` | Load a previously trained model |
+| `--aggregate` | Combine all files for experiment-level FDR |
+
+### Memory-Aware Training
+
+For large datasets, Osprey automatically limits the number of PSMs used for training via `--subset_max_train`. This prevents mokapot from running out of memory:
+
+- Osprey detects available system memory at runtime
+- Estimates ~50 KB per PSM for training memory usage
+- Reserves 2 GB for system overhead
+- Uses 70% of remaining memory as a safety margin
+- If the calculated limit exceeds 1 million PSMs, no limit is applied
+
+The subset is used only for model training. All PSMs are still scored and assigned q-values using the trained model.
 
 ### Feature Weights
 
-Mokapot saves model weights to `mokapot.model.pkl`. Use the inspection script to see which features are most important:
+Mokapot saves model weights to `mokapot.model`. Use the inspection script to see which features are most important:
 
 ```bash
-python scripts/inspect_mokapot_weights.py mokapot.model.pkl
+python scripts/inspect_mokapot_weights.py mokapot/run_level/mokapot.model
 ```
 
 Output:
@@ -143,59 +154,62 @@ Rank   Feature                                  Weight     |Weight|
 1      dot_product                              0.8532      0.8532  ++++++++
 2      xcorr                                    0.7891      0.7891  +++++++
 3      peak_apex                                0.6234      0.6234  ++++++
-4      rt_deviation_normalized                 -0.4521      0.4521  ----
+4      rt_deviation                            -0.4521      0.4521  ----
 5      hyperscore                               0.3987      0.3987  +++
 ...
 ```
 
-Features with very small weights may be candidates for removal to speed up processing.
+## Feature Set (24 Features)
 
-## Feature Set (30 Features)
+### Ridge Regression Features (7)
 
-### Chromatographic Features (12)
+Derived from coefficient time series analysis:
 
 | Feature | Description | Range |
 |---------|-------------|-------|
 | `peak_apex` | Maximum coefficient value | 0-∞ |
 | `peak_area` | Integrated area under curve | 0-∞ |
-| `emg_fit_quality` | EMG fit R² | 0-1 |
 | `peak_width` | FWHM in minutes | 0-∞ |
-| `peak_symmetry` | Leading/trailing ratio | 0-∞ |
-| `rt_deviation` | Observed - predicted RT (min) | -∞ to ∞ |
-| `rt_deviation_normalized` | RT deviation / RT tolerance | -∞ to ∞ |
 | `n_contributing_scans` | Scans with non-zero coefficient | 1-∞ |
 | `coefficient_stability` | CV of coefficients near apex | 0-∞ |
-| `peak_sharpness` | Boundary steepness | 0-∞ |
-| `peak_prominence` | Apex / baseline ratio | 0-∞ |
-| `modification_count` | Number of modifications | 0-∞ |
+| `relative_coefficient` | Coefficient / sum(all) | 0-1 |
+| `explained_intensity` | Explained/total intensity | 0-1 |
 
-### Spectral Features (13)
+### Spectral Matching Features - Mixed (8)
+
+Computed on the observed (mixed) spectrum at apex:
 
 | Feature | Description | Range |
 |---------|-------------|-------|
 | `hyperscore` | X!Tandem-style score | 0-∞ |
 | `xcorr` | Comet-style cross-correlation | 0-∞ |
-| `spectral_contrast_angle` | Normalized spectral angle | 0-1 |
 | `dot_product` | LibCosine (sqrt preprocessing) | 0-1 |
 | `dot_product_smz` | LibCosine (sqrt×mz² preprocessing) | 0-1 |
-| `pearson_correlation` | Pearson intensity correlation | -1 to 1 |
-| `spearman_correlation` | Spearman rank correlation | -1 to 1 |
 | `fragment_coverage` | Matched/predicted fragments | 0-1 |
 | `sequence_coverage` | Backbone coverage | 0-1 |
 | `consecutive_ions` | Longest b/y ion run | 0-n |
-| `base_peak_rank` | Base peak rank in predicted | 1-n |
 | `top3_matches` | Top-3 fragments matched | 0-3 |
-| `explained_intensity` | Explained/total intensity | 0-1 |
 
-### Contextual Features (5)
+### Spectral Matching Features - Deconvoluted (8)
+
+Computed on coefficient-weighted spectra (apex ± 2 scans):
 
 | Feature | Description | Range |
 |---------|-------------|-------|
-| `n_competitors` | Candidates in regression | 1-∞ |
-| `relative_coefficient` | Coefficient / sum(all) | 0-1 |
-| `local_peptide_density` | Candidates per window | 1-∞ |
-| `spectral_complexity` | Spectral complexity estimate | 0-∞ |
-| `regression_residual` | Unexplained signal fraction | 0-1 |
+| `hyperscore_deconv` | X!Tandem-style score | 0-∞ |
+| `xcorr_deconv` | Comet-style cross-correlation | 0-∞ |
+| `dot_product_deconv` | LibCosine (sqrt preprocessing) | 0-1 |
+| `dot_product_smz_deconv` | LibCosine (sqrt×mz² preprocessing) | 0-1 |
+| `fragment_coverage_deconv` | Matched/predicted fragments | 0-1 |
+| `sequence_coverage_deconv` | Backbone coverage | 0-1 |
+| `consecutive_ions_deconv` | Longest b/y ion run | 0-n |
+| `top3_matches_deconv` | Top-3 fragments matched | 0-3 |
+
+### Derived Features (1)
+
+| Feature | Description | Range |
+|---------|-------------|-------|
+| `rt_deviation` | Observed - predicted RT (min) | -∞ to ∞ |
 
 ## Target-Decoy Competition
 
@@ -246,13 +260,20 @@ Find the maximum number of targets where FDR ≤ threshold (e.g., 1%):
 
 ## Output
 
-### Mokapot Output Files
+### Directory Structure
 
-| File | Description |
-|------|-------------|
-| `mokapot.psms.txt` | PSM-level results with q-values |
-| `mokapot.peptides.txt` | Peptide-level results |
-| `mokapot.model.pkl` | Trained model (with `--save_models`) |
+```
+output_dir/
+└── mokapot/
+    ├── file1.pin              # PIN file for file1
+    ├── file2.pin              # PIN file for file2
+    ├── run_level/             # Step 1 outputs
+    │   ├── file1.mokapot.psms.txt
+    │   ├── file2.mokapot.psms.txt
+    │   └── mokapot.model
+    └── experiment_level/      # Step 2 outputs
+        └── mokapot.psms.txt
+```
 
 ### Result Fields
 
@@ -265,53 +286,66 @@ Each passing precursor has:
 | `mokapot_score` | Combined discriminant score |
 | `pep` | Posterior error probability |
 
+### Terminal Output
+
+Osprey reports precursors and peptides at each level:
+
+```
+=== Per-file results (1% FDR) ===
+  file1.mzML: 1234 precursors, 987 peptides
+  file2.mzML: 1456 precursors, 1123 peptides
+
+=== Experiment-level results (1% FDR) ===
+  Experiment: 1567 precursors, 1234 peptides
+```
+
 ## Configuration
 
 ```yaml
 # FDR thresholds
 run_fdr: 0.01           # 1% run-level FDR
 experiment_fdr: 0.01    # 1% experiment-level FDR
-
-# Mokapot settings
-mokapot:
-  train_fdr: 0.01
-  test_fdr: 0.01
-  max_iter: 10
-  num_workers: 8        # Auto-detected if not specified
 ```
+
+CLI options are passed directly to Mokapot. Osprey auto-detects the number of workers (capped at 8).
 
 ## Implementation
 
 Key files:
 - `crates/osprey-fdr/src/lib.rs` - FdrController, target-decoy competition
-- `crates/osprey-fdr/src/mokapot.rs` - MokapotRunner, PIN file generation
+- `crates/osprey-fdr/src/mokapot.rs` - MokapotRunner, PIN file generation, CLI execution
 - `crates/osprey/src/pipeline.rs` - Two-level FDR orchestration
 - `scripts/inspect_mokapot_weights.py` - Feature weight analysis
 
 ### API Example
 
 ```rust
-use osprey_fdr::{FdrController, MokapotRunner, PsmFeatures};
+use osprey_fdr::{MokapotRunner, PsmFeatures};
+use std::collections::HashMap;
 
-// Simple FDR control (no Mokapot)
-let fdr = FdrController::new(0.01);  // 1% FDR
-let passing = fdr.filter_with_competition(&targets, &decoys, |entry| entry.score);
-
-// Mokapot integration
+// Build mokapot runner
 let runner = MokapotRunner::new()
-    .with_train_fdr(0.01)
+    .with_test_fdr(0.01)
     .with_num_workers(8);
 
-// Write PIN file
-runner.write_pin(&psm_features, "output.pin")?;
+// Write PIN files (one per mzML file)
+let psms_by_file: HashMap<String, Vec<PsmFeatures>> = collect_psm_features();
+let pin_files = runner.write_pin_files(&psms_by_file, "mokapot/")?;
 
-// Run Mokapot
-let results = runner.run("output.pin", "output_dir/")?;
+// Run two-step analysis
+let (per_file_results, experiment_results) =
+    runner.run_two_step_analysis(&pin_files, "mokapot/")?;
 
-// Results contain q-values
-for result in results {
-    println!("{}: q-value = {:.4}", result.psm_id, result.q_value);
+// Per-file results (run-level q-values)
+for (file_name, results) in per_file_results {
+    println!("{}: {} PSMs passing FDR", file_name, results.len());
+    for result in results {
+        println!("  {}: q={:.4}", result.psm_id, result.q_value);
+    }
 }
+
+// Experiment-level results
+println!("Experiment: {} PSMs passing FDR", experiment_results.len());
 ```
 
 ## Troubleshooting
@@ -338,12 +372,20 @@ If FDR filtering is too aggressive:
 ### Slow Mokapot Processing
 
 Mokapot cross-validation can be slow with many PSMs:
-1. Ensure `--num_workers` is set (Osprey auto-detects CPUs)
+1. Ensure `--max_workers` is set (Osprey auto-detects CPUs, max 8)
 2. Consider reducing feature set to important features only
-3. Use `--save_models` to inspect which features matter
+3. Use feature weight inspection to identify low-importance features
+
+### Model Loading Errors
+
+If Step 2 fails to load the model:
+1. Check that Step 1 completed successfully
+2. Verify `mokapot.model` exists in `run_level/` directory
+3. Ensure mokapot version matches between steps
 
 ## References
 
 - Mokapot: https://github.com/wfondrie/mokapot
+- Mokapot CLI documentation: https://mokapot.readthedocs.io/en/latest/cli.html
 - Percolator: https://github.com/percolator/percolator
 - Target-decoy approach: Elias & Gygi (2007) Nature Methods
