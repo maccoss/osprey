@@ -25,7 +25,7 @@ pub fn calculate_q_values(is_decoy: &[bool], q_values: &mut [f64]) -> usize {
         "is_decoy and q_values must have same length"
     );
 
-    let mut decoy = 1;
+    let mut decoy = 0;  // Count actual decoys (not conservative +1)
     let mut target = 0;
 
     // Calculate FDR for each position
@@ -63,15 +63,15 @@ mod test {
 
         let passing = calculate_q_values(&is_decoy, &mut q_values);
 
-        // Expected FDR progression: 1/1, 1/2, 1/3, 1/4, 1/5, 2/5, 3/5
-        // Q-values (cumulative min from end): 1/5, 1/5, 1/5, 1/5, 1/5, 2/5, 3/5
-        assert_eq!(q_values[0], 0.2); // 1/5
-        assert_eq!(q_values[4], 0.2); // 1/5
-        assert_eq!(q_values[5], 0.4); // 2/5
-        assert_eq!(q_values[6], 0.6); // 3/5
+        // Expected FDR progression: 0/1, 0/2, 0/3, 0/4, 0/5, 1/5, 2/5
+        // Q-values (cumulative min from end): 0.0, 0.0, 0.0, 0.0, 0.0, 0.2, 0.4
+        assert_eq!(q_values[0], 0.0); // 0/1 = 0.0
+        assert_eq!(q_values[4], 0.0); // 0/5 = 0.0
+        assert_eq!(q_values[5], 0.2); // 1/5 = 0.2
+        assert_eq!(q_values[6], 0.4); // 2/5 = 0.4
 
-        // All 5 targets pass 1% FDR (q <= 0.01)? No, none pass (q = 0.2)
-        assert_eq!(passing, 0);
+        // All 5 targets pass 1% FDR (q = 0.0 <= 0.01)
+        assert_eq!(passing, 5);
     }
 
     #[test]

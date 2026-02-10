@@ -1061,16 +1061,16 @@ fn run_calibration_discovery_windowed(
         )?;
 
         // Filter to passing targets (q-value <= 1% FDR, not decoys)
-        // CRITICAL: Also require minimum correlation score for RT calibration quality
-        // LDA may select peptides with good spectral scores but poor RT correlation
-        const MIN_CORRELATION_FOR_RT_CAL: f64 = 2.5; // Require reasonable XIC co-elution
+        // CRITICAL: Also require minimum S/N for RT calibration quality
+        // LDA may select peptides with good spectral scores but poor peak quality
+        const MIN_SNR_FOR_RT_CAL: f64 = 5.0; // Require reasonable peak signal-to-noise
 
         let passing_targets: Vec<&CalibrationMatch> = all_matches
             .iter()
             .filter(|m| {
                 !m.is_decoy
                     && m.q_value <= calibration_fdr
-                    && m.correlation_score >= MIN_CORRELATION_FOR_RT_CAL
+                    && m.signal_to_noise >= MIN_SNR_FOR_RT_CAL
             })
             .collect();
 
@@ -1084,14 +1084,14 @@ fn run_calibration_discovery_windowed(
             n_decoy_wins
         );
 
-        // Log correlation filter impact
+        // Log S/N filter impact
         if passing_targets.len() < n_target_wins {
             log::info!(
-                "  RT quality filter: {} → {} peptides (removed {} with correlation < {:.1})",
+                "  RT quality filter: {} → {} peptides (removed {} with S/N < {:.1})",
                 n_target_wins,
                 passing_targets.len(),
                 n_target_wins - passing_targets.len(),
-                MIN_CORRELATION_FOR_RT_CAL
+                MIN_SNR_FOR_RT_CAL
             );
         }
 
@@ -2172,18 +2172,7 @@ fn run_two_level_fdr(
         }
     }
 
-    // Report per-file run-level results
-    log::info!("");
-    log::info!("=== Per-File Results (run-level FDR at {}%) ===", (run_fdr * 100.0) as u32);
-    let mut total_run_precursors = 0usize;
-    for (file_name, entries) in per_file_results.iter() {
-        report_file_statistics(file_name, entries, library, run_fdr);
-        total_run_precursors += entries.iter()
-            .filter(|e| !e.is_decoy && e.run_qvalue <= run_fdr)
-            .count();
-    }
-    log::info!("  Total: {} precursors across {} files (sum, not experiment-level controlled)",
-        total_run_precursors, per_file_results.len());
+    // Per-file results already reported by mokapot.rs, skip redundant output here
 
     // ========== Build experiment entries with Step 2 results ==========
     log::info!("");

@@ -85,7 +85,7 @@ def compute_separation_score(targets, decoys):
     return abs(mean_t - mean_d) / pooled_std
 
 
-def generate_report(df, output_path, cols_per_row=3, n_bins=50):
+def generate_report(df, output_path, cols_per_row=4, n_bins=50):
     """Generate an HTML report with feature histograms."""
 
     # Separate targets and decoys
@@ -131,8 +131,8 @@ def generate_report(df, output_path, cols_per_row=3, n_bins=50):
         rows=n_rows,
         cols=cols_per_row,
         subplot_titles=subplot_titles,
-        vertical_spacing=0.08,
-        horizontal_spacing=0.05,
+        vertical_spacing=0.12,
+        horizontal_spacing=0.03,
     )
 
     # Add histograms for each feature
@@ -202,7 +202,8 @@ def generate_report(df, output_path, cols_per_row=3, n_bins=50):
 
     # Update layout
     fig.update_layout(
-        height=280 * n_rows,
+        width=1800,
+        height=440 * n_rows,
         title_text=f"PIN Feature Distributions: {n_targets:,} targets vs {n_decoys:,} decoys<br><sup>Sorted by separation score (higher = better discrimination)</sup>",
         barmode='overlay',
         template="plotly_white",
@@ -373,8 +374,8 @@ Examples:
     parser.add_argument(
         "--cols-per-row", "-c",
         type=int,
-        default=3,
-        help="Number of plots per row (default: 3)",
+        default=4,
+        help="Number of plots per row (default: 4)",
     )
     parser.add_argument(
         "--bins", "-b",

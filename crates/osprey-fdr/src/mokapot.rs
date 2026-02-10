@@ -1080,7 +1080,7 @@ fn find_mokapot_models(dir: &Path) -> Result<Vec<PathBuf>> {
 /// - Ridge regression (chromatographic): peak_apex, peak_area, peak_width,
 ///   n_contributing_scans, coefficient_stability, relative_coefficient, explained_intensity
 /// - Spectral matching (mixed, at apex): hyperscore, xcorr, dot_product, dot_product_smz,
-///   fragment_coverage, sequence_coverage, consecutive_ions, top3_matches
+///   fragment_coverage, sequence_coverage, consecutive_ions, top6_matches
 /// - Spectral matching (deconvoluted, apex ± 2): *_deconv versions
 /// - Derived: rt_deviation
 fn get_feature_header() -> String {
@@ -1102,7 +1102,7 @@ fn get_feature_header() -> String {
         "fragment_coverage",
         "sequence_coverage",
         "consecutive_ions",
-        "top3_matches",
+        "top6_matches",
         // Spectral matching features (deconvoluted, coefficient-weighted apex ± 2 scans)
         "hyperscore_deconv",
         "xcorr_deconv",
@@ -1111,7 +1111,7 @@ fn get_feature_header() -> String {
         "fragment_coverage_deconv",
         "sequence_coverage_deconv",
         "consecutive_ions_deconv",
-        "top3_matches_deconv",
+        "top6_matches_deconv",
         // Derived features
         "rt_deviation",
         // Fragment co-elution features
@@ -1159,7 +1159,7 @@ fn format_features(features: &FeatureSet) -> String {
         features.fragment_coverage,
         features.sequence_coverage,
         features.consecutive_ions,
-        features.top3_matches,
+        features.top6_matches,
         // Spectral matching features (deconvoluted, coefficient-weighted apex ± 2 scans)
         features.hyperscore_deconv,
         features.xcorr_deconv,
@@ -1168,7 +1168,7 @@ fn format_features(features: &FeatureSet) -> String {
         features.fragment_coverage_deconv,
         features.sequence_coverage_deconv,
         features.consecutive_ions_deconv,
-        features.top3_matches_deconv,
+        features.top6_matches_deconv,
         // Derived features
         features.rt_deviation,
         // Fragment co-elution features

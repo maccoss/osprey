@@ -15,6 +15,22 @@ pub struct LinearDiscriminantAnalysis {
 }
 
 impl LinearDiscriminantAnalysis {
+    /// Create LDA from pre-computed weights (eigenvector)
+    ///
+    /// # Arguments
+    /// * `weights` - Feature weights (eigenvector)
+    ///
+    /// # Returns
+    /// LDA model with given weights
+    pub fn from_weights(weights: Vec<f64>) -> Result<LinearDiscriminantAnalysis, String> {
+        if weights.is_empty() {
+            return Err("Weights vector cannot be empty".to_string());
+        }
+        Ok(LinearDiscriminantAnalysis {
+            eigenvector: weights,
+        })
+    }
+
     /// Fit LDA model to data
     ///
     /// # Arguments

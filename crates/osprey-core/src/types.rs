@@ -643,8 +643,8 @@ pub struct FeatureSet {
     pub consecutive_ions: u32,
     /// Rank of base peak in predicted
     pub base_peak_rank: u32,
-    /// Number of top-3 predicted fragments matched
-    pub top3_matches: u32,
+    /// Number of top-6 predicted fragments matched
+    pub top6_matches: u32,
     /// Fraction of observed intensity explained
     pub explained_intensity: f64,
 
@@ -665,8 +665,8 @@ pub struct FeatureSet {
     pub sequence_coverage_deconv: f64,
     /// Consecutive ions from deconvoluted spectrum
     pub consecutive_ions_deconv: u32,
-    /// Top-3 matches from deconvoluted spectrum
-    pub top3_matches_deconv: u32,
+    /// Top-6 matches from deconvoluted spectrum
+    pub top6_matches_deconv: u32,
 
     // Contextual features
     /// Number of competing candidates

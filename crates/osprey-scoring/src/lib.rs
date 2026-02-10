@@ -944,7 +944,7 @@ impl SpectralScorer {
         let base_peak_rank = self.compute_base_peak_rank(&matches, &lib_intensities, &obs_intensities);
 
         // Compute top-3 matches
-        let top3_matches = self.compute_top3_matches(library, &matches);
+        let top6_matches = self.compute_top6_matches(library, &matches);
 
         // Compute LibCosine with SMZ preprocessing (sqrt(intensity) * mz²)
         let lib_cosine_smz = self.lib_cosine_smz(observed, library);
@@ -967,7 +967,7 @@ impl SpectralScorer {
             consecutive_ions,
             sequence_coverage,
             base_peak_rank,
-            top3_matches,
+            top6_matches,
             n_matched_b,
             n_matched_y,
         }
@@ -1168,12 +1168,12 @@ impl SpectralScorer {
     }
 
     /// Count how many of the top-3 library peaks are matched
-    fn compute_top3_matches(&self, library: &LibraryEntry, matches: &[FragmentMatch]) -> u32 {
+    fn compute_top6_matches(&self, library: &LibraryEntry, matches: &[FragmentMatch]) -> u32 {
         if library.fragments.is_empty() {
             return 0;
         }
 
-        // Get top 3 library fragments by intensity
+        // Get top 6 library fragments by intensity
         let mut lib_sorted: Vec<(f64, f64)> = library
             .fragments
             .iter()
@@ -1181,11 +1181,11 @@ impl SpectralScorer {
             .collect();
         lib_sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-        let top3: Vec<f64> = lib_sorted.iter().take(3).map(|(mz, _)| *mz).collect();
+        let top6: Vec<f64> = lib_sorted.iter().take(6).map(|(mz, _)| *mz).collect();
 
         // Count how many are matched
         let mut count = 0;
-        for top_mz in &top3 {
+        for top_mz in &top6 {
             for m in matches {
                 if (m.lib_mz - top_mz).abs() < 0.001 {
                     count += 1;
@@ -1253,7 +1253,7 @@ impl SpectralScorer {
             consecutive_ions: lib_cosine_score.consecutive_ions,
             sequence_coverage: lib_cosine_score.sequence_coverage,
             base_peak_rank: lib_cosine_score.base_peak_rank,
-            top3_matches: lib_cosine_score.top3_matches,
+            top6_matches: lib_cosine_score.top6_matches,
             n_matched_b: lib_cosine_score.n_matched_b,
             n_matched_y: lib_cosine_score.n_matched_y,
         }
@@ -1579,8 +1579,8 @@ pub struct SpectralScore {
     pub sequence_coverage: f64,
     /// Rank of base peak (highest intensity) in library
     pub base_peak_rank: u32,
-    /// Number of top-3 library peaks that matched
-    pub top3_matches: u32,
+    /// Number of top-6 library peaks that matched
+    pub top6_matches: u32,
     /// Number of matched b-ions (for hyperscore)
     pub n_matched_b: u32,
     /// Number of matched y-ions (for hyperscore)
@@ -2119,7 +2119,7 @@ impl FeatureExtractor {
             features.base_peak_rank = spectral_score.base_peak_rank;
 
             // FR-5.2.11: Top-3 match count
-            features.top3_matches = spectral_score.top3_matches;
+            features.top6_matches = spectral_score.top6_matches;
         }
 
         // Count modifications
@@ -2195,7 +2195,7 @@ impl FeatureExtractor {
             features.fragment_coverage_deconv = deconv_score.fragment_coverage;
             features.sequence_coverage_deconv = deconv_score.sequence_coverage;
             features.consecutive_ions_deconv = deconv_score.consecutive_ions;
-            features.top3_matches_deconv = deconv_score.top3_matches;
+            features.top6_matches_deconv = deconv_score.top6_matches;
         }
 
         features
