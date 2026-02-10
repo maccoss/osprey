@@ -55,7 +55,12 @@
       "Read(//mnt/d/GitHub-Repo/maccoss/osprey/example_test_data/astral/**)",
       "Read(//home/maccoss/GitHub-Repo/maccoss/osprey/example_test_data/stellar/calibrated-GPF-data/**)",
       "Read(//mnt/d/GitHub-Repo/maccoss/osprey/example_test_data/stellar/calibrated-GPF-data/**)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Read(//home/maccoss/github/maccoss/osprey/**)",
+      "Read(//mnt/c/Users/macco/Documents/github/maccoss/osprey/**)",
+      "Read(//home/maccoss/github/maccoss/osprey/docs/**)",
+      "Read(//mnt/c/Users/macco/Documents/github/maccoss/osprey/docs/**)",
+      "Bash(sudo apt-get:*)"
     ]
   }
 }

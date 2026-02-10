@@ -23,6 +23,8 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 ### Prerequisites
 
 - Rust 1.75 or later
+- Python 3.8 or later (for mokapot)
+- Mokapot (for FDR control)
 - OpenBLAS development libraries
 - OpenSSL development libraries
 - CMake
@@ -30,7 +32,26 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 On Ubuntu/Debian:
 ```bash
 sudo apt-get update
-sudo apt-get install libopenblas-dev libssl-dev cmake pkg-config
+sudo apt-get install libopenblas-dev libssl-dev cmake pkg-config python3-pip
+```
+
+Install mokapot:
+```bash
+pip install mokapot
+
+# Or install for your user only (recommended)
+pip install --user mokapot
+```
+
+Verify mokapot installation:
+```bash
+mokapot --version
+```
+
+**Note:** If the `mokapot` command is not found after installation, add `~/.local/bin` to your PATH:
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
 ### Building from source
