@@ -664,6 +664,7 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    /// Verifies that a blib file can be created with a source file, spectrum, peak boundaries, and metadata.
     #[test]
     fn test_create_blib() {
         let temp = NamedTempFile::new().unwrap();
@@ -707,6 +708,7 @@ mod tests {
         writer.finalize().unwrap();
     }
 
+    /// Verifies that f64 and f32 vectors are converted to little-endian byte blobs of the correct size.
     #[test]
     fn test_blob_conversion() {
         let values = vec![1.0f64, 2.0, 3.0];
@@ -718,6 +720,7 @@ mod tests {
         assert_eq!(float_blob.len(), 12); // 3 * 4 bytes
     }
 
+    /// Verifies that flanking amino acid characters, underscores, periods, and dashes are stripped from peptide sequences.
     #[test]
     fn test_strip_flanking_chars() {
         // Simple case - no flanking chars
@@ -742,6 +745,7 @@ mod tests {
         assert_eq!(strip_flanking_chars("-PEPTIDE-"), "PEPTIDE");
     }
 
+    /// Verifies that UniMod notation in modified sequences is converted to mass shift notation for Skyline compatibility.
     #[test]
     fn test_convert_unimod_to_mass() {
         // No modifications

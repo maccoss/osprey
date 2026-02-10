@@ -24,6 +24,7 @@ osprey-chromatography = { workspace = true }
 osprey-scoring = { workspace = true }
 osprey-fdr = { workspace = true }
 
+ndarray = { workspace = true }
 clap = { workspace = true }
 rayon = { workspace = true }
 log = { workspace = true }
@@ -32,6 +33,8 @@ indicatif = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 pathdiff = "0.2"
+arrow = "57"
+parquet = "57"
 
 # Optional streaming dependencies
 tokio = { workspace = true, optional = true }

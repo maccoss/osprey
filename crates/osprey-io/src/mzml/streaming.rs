@@ -1,6 +1,9 @@
 //! Streaming mzML parser using async I/O
 //!
-//! This module provides an async streaming mzML parser adapted from Sage.
+//! This module provides an async streaming mzML parser adapted from Sage
+//! (https://github.com/lazear/sage). Sage is Copyright (c) 2022 Michael Lazear,
+//! licensed under the MIT License. See NOTICE.md in the repository root for details.
+//!
 //! It uses event-based XML parsing for memory efficiency and can send
 //! spectra through channels as they are parsed.
 //!

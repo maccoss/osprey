@@ -10,11 +10,11 @@ Mass calibration follows the pyXcorrDIA methodology:
 ┌─────────────────────────────────────────────────────────────────┐
 │              Mass Calibration Workflow                           │
 │                                                                  │
-│  1. Score library vs spectra using LibCosine                    │
-│  2. Target-decoy competition → filter to 1% FDR                 │
+│  1. Score library vs spectra using XCorr (unit resolution bins) │
+│  2. Target-decoy competition (E-value) → filter to 1% FDR      │
 │  3. Collect mass errors ONLY from confident matches:            │
 │     - MS1: Extract M+0 peak from MS1 spectrum                   │
-│     - MS2: Matched fragment mass errors                         │
+│     - MS2: Top-3 fragment mass errors (binary search)           │
 │  4. Calculate statistics: mean, median, SD                      │
 │  5. Set adjusted tolerance: |mean| + 3×SD                       │
 └─────────────────────────────────────────────────────────────────┘
@@ -74,16 +74,20 @@ Osprey optionally generates an ASCII histogram of MS1 errors:
 
 ### Fragment Mass Error Collection
 
-MS2 calibration uses the mass errors from matched fragments:
+MS2 calibration uses mass errors from top-3 fragment matches at the best XCorr spectrum:
 
 ```
 For each confident match:
-  For each matched fragment:
-    1. Calculate PPM error: ((observed_mz - library_mz) / library_mz) × 10⁶
-    2. Add to MS2 error collection
+  Top-3 fragments (by library intensity) are matched via binary search:
+    1. Find closest observed peak within tolerance
+    2. Calculate error: ((observed_mz - library_mz) / library_mz) × 10⁶ (ppm)
+    3. Add to MS2 error collection
+
+Typical yield: 1-3 mass errors per peptide (up to 3 from top-3 fragments)
+With ~10K calibration peptides → ~20-30K MS2 data points
 ```
 
-**Note**: Only fragments that actually matched (within tolerance) contribute errors. Unmatched fragments are not included.
+**Note**: Only the top-3 most intense library fragments are matched (using binary search, O(3 × log n)). This is much faster than full fragment matching while providing sufficient data for calibration.
 
 ### MS2 Error Statistics
 

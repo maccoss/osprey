@@ -399,6 +399,7 @@ pub fn peptide_isotope_cosine(sequence: &str, observed: &[f64; 5]) -> Option<f64
 mod tests {
     use super::*;
 
+    /// Verifies elemental compositions for Ala, Cys, Met and that unknown amino acids return None.
     #[test]
     fn test_amino_acid_compositions() {
         // Test a few amino acids
@@ -419,6 +420,7 @@ mod tests {
         assert!(amino_acid_composition('X').is_none());
     }
 
+    /// Verifies peptide composition includes terminal H2O and sums residue atom counts correctly.
     #[test]
     fn test_peptide_composition() {
         // Simple peptide: AA (Ala-Ala)
@@ -435,6 +437,7 @@ mod tests {
         assert_eq!(comp.s, 2); // One from Cys, one from Met
     }
 
+    /// Verifies binomial coefficient calculation for known values of C(5,k) and C(10,3).
     #[test]
     fn test_binomial_coefficient() {
         assert!((binomial_coefficient(5, 0) - 1.0).abs() < 1e-10);
@@ -445,6 +448,7 @@ mod tests {
         assert!((binomial_coefficient(10, 3) - 120.0).abs() < 1e-10);
     }
 
+    /// Verifies that a small peptide (GGG) has dominant M+0 peak and distribution sums to 1.
     #[test]
     fn test_isotope_distribution_small_peptide() {
         // Small peptide: GGG (Gly-Gly-Gly)
@@ -461,6 +465,7 @@ mod tests {
         assert!((sum - 1.0).abs() < 0.001);
     }
 
+    /// Verifies that a larger peptide (ACDEFGHIK) has significant M+1 and distribution sums to 1.
     #[test]
     fn test_isotope_distribution_larger_peptide() {
         // Larger peptide: ACDEFGHIK (9 residues)
@@ -476,6 +481,7 @@ mod tests {
         assert!((sum - 1.0).abs() < 0.001);
     }
 
+    /// Verifies that identical observed and theoretical distributions yield a cosine score of 1.0.
     #[test]
     fn test_isotope_cosine_perfect_match() {
         // Perfect match: theoretical distribution matches observed
@@ -487,6 +493,7 @@ mod tests {
         assert!((score - 1.0).abs() < 0.001);
     }
 
+    /// Verifies that orthogonal observed and theoretical distributions yield a near-zero score.
     #[test]
     fn test_isotope_cosine_orthogonal() {
         // Completely different distributions
@@ -497,6 +504,7 @@ mod tests {
         assert!(score < 0.1); // Should be near zero
     }
 
+    /// Verifies end-to-end peptide isotope cosine scoring with a self-matching distribution.
     #[test]
     fn test_peptide_isotope_cosine() {
         // Test end-to-end calculation
@@ -517,6 +525,7 @@ mod tests {
         assert!((score - 1.0).abs() < 0.001);
     }
 
+    /// Verifies that sulfur-containing peptides have higher M+2 ratios due to 34S abundance.
     #[test]
     fn test_sulfur_effect() {
         // Compare peptides with and without sulfur

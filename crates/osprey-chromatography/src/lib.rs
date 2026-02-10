@@ -185,6 +185,7 @@ pub struct EmgParameters {
 mod tests {
     use super::*;
 
+    /// Verifies peak detection finds a single Gaussian-like peak with the correct apex near RT 10.
     #[test]
     fn test_peak_detector() {
         let detector = PeakDetector::new().with_min_height(0.1);
@@ -203,6 +204,7 @@ mod tests {
         assert!((peaks[0].apex_rt - 10.0).abs() < 1.0);
     }
 
+    /// Verifies find_best_peak selects the highest-coefficient peak within the given RT tolerance window.
     #[test]
     fn test_find_best_peak() {
         let detector = PeakDetector::new();

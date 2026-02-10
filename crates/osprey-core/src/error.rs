@@ -125,12 +125,14 @@ impl OspreyError {
 mod tests {
     use super::*;
 
+    /// Verifies that OspreyError Display impl formats the error message correctly.
     #[test]
     fn test_error_display() {
         let err = OspreyError::LibraryLoadError("test error".to_string());
         assert_eq!(format!("{}", err), "Failed to load library: test error");
     }
 
+    /// Verifies that helper constructors produce the correct OspreyError variants.
     #[test]
     fn test_error_helpers() {
         let err = OspreyError::library_load("test");

@@ -15,6 +15,7 @@ ndarray = { workspace = true }
 blas-src = { workspace = true }
 openblas-src = { workspace = true }
 rayon = { workspace = true }
+indicatif = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 

@@ -393,6 +393,7 @@ fn decode_peaks_f32(mass_blob: &[u8], intensity_blob: &[u8]) -> Result<Vec<Libra
 mod tests {
     use super::*;
 
+    /// Verifies that an unmodified sequence is parsed into the correct plain sequence with no modifications.
     #[test]
     fn test_parse_modified_sequence_simple() {
         let (seq, mods) = parse_modified_sequence("PEPTIDE").unwrap();
@@ -400,6 +401,7 @@ mod tests {
         assert!(mods.is_empty());
     }
 
+    /// Verifies that a bracketed mass shift modification is extracted with the correct residue position and mass.
     #[test]
     fn test_parse_modified_sequence_with_mod() {
         let (seq, mods) = parse_modified_sequence("PEPTC[+57.021]IDE").unwrap();
@@ -409,6 +411,7 @@ mod tests {
         assert!((mods[0].mass_delta - 57.021).abs() < 0.001);
     }
 
+    /// Verifies that an N-terminal modification is parsed and assigned to position 0.
     #[test]
     fn test_parse_modified_sequence_nterm() {
         let (seq, mods) = parse_modified_sequence("[+42.011]PEPTIDE").unwrap();
@@ -418,6 +421,7 @@ mod tests {
         assert_eq!(mods[0].position, 0);
     }
 
+    /// Verifies that multiple modifications on different residues are all correctly parsed.
     #[test]
     fn test_parse_modified_sequence_multiple() {
         let (seq, mods) = parse_modified_sequence("PEP[+15.995]TC[+57.021]IDE").unwrap();

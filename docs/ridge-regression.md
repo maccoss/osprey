@@ -68,34 +68,47 @@ x = (AᵀA + λI)⁻¹ Aᵀb
 
 ## Design Matrix Construction
 
-### Unit Resolution Mode
+### Binning: Comet BIN Macro
 
-For unit-resolution instruments (~1 Th bins):
+Both unit resolution and HRAM modes use XCorr-style binning via Comet's BIN macro:
 
 ```
-Bin width: 1.0005 Th
-Range: 200-2000 m/z
-Bins: ~1800
+BIN(mass) = (int)(mass / bin_width + (1 - offset))
+```
+
+### Unit Resolution Mode
+
+For unit-resolution instruments (~1 Da bins):
+
+```
+Bin width: 1.0005079 Da
+Offset: 0.4
+Formula: bin = (int)(mz / 1.0005079 + 0.6)
+Bins: 2001
 
 For each library spectrum:
   1. Take fragment (m/z, intensity) pairs
-  2. Assign each to bin: bin_idx = floor((mz - 200) / 1.0005)
+  2. Assign each to bin using BIN macro
   3. Sum intensities in each bin
   4. Normalize to sum = 1
 ```
 
 ### HRAM Mode
 
-For high-resolution accurate mass (HRAM) instruments:
+For high-resolution accurate mass (HRAM) instruments, the same binning approach is used with narrower bins:
 
 ```
-Tolerance: 20 ppm
+Bin width: 0.02 Da
+Offset: 0.0
+Formula: bin = (int)(mz / 0.02 + 1.0)
+Bins: 100,001
 
-Instead of fixed bins:
-  1. Build sparse matrix (CSC format)
-  2. Match observed peaks to library peaks within ppm tolerance
-  3. Use conjugate gradient solver for large problems
+Same binning flow as unit resolution, just with finer bins.
+Library candidates are binned on-the-fly per spectrum (after filtering)
+to avoid pre-binning the entire library into a 100K-bin dense matrix.
 ```
+
+**On-the-fly binning for HRAM**: Pre-binning the entire library (100K bins × 500K entries = 190 GB) is infeasible. Instead, for each spectrum, candidates are filtered first (isolation window + calibrated RT + top-3 fragment match), then only the ~200 passing candidates are binned into a column-major design matrix.
 
 ## M/Z Calibration Before Regression
 
@@ -530,10 +543,9 @@ The solver uses these defaults (in `CdNnlsParams`):
 
 Key files:
 - `crates/osprey-regression/src/cd_nnls.rs` - **Coordinate Descent NNLS solver** (main algorithm)
-- `crates/osprey-regression/src/optimized.rs` - Optimized f32 solver wrapper
-- `crates/osprey-regression/src/binning.rs` - Binner for unit resolution
-- `crates/osprey-regression/src/matrix.rs` - DesignMatrixBuilder
-- `crates/osprey-regression/src/sparse.rs` - Sparse solver for HRAM
+- `crates/osprey-regression/src/solver.rs` - Unified f32 solver (unit res + HRAM)
+- `crates/osprey-regression/src/binning.rs` - Binner (Comet BIN macro, configurable bin width)
+- `crates/osprey-regression/src/matrix.rs` - DesignMatrixBuilder (column-major for BLAS)
 - `crates/osprey/src/pipeline.rs` - Integration in analysis pipeline
 
 ## Performance Considerations
@@ -542,6 +554,6 @@ Key files:
 |--------|--------|------------|
 | Many candidates | More iterations, memory | Limit max_candidates to 500 |
 | Active set efficiency | 10-50× speedup | Most candidates converge to zero |
-| High resolution | Sparse matrices | Use CSC format |
+| HRAM bins (100K) | Larger design matrix | On-the-fly binning per spectrum |
 | Many spectra | Linear scaling | Parallel processing (rayon) |
 | f32 vs f64 | 2× memory, ~1.5× speed | Use f32 for production |

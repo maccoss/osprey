@@ -720,6 +720,7 @@ pub fn std_dev(values: &[f64]) -> f64 {
 mod tests {
     use super::*;
 
+    /// Verifies LOESS calibration fits a linear RT relationship with high R-squared and accurate prediction/extrapolation.
     #[test]
     fn test_rt_calibration_linear() {
         // Linear relationship: measured_rt = 2 * library_rt + 5
@@ -742,6 +743,7 @@ mod tests {
         assert!(stats.r_squared > 0.99, "R² should be > 0.99 for linear data");
     }
 
+    /// Verifies LOESS calibration captures a sinusoidal nonlinear RT relationship with R-squared above 0.9.
     #[test]
     fn test_rt_calibration_nonlinear() {
         // Nonlinear relationship with some noise
@@ -759,6 +761,7 @@ mod tests {
         assert!(stats.r_squared > 0.9, "R² should be > 0.9 for smooth nonlinear data, got {}", stats.r_squared);
     }
 
+    /// Verifies the RT stratified sampler distributes samples evenly across all bins.
     #[test]
     fn test_stratified_sampler() {
         // Create retention times spanning 0-100
@@ -789,6 +792,7 @@ mod tests {
         }
     }
 
+    /// Verifies calibration succeeds with exactly the minimum number of points and fails with fewer.
     #[test]
     fn test_calibration_edge_cases() {
         // Minimum points
@@ -806,6 +810,7 @@ mod tests {
         assert!(result.is_err(), "Should fail with too few points");
     }
 
+    /// Verifies median computation for odd-length, even-length, and empty slices.
     #[test]
     fn test_median() {
         assert!((median(&[1.0, 2.0, 3.0]) - 2.0).abs() < 1e-10);
@@ -813,6 +818,7 @@ mod tests {
         assert!((median(&[]) - 0.0).abs() < 1e-10);
     }
 
+    /// Verifies sample standard deviation calculation against a known reference value.
     #[test]
     fn test_std_dev() {
         let vals = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
@@ -820,6 +826,7 @@ mod tests {
         assert!((sd - 2.138).abs() < 0.01, "std dev should be ~2.138, got {}", sd);
     }
 
+    /// Verifies that local RT tolerance values are computed and respect the minimum floor across the RT range.
     #[test]
     fn test_local_tolerance_varies_with_rt() {
         // Create calibration with varying residuals: small at early RT, large at late RT
@@ -842,6 +849,7 @@ mod tests {
         assert!(tol_late >= 0.25, "Late tolerance should be at least 0.25");
     }
 
+    /// Verifies that local tolerance returns the minimum floor when residuals are near zero.
     #[test]
     fn test_local_tolerance_minimum_floor() {
         // Create calibration with very small residuals
@@ -857,6 +865,7 @@ mod tests {
         assert!((tol - 0.25).abs() < 0.01, "Tolerance should be at minimum floor 0.25, got {}", tol);
     }
 
+    /// Verifies that local tolerance returns valid values when queried outside the calibration RT range.
     #[test]
     fn test_local_tolerance_extrapolation() {
         // Test extrapolation outside calibration range
@@ -875,6 +884,7 @@ mod tests {
         assert!(tol_above >= 0.25, "Above-range tolerance should be at least 0.25");
     }
 
+    /// Verifies that absolute residuals survive an export/import roundtrip and produce matching local tolerances.
     #[test]
     fn test_model_params_roundtrip_with_abs_residuals() {
         // Test that abs_residuals are preserved through export/import
@@ -897,6 +907,7 @@ mod tests {
         assert!((orig_tol - recon_tol).abs() < 0.01, "Reconstructed calibration should give same local tolerance");
     }
 
+    /// Verifies that loading old model params without abs_residuals falls back to uniform residual_std for tolerance.
     #[test]
     fn test_backwards_compatibility_no_abs_residuals() {
         // Test loading old model params without abs_residuals

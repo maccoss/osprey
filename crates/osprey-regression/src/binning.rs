@@ -105,6 +105,37 @@ impl Binner {
             }
         }
     }
+
+    /// Bin a library entry into a dense f32 slice (for on-the-fly design matrix construction)
+    ///
+    /// Writes binned intensities into `target` (which must have length n_bins).
+    /// Normalizes to unit sum after binning.
+    pub fn bin_library_entry_into(&self, entry: &LibraryEntry, target: &mut [f32]) {
+        target.iter_mut().for_each(|v| *v = 0.0);
+        for frag in &entry.fragments {
+            if let Some(bin) = self.config.mz_to_bin(frag.mz) {
+                target[bin] += frag.relative_intensity;
+            }
+        }
+        // Normalize to unit sum
+        let sum: f32 = target.iter().sum();
+        if sum > 0.0 {
+            target.iter_mut().for_each(|v| *v /= sum);
+        }
+    }
+
+    /// Bin an observed spectrum into a dense f32 vector
+    ///
+    /// Returns a dense vector of length n_bins with raw intensities.
+    pub fn bin_spectrum_dense_f32(&self, spectrum: &Spectrum) -> Vec<f32> {
+        let mut dense = vec![0.0f32; self.config.n_bins];
+        for (&mz, &intensity) in spectrum.mzs.iter().zip(spectrum.intensities.iter()) {
+            if let Some(bin) = self.config.mz_to_bin(mz) {
+                dense[bin] += intensity;
+            }
+        }
+        dense
+    }
 }
 
 impl Default for Binner {
@@ -118,6 +149,7 @@ mod tests {
     use super::*;
     use osprey_core::IsolationWindow;
 
+    /// Verifies that the unit resolution binner creates a reasonable number of bins (between 1000 and 3000).
     #[test]
     fn test_unit_resolution_binner() {
         let binner = Binner::unit_resolution();
@@ -125,6 +157,7 @@ mod tests {
         assert!(binner.n_bins() < 3000);
     }
 
+    /// Verifies that binning a spectrum with four distinct m/z values produces exactly four bins.
     #[test]
     fn test_bin_spectrum() {
         let binner = Binner::unit_resolution();
@@ -142,6 +175,7 @@ mod tests {
         assert_eq!(binned.len(), 4);
     }
 
+    /// Verifies that normalizing a binned spectrum produces intensities that sum to 1.0.
     #[test]
     fn test_normalize() {
         let binner = Binner::unit_resolution();
@@ -153,6 +187,7 @@ mod tests {
         assert!((total - 1.0).abs() < 1e-6);
     }
 
+    /// Verifies that converting a sparse binned spectrum to a dense vector places intensities at the correct bin indices.
     #[test]
     fn test_to_dense() {
         let binner = Binner::unit_resolution();

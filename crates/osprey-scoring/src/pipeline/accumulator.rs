@@ -248,6 +248,7 @@ mod tests {
         }
     }
 
+    /// Verifies that the accumulator groups spectra by isolation window and tracks correct window and spectrum counts.
     #[test]
     fn test_accumulator_grouping() {
         let mut acc = WindowAccumulator::new();
@@ -265,6 +266,7 @@ mod tests {
         assert_eq!(stats.avg_spectra_per_window, 2.0);
     }
 
+    /// Verifies that drain_all returns all accumulated windows and leaves the accumulator empty.
     #[test]
     fn test_drain_all() {
         let mut acc = WindowAccumulator::new();
@@ -277,6 +279,7 @@ mod tests {
         assert_eq!(acc.num_windows(), 0);
     }
 
+    /// Verifies that WindowKey equality uses discretized bounds so that floating-point values within rounding tolerance are treated as equal.
     #[test]
     fn test_window_key() {
         let key1 = WindowKey::from_bounds(400.0, 425.0);

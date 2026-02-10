@@ -133,7 +133,7 @@ impl MokapotRunner {
 
         let max_psms = safe_bytes / BYTES_PER_PSM;
 
-        log::info!(
+        log::debug!(
             "Memory-aware training: {:.1} GB available / {:.1} GB total → max {} PSMs for training",
             available_bytes as f64 / 1e9,
             total_bytes as f64 / 1e9,
@@ -219,7 +219,7 @@ impl MokapotRunner {
         // Write header
         writeln!(
             writer,
-            "SpecId\tLabel\tScanNr\tChargeState\t{}\tPeptide\tProteins",
+            "SpecId\tLabel\tScanNr\tCharge1\tCharge2\tCharge3\tCharge4\tCharge5\t{}\tPeptide\tProteins",
             get_feature_header()
         )
         .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
@@ -239,7 +239,7 @@ impl MokapotRunner {
                 psm.psm_id,
                 label,
                 psm.scan_number,
-                psm.charge,
+                format_charge_features(psm.charge),
                 format_features(&psm.features),
                 format_peptide(&psm.peptide),
                 proteins
@@ -296,7 +296,7 @@ impl MokapotRunner {
         // Write header
         writeln!(
             writer,
-            "SpecId\tLabel\tScanNr\tChargeState\t{}\tPeptide\tProteins",
+            "SpecId\tLabel\tScanNr\tCharge1\tCharge2\tCharge3\tCharge4\tCharge5\t{}\tPeptide\tProteins",
             get_feature_header()
         )
         .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
@@ -316,7 +316,7 @@ impl MokapotRunner {
                 psm.psm_id,
                 label,
                 psm.scan_number,
-                psm.charge,
+                format_charge_features(psm.charge),
                 format_features(&psm.features),
                 format_peptide(&psm.peptide),
                 proteins
@@ -507,7 +507,7 @@ impl MokapotRunner {
             });
         }
 
-        log::info!("Parsed {} mokapot results", results.len());
+        log::debug!("Parsed {} total mokapot results (before FDR filtering)", results.len());
         Ok(results)
     }
 
@@ -609,7 +609,7 @@ print("SUCCESS")
             // Write header
             writeln!(
                 writer,
-                "SpecId\tLabel\tScanNr\tChargeState\t{}\tPeptide\tProteins",
+                "SpecId\tLabel\tScanNr\tCharge1\tCharge2\tCharge3\tCharge4\tCharge5\t{}\tPeptide\tProteins",
                 get_feature_header()
             )
             .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
@@ -728,9 +728,12 @@ print("SUCCESS")
             let results = self.parse_results(&results_file)?;
             let file_name = &file_names[0];
 
-            // Log single-file statistics
-            let precursor_count = results.len();
-            let unique_peptides: HashSet<&str> = results.iter()
+            // Log single-file statistics (filtered by FDR threshold)
+            let passing_results: Vec<_> = results.iter()
+                .filter(|r| r.q_value <= self.test_fdr)
+                .collect();
+            let precursor_count = passing_results.len();
+            let unique_peptides: HashSet<&str> = passing_results.iter()
                 .map(|r| r.peptide.as_str())
                 .collect();
             let peptide_count = unique_peptides.len();
@@ -785,9 +788,12 @@ print("SUCCESS")
                 if results_file.exists() {
                     let results = self.parse_results(&results_file)?;
 
-                    // Count precursors and unique peptides for this file
-                    let precursor_count = results.len();
-                    let unique_peptides: HashSet<&str> = results.iter()
+                    // Count precursors and unique peptides passing FDR threshold
+                    let passing_results: Vec<_> = results.iter()
+                        .filter(|r| r.q_value <= self.test_fdr)
+                        .collect();
+                    let precursor_count = passing_results.len();
+                    let unique_peptides: HashSet<&str> = passing_results.iter()
                         .map(|r| r.peptide.as_str())
                         .collect();
                     let peptide_count = unique_peptides.len();
@@ -823,13 +829,8 @@ print("SUCCESS")
                 per_file_results.len()
             );
 
-            // Check if model file was created by Step 1
-            // Mokapot may use different naming conventions depending on version
-            let model_file = find_mokapot_model(&step1_dir)?;
-            log::info!("Found saved model: {}", model_file.display());
-
             log::info!(
-                "Step 2: Computing experiment-level FDR using saved model..."
+                "Step 2: Training new model for experiment-level FDR..."
             );
 
             // Create step2 directory
@@ -837,23 +838,26 @@ print("SUCCESS")
                 OspreyError::OutputError(format!("Failed to create step2 directory: {}", e))
             })?;
 
-            // Step 2: Run mokapot WITH --aggregate + WITH --load_models
-            // This reuses the model from Step 1 and reports combined experiment-level results
+            // Step 2: Run mokapot WITH --aggregate, training a fresh model
+            // This trains independently from Step 1 to avoid any model bias
             self.run_mokapot_cli(
                 &pin_paths,
                 &step2_dir,
-                true,             // aggregate
-                false,            // don't save models (already have one)
-                Some(&model_file), // load models from Step 1
+                true,   // aggregate
+                false,  // don't save models
+                None,   // train a new model (don't reuse Step 1)
             )?;
 
             // Parse experiment-level results from Step 2
             let experiment_results_file = step2_dir.join("mokapot.psms.txt");
             let experiment_results = self.parse_results(&experiment_results_file)?;
 
-            // Log experiment-level statistics
-            let exp_precursor_count = experiment_results.len();
-            let exp_unique_peptides: HashSet<&str> = experiment_results.iter()
+            // Log experiment-level statistics (filtered by FDR threshold)
+            let passing_exp_results: Vec<_> = experiment_results.iter()
+                .filter(|r| r.q_value <= self.test_fdr)
+                .collect();
+            let exp_precursor_count = passing_exp_results.len();
+            let exp_unique_peptides: HashSet<&str> = passing_exp_results.iter()
                 .map(|r| r.peptide.as_str())
                 .collect();
             let exp_peptide_count = exp_unique_peptides.len();
@@ -877,7 +881,7 @@ print("SUCCESS")
         output_dir: &Path,
         aggregate: bool,
         save_models: bool,
-        load_models: Option<&Path>,
+        load_models: Option<&[PathBuf]>,
     ) -> Result<()> {
         let mut cmd = Command::new(&self.mokapot_path);
 
@@ -901,7 +905,7 @@ print("SUCCESS")
         // Memory-aware training subset (only for training step, not when loading models)
         if load_models.is_none() {
             if let Some(subset_size) = self.effective_subset_max_train() {
-                log::info!(
+                log::debug!(
                     "Using --subset_max_train {} to limit memory usage",
                     subset_size
                 );
@@ -918,8 +922,11 @@ print("SUCCESS")
         if save_models {
             cmd.arg("--save_models");
         }
-        if let Some(model_path) = load_models {
-            cmd.arg("--load_models").arg(model_path);
+        if let Some(model_paths) = load_models {
+            cmd.arg("--load_models");
+            for model_path in model_paths {
+                cmd.arg(model_path);
+            }
         }
 
         // Verbosity
@@ -945,6 +952,12 @@ print("SUCCESS")
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 if let Ok(line) = line {
+                    // Skip Python FutureWarning/DeprecationWarning messages (not actionable)
+                    if line.contains("FutureWarning") || line.contains("DeprecationWarning") {
+                        log::debug!("[mokapot] {}", line);
+                        continue;
+                    }
+
                     if line.contains("INFO") || line.contains("iter") || line.contains("Iteration") {
                         log::info!("[mokapot] {}", line);
                     } else if line.contains("ERROR")
@@ -994,27 +1007,51 @@ impl Default for MokapotRunner {
     }
 }
 
-/// Find the mokapot model file in a directory
+/// Find mokapot model file(s) in a directory
 ///
 /// Mokapot may use different naming conventions depending on version:
-/// - `mokapot.model` (current standard)
+/// - `mokapot.model` (single model, older versions)
+/// - `mokapot.model.pkl` (pickle format)
+/// - `mokapot.model_fold-1.pkl`, `mokapot.model_fold-2.pkl`, etc. (cross-validation folds)
 /// - `mokapot.weights.csv` (older versions)
-/// - `mokapot.model.pkl` (pickle format in some versions)
 ///
-/// Returns an error if no model file is found.
-fn find_mokapot_model(dir: &Path) -> Result<PathBuf> {
-    // Try different possible model file names
-    let candidates = [
+/// Returns a vector of model file paths. For cross-validation, returns all fold files.
+#[allow(dead_code)]
+fn find_mokapot_models(dir: &Path) -> Result<Vec<PathBuf>> {
+    // First, check for cross-validation fold files (mokapot.model_fold-N.pkl)
+    let mut fold_files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.starts_with("mokapot.model_fold-") && name.ends_with(".pkl")
+                })
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Sort fold files to ensure consistent ordering
+    fold_files.sort();
+
+    if !fold_files.is_empty() {
+        log::debug!("Found {} cross-validation fold model files", fold_files.len());
+        return Ok(fold_files);
+    }
+
+    // Fall back to single model file names
+    let single_candidates = [
         "mokapot.model",
-        "mokapot.weights.csv",
         "mokapot.model.pkl",
+        "mokapot.weights.csv",
         "mokapot.weights",
     ];
 
-    for name in &candidates {
+    for name in &single_candidates {
         let path = dir.join(name);
         if path.exists() {
-            return Ok(path);
+            return Ok(vec![path]);
         }
     }
 
@@ -1030,10 +1067,9 @@ fn find_mokapot_model(dir: &Path) -> Result<PathBuf> {
 
     Err(OspreyError::ExternalToolError(format!(
         "Mokapot model file not found in {}. \
-         Expected one of: {:?}. \
+         Expected fold files (mokapot.model_fold-*.pkl) or single file. \
          Files in directory: {:?}",
         dir.display(),
-        candidates,
         files_in_dir
     )))
 }
@@ -1077,14 +1113,34 @@ fn get_feature_header() -> String {
         "top3_matches_deconv",
         // Derived features
         "rt_deviation",
+        // Fragment co-elution features
+        "fragment_coelution_sum",
+        "fragment_coelution_min",
+        "n_coeluting_fragments",
+        // Per-fragment mass accuracy
+        "mass_accuracy_mean",
+        "mass_accuracy_std",
     ]
     .join("\t")
+}
+
+/// Format charge state as 5 binary one-hot features (Charge1..Charge5)
+/// Charge 6+ produces all zeros.
+fn format_charge_features(charge: u8) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}",
+        if charge == 1 { 1 } else { 0 },
+        if charge == 2 { 1 } else { 0 },
+        if charge == 3 { 1 } else { 0 },
+        if charge == 4 { 1 } else { 0 },
+        if charge == 5 { 1 } else { 0 },
+    )
 }
 
 /// Format features for PIN output
 fn format_features(features: &FeatureSet) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         // Ridge regression features (chromatographic profile)
         features.peak_apex,
         features.peak_area,
@@ -1113,19 +1169,46 @@ fn format_features(features: &FeatureSet) -> String {
         features.top3_matches_deconv,
         // Derived features
         features.rt_deviation,
+        // Fragment co-elution features
+        features.fragment_coelution_sum,
+        features.fragment_coelution_min,
+        features.n_coeluting_fragments,
+        // Per-fragment mass accuracy
+        features.mass_accuracy_mean,
+        features.mass_accuracy_std,
     )
 }
 
 /// Format peptide for PIN output
 /// Percolator/mokapot expects format: FLANKING.SEQUENCE.FLANKING
 fn format_peptide(peptide: &str) -> String {
-    // If peptide already has flanking residues, use as-is
-    if peptide.contains('.') {
-        peptide.to_string()
-    } else {
-        // Add placeholder flanking residues
-        format!("-.{}.-", peptide)
+    // First, strip any existing flanking characters (underscores, dots, dashes)
+    let stripped = strip_flanking_chars(peptide);
+
+    // Add standard PIN format flanking residues
+    format!("-.{}.-", stripped)
+}
+
+/// Strip flanking characters from peptide sequences
+///
+/// Handles various formats:
+/// - `_PEPTIDE_` → `PEPTIDE`
+/// - `K.PEPTIDE.R` → `PEPTIDE`
+/// - `-PEPTIDE-` → `PEPTIDE`
+fn strip_flanking_chars(seq: &str) -> String {
+    let trimmed = seq.trim_matches(|c| c == '_' || c == '.' || c == '-');
+
+    // Also handle internal patterns like "K.PEPTIDE.R" -> "PEPTIDE"
+    if let Some(start) = trimmed.find('.') {
+        if let Some(end) = trimmed.rfind('.') {
+            if start < end {
+                // Extract the middle part between the first and last dots
+                return trimmed[start + 1..end].to_string();
+            }
+        }
     }
+
+    trimmed.to_string()
 }
 
 /// Write a simple TSV report of mokapot results
@@ -1157,12 +1240,15 @@ pub fn write_mokapot_report<P: AsRef<Path>>(
 mod tests {
     use super::*;
 
+    /// Verifies that peptide sequences are wrapped in standard PIN flanking format and existing flanking characters are stripped.
     #[test]
     fn test_format_peptide() {
         assert_eq!(format_peptide("PEPTIDE"), "-.PEPTIDE.-");
-        assert_eq!(format_peptide("K.PEPTIDE.R"), "K.PEPTIDE.R");
+        // Flanking residues are stripped and re-wrapped with standard format
+        assert_eq!(format_peptide("K.PEPTIDE.R"), "-.PEPTIDE.-");
     }
 
+    /// Verifies that the PIN feature header contains expected feature names and excludes optional fields.
     #[test]
     fn test_feature_header() {
         let header = get_feature_header();
@@ -1171,6 +1257,19 @@ mod tests {
         assert!(!header.contains("precursor_intensity")); // Optional field not included
     }
 
+    /// Verifies that charge states 1-5 produce correct one-hot encodings and out-of-range charges produce all zeros.
+    #[test]
+    fn test_charge_features() {
+        assert_eq!(format_charge_features(1), "1\t0\t0\t0\t0");
+        assert_eq!(format_charge_features(2), "0\t1\t0\t0\t0");
+        assert_eq!(format_charge_features(3), "0\t0\t1\t0\t0");
+        assert_eq!(format_charge_features(4), "0\t0\t0\t1\t0");
+        assert_eq!(format_charge_features(5), "0\t0\t0\t0\t1");
+        assert_eq!(format_charge_features(6), "0\t0\t0\t0\t0");
+        assert_eq!(format_charge_features(0), "0\t0\t0\t0\t0");
+    }
+
+    /// Verifies that the MokapotRunner can check for mokapot availability without panicking.
     #[test]
     fn test_mokapot_runner_availability() {
         let runner = MokapotRunner::new();

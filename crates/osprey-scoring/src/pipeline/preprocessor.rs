@@ -6,29 +6,27 @@
 //! Note: LibCosine scoring uses PPM matching (not binning) and is computed
 //! on-demand using LibCosineScorer, not preprocessed vectors.
 
-use osprey_core::{IsolationWindow, Spectrum};
+use osprey_core::{BinConfig, IsolationWindow, Spectrum};
 
 /// Configuration for spectrum preprocessing (XCorr only)
 #[derive(Debug, Clone)]
 pub struct PreprocessingConfig {
-    /// Number of bins for XCorr scoring (default: 2000)
-    pub num_bins: usize,
-    /// Minimum m/z for binning
-    pub min_mz: f64,
-    /// Bin width for binning
-    pub bin_width: f64,
+    /// Bin configuration (Comet BIN macro)
+    pub bin_config: BinConfig,
 }
 
 impl Default for PreprocessingConfig {
     fn default() -> Self {
-        let bin_width = 1.0005079; // Comet default
-        let max_mz = 2000.0;
-        let num_bins = ((max_mz / bin_width) + 0.6) as usize + 1;
         Self {
-            num_bins,
-            min_mz: 0.0,
-            bin_width,
+            bin_config: BinConfig::unit_resolution(),
         }
+    }
+}
+
+impl PreprocessingConfig {
+    /// Create config from a BinConfig
+    pub fn with_bin_config(bin_config: BinConfig) -> Self {
+        Self { bin_config }
     }
 }
 
@@ -95,11 +93,12 @@ impl PreprocessingWorker {
     /// Preprocess spectrum for XCorr scoring (Comet-style)
     /// Uses f32 for memory efficiency - source intensities are already f32.
     fn preprocess_for_xcorr(&self, spectrum: &Spectrum) -> Vec<f32> {
-        // Bin with sqrt transformation
-        let mut binned = vec![0.0f32; self.config.num_bins];
+        let n_bins = self.config.bin_config.n_bins;
+
+        // Bin with sqrt transformation using Comet BIN macro
+        let mut binned = vec![0.0f32; n_bins];
         for (&mz, &intensity) in spectrum.mzs.iter().zip(spectrum.intensities.iter()) {
-            let bin = ((mz / self.config.bin_width) + 0.6) as usize;
-            if bin < self.config.num_bins {
+            if let Some(bin) = self.config.bin_config.mz_to_bin(mz) {
                 binned[bin] += intensity.sqrt();
             }
         }
@@ -117,12 +116,13 @@ impl PreprocessingWorker {
     /// maximum peak to 50.0, with a 5% threshold.
     fn apply_windowing_normalization(&self, binned: &[f32]) -> Vec<f32> {
         let mut result = binned.to_vec();
+        let n_bins = self.config.bin_config.n_bins;
         let num_windows = 10;
-        let window_size = self.config.num_bins / num_windows;
+        let window_size = n_bins / num_windows;
 
         for w in 0..num_windows {
             let start = w * window_size;
-            let end = ((w + 1) * window_size).min(self.config.num_bins);
+            let end = ((w + 1) * window_size).min(n_bins);
 
             // Find max in this window
             let max_val = result[start..end]
@@ -147,50 +147,27 @@ impl PreprocessingWorker {
         result
     }
 
-    /// Apply sliding window subtraction for XCorr
+    /// Apply sliding window subtraction for XCorr (Comet-style)
     ///
-    /// Subtracts the average of neighboring bins to remove
-    /// systematic bias (flanking bin subtraction).
-    fn apply_sliding_window(&self, windowed: &[f32]) -> Vec<f32> {
-        let offset = 75; // Comet default offset
-        let mut result = vec![0.0f32; windowed.len()];
+    /// Uses prefix sum for O(n) performance. Comet divides by (2*offset) = 150.
+    fn apply_sliding_window(&self, spectrum: &[f32]) -> Vec<f32> {
+        let n = spectrum.len();
+        let offset: usize = 75;
+        let norm_factor = 1.0f32 / (2 * offset) as f32;
 
-        for i in 0..windowed.len() {
-            // Calculate sum of bins in the offset window
-            let mut sum = 0.0f32;
-            let mut count = 0usize;
+        // Build prefix sum for O(n) window sums
+        let mut prefix = vec![0.0f32; n + 1];
+        for i in 0..n {
+            prefix[i + 1] = prefix[i] + spectrum[i];
+        }
 
-            // Left side of window
-            if i >= offset {
-                for j in (i - offset)..i {
-                    sum += windowed[j];
-                    count += 1;
-                }
-            } else {
-                for j in 0..i {
-                    sum += windowed[j];
-                    count += 1;
-                }
-            }
-
-            // Right side of window
-            if i + offset < windowed.len() {
-                for j in (i + 1)..=(i + offset) {
-                    if j < windowed.len() {
-                        sum += windowed[j];
-                        count += 1;
-                    }
-                }
-            } else {
-                for j in (i + 1)..windowed.len() {
-                    sum += windowed[j];
-                    count += 1;
-                }
-            }
-
-            // Subtract average of neighbors from center bin
-            let avg = if count > 0 { sum / count as f32 } else { 0.0 };
-            result[i] = windowed[i] - avg;
+        let mut result = vec![0.0f32; n];
+        for i in 0..n {
+            let left = if i >= offset { i - offset } else { 0 };
+            let right = if i + offset < n { i + offset + 1 } else { n };
+            let window_sum = prefix[right] - prefix[left];
+            let sum_excluding_center = window_sum - spectrum[i];
+            result[i] = spectrum[i] - sum_excluding_center * norm_factor;
         }
 
         result
@@ -217,6 +194,7 @@ mod tests {
         }
     }
 
+    /// Verifies that the preprocessing worker preserves scan metadata and produces an XCorr vector with the correct bin count.
     #[test]
     fn test_preprocessing_worker() {
         let worker = PreprocessingWorker::new();
@@ -230,9 +208,10 @@ mod tests {
 
         assert_eq!(preprocessed.scan_number, 1);
         assert!((preprocessed.retention_time - 10.0).abs() < 0.001);
-        assert_eq!(preprocessed.xcorr_vector.len(), worker.config.num_bins);
+        assert_eq!(preprocessed.xcorr_vector.len(), worker.config.bin_config.n_bins);
     }
 
+    /// Verifies that preprocessing an empty spectrum produces an all-zero XCorr vector without errors.
     #[test]
     fn test_empty_spectrum() {
         let worker = PreprocessingWorker::new();

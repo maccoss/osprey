@@ -138,6 +138,23 @@ impl FdrController {
         // Sort winners by score descending (highest scores first)
         winners.sort_by(|a, b| b.0.total_cmp(&a.0));
 
+        // Log score ranges and first decoy position for diagnostics
+        if !winners.is_empty() {
+            let first_decoy_rank = winners.iter().position(|(_, is_target, _)| !*is_target);
+            let target_scores: Vec<f64> = winners.iter().filter(|(_, is_t, _)| *is_t).map(|(s, _, _)| *s).collect();
+            let decoy_scores: Vec<f64> = winners.iter().filter(|(_, is_t, _)| !*is_t).map(|(s, _, _)| *s).collect();
+
+            log::debug!(
+                "FDR walk: {} winners, first decoy at rank {} | target scores: [{:.2}, {:.2}] | decoy scores: [{:.2}, {:.2}]",
+                winners.len(),
+                first_decoy_rank.map_or("none".to_string(), |r| (r + 1).to_string()),
+                target_scores.first().copied().unwrap_or(0.0),
+                target_scores.last().copied().unwrap_or(0.0),
+                decoy_scores.first().copied().unwrap_or(0.0),
+                decoy_scores.last().copied().unwrap_or(0.0),
+            );
+        }
+
         // First pass: walk down and find MAX cumulative_targets at any position where FDR <= threshold
         // This matches pyXcorrDIA's approach: valid['cumulative_targets'].max()
         let mut n_target_wins = 0usize;
@@ -301,6 +318,7 @@ pub struct FdrCounts {
 mod tests {
     use super::*;
 
+    /// Verifies that q-values are computed correctly from target and decoy score distributions.
     #[test]
     fn test_qvalue_computation() {
         let controller = FdrController::new(0.01);
@@ -319,6 +337,7 @@ mod tests {
         // (not strictly monotonic due to decoy competition)
     }
 
+    /// Verifies that items are correctly filtered to only those at or below the q-value threshold.
     #[test]
     fn test_filter_by_qvalue() {
         let controller = FdrController::new(0.05);
@@ -329,6 +348,7 @@ mod tests {
         assert_eq!(filtered, vec!["a", "b"]);
     }
 
+    /// Verifies that detection counts at standard FDR thresholds (0.1%, 1%, 5%, 10%) are tallied correctly.
     #[test]
     fn test_count_at_thresholds() {
         let controller = FdrController::new(0.01);
@@ -346,6 +366,7 @@ mod tests {
     // Tests for compete_and_filter (pyXcorrDIA style)
     // ============================================
 
+    /// Verifies that target-decoy competition selects the target when its score exceeds the decoy.
     #[test]
     fn test_competition_target_wins() {
         // Target has higher score than its decoy -> target wins
@@ -367,6 +388,7 @@ mod tests {
         assert_eq!(result.passing_targets[0], "target_1");
     }
 
+    /// Verifies that the decoy wins competition when its score is higher than the target.
     #[test]
     fn test_competition_decoy_wins() {
         // Decoy has higher score than target -> decoy wins
@@ -385,6 +407,7 @@ mod tests {
         assert_eq!(result.passing_targets.len(), 0); // No targets pass
     }
 
+    /// Verifies that tied scores are conservatively awarded to the decoy for FDR estimation.
     #[test]
     fn test_competition_tie_goes_to_decoy() {
         // Equal scores -> decoy wins (conservative for FDR)
@@ -403,6 +426,7 @@ mod tests {
         assert_eq!(result.passing_targets.len(), 0);
     }
 
+    /// Verifies that cumulative FDR is computed correctly as decoy_wins/target_wins and only targets below the threshold pass.
     #[test]
     fn test_competition_fdr_calculation() {
         // Test FDR = decoy_wins / target_wins at each threshold
@@ -444,6 +468,7 @@ mod tests {
         assert_eq!(result.passing_targets.len(), 3);
     }
 
+    /// Verifies that all targets pass when every target beats its paired decoy, yielding 0% FDR.
     #[test]
     fn test_competition_multiple_pairs_all_targets_win() {
         // All targets beat their decoys
@@ -464,6 +489,7 @@ mod tests {
         assert!(result.fdr_at_threshold < 0.001); // FDR is 0
     }
 
+    /// Verifies that no targets pass when all decoys outscore their paired targets.
     #[test]
     fn test_competition_all_decoys_win() {
         // All decoys beat their targets
@@ -483,6 +509,7 @@ mod tests {
         assert_eq!(result.passing_targets.len(), 0);
     }
 
+    /// Verifies that when a peptide is scored multiple times, only the best score per target ID is retained for competition.
     #[test]
     fn test_competition_keeps_best_score_per_peptide() {
         // Same peptide scored multiple times, keep best
@@ -506,6 +533,7 @@ mod tests {
         assert_eq!(result.passing_targets[0], "t1_v2"); // The better-scoring version
     }
 
+    /// Verifies that competition with no input produces zero wins and an empty result set.
     #[test]
     fn test_competition_empty_input() {
         let controller = FdrController::new(0.01);
@@ -518,6 +546,7 @@ mod tests {
         assert_eq!(result.passing_targets.len(), 0);
     }
 
+    /// Verifies that a target with no corresponding decoy wins by default against negative infinity.
     #[test]
     fn test_competition_target_without_decoy() {
         // Target has no corresponding decoy (decoy score defaults to 0)
@@ -535,6 +564,7 @@ mod tests {
         assert_eq!(result.passing_targets.len(), 1);
     }
 
+    /// Verifies that FDR recovery after a decoy spike allows later targets to pass, matching pyXcorrDIA's max cumulative targets behavior.
     #[test]
     fn test_competition_fdr_recovers_after_spike() {
         // Key test: FDR spikes above threshold early, but recovers as more targets accumulate

@@ -13,7 +13,6 @@ osprey-core = { workspace = true }
 ndarray = { workspace = true }
 blas-src = { workspace = true }
 openblas-src = { workspace = true }
-sprs = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

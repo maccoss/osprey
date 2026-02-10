@@ -126,6 +126,7 @@ mod tests {
         }
     }
 
+    /// Verifies that LibraryLoader::supports_format matches only the expected file extension.
     #[test]
     fn test_mock_loader() {
         let loader = MockLoader;

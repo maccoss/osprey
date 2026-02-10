@@ -127,10 +127,12 @@ fn apply_windowing_normalization(spectrum: &[f64]) -> Vec<f64> {
 
 ### Step 3: Flanking Bin Subtraction (Fast XCorr)
 
-Comet's fast XCorr preprocessing subtracts the local average to create an autocorrelation-like effect:
+Comet's fast XCorr preprocessing subtracts the local average to create an autocorrelation-like effect.
+
+**Naive O(n × 151) implementation** (for reference):
 
 ```rust
-fn apply_sliding_window(spectrum: &[f64]) -> Vec<f64> {
+fn apply_sliding_window_naive(spectrum: &[f64]) -> Vec<f64> {
     let mut result = vec![0.0; spectrum.len()];
     let offset: i64 = 75;  // Comet's iXcorrProcessingOffset
     let window_range = 2 * offset + 1;  // 151 bins total
@@ -138,21 +140,48 @@ fn apply_sliding_window(spectrum: &[f64]) -> Vec<f64> {
 
     for i in 0..spectrum.len() {
         let mut sum = 0.0;
-
-        // Sum values in window, excluding center
         for j in (i as i64 - offset)..=(i as i64 + offset) {
             if j >= 0 && j < spectrum.len() as i64 && j != i as i64 {
                 sum += spectrum[j as usize];
             }
         }
-
-        // Subtract local average from center value
         result[i] = spectrum[i] - sum * norm_factor;
     }
-
     result
 }
 ```
+
+**Optimized O(n) prefix-sum implementation** (used in Osprey):
+
+The naive approach is O(n × 151) — fine for 2K unit-resolution bins but ~14M ops for 95K HRAM bins per spectrum. Osprey uses a prefix-sum approach:
+
+```rust
+fn apply_sliding_window(spectrum: &[f64]) -> Vec<f64> {
+    let n = spectrum.len();
+    let offset: usize = 75;
+    let norm_factor = 1.0 / (2 * offset) as f64;  // Exclude center from 151 bins
+
+    // Build prefix sum: prefix[i] = spectrum[0] + spectrum[1] + ... + spectrum[i-1]
+    let mut prefix = vec![0.0; n + 1];
+    for i in 0..n {
+        prefix[i + 1] = prefix[i] + spectrum[i];
+    }
+
+    // For each bin, compute window sum using prefix sums
+    let mut result = vec![0.0; n];
+    for i in 0..n {
+        let left = if i >= offset { i - offset } else { 0 };
+        let right = (i + offset + 1).min(n);
+
+        // Window sum = prefix[right] - prefix[left], then subtract center
+        let window_sum = prefix[right] - prefix[left] - spectrum[i];
+        result[i] = spectrum[i] - window_sum * norm_factor;
+    }
+    result
+}
+```
+
+This reduces sliding window from O(n × 151) to O(n), critical for HRAM bins where n ≈ 100,000.
 
 **Why flanking subtraction?**
 - Enhances peaks that stand out from their local background
@@ -228,26 +257,46 @@ The 0.005 scaling factor comes from Comet's normalization:
 
 ## BLAS Vectorization
 
-For efficiency, Osprey preprocesses all spectra and library entries once per isolation window, then uses matrix multiplication:
+For efficiency, Osprey uses BLAS-accelerated dot products for XCorr scoring.
+
+### Calibration XCorr (per-peptide scoring)
+
+During calibration, each peptide is scored against all spectra in its RT window. The experimental spectrum is preprocessed once, and XCorr is computed via `ndarray::ArrayView1::dot()` which dispatches to BLAS `sdot` for contiguous f32 slices:
 
 ```rust
-// Preprocess all experimental spectra ONCE
-let experimental_matrix: Vec<Vec<f64>> = spectra
-    .iter()
-    .map(|s| preprocess_spectrum_for_xcorr(s))
-    .collect();
+// Preprocess experimental spectrum ONCE
+let exp_preprocessed = scorer.preprocess_spectrum_for_xcorr(&spectrum);
 
-// Preprocess all library entries ONCE (just binning, no windowing)
-let theoretical_matrix: Vec<Vec<f64>> = entries
-    .iter()
-    .map(|e| preprocess_library_for_xcorr(e))
-    .collect();
+// Preprocess library entry (just binning, no windowing)
+let lib_preprocessed = scorer.preprocess_library_for_xcorr(&entry);
 
-// Matrix multiply for all-vs-all scoring
-// xcorr_matrix[i][j] = dot(theoretical[i], experimental[j]) * 0.005
+// XCorr via BLAS sdot (dispatched by ndarray)
+let xcorr = exp_view.dot(&lib_view) * 0.005;
 ```
 
-This allows scoring thousands of peptide-spectrum pairs with a single BLAS call.
+### Feature Extraction XCorr (O(n_fragments) optimization)
+
+During post-regression feature extraction, XCorr is computed using an O(n_fragments) shortcut. Since the theoretical spectrum has unit intensities at fragment bin positions, the dot product reduces to summing the preprocessed experimental values at those positions:
+
+```rust
+// O(n_fragments) instead of O(n_bins)
+let mut xcorr = 0.0;
+for fragment in &entry.fragments {
+    let bin = bin_config.mz_to_bin(fragment.mz);
+    if bin < preprocessed.len() {
+        xcorr += preprocessed[bin];
+    }
+}
+xcorr *= 0.005;
+```
+
+This avoids creating a dense theoretical vector and is faster when n_fragments << n_bins (typical: 20-50 fragments vs 2K-100K bins).
+
+## Calibration: Always Unit Resolution Bins
+
+Calibration XCorr always uses **unit resolution bins** (2001 bins, 1.0005 Da) regardless of whether the data is unit resolution or HRAM. This provides ~50x faster scoring for HRAM data while maintaining sufficient discriminating power for calibration.
+
+HRAM-resolution bins (0.02 Da, 100K bins) are only used for the ridge regression phase (Phase 3), not for calibration.
 
 ## Comparison: XCorr vs LibCosine
 
@@ -257,7 +306,7 @@ This allows scoring thousands of peptide-spectrum pairs with a single BLAS call.
 | **Normalization** | Window max=50 | L2 normalization |
 | **Matching** | Bin position lookup | ppm tolerance matching |
 | **Score range** | 0-10 typical | 0-1 (cosine similarity) |
-| **Best for** | RT selection (all spectra) | Fragment scoring (best RT) |
+| **Used in** | Calibration (all spectra) + feature extraction | Post-regression feature extraction only |
 | **Library intensity** | Ignored (unit=1.0) | sqrt-transformed |
 
 ## Example
@@ -334,14 +383,18 @@ Key files:
 
 ```rust
 use osprey_scoring::SpectralScorer;
+use osprey_core::BinConfig;
 
-// Create scorer (unit resolution)
-let scorer = SpectralScorer::unit_resolution();
+// Create scorer — unit resolution (default, used for calibration)
+let scorer = SpectralScorer::new();  // 2001 bins, 1.0005 Da
+
+// Create scorer — HRAM (for feature extraction)
+let scorer = SpectralScorer::with_bin_config(BinConfig::hram());  // 100K bins, 0.02 Da
 
 // Single spectrum scoring
 let score = scorer.xcorr(&spectrum, &library_entry);
 
-// Batch preprocessing for BLAS
+// Batch preprocessing for BLAS sdot
 let exp_preprocessed = scorer.preprocess_spectrum_for_xcorr(&spectrum);
 let theo_preprocessed = scorer.preprocess_library_for_xcorr(&entry);
 let xcorr = SpectralScorer::xcorr_from_preprocessed(&exp_preprocessed, &theo_preprocessed);

@@ -111,6 +111,7 @@ mod tests {
         entry
     }
 
+    /// Verifies that the design matrix has correct dimensions and column-normalized entries summing to 1.0.
     #[test]
     fn test_build_design_matrix() {
         let builder = DesignMatrixBuilder::default();
@@ -131,6 +132,7 @@ mod tests {
         assert!((col2_sum - 1.0).abs() < 1e-6);
     }
 
+    /// Verifies that build_with_indices returns the correct library entry IDs alongside the design matrix.
     #[test]
     fn test_build_with_indices() {
         let builder = DesignMatrixBuilder::default();

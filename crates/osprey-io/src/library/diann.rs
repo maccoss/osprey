@@ -176,7 +176,7 @@ impl DiannTsvLoader {
         // Required fields
         let precursor_mz = parse_f64(get_field(cols.precursor_mz, "PrecursorMz")?, "PrecursorMz")?;
         let charge = parse_u8(get_field(cols.precursor_charge, "PrecursorCharge")?, "PrecursorCharge")?;
-        let modified_sequence = get_field(cols.modified_peptide, "ModifiedPeptide")?.to_string();
+        let modified_sequence = strip_flanking_chars(get_field(cols.modified_peptide, "ModifiedPeptide")?);
         let fragment_mz = parse_f64(get_field(cols.fragment_mz, "FragmentMz")?, "FragmentMz")?;
         let relative_intensity = parse_f32(
             get_field(cols.relative_intensity, "RelativeIntensity")?,
@@ -385,6 +385,28 @@ struct PrecursorData {
     fragments: Vec<LibraryFragment>,
 }
 
+/// Strip flanking characters from peptide sequences
+///
+/// Handles various formats from different library sources:
+/// - `_PEPTIDE_` → `PEPTIDE` (DIA-NN format)
+/// - `K.PEPTIDE.R` → `PEPTIDE` (Percolator format)
+/// - `-PEPTIDE-` → `PEPTIDE`
+fn strip_flanking_chars(seq: &str) -> String {
+    let trimmed = seq.trim_matches(|c| c == '_' || c == '.' || c == '-');
+
+    // Also handle internal patterns like "K.PEPTIDE.R" -> "PEPTIDE"
+    if let Some(start) = trimmed.find('.') {
+        if let Some(end) = trimmed.rfind('.') {
+            if start < end {
+                // Extract the middle part between the first and last dots
+                return trimmed[start + 1..end].to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
 /// Strip modifications from a modified peptide sequence
 fn strip_modifications(modified: &str) -> String {
     let mut result = String::with_capacity(modified.len());
@@ -521,6 +543,7 @@ fn split_list(s: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Verifies that modification notations in brackets and parentheses are correctly stripped from peptide sequences.
     #[test]
     fn test_strip_modifications() {
         assert_eq!(strip_modifications("PEPTIDE"), "PEPTIDE");
@@ -529,6 +552,7 @@ mod tests {
         assert_eq!(strip_modifications("PEPTM[Oxidation]IDE"), "PEPTMIDE");
     }
 
+    /// Verifies that bracketed mass shift modifications are parsed with correct position and mass delta.
     #[test]
     fn test_parse_modifications() {
         let mods = parse_modifications("PEPTM[+15.9949]IDE");
@@ -537,6 +561,7 @@ mod tests {
         assert!((mods[0].mass_delta - 15.9949).abs() < 1e-4);
     }
 
+    /// Verifies that semicolon-delimited and comma-delimited protein/gene lists are correctly split and trimmed.
     #[test]
     fn test_split_list() {
         assert_eq!(split_list("A;B;C"), vec!["A", "B", "C"]);
@@ -544,6 +569,7 @@ mod tests {
         assert_eq!(split_list("A; B; C"), vec!["A", "B", "C"]);
     }
 
+    /// Verifies that modification mass parsing handles signed numeric strings and named modifications like Oxidation.
     #[test]
     fn test_parse_mod_mass() {
         assert!((parse_mod_mass("+15.9949").unwrap() - 15.9949).abs() < 1e-4);

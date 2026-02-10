@@ -4,13 +4,13 @@ Osprey uses spectral similarity scoring to assess whether an observed spectrum m
 
 ## Overview
 
-The scoring system follows the pyXcorrDIA methodology for calibration:
+The scoring system uses XCorr with E-value for calibration:
 
 ```
-Workflow:
+Calibration Workflow:
   1. For each library entry, calculate XCorr against ALL spectra in RT window
   2. Select best spectrum by XCorr (RT selection)
-  3. Calculate LibCosine at the best XCorr spectrum
+  3. Collect MS2 mass errors from top-3 fragment matches at best spectrum
   4. Calculate E-value from XCorr survival function (Comet-style)
   5. Extract MS1 isotope envelope → isotope cosine score
   6. Use E-value for target-decoy competition
@@ -19,16 +19,18 @@ Workflow:
 
 ## Scoring Methods
 
-### XCorr (RT Selection Score)
+### XCorr (Primary Calibration Score)
 
 XCorr uses Comet-style preprocessing for cross-correlation scoring. It is calculated for ALL spectra in the RT tolerance window and used to select the best retention time. See [XCorr Scoring](xcorr-scoring.md) for detailed implementation.
 
+Calibration XCorr always uses **unit resolution bins** (2001 bins, 1.0005 m/z) regardless of whether the data is unit resolution or HRAM. This provides ~50x faster scoring for HRAM data while maintaining sufficient discriminating power for calibration.
+
 ```
 Experimental Spectrum Preprocessing:
-  1. Bin into discrete bins (0-2000 m/z, bin_width = 1.0005079 Da)
+  1. Bin into discrete bins (Comet BIN macro: bin_width = 1.0005079 Da, offset = 0.4)
   2. Apply sqrt transformation
   3. Windowing normalization (10 windows, normalize each to max=50, threshold 5%)
-  4. Flanking bin subtraction (offset=75, removes local average)
+  4. Flanking bin subtraction (prefix-sum O(n), offset=75, removes local average)
 
 Theoretical Spectrum (NO preprocessing - this is critical!):
   1. Bin fragment m/z values with unit intensity (1.0)
@@ -37,34 +39,10 @@ Theoretical Spectrum (NO preprocessing - this is critical!):
 
 Scoring:
   - XCorr = Σ experimental_preprocessed[fragment_bins] × 0.005
-  - Equivalent to dot product since theoretical has unit intensities
+  - Computed via BLAS sdot (ndarray ArrayView1::dot)
 ```
 
-**Key insight**: Comet does NOT preprocess the theoretical spectrum. It simply looks up values from the preprocessed experimental spectrum at each fragment bin position and sums them. Applying windowing to the theoretical spectrum would inflate scores by ~50x.
-
-### LibCosine (Fragment Match Score)
-
-LibCosine is a cosine similarity score with sqrt intensity preprocessing:
-
-```
-Preprocessing (per fragment):
-  value = sqrt(intensity)
-
-Scoring:
-  1. Match library fragments to observed peaks (within ppm tolerance)
-  2. Apply sqrt preprocessing to matched intensities
-  3. L2 normalize both vectors
-  4. Compute cosine similarity (dot product of normalized vectors)
-
-Score range: 0-1 (1 = perfect match)
-```
-
-**Why sqrt preprocessing?**
-- Down-weights dominant peaks and gives more influence to smaller peaks
-- Accounts for measurement variability in fragment intensities
-- L2 normalization enables meaningful comparison regardless of total intensity
-
-**Note**: LibCosine uses **PPM matching** (no binning). Each library fragment is matched to the closest observed peak within the tolerance window.
+**Key insight**: Comet does NOT preprocess the theoretical spectrum. It simply looks up values from the preprocessed experimental spectrum at each fragment bin position and sums them.
 
 ### E-Value (Significance Score)
 
@@ -79,6 +57,23 @@ E-value calculation:
 ```
 
 Lower E-value = better statistical significance. E-value is used for target-decoy competition.
+
+### Top-3 Fragment Matching (MS2 Calibration)
+
+After XCorr selects the best spectrum, Osprey collects MS2 mass errors from the top-3 most intense library fragments using binary search:
+
+```
+For the best XCorr spectrum:
+  1. Find top 3 library fragments by intensity
+  2. Binary search each in sorted observed m/z array
+  3. Find closest peak within tolerance window
+  4. Compute signed mass error (ppm or Th)
+
+Returns: (has_match: bool, mass_errors: Vec<f64>)
+Cost: O(3 × log n_peaks) per peptide
+```
+
+These mass errors feed into MS2 mass calibration for the main search phase.
 
 ### Isotope Cosine Score (MS1 Quality)
 
@@ -107,35 +102,13 @@ The isotope cosine score compares the observed MS1 isotope envelope to the theor
 - Sulfur-containing peptides (Cys, Met) have distinct M+2 patterns
 - Enables confident MS1-level validation
 
-## Fragment Matching
+## Pre-Filtering
 
-Library fragments are matched to observed peaks using **closest m/z** within tolerance (pyXcorrDIA approach):
-
-```rust
-// Find closest matching experimental peak within tolerance
-// Select peak with smallest m/z difference, NOT highest intensity
-let mut best_mz_diff = f64::INFINITY;
-
-for (&exp_mz, &exp_intensity) in spectrum.mzs.iter().zip(spectrum.intensities.iter()) {
-    if tolerance.within_tolerance(lib_mz, exp_mz) {
-        let mz_diff = (exp_mz - lib_mz).abs();
-        if mz_diff < best_mz_diff {
-            best_mz_diff = mz_diff;
-            best_intensity = exp_intensity;
-            best_mz = Some(exp_mz);
-        }
-    }
-}
-```
+Before XCorr scoring, candidates are filtered using the `has_top3_fragment_match` function — a fast binary search check that requires at least 1 of the top-3 most intense library fragments to be present in the observed spectrum. This eliminates candidates with no spectral evidence before expensive XCorr preprocessing.
 
 **Tolerance modes:**
 - **ppm tolerance**: 10-20 ppm (HRAM instruments - Orbitrap, TOF)
 - **Da tolerance**: 0.5 Da (unit resolution instruments)
-
-**Metrics computed:**
-- `n_matched`: Number of library fragments with matches
-- `n_library`: Total library fragments
-- `mass_errors`: Vector of (observed - theoretical) errors for calibration
 
 ## Target-Decoy Competition
 
@@ -161,19 +134,19 @@ FDR calculation:
 ```
 Per peptide (target or decoy):
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. Find all spectra in RT tolerance window (~700 spectra)   │
+│ 1. Filter by RT tolerance + top-3 fragment match            │
 │                                                             │
-│ 2. Calculate XCorr for ALL spectra                          │
+│ 2. Calculate XCorr for ALL passing spectra                  │
 │    → Collect all scores for E-value calculation             │
 │    → Track best XCorr and its spectrum index                │
 │                                                             │
 │ 3. At best XCorr spectrum:                                  │
-│    → Calculate LibCosine (PPM matching, sqrt intensity)     │
+│    → Collect MS2 mass errors from top-3 fragments           │
 │    → Extract MS1 isotope envelope                           │
 │                                                             │
 │ 4. Calculate E-value from XCorr survival function           │
 │                                                             │
-│ 5. Output: E-value, LibCosine, XCorr, isotope_cosine        │
+│ 5. Output: E-value, XCorr, MS2 errors, isotope_cosine      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -198,44 +171,27 @@ Spectral scoring populates these fields in CalibrationMatch:
 | Field | Source | Description |
 |-------|--------|-------------|
 | `evalue` | XCorr survival | Comet-style E-value (lower = better) |
-| `score` | LibCosine | Cosine similarity score (0-1) |
+| `score` | XCorr | Same as xcorr_score (primary score) |
 | `xcorr_score` | XCorr | Comet-style cross-correlation |
 | `isotope_cosine_score` | MS1 | Isotope envelope match (0-1) |
-| `n_matched_fragments` | Matching | Number of library fragments matched |
-| `ms2_mass_errors` | Matching | Fragment mass errors (ppm) |
-| `ms1_ppm_error` | MS1 | Precursor mass error (ppm) |
+| `n_matched_fragments` | Top-3 matching | Number of top-3 fragments matched (0-3) |
+| `ms2_mass_errors` | Top-3 matching | Fragment mass errors (ppm or Th) |
+| `ms1_error` | MS1 | Precursor mass error (ppm or Th) |
 
 ## Implementation
 
 Key files:
-- `crates/osprey-scoring/src/lib.rs` - SpectralScorer (XCorr preprocessing)
-- `crates/osprey-scoring/src/batch.rs` - LibCosineScorer, E-value calculation, batch scoring
+- `crates/osprey-scoring/src/lib.rs` - SpectralScorer (XCorr preprocessing), `top3_fragment_match_with_errors`
+- `crates/osprey-scoring/src/batch.rs` - E-value calculation, calibration batch scoring
 - `crates/osprey-core/src/isotope.rs` - Isotope distribution calculations
 - `crates/osprey/src/pipeline.rs` - Integration in calibration workflow
-
-### LibCosineScorer API
-
-```rust
-use osprey_scoring::batch::LibCosineScorer;
-
-// Create scorer with ppm tolerance
-let scorer = LibCosineScorer::hram(10.0);  // 10 ppm
-
-// Score with mass error collection
-let (score, mass_errors) = scorer.score_with_errors(&library_entry, &spectrum);
-println!("LibCosine: {:.3}", score);
-println!("Matched fragments: {}", mass_errors.len());
-
-// Fragment matching details
-let match_result = scorer.match_fragments(&library_entry, &spectrum);
-println!("Matched {}/{} fragments", match_result.n_matched, library_entry.fragments.len());
-```
 
 ### SpectralScorer API (XCorr)
 
 ```rust
 use osprey_scoring::SpectralScorer;
 
+// Create scorer (always unit resolution for calibration)
 let xcorr_scorer = SpectralScorer::new();
 
 // Preprocess spectrum for XCorr
@@ -244,8 +200,25 @@ let spec_preprocessed = xcorr_scorer.preprocess_spectrum_for_xcorr(&spectrum);
 // Preprocess library entry for XCorr
 let lib_preprocessed = xcorr_scorer.preprocess_library_for_xcorr(&entry);
 
-// Compute XCorr from preprocessed vectors
+// Compute XCorr from preprocessed vectors (BLAS sdot)
 let xcorr = SpectralScorer::xcorr_from_preprocessed(&spec_preprocessed, &lib_preprocessed);
+```
+
+### Top-3 Fragment Matching API
+
+```rust
+use osprey_scoring::top3_fragment_match_with_errors;
+
+// Get both filter result and mass errors in one call
+let (has_match, ms2_errors) = top3_fragment_match_with_errors(
+    &entry.fragments,
+    &spectrum.mzs,
+    tolerance,
+    unit,
+);
+
+// has_match: true if at least 1 of top-3 matched
+// ms2_errors: signed mass errors for each matched fragment
 ```
 
 ### E-Value Calculation API
@@ -254,9 +227,9 @@ let xcorr = SpectralScorer::xcorr_from_preprocessed(&spec_preprocessed, &lib_pre
 use osprey_scoring::batch::calculate_evalue_from_xcorr_distribution;
 
 // Collect ALL XCorr scores in RT window
-let all_xcorr_scores: Vec<f64> = spectra_in_window
+let all_xcorr_scores: Vec<f64> = candidate_spectra
     .iter()
-    .map(|spec| xcorr_scorer.score(entry, spec))
+    .map(|spec| SpectralScorer::xcorr_from_preprocessed(&spec_preprocessed, &lib_preprocessed))
     .collect();
 
 // Calculate E-value from survival function
@@ -288,56 +261,43 @@ if envelope.has_m0() {
 ```
 Peptide: PEPTIDEK (charge 2+)
 Library fragments: y3(348.2), y4(461.3), y5(576.3), b3(357.2), b4(458.2)
+Top-3 by intensity: y3, y4, y5
 
-Step 1: XCorr against ALL spectra in RT window (20% tolerance)
-  700 spectra scored
+Step 1: Pre-filter (top-3 check)
+  y3: 348.2 → binary search → 348.201 found ✓ → passes filter
+
+Step 2: XCorr against ALL spectra in RT window (20% tolerance)
+  700 spectra preprocessed (unit resolution: 2001 bins)
   Best XCorr: 0.42 at RT=25.3 min (scan 1234)
   All XCorr scores collected for E-value calculation
 
-Step 2: LibCosine at best XCorr spectrum (RT=25.3 min)
-  Observed spectrum:
-    m/z: [348.201, 461.299, 576.305, 400.1, 550.2, ...]
-    intensity: [1000, 800, 600, 200, 150, ...]
+Step 3: Top-3 fragment errors at best XCorr spectrum (RT=25.3 min)
+  y3: 348.2 → 348.201 ✓ (error: +2.9 ppm)
+  y4: 461.3 → 461.299 ✓ (error: -2.2 ppm)
+  y5: 576.3 → 576.305 ✓ (error: +8.7 ppm)
+  → 3 MS2 mass errors for calibration
 
-  Fragment matching (10 ppm tolerance):
-    y3: 348.2 → 348.201 ✓ (error: +2.9 ppm, closest m/z)
-    y4: 461.3 → 461.299 ✓ (error: -2.2 ppm)
-    y5: 576.3 → 576.305 ✓ (error: +8.7 ppm)
-    b3: 357.2 → no match ✗
-    b4: 458.2 → no match ✗
-
-  Metrics:
-    n_matched: 3
-    n_library: 5
-    avg_ms2_error: +3.1 ppm
-
-  LibCosine scoring (sqrt intensity, NO m/z weighting):
-    Library:  [sqrt(100), sqrt(80), sqrt(60)]
-    Observed: [sqrt(1000), sqrt(800), sqrt(600)]
-    (normalized and dot product computed)
-    LibCosine: 0.95
-
-Step 3: E-value from XCorr survival function
+Step 4: E-value from XCorr survival function
   700 XCorr scores → fit survival function → E-value: 1.2e-8
 
-Step 4: Isotope cosine (from MS1)
+Step 5: Isotope cosine (from MS1)
   Theoretical: [0.55, 0.30, 0.12, 0.03]  (from C41H68N10O15)
   Observed:    [0.52, 0.31, 0.13, 0.04]
   Isotope cosine: 0.998
 
 Final scores:
   E-value: 1.2e-8 (used for target-decoy competition)
-  LibCosine: 0.95
-  XCorr: 0.42
+  XCorr: 0.42 (primary score)
+  MS2 errors: [+2.9, -2.2, +8.7] ppm (for MS2 calibration)
   Isotope cosine: 0.998
 ```
 
 ## Notes
 
-1. **XCorr for RT selection**: XCorr is calculated against ALL spectra in RT window to find the best retention time
-2. **LibCosine at best RT**: LibCosine is only computed once, at the spectrum with the best XCorr
-3. **E-value for competition**: E-value (not LibCosine) is used for target-decoy competition
-4. **Score interpretation**: LibCosine > 0.7 is typically a reasonable match, E-value < 1e-5 is good
-5. **Closest m/z matching**: Ensures accurate mass error calculation for calibration
-6. **Isotope scoring**: Only available when MS1 spectra are present in the mzML file
+1. **XCorr for everything**: XCorr is both the RT selection score and the primary calibration score
+2. **Unit resolution bins for calibration**: Always 2001 bins regardless of data type (~50x faster for HRAM)
+3. **E-value for competition**: E-value (from XCorr survival function) is used for target-decoy competition
+4. **Top-3 for MS2 calibration**: MS2 mass errors come from top-3 fragment matching (binary search), not full fragment matching
+5. **Isotope scoring**: Only available when MS1 spectra are present in the mzML file
+6. **LibCosine in post-regression**: LibCosine (ppm fragment matching) is used during post-regression feature extraction (Phase 4), not during calibration
 7. **Multiple scores**: All scores written to debug CSV for analysis

@@ -375,12 +375,14 @@ fn decode_blib_peaks(mz_blob: &[u8], intensity_blob: &[u8]) -> Result<Vec<Librar
 mod tests {
     use super::*;
 
+    /// Verifies that an unmodified peptide sequence produces an empty modifications list.
     #[test]
     fn test_parse_blib_modifications_simple() {
         let mods = parse_blib_modifications("PEPTIDE");
         assert!(mods.is_empty());
     }
 
+    /// Verifies that a carbamidomethyl modification is parsed with correct position, mass, and UniMod ID.
     #[test]
     fn test_parse_blib_modifications_carbamidomethyl() {
         let mods = parse_blib_modifications("PEPTC[+57.021]IDE");
@@ -390,6 +392,7 @@ mod tests {
         assert_eq!(mods[0].unimod_id, Some(4));
     }
 
+    /// Verifies that an oxidation modification is parsed with the correct residue position and UniMod ID.
     #[test]
     fn test_parse_blib_modifications_oxidation() {
         let mods = parse_blib_modifications("PEPTM[+15.995]IDE");
@@ -398,6 +401,7 @@ mod tests {
         assert_eq!(mods[0].unimod_id, Some(35));
     }
 
+    /// Verifies that a mass delta is correctly identified as carbamidomethyl with its UniMod ID and name.
     #[test]
     fn test_identify_modification() {
         let (mass, unimod, name) = identify_modification(57.021, false);

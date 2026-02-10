@@ -3,7 +3,29 @@
 use anyhow::Result;
 use clap::Parser;
 use osprey::{run_analysis, ConfigOverrides, OspreyConfig, ResolutionMode, ToleranceUnit};
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// Writer that tees output to both stderr and a log file
+struct TeeWriter {
+    stderr: std::io::Stderr,
+    file: Mutex<std::io::BufWriter<std::fs::File>>,
+}
+
+impl Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stderr.write_all(buf)?;
+        self.file.lock().unwrap().write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stderr.flush()?;
+        self.file.lock().unwrap().flush()?;
+        Ok(())
+    }
+}
 
 /// Osprey: Peptide-centric DIA analysis tool
 #[derive(Parser, Debug)]
@@ -63,6 +85,14 @@ struct Args {
     #[arg(long)]
     fragment_unit: Option<String>,
 
+    /// Precursor m/z tolerance (e.g., 10 for 10 ppm, or 1.0 for 1.0 Th)
+    #[arg(long)]
+    precursor_tolerance: Option<f64>,
+
+    /// Precursor tolerance unit: ppm, mz (Thompson)
+    #[arg(long)]
+    precursor_unit: Option<String>,
+
     /// RT tolerance in minutes (fallback when calibration disabled)
     #[arg(long, default_value_t = 2.0)]
     rt_tolerance: f64,
@@ -91,6 +121,10 @@ struct Args {
     #[arg(long)]
     report: Option<PathBuf>,
 
+    /// Export coefficient time series to parquet file(s)
+    #[arg(long)]
+    export_coefficients: bool,
+
     /// Use streaming mode for memory-efficient processing (requires streaming feature)
     #[arg(long)]
     streaming: bool,
@@ -103,9 +137,17 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging
+    // Initialize logging — tee to both stderr and a log file in the current directory
     let log_level = if args.verbose { "debug" } else { "info" };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+    let log_filename = format!("osprey_{}.log", chrono::Local::now().format("%Y-%m-%d_%H%M%S"));
+    let log_file = std::fs::File::create(&log_filename)?;
+    let tee = TeeWriter {
+        stderr: std::io::stderr(),
+        file: Mutex::new(std::io::BufWriter::new(log_file)),
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
+        .target(env_logger::Target::Pipe(Box::new(tee)))
+        .init();
 
     // Handle --generate-config
     if let Some(config_path) = args.generate_config {
@@ -130,13 +172,24 @@ fn main() -> Result<()> {
         OspreyConfig::default()
     };
 
-    // Parse fragment unit if provided
+    // Parse tolerance units if provided
     let fragment_unit = args.fragment_unit.as_ref().map(|s| {
         match s.to_lowercase().as_str() {
             "ppm" => ToleranceUnit::Ppm,
             "mz" | "th" | "da" => ToleranceUnit::Mz,
             _ => {
                 log::warn!("Unknown fragment unit '{}', defaulting to ppm", s);
+                ToleranceUnit::Ppm
+            }
+        }
+    });
+
+    let precursor_unit = args.precursor_unit.as_ref().map(|s| {
+        match s.to_lowercase().as_str() {
+            "ppm" => ToleranceUnit::Ppm,
+            "mz" | "th" | "da" => ToleranceUnit::Mz,
+            _ => {
+                log::warn!("Unknown precursor unit '{}', defaulting to ppm", s);
                 ToleranceUnit::Ppm
             }
         }
@@ -157,6 +210,8 @@ fn main() -> Result<()> {
         streaming: args.streaming,
         fragment_tolerance: args.fragment_tolerance,
         fragment_unit,
+        precursor_tolerance: args.precursor_tolerance,
+        precursor_unit,
     };
 
     // Apply CLI overrides
@@ -170,24 +225,37 @@ fn main() -> Result<()> {
     };
     config.resolution_mode = resolution_mode;
 
-    // If resolution mode is unit and fragment unit wasn't explicitly specified,
-    // default to Th (Mz) instead of ppm for both MS1 and MS2 calibration
-    if resolution_mode == ResolutionMode::UnitResolution && args.fragment_unit.is_none() {
-        config.fragment_tolerance.unit = ToleranceUnit::Mz;
-        config.precursor_tolerance.unit = ToleranceUnit::Mz;
-        // Also set default tolerance if not specified (0.5 Th is typical for unit resolution)
-        if args.fragment_tolerance.is_none() {
-            config.fragment_tolerance.tolerance = 0.5;
+    // Apply unit resolution defaults (Th units, 1.0 Th precursor, 0.5 Th fragment)
+    // Explicit CLI args override these defaults
+    if resolution_mode == ResolutionMode::UnitResolution {
+        // Precursor tolerance defaults for unit resolution
+        if args.precursor_unit.is_none() {
+            config.precursor_tolerance.unit = ToleranceUnit::Mz;
         }
-        // Set precursor tolerance to match (0.5 Th is reasonable for MS1 on unit resolution)
-        config.precursor_tolerance.tolerance = 0.5;
-        log::info!("Unit resolution mode: using Th units for mass calibration (MS1: {:.2} Th, MS2: {:.2} Th)",
-            config.precursor_tolerance.tolerance,
-            config.fragment_tolerance.tolerance);
+        if args.precursor_tolerance.is_none() {
+            config.precursor_tolerance.tolerance = 1.0;
+        }
+
+        // Fragment tolerance defaults for unit resolution
+        if args.fragment_unit.is_none() {
+            config.fragment_tolerance.unit = ToleranceUnit::Mz;
+            if args.fragment_tolerance.is_none() {
+                config.fragment_tolerance.tolerance = 0.5;
+            }
+        }
+
+        log::info!("Unit resolution mode: MS1 {:.2} {:?}, MS2 {:.2} {:?}",
+            config.precursor_tolerance.tolerance, config.precursor_tolerance.unit,
+            config.fragment_tolerance.tolerance, config.fragment_tolerance.unit);
     }
 
     // Set max candidates
     config.max_candidates_per_spectrum = args.max_candidates;
+
+    // Set export coefficients
+    if args.export_coefficients {
+        config.export_coefficients = true;
+    }
 
     // Set thread count
     if let Some(threads) = args.threads {
@@ -208,20 +276,20 @@ fn main() -> Result<()> {
         // Don't set config.streaming since we already merged args
     }
 
-    // Run analysis
+    // Log reproducibility header
     log::info!("Osprey v{}", env!("CARGO_PKG_VERSION"));
-    log::info!("Input files: {:?}", config.input_files);
-    log::info!("Library: {:?}", config.library_source.path());
-    log::info!("Output: {:?}", config.output_blib);
+    log::info!("Command: {}", std::env::args().collect::<Vec<_>>().join(" "));
+    log::info!("Log file: {}", log_filename);
+    match config.to_yaml_string() {
+        Ok(yaml) => log::info!("Resolved configuration:\n{}", yaml),
+        Err(e) => log::warn!("Could not serialize config: {}", e),
+    }
 
-    let results = run_analysis(config)?;
+    // Run analysis
+
+    run_analysis(config)?;
 
     log::info!("Analysis complete.");
-    log::info!("Total regression results: {}", results.len());
-
-    // Summary statistics
-    let total_coefficients: usize = results.iter().map(|r| r.coefficients.len()).sum();
-    log::info!("Total non-zero coefficients: {}", total_coefficients);
 
     Ok(())
 }

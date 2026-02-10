@@ -363,6 +363,7 @@ pub fn is_within_calibrated_tolerance(
 mod tests {
     use super::*;
 
+    /// Verifies PPM error calculation for a known observed/theoretical m/z pair.
     #[test]
     fn test_ppm_error_calculation() {
         // Observed = 500.001, Theoretical = 500.0
@@ -371,6 +372,7 @@ mod tests {
         assert!((error - 2.0).abs() < 0.01);
     }
 
+    /// Verifies that applying a negative PPM offset shifts observed m/z upward by the expected amount.
     #[test]
     fn test_apply_calibration_negative_offset() {
         let calibration = MzCalibration {
@@ -392,6 +394,7 @@ mod tests {
         assert!((corrected - 500.00125).abs() < 0.00001);
     }
 
+    /// Verifies that applying a positive PPM offset shifts observed m/z downward by the expected amount.
     #[test]
     fn test_apply_calibration_positive_offset() {
         let calibration = MzCalibration {
@@ -413,6 +416,7 @@ mod tests {
         assert!((corrected - 499.99875).abs() < 0.00001);
     }
 
+    /// Verifies MS1/MS2 calibration statistics (mean, median, SD, count, histogram) from known error distributions.
     #[test]
     fn test_calculate_mz_calibration() {
         let mut qc_data = MzQCData::new(ToleranceUnit::Ppm);
@@ -444,6 +448,7 @@ mod tests {
         assert_eq!(ms2_cal.unit, "ppm");
     }
 
+    /// Verifies that empty QC data produces uncalibrated parameters with zero mean and SD.
     #[test]
     fn test_empty_qc_data() {
         let qc_data = MzQCData::new(ToleranceUnit::Ppm);
@@ -459,6 +464,7 @@ mod tests {
         assert!(!ms2_cal.calibrated);
     }
 
+    /// Verifies that uncalibrated m/z correction returns the observed value unchanged.
     #[test]
     fn test_uncalibrated_passthrough() {
         let calibration = MzCalibration {
@@ -478,6 +484,7 @@ mod tests {
         assert_eq!(corrected, observed);
     }
 
+    /// Verifies tolerance checking accepts m/z errors near the calibrated mean and rejects those far from it.
     #[test]
     fn test_within_calibrated_tolerance() {
         let calibration = MzCalibration {
@@ -506,6 +513,7 @@ mod tests {
         assert!(!is_within_calibrated_tolerance(observed_outside, theoretical, &calibration, 10.0));
     }
 
+    /// Verifies histogram bin structure and total count consistency for a set of m/z errors.
     #[test]
     fn test_histogram_generation() {
         let mut qc_data = MzQCData::new(ToleranceUnit::Ppm);
@@ -526,6 +534,7 @@ mod tests {
         assert_eq!(total_count, 7);
     }
 
+    /// Verifies median calculation for both odd and even numbers of m/z error observations.
     #[test]
     fn test_median_calculation() {
         // Odd number of elements
@@ -545,6 +554,7 @@ mod tests {
         assert!((ms1_cal.median - 2.5).abs() < 0.001);
     }
 
+    /// Verifies that unit resolution (Th) calibration produces results with correct unit labels and calibrated state.
     #[test]
     fn test_unit_resolution_calibration() {
         // Test with Th units for unit resolution instruments

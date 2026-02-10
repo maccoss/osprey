@@ -86,14 +86,6 @@ impl CalibrationParams {
             self.rt_calibration.residual_sd,
             self.rt_calibration.r_squared
         );
-
-        // Display ASCII histograms if available
-        if self.ms1_calibration.calibrated {
-            self.ms1_calibration.log_histogram("MS1 (precursor)");
-        }
-        if self.ms2_calibration.calibrated {
-            self.ms2_calibration.log_histogram("MS2 (fragment)");
-        }
     }
 }
 
@@ -343,6 +335,7 @@ pub use io::{save_calibration, load_calibration, calibration_filename, calibrati
 mod tests {
     use super::*;
 
+    /// Verifies that uncalibrated default parameters report all calibration flags as false.
     #[test]
     fn test_uncalibrated_params() {
         let params = CalibrationParams::uncalibrated();
@@ -352,6 +345,7 @@ mod tests {
         assert!(!params.rt_calibration.is_calibrated());
     }
 
+    /// Verifies effective_tolerance returns base tolerance when uncalibrated and adjusted tolerance when calibrated.
     #[test]
     fn test_effective_tolerance() {
         let uncalibrated = MzCalibration::uncalibrated();
@@ -371,6 +365,7 @@ mod tests {
         assert_eq!(calibrated.effective_tolerance(10.0), 5.5);
     }
 
+    /// Verifies JSON round-trip serialization preserves all calibration fields including histograms and model params.
     #[test]
     fn test_serialization() {
         let params = CalibrationParams {

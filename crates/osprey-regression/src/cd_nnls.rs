@@ -337,6 +337,7 @@ mod tests {
     use super::*;
     use ndarray::arr1;
 
+    /// Verifies that CD-NNLS with identity matrix and zero lambda recovers the exact solution.
     #[test]
     fn test_cd_identity_matrix() {
         // A = I, b = [1, 2, 3], lambda = 0 -> x = [1, 2, 3]
@@ -351,6 +352,7 @@ mod tests {
         assert!((x[2] - 3.0).abs() < 1e-5, "x[2] = {}", x[2]);
     }
 
+    /// Verifies that CD-NNLS with lambda=1 shrinks identity matrix coefficients by a factor of 2.
     #[test]
     fn test_cd_with_regularization() {
         // A = I, b = [1, 2, 3], lambda = 1 -> x = [0.5, 1.0, 1.5]
@@ -366,6 +368,7 @@ mod tests {
         assert!((x[2] - 1.5).abs() < 1e-5, "x[2] = {}", x[2]);
     }
 
+    /// Verifies that CD-NNLS clamps negative unconstrained solutions to zero while preserving positive ones.
     #[test]
     fn test_cd_nnls_projection() {
         // A = I, b = [1, -2, 3], lambda = 0 -> x = [1, 0, 3]
@@ -381,6 +384,7 @@ mod tests {
         assert!((x[2] - 3.0).abs() < 1e-5, "x[2] = {}", x[2]);
     }
 
+    /// Verifies that CD-NNLS handles correlated (collinear) columns with non-negative coefficients and reasonable residual.
     #[test]
     fn test_cd_correlated_columns() {
         // Two columns with similar patterns
@@ -409,6 +413,7 @@ mod tests {
         assert!(residual < 2.0, "Residual too large: {}", residual);
     }
 
+    /// Verifies that CD-NNLS with 100 candidates correctly identifies 5 true peptides via active set acceleration.
     #[test]
     fn test_cd_large_k_sparse_solution() {
         // k = 100 candidates, only 5 have signal
@@ -476,6 +481,7 @@ mod tests {
         }
     }
 
+    /// Verifies that the f64 version of CD-NNLS produces the same results as the f32 version with tighter tolerance.
     #[test]
     fn test_cd_f64_version() {
         // Same as f32 test but with f64
@@ -490,6 +496,7 @@ mod tests {
         assert!((x[2] - 3.0).abs() < 1e-10, "x[2] = {}", x[2]);
     }
 
+    /// Verifies that CD-NNLS returns an empty coefficient vector when given zero candidates.
     #[test]
     fn test_cd_empty_input() {
         let a = Array2::<f32>::zeros((10, 0));
@@ -500,6 +507,7 @@ mod tests {
         assert_eq!(x.len(), 0);
     }
 
+    /// Verifies that CD-NNLS returns an error when design matrix rows and observation vector length differ.
     #[test]
     fn test_cd_dimension_mismatch() {
         let a = Array2::<f32>::zeros((10, 5));

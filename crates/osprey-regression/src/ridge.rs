@@ -172,6 +172,7 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use ndarray::array;
 
+    /// Verifies that ridge regression with identity matrix and zero lambda recovers the exact solution.
     #[test]
     fn test_ridge_identity() {
         // Simple test: A = I, b = [1, 2, 3], lambda = 0
@@ -187,6 +188,7 @@ mod tests {
         assert_abs_diff_eq!(x[2], 3.0, epsilon = 1e-10);
     }
 
+    /// Verifies that ridge regression with lambda=1 shrinks coefficients by a factor of 2 for an identity design matrix.
     #[test]
     fn test_ridge_with_regularization() {
         // With regularization, solution should be shrunk toward zero
@@ -202,6 +204,7 @@ mod tests {
         assert_abs_diff_eq!(x[2], 1.5, epsilon = 1e-10);
     }
 
+    /// Verifies that NNLS projects negative unconstrained solutions to zero.
     #[test]
     fn test_nonnegative_simple() {
         // Test that negative solutions are projected to zero
@@ -216,6 +219,7 @@ mod tests {
         assert!(x[2] >= 0.0);
     }
 
+    /// Verifies that NNLS produces all non-negative coefficients with a reasonable residual for correlated columns.
     #[test]
     fn test_nonnegative_non_trivial() {
         // Test with a non-identity matrix where the unconstrained solution
@@ -244,6 +248,7 @@ mod tests {
         assert!(residual < 1.0, "Residual too high: {}", residual);
     }
 
+    /// Verifies that NNLS achieves a lower or equal residual compared to naive clamping of negative values.
     #[test]
     fn test_nonnegative_better_than_naive_projection() {
         // Verify that NNLS produces a better solution than naive projection
@@ -279,6 +284,7 @@ mod tests {
         );
     }
 
+    /// Verifies that NNLS returns the same result as unconstrained ridge when all coefficients are already positive.
     #[test]
     fn test_nonnegative_all_positive_unconstrained() {
         // When unconstrained solution is already all positive,
@@ -296,6 +302,7 @@ mod tests {
         }
     }
 
+    /// Verifies that the residual norm is zero when the solution exactly matches the observed vector.
     #[test]
     fn test_residual() {
         let solver = RidgeSolver::new(0.0);

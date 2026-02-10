@@ -681,12 +681,27 @@ pub struct FeatureSet {
     pub precursor_intensity: Option<f64>,
     /// Number of modifications
     pub modification_count: u32,
+
+    // Fragment co-elution features (DIA-NN pTimeCorr-inspired)
+    /// Sum of Pearson correlations between each fragment XIC and the coefficient time series
+    pub fragment_coelution_sum: f64,
+    /// Minimum per-fragment correlation with coefficient time series
+    pub fragment_coelution_min: f64,
+    /// Number of fragments with positive correlation to coefficient series
+    pub n_coeluting_fragments: u32,
+
+    // Per-fragment mass accuracy at apex (ppm for HRAM, Th for unit resolution)
+    /// Mean absolute mass error across matched fragments at apex
+    pub mass_accuracy_mean: f64,
+    /// Standard deviation of mass errors across matched fragments at apex
+    pub mass_accuracy_std: f64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Verifies that IsolationWindow correctly includes/excludes m/z values at boundaries.
     #[test]
     fn test_isolation_window_contains() {
         let window = IsolationWindow::symmetric(500.0, 12.5);
@@ -697,12 +712,14 @@ mod tests {
         assert!(!window.contains(512.6));
     }
 
+    /// Verifies that NeutralLoss::H2O and NH3 return correct monoisotopic masses.
     #[test]
     fn test_neutral_loss_mass() {
         assert!((NeutralLoss::H2O.mass() - 18.010565).abs() < 1e-6);
         assert!((NeutralLoss::NH3.mass() - 17.026549).abs() < 1e-6);
     }
 
+    /// Verifies that IonType::from_char parses b/y/z ions and returns Unknown for invalid chars.
     #[test]
     fn test_ion_type_from_char() {
         assert_eq!(IonType::from_char('b'), IonType::B);
@@ -711,6 +728,7 @@ mod tests {
         assert_eq!(IonType::from_char('?'), IonType::Unknown);
     }
 
+    /// Verifies that MS1 find_peak_ppm returns the most intense peak within ppm tolerance.
     #[test]
     fn test_ms1_spectrum_find_peak() {
         let mut ms1 = MS1Spectrum::new(1, 10.0);
@@ -734,6 +752,7 @@ mod tests {
         assert!(result3.is_none());
     }
 
+    /// Verifies isotope m/z spacing calculation for charge 2 using neutron mass.
     #[test]
     fn test_isotope_envelope_mz_calculation() {
         // Test isotope m/z calculation for charge 2
@@ -747,6 +766,7 @@ mod tests {
         assert!((mzs[4] - (500.0 + 3.0 * gap)).abs() < 1e-6); // M+3
     }
 
+    /// Verifies isotope envelope extraction recovers intensities and M+0 mass error from MS1.
     #[test]
     fn test_isotope_envelope_extraction() {
         // Create MS1 spectrum with isotope peaks
@@ -788,6 +808,7 @@ mod tests {
         assert!((ppm - 4.0).abs() < 0.1);
     }
 
+    /// Verifies that missing isotope peaks are reported as zero while present ones are detected.
     #[test]
     fn test_isotope_envelope_missing_peaks() {
         // MS1 spectrum missing some isotope peaks

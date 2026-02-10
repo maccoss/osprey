@@ -198,6 +198,7 @@ mod tests {
         }
     }
 
+    /// Verifies that calibration_filename appends ".calibration.json" to the base name.
     #[test]
     fn test_calibration_filename() {
         assert_eq!(calibration_filename("results"), "results.calibration.json");
@@ -205,6 +206,7 @@ mod tests {
         assert_eq!(calibration_filename("test"), "test.calibration.json");
     }
 
+    /// Verifies calibration filename derivation from input mzML paths, including multi-extension filenames.
     #[test]
     fn test_calibration_filename_for_input() {
         use std::path::Path;
@@ -228,6 +230,7 @@ mod tests {
         );
     }
 
+    /// Verifies that calibration_path_for_input joins the output directory with the input-derived calibration filename.
     #[test]
     fn test_calibration_path_for_input() {
         use std::path::Path;

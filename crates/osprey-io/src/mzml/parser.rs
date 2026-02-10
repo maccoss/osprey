@@ -485,6 +485,7 @@ pub fn load_ms1_spectra<P: AsRef<Path>>(path: P) -> Result<MS1Index> {
 mod tests {
     use super::*;
 
+    /// Verifies that a symmetric isolation window has the correct center m/z and total width.
     #[test]
     fn test_isolation_window() {
         let window = IsolationWindow::symmetric(500.0, 12.5);

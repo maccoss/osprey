@@ -49,14 +49,6 @@ pub struct OspreyConfig {
     /// Convergence threshold
     pub convergence_threshold: f64,
 
-    // Background correction
-    /// RT offsets for background estimation
-    pub background_rt_offsets: Vec<f64>,
-
-    // Two-step search
-    /// Two-step search configuration
-    pub two_step_search: TwoStepConfig,
-
     // FDR control
     /// Run-level FDR threshold
     pub run_fdr: f64,
@@ -74,10 +66,8 @@ pub struct OspreyConfig {
     pub memory_limit_gb: Option<f64>,
 
     // Output options
-    /// Include coefficient time series in blib
+    /// Export coefficient time series to parquet
     pub export_coefficients: bool,
-    /// Write features to separate TSV
-    pub export_features: bool,
 
     // Processing mode
     /// Use streaming mode for memory-efficient processing
@@ -102,8 +92,6 @@ impl Default for OspreyConfig {
             regularization_lambda: RegularizationSetting::CrossValidated,
             max_iterations: 1000,
             convergence_threshold: 1e-6,
-            background_rt_offsets: vec![5.0, 8.0],
-            two_step_search: TwoStepConfig::default(),
             run_fdr: 0.01,
             experiment_fdr: 0.01,
             decoy_method: DecoyMethod::Reverse,
@@ -111,7 +99,6 @@ impl Default for OspreyConfig {
             n_threads: num_cpus(),
             memory_limit_gb: None,
             export_coefficients: false,
-            export_features: false,
             streaming: false,
         }
     }
@@ -225,22 +212,17 @@ max_candidates_per_spectrum: 500
 rt_calibration:
   enabled: true
   loess_bandwidth: 0.3            # Fraction of data for local fits (0.2-0.5)
-  min_calibration_points: 50      # Minimum detections required
+  min_calibration_points: 200     # Minimum detections required for robust LOESS fit
   rt_tolerance_factor: 3.0        # Multiplier for residual SD (for calibrated search)
   initial_tolerance_fraction: 1.0   # Initial tolerance as fraction of RT range (1.0 = no RT filtering during calibration)
-  calibration_sample_size: 10000  # Number of peptides to sample for calibration (0 = use all)
+  calibration_sample_size: 100000 # Target peptides to sample for calibration (0 = all)
+  calibration_retry_factor: 2.0   # Multiply sample size on retry if too few calibration points
 
 # Regression
 regularization_lambda: CrossValidated
 # Options: CrossValidated, Adaptive, or Fixed with value
 # regularization_lambda:
 #   Fixed: 0.5
-
-# Two-step search (recommended)
-two_step_search:
-  enabled: true
-  step1_fdr: 0.01
-  min_runs_for_step2: 1
 
 # FDR control
 run_fdr: 0.01
@@ -253,8 +235,7 @@ n_threads: 0  # 0 = auto-detect
 # memory_limit_gb: 16.0  # Optional memory limit
 
 # Output options
-export_coefficients: false  # Include coefficient time series
-export_features: false      # Write features to TSV
+export_coefficients: false  # Export coefficient time series to parquet
 
 # Processing mode
 streaming: false  # Use streaming mode for memory-efficient processing (requires streaming feature)
@@ -311,6 +292,12 @@ streaming: false  # Use streaming mode for memory-efficient processing (requires
         if let Some(unit) = args.fragment_unit {
             self.fragment_tolerance.unit = unit;
         }
+        if let Some(tol) = args.precursor_tolerance {
+            self.precursor_tolerance.tolerance = tol;
+        }
+        if let Some(unit) = args.precursor_unit {
+            self.precursor_tolerance.unit = unit;
+        }
     }
 }
 
@@ -330,45 +317,8 @@ pub struct ConfigOverrides {
     pub streaming: bool,
     pub fragment_tolerance: Option<f64>,
     pub fragment_unit: Option<ToleranceUnit>,
-}
-
-/// Two-step search configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TwoStepConfig {
-    /// Enable two-step search
-    pub enabled: bool,
-    /// Step 1 FDR threshold
-    pub step1_fdr: f64,
-    /// Minimum runs for peptide inclusion in Step 2
-    pub min_runs_for_step2: usize,
-    /// Include library peptides even if not detected
-    pub include_high_confidence: bool,
-}
-
-impl Default for TwoStepConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            step1_fdr: 0.01,
-            min_runs_for_step2: 1,
-            include_high_confidence: false,
-        }
-    }
-}
-
-impl TwoStepConfig {
-    /// Create enabled two-step configuration
-    pub fn enabled() -> Self {
-        Self::default()
-    }
-
-    /// Create disabled two-step configuration
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            ..Self::default()
-        }
-    }
+    pub precursor_tolerance: Option<f64>,
+    pub precursor_unit: Option<ToleranceUnit>,
 }
 
 /// RT Calibration configuration
@@ -379,9 +329,10 @@ impl TwoStepConfig {
 /// ## Calibration Sampling Strategy (pyXcorrDIA-style)
 ///
 /// For large libraries (millions of entries), calibration samples a subset:
-/// - **Default: 2000 peptides** sampled for calibration scoring
-/// - **Doubles to 4000** if first attempt doesn't yield enough calibration points
-/// - Dramatically faster than scoring the full library
+/// - **Attempt 1: 100,000 peptides** sampled for calibration scoring
+/// - **Attempt 2: 200,000 peptides** (2× retry) if first attempt doesn't yield enough calibration points
+/// - **Attempt 3: ALL peptides** as final fallback
+/// - FDR is cumulative across attempts (matches accumulate)
 ///
 /// ## Multi-File Strategy
 ///
@@ -406,13 +357,26 @@ pub struct RTCalibrationConfig {
     /// Initial tolerance as fraction of library RT range for first file calibration (default: 1.0 = 100%)
     /// Set to 1.0 to match pyXcorrDIA's approach of no RT filtering during calibration
     pub initial_tolerance_fraction: f64,
-    /// Number of peptides to sample for calibration (default: 2000, like pyXcorrDIA)
-    /// Set to 0 to use all library entries (slower but more comprehensive)
+    /// Number of target peptides to sample for calibration (0 = use all). Default: 100,000.
+    /// Sampling uses 2D stratification across RT and m/z for uniform coverage.
+    #[serde(default = "default_calibration_sample_size")]
     pub calibration_sample_size: usize,
+    /// Multiplier for expanding sample on retry if too few calibration points. Default: 2.0.
+    /// On each retry, sample_size is multiplied by this factor. Final attempt uses all entries.
+    #[serde(default = "default_calibration_retry_factor")]
+    pub calibration_retry_factor: f64,
 }
 
 fn default_min_rt_tolerance() -> f64 {
     0.1
+}
+
+fn default_calibration_sample_size() -> usize {
+    100000
+}
+
+fn default_calibration_retry_factor() -> f64 {
+    2.0
 }
 
 impl Default for RTCalibrationConfig {
@@ -420,12 +384,13 @@ impl Default for RTCalibrationConfig {
         Self {
             enabled: true,
             loess_bandwidth: 0.3,
-            min_calibration_points: 50,
+            min_calibration_points: 200,
             rt_tolerance_factor: 3.0,
             fallback_rt_tolerance: 2.0,
             min_rt_tolerance: 0.1, // 6 seconds minimum (was 0.25 = 15 sec)
             initial_tolerance_fraction: 1.0, // 100% of RT range (no RT filtering, like pyXcorrDIA)
-            calibration_sample_size: 10000, // Sample 10000 peptides (Rust is faster than pyXcorrDIA's 2000)
+            calibration_sample_size: 100000,
+            calibration_retry_factor: 2.0,
         }
     }
 }
@@ -649,15 +614,21 @@ pub enum RtType {
     CalibratedMinutes,
 }
 
-/// Binning configuration
+/// Binning configuration using Comet's BIN macro:
+///   BIN(mass) = (int)(mass / bin_width + (1 - offset))
+///
+/// Unit resolution: bin_width=1.0005079, offset=0.4 → BIN(m) = (int)(m/1.0005 + 0.6)
+/// HRAM:            bin_width=0.02,      offset=0.0 → BIN(m) = (int)(m/0.02 + 1.0)
 #[derive(Debug, Clone, Copy)]
 pub struct BinConfig {
     /// Bin width in Th
     pub bin_width: f64,
-    /// Bin offset in Th
+    /// Bin offset (Comet fragment_bin_offset): 0.4 for unit resolution, 0.0 for HRAM
     pub bin_offset: f64,
-    /// Minimum m/z
-    pub min_mz: f64,
+    /// Precomputed: 1.0 / bin_width (for fast BIN macro)
+    pub inverse_bin_width: f64,
+    /// Precomputed: 1.0 - bin_offset (for fast BIN macro)
+    pub one_minus_offset: f64,
     /// Maximum m/z
     pub max_mz: f64,
     /// Total number of bins
@@ -666,36 +637,53 @@ pub struct BinConfig {
 
 impl BinConfig {
     /// Create unit resolution binning configuration (Comet-style)
+    ///
+    /// BIN(mass) = (int)(mass / 1.0005079 + 0.6)
     pub fn unit_resolution() -> Self {
-        Self {
-            bin_width: 1.0005079,
-            bin_offset: 0.4,
-            min_mz: 100.0,
-            max_mz: 2000.0,
-            n_bins: 1899,
-        }
-    }
-
-    /// Create HRAM binning configuration (fixed 0.02 Th bins, 0 offset)
-    pub fn hram() -> Self {
-        let min_mz = 100.0;
+        let bin_width = 1.0005079;
+        let bin_offset = 0.4;
         let max_mz = 2000.0;
-        let bin_width = 0.02; // Fixed 0.02 Th for HRAM Xcorr
+        let inverse_bin_width = 1.0 / bin_width;
+        let one_minus_offset = 1.0 - bin_offset;
+        let n_bins = (max_mz * inverse_bin_width + one_minus_offset) as usize + 1;
         Self {
             bin_width,
-            bin_offset: 0.0,
-            min_mz,
+            bin_offset,
+            inverse_bin_width,
+            one_minus_offset,
             max_mz,
-            n_bins: ((max_mz - min_mz) / bin_width).ceil() as usize,
+            n_bins,
         }
     }
 
-    /// Convert m/z to bin index
+    /// Create HRAM binning configuration (Comet-style, 0.02 Th bins, 0 offset)
+    ///
+    /// BIN(mass) = (int)(mass / 0.02 + 1.0)
+    pub fn hram() -> Self {
+        let bin_width = 0.02;
+        let bin_offset = 0.0;
+        let max_mz = 2000.0;
+        let inverse_bin_width = 1.0 / bin_width;
+        let one_minus_offset = 1.0 - bin_offset;
+        let n_bins = (max_mz * inverse_bin_width + one_minus_offset) as usize + 1;
+        Self {
+            bin_width,
+            bin_offset,
+            inverse_bin_width,
+            one_minus_offset,
+            max_mz,
+            n_bins,
+        }
+    }
+
+    /// Convert m/z to bin index using Comet BIN macro:
+    ///   BIN(mass) = (int)(mass * inverse_bin_width + one_minus_offset)
+    #[inline]
     pub fn mz_to_bin(&self, mz: f64) -> Option<usize> {
-        if mz < self.min_mz || mz > self.max_mz {
+        if mz < 0.0 || mz > self.max_mz {
             return None;
         }
-        let bin = ((mz - self.min_mz + self.bin_offset) / self.bin_width).floor() as usize;
+        let bin = (mz * self.inverse_bin_width + self.one_minus_offset) as usize;
         if bin < self.n_bins {
             Some(bin)
         } else {
@@ -703,9 +691,9 @@ impl BinConfig {
         }
     }
 
-    /// Convert bin index to m/z (bin center)
+    /// Convert bin index to approximate m/z (bin center)
     pub fn bin_to_mz(&self, bin: usize) -> f64 {
-        self.min_mz - self.bin_offset + (bin as f64 + 0.5) * self.bin_width
+        (bin as f64 + 0.5 - self.one_minus_offset) * self.bin_width
     }
 }
 
@@ -719,6 +707,7 @@ impl Default for BinConfig {
 mod tests {
     use super::*;
 
+    /// Verifies that unit resolution BinConfig creates bins with correct width and m/z round-trip.
     #[test]
     fn test_bin_config_unit_resolution() {
         let config = BinConfig::unit_resolution();
@@ -733,6 +722,7 @@ mod tests {
         assert!((mz_back - 500.0).abs() < config.bin_width);
     }
 
+    /// Verifies that LibrarySource auto-detects format from file extension.
     #[test]
     fn test_library_source_from_path() {
         let tsv = LibrarySource::from_path(PathBuf::from("library.tsv"));
@@ -745,15 +735,16 @@ mod tests {
         assert!(matches!(elib, LibrarySource::Elib(_)));
     }
 
+    /// Verifies that default OspreyConfig has expected RT tolerance, FDR, and calibration values.
     #[test]
     fn test_default_config() {
         let config = OspreyConfig::default();
         assert_eq!(config.rt_calibration.fallback_rt_tolerance, 2.0);
         assert_eq!(config.run_fdr, 0.01);
-        assert!(config.two_step_search.enabled);
         assert!(config.rt_calibration.enabled);
     }
 
+    /// Verifies that YAML serialization and deserialization preserves config field values.
     #[test]
     fn test_yaml_roundtrip() {
         let config = OspreyConfig::default();
@@ -765,6 +756,7 @@ mod tests {
         assert_eq!(parsed.run_fdr, config.run_fdr);
     }
 
+    /// Verifies that CLI ConfigOverrides correctly override config file values.
     #[test]
     fn test_config_merge() {
         let mut config = OspreyConfig::default();
@@ -779,6 +771,7 @@ mod tests {
         assert_eq!(config.run_fdr, 0.05);
     }
 
+    /// Verifies RTCalibrationConfig defaults and that disabled() turns off calibration.
     #[test]
     fn test_rt_calibration_config() {
         let config = RTCalibrationConfig::default();
@@ -790,6 +783,7 @@ mod tests {
         assert!(!disabled.enabled);
     }
 
+    /// Verifies ppm-based fragment tolerance Da conversion, within_tolerance, and mass_error.
     #[test]
     fn test_fragment_tolerance_ppm() {
         let config = FragmentToleranceConfig::hram(10.0);
@@ -811,6 +805,7 @@ mod tests {
         assert!((error - 10.0).abs() < 0.1);
     }
 
+    /// Verifies Da-based fragment tolerance is constant across m/z values.
     #[test]
     fn test_fragment_tolerance_da() {
         let config = FragmentToleranceConfig::unit_resolution(0.3);
@@ -830,6 +825,7 @@ mod tests {
         assert!((error - 0.25).abs() < 1e-10);
     }
 
+    /// Verifies that default FragmentToleranceConfig is 10 ppm for HRAM data.
     #[test]
     fn test_fragment_tolerance_default() {
         let config = FragmentToleranceConfig::default();

@@ -43,11 +43,693 @@ pub mod batch;
 pub mod pipeline;
 
 use osprey_core::{
-    FeatureSet, FragmentAnnotation, IonType, LibraryEntry, LibraryFragment, Modification, Result,
-    Spectrum,
+    BinConfig, FeatureSet, FragmentAnnotation, IonType, LibraryEntry, LibraryFragment, Modification,
+    Result, Spectrum, ToleranceUnit,
 };
 use rayon::prelude::*;
 use std::collections::HashMap;
+
+/// Check if at least 2 of the top 6 library peaks match observed spectrum peaks
+///
+/// This is a fast pre-filter using binary search to eliminate candidates that have
+/// no signal overlap with the observed spectrum before expensive scoring.
+///
+/// # Arguments
+/// * `library_fragments` - Library fragment ions for a candidate entry
+/// * `spectrum_mzs` - Sorted observed m/z values from the spectrum
+/// * `tolerance` - Fragment tolerance value
+/// * `unit` - Tolerance unit (ppm or Th)
+///
+/// # Returns
+/// `true` if at least 2 of the top 6 library peaks have matching observed peaks
+pub fn has_top3_fragment_match(
+    library_fragments: &[LibraryFragment],
+    spectrum_mzs: &[f64],
+    tolerance: f64,
+    unit: ToleranceUnit,
+) -> bool {
+    if library_fragments.is_empty() || spectrum_mzs.is_empty() {
+        return true; // Be conservative - don't filter if no data
+    }
+
+    // Get indices of top 6 fragments by intensity
+    let n_top = library_fragments.len().min(6);
+    let top_indices: Vec<usize> = if library_fragments.len() <= 6 {
+        (0..library_fragments.len()).collect()
+    } else {
+        let mut indexed: Vec<(usize, f32)> = library_fragments
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.relative_intensity))
+            .collect();
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+        indexed.iter().take(6).map(|(i, _)| *i).collect()
+    };
+
+    // Require at least 2 of the top 6 to have matches
+    // For entries with only 1 fragment, accept 1 match
+    let required_matches = if n_top <= 1 { 1 } else { 2 };
+    let mut match_count = 0u32;
+
+    for &idx in &top_indices {
+        let lib_mz = library_fragments[idx].mz;
+
+        // Calculate tolerance window based on unit
+        let tol_da = match unit {
+            ToleranceUnit::Ppm => lib_mz * tolerance / 1e6,
+            ToleranceUnit::Mz => tolerance,
+        };
+
+        let lower = lib_mz - tol_da;
+        let upper = lib_mz + tol_da;
+
+        // Binary search for first m/z >= lower bound
+        let start_idx = spectrum_mzs.partition_point(|&mz| mz < lower);
+
+        // Check if any peak is within the tolerance window
+        if start_idx < spectrum_mzs.len() && spectrum_mzs[start_idx] <= upper {
+            match_count += 1;
+            if match_count >= required_matches {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if any top-3 library fragment matches an observed peak, and collect mass errors.
+///
+/// Combines the filtering check with mass error collection for calibration.
+/// Uses binary search for O(3 × log n) performance. For each matched top-3 fragment,
+/// finds the closest observed peak and computes the mass error.
+///
+/// # Returns
+/// `(has_match, mass_errors)` where `has_match` is true if at least 1 top-3 peak matches,
+/// and `mass_errors` contains the error (in the configured unit) for each matched fragment.
+pub fn top3_fragment_match_with_errors(
+    library_fragments: &[LibraryFragment],
+    spectrum_mzs: &[f64],
+    tolerance: f64,
+    unit: ToleranceUnit,
+) -> (bool, Vec<f64>) {
+    if library_fragments.is_empty() || spectrum_mzs.is_empty() {
+        return (true, Vec::new());
+    }
+
+    // Get indices of top 3 fragments by intensity
+    let mut top3_indices: Vec<usize> = (0..library_fragments.len().min(3)).collect();
+
+    if library_fragments.len() > 3 {
+        let mut indexed: Vec<(usize, f32)> = library_fragments
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.relative_intensity))
+            .collect();
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+        top3_indices = indexed.iter().take(3).map(|(i, _)| *i).collect();
+    }
+
+    let mut has_match = false;
+    let mut mass_errors = Vec::with_capacity(3);
+
+    for &idx in &top3_indices {
+        let lib_mz = library_fragments[idx].mz;
+
+        let tol_da = match unit {
+            ToleranceUnit::Ppm => lib_mz * tolerance / 1e6,
+            ToleranceUnit::Mz => tolerance,
+        };
+
+        let lower = lib_mz - tol_da;
+        let upper = lib_mz + tol_da;
+
+        // Binary search for first m/z >= lower bound
+        let start_idx = spectrum_mzs.partition_point(|&mz| mz < lower);
+
+        if start_idx < spectrum_mzs.len() && spectrum_mzs[start_idx] <= upper {
+            has_match = true;
+
+            // Find closest peak within tolerance window
+            let mut best_mz = spectrum_mzs[start_idx];
+            let mut best_diff = (best_mz - lib_mz).abs();
+            let mut j = start_idx + 1;
+            while j < spectrum_mzs.len() && spectrum_mzs[j] <= upper {
+                let diff = (spectrum_mzs[j] - lib_mz).abs();
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_mz = spectrum_mzs[j];
+                }
+                j += 1;
+            }
+
+            // Compute mass error in configured unit
+            let error = match unit {
+                ToleranceUnit::Ppm => (best_mz - lib_mz) / lib_mz * 1e6,
+                ToleranceUnit::Mz => best_mz - lib_mz,
+            };
+            mass_errors.push(error);
+        }
+    }
+
+    (has_match, mass_errors)
+}
+
+/// Compute fragment co-elution correlation (DIA-NN pTimeCorr-inspired).
+///
+/// For each of the top 6 library fragments, extracts a raw XIC from the peak region
+/// spectra and computes Pearson correlation against the regression coefficient time series.
+/// The coefficient series serves as the deconvolved elution profile reference.
+///
+/// Uses plain Pearson correlation on raw intensities (no sqrt transform), matching DIA-NN.
+///
+/// # Returns
+/// `(sum, min, n_positive)` — sum of per-fragment correlations, minimum correlation,
+/// and count of fragments with positive correlation.
+pub fn compute_fragment_coelution(
+    library_fragments: &[LibraryFragment],
+    coefficient_series: &[(f64, f64)],  // (RT, coefficient) pairs
+    spectra: &[&Spectrum],              // peak region spectra (sorted by RT)
+    tolerance_da: f64,
+    tolerance_ppm: f64,
+) -> (f64, f64, u32) {
+    if library_fragments.is_empty() || coefficient_series.len() < 3 || spectra.is_empty() {
+        return (0.0, 0.0, 0);
+    }
+
+    // Select top 6 fragments by relative intensity
+    let top_indices: Vec<usize> = if library_fragments.len() <= 6 {
+        (0..library_fragments.len()).collect()
+    } else {
+        let mut indexed: Vec<(usize, f32)> = library_fragments
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.relative_intensity))
+            .collect();
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+        indexed.iter().take(6).map(|(i, _)| *i).collect()
+    };
+
+    // Build a map from spectrum RT to index for alignment with coefficient series
+    // Both coefficient_series and spectra should cover the same RT region
+    let spec_rts: Vec<f64> = spectra.iter().map(|s| s.retention_time).collect();
+
+    let mut coelution_sum = 0.0;
+    let mut coelution_min = f64::MAX;
+    let mut n_positive: u32 = 0;
+    let mut n_scored: u32 = 0;
+
+    for &frag_idx in &top_indices {
+        let frag_mz = library_fragments[frag_idx].mz;
+        let tol = tolerance_da.max(frag_mz * tolerance_ppm / 1e6);
+
+        // Extract raw XIC: for each coefficient series point, find the nearest spectrum
+        // and extract the fragment intensity via binary search
+        let mut xic: Vec<f64> = Vec::with_capacity(coefficient_series.len());
+        let mut coefs: Vec<f64> = Vec::with_capacity(coefficient_series.len());
+
+        for &(rt, coef) in coefficient_series {
+            // Find the spectrum closest to this RT
+            let spec_idx = match spec_rts.binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal)) {
+                Ok(i) => i,
+                Err(i) => {
+                    if i == 0 { 0 }
+                    else if i >= spec_rts.len() { spec_rts.len() - 1 }
+                    else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() { i }
+                    else { i - 1 }
+                }
+            };
+
+            // Binary search for the fragment m/z in the spectrum
+            let spectrum = &spectra[spec_idx];
+            let lower = frag_mz - tol;
+            let upper = frag_mz + tol;
+            let start = spectrum.mzs.partition_point(|&mz| mz < lower);
+
+            let intensity = if start < spectrum.mzs.len() && spectrum.mzs[start] <= upper {
+                // Find closest peak within tolerance
+                let mut best_intensity = spectrum.intensities[start] as f64;
+                let mut best_diff = (spectrum.mzs[start] - frag_mz).abs();
+                let mut j = start + 1;
+                while j < spectrum.mzs.len() && spectrum.mzs[j] <= upper {
+                    let diff = (spectrum.mzs[j] - frag_mz).abs();
+                    if diff < best_diff {
+                        best_diff = diff;
+                        best_intensity = spectrum.intensities[j] as f64;
+                    }
+                    j += 1;
+                }
+                best_intensity
+            } else {
+                0.0
+            };
+
+            xic.push(intensity);
+            coefs.push(coef);
+        }
+
+        // Compute Pearson correlation between XIC and coefficient series
+        if xic.len() >= 3 {
+            let corr = pearson_correlation_raw(&xic, &coefs);
+            coelution_sum += corr;
+            if corr < coelution_min {
+                coelution_min = corr;
+            }
+            if corr > 0.0 {
+                n_positive += 1;
+            }
+            n_scored += 1;
+        }
+    }
+
+    if n_scored == 0 {
+        return (0.0, 0.0, 0);
+    }
+    if coelution_min == f64::MAX {
+        coelution_min = 0.0;
+    }
+
+    (coelution_sum, coelution_min, n_positive)
+}
+
+/// Compute per-fragment mass accuracy statistics at the apex scan.
+///
+/// # Arguments
+/// * `matches` - Fragment matches from the apex spectrum
+/// * `unit` - Tolerance unit determining error computation (ppm for HRAM, Th for unit resolution)
+///
+/// # Returns
+/// `(mean_abs_error, std_error)` in the configured unit
+pub fn compute_mass_accuracy(
+    matches: &[FragmentMatch],
+    unit: ToleranceUnit,
+) -> (f64, f64) {
+    if matches.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let errors: Vec<f64> = matches
+        .iter()
+        .map(|m| match unit {
+            ToleranceUnit::Ppm => (m.obs_mz - m.lib_mz) / m.lib_mz * 1e6,
+            ToleranceUnit::Mz => m.obs_mz - m.lib_mz,
+        })
+        .collect();
+
+    let n = errors.len() as f64;
+
+    // Mean of absolute errors
+    let mean_abs: f64 = errors.iter().map(|e| e.abs()).sum::<f64>() / n;
+
+    // Standard deviation of signed errors
+    let mean_signed: f64 = errors.iter().sum::<f64>() / n;
+    let variance: f64 = errors.iter().map(|e| (e - mean_signed).powi(2)).sum::<f64>() / n;
+    let std_dev = variance.sqrt();
+
+    (mean_abs, std_dev)
+}
+
+/// Extract XICs for the top N library fragments from a set of spectra.
+///
+/// Fragment XIC extraction approach inspired by DIA-NN (Demichev et al.,
+/// Nature Methods, 2020).
+///
+/// For each fragment, uses binary search on each spectrum's sorted m/z array
+/// to extract the intensity at the fragment's m/z (or 0 if not found).
+///
+/// # Returns
+/// Vec of `(fragment_index, xic)` where xic is `Vec<(RT, intensity)>`.
+/// Only returns fragments that have at least one non-zero intensity.
+pub fn extract_fragment_xics(
+    library_fragments: &[LibraryFragment],
+    spectra: &[&Spectrum],
+    tolerance_da: f64,
+    tolerance_ppm: f64,
+    max_fragments: usize,
+) -> Vec<(usize, Vec<(f64, f64)>)> {
+    if library_fragments.is_empty() || spectra.is_empty() {
+        return Vec::new();
+    }
+
+    // Select top N fragments by relative intensity
+    let n_top = library_fragments.len().min(max_fragments);
+    let top_indices: Vec<usize> = if library_fragments.len() <= max_fragments {
+        (0..library_fragments.len()).collect()
+    } else {
+        let mut indexed: Vec<(usize, f32)> = library_fragments
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.relative_intensity))
+            .collect();
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+        indexed.iter().take(max_fragments).map(|(i, _)| *i).collect()
+    };
+
+    let mut results = Vec::with_capacity(n_top);
+
+    for &frag_idx in &top_indices {
+        let frag_mz = library_fragments[frag_idx].mz;
+        let tol = tolerance_da.max(frag_mz * tolerance_ppm / 1e6);
+        let lower = frag_mz - tol;
+        let upper = frag_mz + tol;
+
+        let mut xic = Vec::with_capacity(spectra.len());
+        let mut has_signal = false;
+
+        for spectrum in spectra {
+            let start = spectrum.mzs.partition_point(|&mz| mz < lower);
+
+            let intensity = if start < spectrum.mzs.len() && spectrum.mzs[start] <= upper {
+                // Find closest peak within tolerance
+                let mut best_intensity = spectrum.intensities[start] as f64;
+                let mut best_diff = (spectrum.mzs[start] - frag_mz).abs();
+                let mut j = start + 1;
+                while j < spectrum.mzs.len() && spectrum.mzs[j] <= upper {
+                    let diff = (spectrum.mzs[j] - frag_mz).abs();
+                    if diff < best_diff {
+                        best_diff = diff;
+                        best_intensity = spectrum.intensities[j] as f64;
+                    }
+                    j += 1;
+                }
+                has_signal = true;
+                best_intensity
+            } else {
+                0.0
+            };
+
+            xic.push((spectrum.retention_time, intensity));
+        }
+
+        if has_signal {
+            results.push((frag_idx, xic));
+        }
+    }
+
+    results
+}
+
+/// Build a consensus XIC from co-eluting fragment ions and compute FWHM.
+///
+/// Uses co-eluting fragment XICs (inspired by DIA-NN's approach, Demichev et al.,
+/// Nature Methods, 2020) to determine chromatographic peak boundaries.
+///
+/// 1. Extracts XICs for top 6 fragments
+/// 2. Correlates each against the coefficient series (reference)
+/// 3. For fragments with positive correlation (co-eluting):
+///    - Normalize each XIC to max=1
+///    - Sum into consensus XIC
+/// 4. Compute FWHM with linear interpolation on the consensus
+/// 5. Derive 95% Gaussian boundaries: apex ± 1.96σ where σ = FWHM/2.355
+///
+/// # Returns
+/// `Some((start_rt, end_rt, fwhm))` using 95% Gaussian boundaries,
+/// or `None` if FWHM cannot be computed.
+pub fn compute_fragment_fwhm(
+    library_fragments: &[LibraryFragment],
+    coefficient_series: &[(f64, f64)],
+    spectra: &[&Spectrum],
+    tolerance_da: f64,
+    tolerance_ppm: f64,
+) -> Option<(f64, f64, f64)> {
+    if coefficient_series.len() < 3 || spectra.is_empty() {
+        return None;
+    }
+
+    // Extract XICs for top 6 fragments
+    let xics = extract_fragment_xics(library_fragments, spectra, tolerance_da, tolerance_ppm, 6);
+    if xics.is_empty() {
+        return None;
+    }
+
+    // For each fragment XIC, correlate against the coefficient series
+    // Align by finding the nearest spectrum RT for each coefficient point
+    let spec_rts: Vec<f64> = spectra.iter().map(|s| s.retention_time).collect();
+
+    let mut coeluting_xics: Vec<&Vec<(f64, f64)>> = Vec::new();
+
+    for (_frag_idx, xic) in &xics {
+        // Build aligned vectors: for each coefficient point, find nearest XIC value
+        let mut xic_aligned: Vec<f64> = Vec::with_capacity(coefficient_series.len());
+        let mut coefs: Vec<f64> = Vec::with_capacity(coefficient_series.len());
+
+        for &(rt, coef) in coefficient_series {
+            let spec_idx = match spec_rts.binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal)) {
+                Ok(i) => i,
+                Err(i) => {
+                    if i == 0 { 0 }
+                    else if i >= spec_rts.len() { spec_rts.len() - 1 }
+                    else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() { i }
+                    else { i - 1 }
+                }
+            };
+            xic_aligned.push(xic[spec_idx].1);
+            coefs.push(coef);
+        }
+
+        let corr = pearson_correlation_raw(&xic_aligned, &coefs);
+        if corr > 0.0 {
+            coeluting_xics.push(xic);
+        }
+    }
+
+    if coeluting_xics.is_empty() {
+        return None;
+    }
+
+    // Build consensus XIC: normalize each co-eluting XIC to max=1, then sum
+    let n_points = coeluting_xics[0].len();
+    let mut consensus: Vec<(f64, f64)> = coeluting_xics[0].iter().map(|&(rt, _)| (rt, 0.0)).collect();
+
+    for xic in &coeluting_xics {
+        let max_val = xic.iter().map(|(_, v)| *v).fold(0.0f64, f64::max);
+        if max_val > 0.0 {
+            for i in 0..n_points.min(xic.len()) {
+                consensus[i].1 += xic[i].1 / max_val;
+            }
+        }
+    }
+
+    // Compute FWHM on the consensus XIC
+    let (fwhm, _left, _right) = compute_fwhm_interpolated(&consensus)?;
+
+    // 95% Gaussian boundaries: apex ± 1.96σ where σ = FWHM / 2.355
+    let apex_rt = consensus
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(rt, _)| *rt)?;
+    let sigma = fwhm / 2.355;
+    let start_rt = apex_rt - 1.96 * sigma;
+    let end_rt = apex_rt + 1.96 * sigma;
+
+    Some((start_rt, end_rt, fwhm))
+}
+
+/// Plain Pearson correlation on raw values (no intensity transform).
+pub fn pearson_correlation_raw(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len().min(y.len());
+    if n < 2 {
+        return 0.0;
+    }
+
+    let dn = n as f64;
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    let mut sx2 = 0.0;
+    let mut sy2 = 0.0;
+    let mut sxy = 0.0;
+
+    for i in 0..n {
+        let xi = x[i];
+        let yi = y[i];
+        sx += xi;
+        sy += yi;
+        sx2 += xi * xi;
+        sy2 += yi * yi;
+        sxy += xi * yi;
+    }
+
+    let denom = ((dn * sx2 - sx * sx) * (dn * sy2 - sy * sy)).max(1e-30).sqrt();
+    (dn * sxy - sx * sy) / denom
+}
+
+/// Compute FWHM with linear interpolation on a coefficient time series.
+///
+/// Uses DIA-NN's approach: scan left/right from the apex until the coefficient
+/// drops below half-height, then linearly interpolate to find the exact crossing RT.
+///
+/// # Returns
+/// `Some((fwhm, left_half_rt, right_half_rt))` or `None` if FWHM cannot be computed
+/// (e.g., series too short, or signal never drops below half-height).
+pub fn compute_fwhm_interpolated(series: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
+    if series.len() < 3 {
+        return None;
+    }
+
+    // Find apex
+    let (apex_idx, &(_, apex_coef)) = series
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))?;
+
+    if apex_coef <= 0.0 {
+        return None;
+    }
+
+    let half = apex_coef / 2.0;
+
+    // Scan right from apex to find half-height crossing
+    let right_rt = {
+        let mut found = None;
+        for i in apex_idx..series.len() - 1 {
+            if series[i].1 >= half && series[i + 1].1 < half {
+                // Linear interpolation between points i and i+1
+                let denom = series[i].1 - series[i + 1].1;
+                if denom > 1e-30 {
+                    let frac = (series[i].1 - half) / denom;
+                    found = Some(series[i].0 + frac * (series[i + 1].0 - series[i].0));
+                } else {
+                    found = Some(series[i].0);
+                }
+                break;
+            }
+        }
+        // If never drops below half, use the last point
+        found.unwrap_or(series.last()?.0)
+    };
+
+    // Scan left from apex to find half-height crossing
+    let left_rt = {
+        let mut found = None;
+        for i in (1..=apex_idx).rev() {
+            if series[i].1 >= half && series[i - 1].1 < half {
+                // Linear interpolation between points i-1 and i
+                let denom = series[i].1 - series[i - 1].1;
+                if denom > 1e-30 {
+                    let frac = (series[i].1 - half) / denom;
+                    found = Some(series[i].0 - frac * (series[i].0 - series[i - 1].0));
+                } else {
+                    found = Some(series[i].0);
+                }
+                break;
+            }
+        }
+        // If never drops below half, use the first point
+        found.unwrap_or(series.first()?.0)
+    };
+
+    let fwhm = right_rt - left_rt;
+    if fwhm > 0.0 {
+        Some((fwhm, left_rt, right_rt))
+    } else {
+        None
+    }
+}
+
+/// Result of hyperscore computation with binary search fragment matching.
+#[derive(Debug, Clone)]
+pub struct HyperscoreResult {
+    /// X!Tandem hyperscore: ln(n_b!) + ln(n_y!) + Σ ln(I+1)
+    pub score: f64,
+    /// Number of matched b-ions
+    pub n_b: u32,
+    /// Number of matched y-ions
+    pub n_y: u32,
+    /// Total number of matched fragments
+    pub n_matched: usize,
+    /// Signed mass errors for ALL matched fragments (in configured unit)
+    pub mass_errors: Vec<f64>,
+}
+
+/// Compute X!Tandem-style hyperscore using binary search fragment matching.
+///
+/// Matches ALL library fragments against sorted observed peaks within tolerance,
+/// counts b/y ions, and computes hyperscore = ln(n_b!) + ln(n_y!) + Σ ln(I+1).
+///
+/// Uses binary search for O(n_frags × log n_peaks) performance — same pattern as
+/// `has_top3_fragment_match` but for ALL fragments.
+///
+/// Mass errors for all matched fragments are collected as a side product,
+/// so no separate mass error collection pass is needed.
+pub fn compute_hyperscore(
+    library_fragments: &[LibraryFragment],
+    spectrum_mzs: &[f64],
+    spectrum_intensities: &[f64],
+    tolerance: f64,
+    unit: ToleranceUnit,
+) -> HyperscoreResult {
+    let mut n_b: u32 = 0;
+    let mut n_y: u32 = 0;
+    let mut n_matched: usize = 0;
+    let mut sum_log_intensity: f64 = 0.0;
+    let mut mass_errors = Vec::new();
+
+    if library_fragments.is_empty() || spectrum_mzs.is_empty() {
+        return HyperscoreResult { score: 0.0, n_b: 0, n_y: 0, n_matched: 0, mass_errors };
+    }
+
+    for frag in library_fragments {
+        let lib_mz = frag.mz;
+
+        // Calculate Da tolerance from configured unit
+        let tol_da = match unit {
+            ToleranceUnit::Ppm => lib_mz * tolerance / 1e6,
+            ToleranceUnit::Mz => tolerance,
+        };
+
+        let lower = lib_mz - tol_da;
+        let upper = lib_mz + tol_da;
+
+        // Binary search for first m/z >= lower bound
+        let start_idx = spectrum_mzs.partition_point(|&mz| mz < lower);
+
+        if start_idx >= spectrum_mzs.len() || spectrum_mzs[start_idx] > upper {
+            continue; // No match within tolerance
+        }
+
+        // Find closest peak within tolerance window (by m/z distance)
+        let mut best_idx = start_idx;
+        let mut best_diff = (spectrum_mzs[start_idx] - lib_mz).abs();
+        let mut j = start_idx + 1;
+        while j < spectrum_mzs.len() && spectrum_mzs[j] <= upper {
+            let diff = (spectrum_mzs[j] - lib_mz).abs();
+            if diff < best_diff {
+                best_diff = diff;
+                best_idx = j;
+            }
+            j += 1;
+        }
+
+        // Record match
+        n_matched += 1;
+        let obs_intensity = spectrum_intensities[best_idx];
+        sum_log_intensity += (obs_intensity as f64 + 1.0).ln();
+
+        // Count b/y ion types
+        match frag.annotation.ion_type {
+            IonType::B => n_b += 1,
+            IonType::Y => n_y += 1,
+            _ => {} // Other ion types contribute to intensity but not factorial terms
+        }
+
+        // Collect signed mass error
+        let best_mz = spectrum_mzs[best_idx];
+        let error = match unit {
+            ToleranceUnit::Ppm => (best_mz - lib_mz) / lib_mz * 1e6,
+            ToleranceUnit::Mz => best_mz - lib_mz,
+        };
+        mass_errors.push(error);
+    }
+
+    // hyperscore = ln(n_b!) + ln(n_y!) + Σ ln(I+1)
+    let score = if n_matched > 0 {
+        ln_gamma(n_b as f64 + 1.0) + ln_gamma(n_y as f64 + 1.0) + sum_log_intensity
+    } else {
+        0.0
+    };
+
+    HyperscoreResult { score, n_b, n_y, n_matched, mass_errors }
+}
 
 /// Spectral similarity scorer implementing LibCosine, XCorr, and Hyperscore
 ///
@@ -62,36 +744,37 @@ pub struct SpectralScorer {
     tolerance_da: f64,
     /// Mass tolerance for matching fragments (ppm)
     tolerance_ppm: f64,
-    /// Number of bins for XCorr (0-2000 m/z range, Comet-style)
-    num_bins: usize,
-    /// Bin width for XCorr
-    bin_width: f64,
-    /// Minimum m/z for binning (0.0 to match Comet/pyXcorrDIA)
-    #[allow(dead_code)]
-    min_mz: f64,
+    /// Binning configuration for XCorr (Comet BIN macro)
+    bin_config: BinConfig,
 }
 
 impl Default for SpectralScorer {
     fn default() -> Self {
-        let bin_width = 1.0005079; // Comet default bin width
-        let max_mz = 2000.0;
-        // Comet BIN macro: BIN(mass) = (int)(mass / bin_width + (1 - offset))
-        // With offset = 0.4: num_bins = (int)(2000 / 1.0005079 + 0.6) + 1
-        let num_bins = ((max_mz / bin_width) + 0.6) as usize + 1;
         Self {
             tolerance_da: 0.5, // For unit resolution
             tolerance_ppm: 20.0, // For HRAM
-            num_bins,
-            bin_width,
-            min_mz: 0.0, // Start at 0 m/z (Comet/pyXcorrDIA style)
+            bin_config: BinConfig::unit_resolution(),
         }
     }
 }
 
 impl SpectralScorer {
-    /// Create a new spectral scorer with default settings
+    /// Create a new spectral scorer with default unit resolution settings
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a scorer with a specific BinConfig (e.g., HRAM)
+    pub fn with_bin_config(bin_config: BinConfig) -> Self {
+        Self {
+            bin_config,
+            ..Self::default()
+        }
+    }
+
+    /// Create an HRAM scorer (0.02 Th bins, 0.0 offset)
+    pub fn hram() -> Self {
+        Self::with_bin_config(BinConfig::hram())
     }
 
     /// Set Da tolerance for unit resolution matching
@@ -104,6 +787,16 @@ impl SpectralScorer {
     pub fn with_tolerance_ppm(mut self, tolerance: f64) -> Self {
         self.tolerance_ppm = tolerance;
         self
+    }
+
+    /// Get the Da tolerance value
+    pub fn tolerance_da(&self) -> f64 {
+        self.tolerance_da
+    }
+
+    /// Get the ppm tolerance value
+    pub fn tolerance_ppm(&self) -> f64 {
+        self.tolerance_ppm
     }
 
     /// Compute LibCosine score between observed spectrum and library entry
@@ -461,12 +1154,10 @@ impl SpectralScorer {
         // First get LibCosine for additional metrics
         let lib_cosine_score = self.lib_cosine(observed, library);
 
-        // Bin observed spectrum using Comet-style BIN macro
-        // BIN(mass) = (int)(mass / bin_width + (1 - offset)) = (int)(mass / bin_width + 0.6)
-        let mut obs_binned = vec![0.0f32; self.num_bins];
+        // Bin observed spectrum using Comet BIN macro
+        let mut obs_binned = vec![0.0f32; self.bin_config.n_bins];
         for (&mz, &intensity) in observed.mzs.iter().zip(observed.intensities.iter()) {
-            let bin = ((mz / self.bin_width) + 0.6) as usize;
-            if bin < self.num_bins {
+            if let Some(bin) = self.bin_config.mz_to_bin(mz) {
                 // Apply sqrt transformation to experimental spectrum
                 obs_binned[bin] += intensity.sqrt();
             }
@@ -478,27 +1169,13 @@ impl SpectralScorer {
         // Apply sliding window subtraction (fast XCorr preprocessing)
         let xcorr_preprocessed = self.apply_sliding_window(&windowed);
 
-        // Bin library spectrum (theoretical) - use unit intensity like Comet
-        // Comet BIN macro: BIN(mass) = (int)(mass / bin_width + (1 - offset))
-        // With offset = 0.4: bin = (int)(mz / bin_width + 0.6)
-        let mut lib_binned = vec![0.0f32; self.num_bins];
-        for frag in &library.fragments {
-            // Comet-style binning: bin = (int)(mz / bin_width + 0.6)
-            let bin = ((frag.mz / self.bin_width) + 0.6) as usize;
-            if bin < self.num_bins {
-                // Use unit intensity (1.0) for theoretical spectrum, NOT library intensity
-                // NO windowing for theoretical - Comet just looks up preprocessed experimental
-                // values at fragment bin positions and sums them
-                lib_binned[bin] = 1.0;
-            }
-        }
-
-        // XCorr = dot product with scaling (NO windowing on theoretical)
+        // XCorr = sum of preprocessed experimental values at fragment bin positions
         // This matches Comet exactly: score = sum(experimental_preprocessed[frag_bins]) * 0.005
-        let xcorr_raw: f32 = lib_binned
+        // Directly sum at fragment positions — O(n_fragments) instead of O(n_bins)
+        let xcorr_raw: f32 = library.fragments
             .iter()
-            .zip(xcorr_preprocessed.iter())
-            .map(|(a, b)| a * b)
+            .filter_map(|frag| self.bin_config.mz_to_bin(frag.mz))
+            .map(|bin| xcorr_preprocessed[bin])
             .sum();
 
         // Scale XCorr (pyXcorrDIA uses 0.005 for spectrum-centric)
@@ -624,33 +1301,38 @@ impl SpectralScorer {
     }
 
     /// Match library fragments to observed peaks
-    fn match_fragments(&self, observed: &Spectrum, library: &LibraryEntry) -> Vec<FragmentMatch> {
+    ///
+    /// Uses binary search on sorted observed m/z values for O(n_fragments × log(n_peaks))
+    /// instead of O(n_fragments × n_peaks) linear scan.
+    pub fn match_fragments(&self, observed: &Spectrum, library: &LibraryEntry) -> Vec<FragmentMatch> {
         let mut matches = Vec::new();
 
         for frag in &library.fragments {
-            // Find best matching observed peak
+            // Calculate tolerance window (use whichever is larger: Da or ppm-derived)
+            let tol_da = self.tolerance_da.max(frag.mz * self.tolerance_ppm / 1e6);
+            let lower = frag.mz - tol_da;
+            let upper = frag.mz + tol_da;
+
+            // Binary search for first m/z >= lower bound (observed.mzs is sorted)
+            let start = observed.mzs.partition_point(|&mz| mz < lower);
+
+            // Scan only within the tolerance window to find best match
             let mut best_match: Option<(usize, f64)> = None;
             let mut best_error = f64::MAX;
-
-            for (i, (&mz, &intensity)) in
-                observed.mzs.iter().zip(observed.intensities.iter()).enumerate()
-            {
-                let error_da = (mz - frag.mz).abs();
-                let error_ppm = error_da / frag.mz * 1e6;
-
-                // Check if within tolerance (use both Da and ppm, take minimum)
-                let within_tolerance =
-                    error_da <= self.tolerance_da || error_ppm <= self.tolerance_ppm;
-
-                if within_tolerance && error_da < best_error {
+            let mut i = start;
+            while i < observed.mzs.len() && observed.mzs[i] <= upper {
+                let error_da = (observed.mzs[i] - frag.mz).abs();
+                if error_da < best_error {
                     best_error = error_da;
-                    best_match = Some((i, intensity as f64));
+                    best_match = Some((i, observed.intensities[i] as f64));
                 }
+                i += 1;
             }
 
-            if let Some((_idx, obs_intensity)) = best_match {
+            if let Some((idx, obs_intensity)) = best_match {
                 matches.push(FragmentMatch {
                     lib_mz: frag.mz,
+                    obs_mz: observed.mzs[idx],
                     lib_intensity: frag.relative_intensity,
                     obs_intensity: obs_intensity as f32,
                     ion_type: frag.annotation.ion_type,
@@ -699,30 +1381,33 @@ impl SpectralScorer {
         result
     }
 
-    /// Apply sliding window subtraction for fast XCorr
+    /// Apply sliding window subtraction for fast XCorr (Comet-style)
     ///
-    /// Subtracts local average (excluding center) with offset=75
+    /// Uses prefix sum for O(n) performance instead of O(n × window).
+    /// Comet divides by (2*offset) = 150 regardless of boundary effects.
+    /// offset=75, matching Comet's iXcorrProcessingOffset default.
     fn apply_sliding_window(&self, spectrum: &[f32]) -> Vec<f32> {
-        let mut result = vec![0.0f32; spectrum.len()];
-        let offset: i64 = 75;
-        let window_range = 2 * offset + 1;
-        let norm_factor = 1.0f32 / (window_range - 1) as f32;
+        let n = spectrum.len();
+        let offset: usize = 75;
+        // Comet uses (window_size - 1) = 2*offset = 150 as divisor
+        let norm_factor = 1.0f32 / (2 * offset) as f32;
 
-        let n = spectrum.len() as i64;
+        // Build prefix sum for O(n) window sums
+        let mut prefix = vec![0.0f32; n + 1];
+        for i in 0..n {
+            prefix[i + 1] = prefix[i] + spectrum[i];
+        }
 
-        for i in 0..spectrum.len() {
-            let i64_i = i as i64;
-            let mut sum = 0.0f32;
-
-            // Sum values in window, excluding center
-            for j in (i64_i - offset)..=(i64_i + offset) {
-                if j >= 0 && j < n && j != i64_i {
-                    sum += spectrum[j as usize];
-                }
-            }
-
+        let mut result = vec![0.0f32; n];
+        for i in 0..n {
+            let left = if i >= offset { i - offset } else { 0 };
+            let right = if i + offset < n { i + offset + 1 } else { n };
+            // Window sum including center
+            let window_sum = prefix[right] - prefix[left];
+            // Subtract center to get sum excluding center
+            let sum_excluding_center = window_sum - spectrum[i];
             // Subtract local average from center value
-            result[i] = spectrum[i] - sum * norm_factor;
+            result[i] = spectrum[i] - sum_excluding_center * norm_factor;
         }
 
         result
@@ -739,11 +1424,10 @@ impl SpectralScorer {
     ///
     /// This allows precomputing once per spectrum and reusing across library entries.
     pub fn preprocess_spectrum_for_xcorr(&self, spectrum: &Spectrum) -> Vec<f32> {
-        // Bin observed spectrum with sqrt transformation
-        let mut binned = vec![0.0f32; self.num_bins];
+        // Bin observed spectrum with sqrt transformation using Comet BIN macro
+        let mut binned = vec![0.0f32; self.bin_config.n_bins];
         for (&mz, &intensity) in spectrum.mzs.iter().zip(spectrum.intensities.iter()) {
-            let bin = ((mz / self.bin_width) + 0.6) as usize;
-            if bin < self.num_bins {
+            if let Some(bin) = self.bin_config.mz_to_bin(mz) {
                 binned[bin] += intensity.sqrt();
             }
         }
@@ -762,13 +1446,12 @@ impl SpectralScorer {
     ///
     /// This allows precomputing once per library entry and reusing across spectra.
     pub fn preprocess_library_for_xcorr(&self, entry: &LibraryEntry) -> Vec<f32> {
-        // Bin library fragments with unit intensity
+        // Bin library fragments with unit intensity using Comet BIN macro
         // Comet-style: theoretical spectrum is NOT windowed, just unit intensities at fragment bins
         // The score is simply: sum(experimental_preprocessed[frag_bins]) * 0.005
-        let mut binned = vec![0.0f32; self.num_bins];
+        let mut binned = vec![0.0f32; self.bin_config.n_bins];
         for frag in &entry.fragments {
-            let bin = ((frag.mz / self.bin_width) + 0.6) as usize;
-            if bin < self.num_bins {
+            if let Some(bin) = self.bin_config.mz_to_bin(frag.mz) {
                 // Use unit intensity (1.0), NOT library intensity (Comet-style)
                 // NO windowing applied - this matches Comet exactly
                 binned[bin] = 1.0;
@@ -782,16 +1465,16 @@ impl SpectralScorer {
 
     /// Compute XCorr from preprocessed vectors
     ///
-    /// This is a simple dot product with scaling, used after preprocessing.
+    /// Uses ndarray dot product which dispatches to BLAS sdot for contiguous f32 slices.
     /// Returns f64 for compatibility with scoring pipelines.
     #[inline]
     pub fn xcorr_from_preprocessed(spectrum_preprocessed: &[f32], library_preprocessed: &[f32]) -> f64 {
+        use ndarray::ArrayView1;
+
         let min_len = spectrum_preprocessed.len().min(library_preprocessed.len());
-        let raw: f32 = spectrum_preprocessed[..min_len]
-            .iter()
-            .zip(library_preprocessed[..min_len].iter())
-            .map(|(s, l)| s * l)
-            .sum();
+        let spec = ArrayView1::from(&spectrum_preprocessed[..min_len]);
+        let lib = ArrayView1::from(&library_preprocessed[..min_len]);
+        let raw = spec.dot(&lib);
 
         // Scale XCorr (pyXcorrDIA uses 0.005 for spectrum-centric)
         (raw * 0.005f32) as f64
@@ -799,7 +1482,12 @@ impl SpectralScorer {
 
     /// Get the number of bins used for XCorr
     pub fn num_bins(&self) -> usize {
-        self.num_bins
+        self.bin_config.n_bins
+    }
+
+    /// Get the bin configuration
+    pub fn bin_config(&self) -> &BinConfig {
+        &self.bin_config
     }
 }
 
@@ -842,14 +1530,15 @@ pub struct SpectralScore {
     pub n_matched_y: u32,
 }
 
-/// Internal struct for fragment matching
+/// Fragment matching result with observed m/z for mass accuracy computation
 #[derive(Debug)]
-struct FragmentMatch {
-    lib_mz: f64,
-    lib_intensity: f32,
-    obs_intensity: f32,
+pub struct FragmentMatch {
+    pub lib_mz: f64,
+    pub obs_mz: f64,
+    pub lib_intensity: f32,
+    pub obs_intensity: f32,
     /// Ion type of the matched fragment (for hyperscore b/y counting)
-    ion_type: IonType,
+    pub ion_type: IonType,
 }
 
 /// Spectrum aggregator for combining spectra across peak apex region
@@ -894,7 +1583,7 @@ impl SpectrumAggregator {
     ///
     /// Combines peaks from multiple spectra within the apex region
     /// by summing intensities of peaks at similar m/z values.
-    pub fn aggregate(&self, spectra: &[Spectrum], apex_rt: f64) -> Spectrum {
+    pub fn aggregate(&self, spectra: &[&Spectrum], apex_rt: f64) -> Spectrum {
         if spectra.is_empty() {
             return Spectrum::new(
                 0,
@@ -981,7 +1670,7 @@ impl SpectrumAggregator {
     /// of each scan to the aggregated spectrum.
     pub fn aggregate_weighted(
         &self,
-        spectra: &[Spectrum],
+        spectra: &[&Spectrum],
         coefficients: &[(f64, f64)], // (rt, coefficient) pairs
         apex_rt: f64,
     ) -> Spectrum {
@@ -1222,7 +1911,7 @@ impl FeatureExtractor {
         &self,
         entry: &LibraryEntry,
         coefficient_series: &[(f64, f64)],
-        spectra: &[Spectrum],
+        spectra: &[&Spectrum],
         expected_rt: Option<f64>,
     ) -> FeatureSet {
         // Find apex RT from coefficient series
@@ -1294,14 +1983,9 @@ impl FeatureExtractor {
                 .filter(|(_, c)| *c > 0.0)
                 .count() as u32;
 
-            // FR-5.1.4: Peak width (FWHM)
-            let half_max = features.peak_apex / 2.0;
-            let above_half: Vec<_> = coefficient_series
-                .iter()
-                .filter(|(_, c)| *c >= half_max)
-                .collect();
-            if above_half.len() >= 2 {
-                features.peak_width = above_half.last().unwrap().0 - above_half.first().unwrap().0;
+            // FR-5.1.4: Peak width (FWHM with linear interpolation)
+            if let Some((fwhm, _, _)) = compute_fwhm_interpolated(coefficient_series) {
+                features.peak_width = fwhm;
             }
 
             // FR-5.1.5: Peak symmetry (leading/trailing ratio)
@@ -1400,7 +2084,7 @@ impl FeatureExtractor {
         &self,
         entry: &LibraryEntry,
         coefficient_series: &[(f64, f64)],
-        spectra: &[Spectrum],
+        spectra: &[&Spectrum],
         expected_rt: Option<f64>,
     ) -> FeatureSet {
         // Find apex RT and spectrum
@@ -1418,7 +2102,8 @@ impl FeatureExtractor {
                     .abs()
                     .partial_cmp(&(b.retention_time - apex_rt).abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            })
+            .copied();
 
         // First, extract features with mixed (apex) spectrum
         let mut features = self.extract_with_expected_rt(
@@ -2354,6 +3039,7 @@ mod tests {
     use super::*;
     use osprey_core::IsolationWindow;
 
+    /// Verifies that FeatureExtractor computes correct peak apex, area, and scan count from a coefficient time series.
     #[test]
     fn test_feature_extractor() {
         let extractor = FeatureExtractor::new();
@@ -2367,6 +3053,7 @@ mod tests {
         assert_eq!(features.n_contributing_scans, 3);
     }
 
+    /// Verifies that LibCosine scorer returns a score near 1.0 when the observed spectrum perfectly matches the library entry.
     #[test]
     fn test_spectral_scorer_lib_cosine() {
         let scorer = SpectralScorer::new();
@@ -2409,6 +3096,7 @@ mod tests {
         assert!((score.fragment_coverage - 1.0).abs() < 1e-6);
     }
 
+    /// Verifies that LibCosine scorer correctly reports partial fragment coverage when only some peaks match.
     #[test]
     fn test_spectral_scorer_partial_match() {
         let scorer = SpectralScorer::new();
@@ -2457,6 +3145,7 @@ mod tests {
         assert!(score.lib_cosine > 0.9, "LibCosine should be high for matched fragments");
     }
 
+    /// Verifies that LibCosine scorer returns zero score and zero coverage when no peaks overlap.
     #[test]
     fn test_spectral_scorer_no_match() {
         let scorer = SpectralScorer::new();
@@ -2488,6 +3177,7 @@ mod tests {
         assert!((score.lib_cosine - 0.0).abs() < 1e-6);
     }
 
+    /// Verifies that XCorr scoring produces a non-zero score for matching library and observed spectra.
     #[test]
     fn test_spectral_scorer_xcorr() {
         let scorer = SpectralScorer::new();
@@ -2525,6 +3215,7 @@ mod tests {
         assert!(score.xcorr != 0.0 || score.lib_cosine > 0.9, "Should have some score");
     }
 
+    /// Verifies that FeatureExtractor computes both chromatographic and spectral features when given an apex spectrum.
     #[test]
     fn test_feature_extractor_with_spectrum() {
         let extractor = FeatureExtractor::new();
@@ -2565,6 +3256,7 @@ mod tests {
         assert!((features.fragment_coverage - 1.0).abs() < 1e-6, "All fragments should match");
     }
 
+    /// Verifies that trypsin-aware decoy generation reverses the peptide sequence while preserving the C-terminal residue.
     #[test]
     fn test_decoy_reverse_trypsin() {
         let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
@@ -2582,6 +3274,7 @@ mod tests {
         assert_eq!(decoy.id, 1 | 0x80000000);
     }
 
+    /// Verifies that LysN-aware decoy generation reverses the peptide sequence while preserving the N-terminal residue.
     #[test]
     fn test_decoy_reverse_lysn() {
         let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::LysN);
@@ -2596,6 +3289,7 @@ mod tests {
         assert_eq!(decoy.sequence, "KEDITPEP"); // K stays, PEPTIDE->EDITPEP
     }
 
+    /// Verifies that decoy generation preserves the precursor m/z since the amino acid composition is unchanged.
     #[test]
     fn test_decoy_preserves_precursor_mz() {
         let generator = DecoyGenerator::new(DecoyMethod::Reverse);
@@ -2607,6 +3301,7 @@ mod tests {
         assert!((decoy.precursor_mz - 500.123).abs() < 1e-6);
     }
 
+    /// Verifies that decoy generation adds "DECOY_" prefix to all associated protein IDs.
     #[test]
     fn test_decoy_protein_id_prefix() {
         let generator = DecoyGenerator::new(DecoyMethod::Reverse);
@@ -2620,6 +3315,7 @@ mod tests {
         assert!(decoy.protein_ids[1].starts_with("DECOY_"));
     }
 
+    /// Verifies that modification positions are correctly remapped when the peptide sequence is reversed for decoy generation.
     #[test]
     fn test_decoy_with_modification() {
         let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
@@ -2651,6 +3347,7 @@ mod tests {
         assert_eq!(decoy.modifications[0].position, 3);
     }
 
+    /// Verifies that sequences too short to meaningfully reverse are returned unchanged.
     #[test]
     fn test_short_sequence() {
         let generator = DecoyGenerator::new(DecoyMethod::Reverse);
@@ -2662,6 +3359,7 @@ mod tests {
         assert_eq!(decoy.sequence, "PK");
     }
 
+    /// Verifies that enzyme cleavage site classification correctly identifies C-terminal vs N-terminal cutters.
     #[test]
     fn test_enzyme_detection() {
         assert!(Enzyme::Trypsin.preserves_c_terminus());
@@ -2670,6 +3368,7 @@ mod tests {
         assert!(!Enzyme::AspN.preserves_c_terminus());
     }
 
+    /// Verifies that SpectrumAggregator correctly sums intensities across multiple spectra for matching m/z bins.
     #[test]
     fn test_spectrum_aggregator() {
         let aggregator = SpectrumAggregator::new().with_tolerance_da(0.5);
@@ -2702,7 +3401,8 @@ mod tests {
             },
         ];
 
-        let aggregated = aggregator.aggregate(&spectra, 10.0);
+        let spectra_refs: Vec<&Spectrum> = spectra.iter().collect();
+        let aggregated = aggregator.aggregate(&spectra_refs, 10.0);
 
         // Should have 2 peaks (300.0 and 400.0)
         assert_eq!(aggregated.mzs.len(), 2);
@@ -2716,6 +3416,7 @@ mod tests {
         assert!((int_400 - 110.0).abs() < 1.0, "Expected ~110, got {}", int_400);
     }
 
+    /// Verifies that weighted spectrum aggregation applies coefficient-based weights and normalizes correctly.
     #[test]
     fn test_spectrum_aggregator_weighted() {
         let aggregator = SpectrumAggregator::new().with_tolerance_da(0.5);
@@ -2743,7 +3444,8 @@ mod tests {
         // Coefficients: scan 1 has weight 0.2, scan 2 has weight 0.8
         let coefficients = vec![(9.5, 0.2), (10.0, 0.8)];
 
-        let aggregated = aggregator.aggregate_weighted(&spectra, &coefficients, 10.0);
+        let spectra_refs: Vec<&Spectrum> = spectra.iter().collect();
+        let aggregated = aggregator.aggregate_weighted(&spectra_refs, &coefficients, 10.0);
 
         // Should have 1 peak
         assert_eq!(aggregated.mzs.len(), 1);
@@ -2754,6 +3456,7 @@ mod tests {
         assert!((int - 100.0).abs() < 1.0, "Expected ~100, got {}", int);
     }
 
+    /// Verifies that decoy collision detection prevents generating decoys whose sequences match existing target sequences.
     #[test]
     fn test_decoy_collision_detection() {
         let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
@@ -2807,6 +3510,7 @@ mod tests {
         }
     }
 
+    /// Verifies that cyclic permutation shifts the peptide body by the specified offset while preserving the terminal residue.
     #[test]
     fn test_cycle_sequence() {
         let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);

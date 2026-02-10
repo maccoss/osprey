@@ -1,6 +1,6 @@
 # RT Calibration
 
-Osprey uses LOESS (Locally Estimated Scatterplot Smoothing) regression to calibrate library retention times against measured retention times. The calibration phase uses LibCosine scoring with target-decoy competition to identify high-confidence matches for fitting.
+Osprey uses LOESS (Locally Estimated Scatterplot Smoothing) regression to calibrate library retention times against measured retention times. The calibration phase uses XCorr scoring with E-value-based target-decoy competition to identify high-confidence matches for fitting.
 
 ## Overview
 
@@ -12,7 +12,7 @@ RT calibration follows the pyXcorrDIA methodology:
 │                                                                  │
 │  1. Generate decoys (enzyme-aware reversal)                     │
 │  2. Sample ~2000 peptides for calibration                       │
-│  3. Score ALL spectra via LibCosine (pyXcorrDIA-compatible)     │
+│  3. Score spectra via XCorr (unit resolution bins, E-value)     │
 │  4. Target-decoy competition → winners                          │
 │  5. Filter to targets at ≤1% FDR                                │
 │  6. Fit LOESS on (library_RT, measured_RT) pairs                │
@@ -34,35 +34,35 @@ For large libraries (millions of entries), scoring all entries would be too slow
 let calibration_library = sample_calibration_peptides(&library, 2000);
 ```
 
-### LibCosine Scoring
+### XCorr Scoring
 
-Each sampled peptide is scored against all spectra within RT tolerance using LibCosine:
+Each sampled peptide is scored against all spectra within RT tolerance using XCorr:
 
 ```
 For each library entry:
-  For each spectrum within RT tolerance:
-    1. Check precursor m/z falls in isolation window
-    2. Match library fragments to observed peaks (ppm tolerance)
-    3. Calculate LibCosine: cosine(SMZ_library, SMZ_observed)
-  Keep best scoring spectrum for this entry
+  1. Filter spectra by RT tolerance + top-3 fragment match
+  2. Calculate XCorr against all passing spectra (unit resolution bins: 2001 bins)
+  3. Select best spectrum by XCorr
+  4. Calculate E-value from XCorr survival function
+  5. Collect top-3 fragment mass errors at best spectrum
 ```
 
-**SMZ preprocessing**: `sqrt(intensity) × m/z²`
+Calibration always uses unit resolution bins (1.0005 Da, 2001 bins) regardless of data type for ~50x faster scoring on HRAM data.
 
 ### Target-Decoy Competition
 
-Following pyXcorrDIA, each target competes against its paired decoy:
+Each target competes against its paired decoy using E-values:
 
 ```
 Target-decoy pairing: decoy_id = target_id | 0x80000000
 
 For each target-decoy pair:
-  if target_score > decoy_score:
+  if target_evalue < decoy_evalue:  # Lower E-value is better
     winner = target
   else:  # Including ties - conservative
     winner = decoy
 
-Sort winners by score (descending)
+Sort winners by E-value (ascending)
 FDR = cumulative_decoys / cumulative_targets
 Filter to targets where FDR ≤ 0.01
 ```
@@ -210,15 +210,15 @@ The fallback uses library RTs directly with a wider tolerance.
 Key files:
 - `crates/osprey-chromatography/src/calibration/rt.rs` - LOESS fitting
 - `crates/osprey-chromatography/src/calibration/mod.rs` - CalibrationParams
-- `crates/osprey-scoring/src/batch.rs` - LibCosine scoring
+- `crates/osprey-scoring/src/batch.rs` - XCorr calibration scoring, E-value calculation
 - `crates/osprey-fdr/src/controller.rs` - Target-decoy competition
 - `crates/osprey/src/pipeline.rs` - Calibration workflow
 
 ### Pipeline Integration
 
 ```rust
-// Run calibration discovery with LibCosine scoring
-let matches = run_libcosine_calibration_scoring_with_ms1(
+// Run calibration scoring (XCorr + top-3 fragment matching, unit resolution bins)
+let matches = run_xcorr_calibration_scoring(
     &calibration_library,
     &spectra,
     Some(&ms1_index),
@@ -253,7 +253,7 @@ Experiment: DIA analysis with predicted library
 Library: 100,000 peptides
 Sampled for calibration: 2,000 targets + 2,000 decoys
 
-LibCosine scoring:
+XCorr scoring (unit resolution bins):
   Initial RT tolerance: 5.0 min (wide)
   Fragment tolerance: 10 ppm
   Matched peptides: 3,847

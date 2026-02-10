@@ -22,7 +22,7 @@ Osprey has a **working prototype** that can:
 |----------|-------------|
 | [RT Calibration](rt-calibration.md) | LOESS-based RT calibration with target-decoy FDR |
 | [Mass Calibration](mass-calibration.md) | MS1 (precursor) and MS2 (fragment) mass calibration |
-| [Spectral Scoring](spectral-scoring.md) | LibCosine scoring (calibration phase) |
+| [Spectral Scoring](spectral-scoring.md) | XCorr + E-value scoring (calibration phase) |
 | [XCorr Scoring](xcorr-scoring.md) | Comet-style XCorr implementation |
 | [Deconvolution Scoring](deconvolution-scoring.md) | Post-regression scoring: all scores computed after ridge regression |
 | [Ridge Regression](ridge-regression.md) | NNLS ridge regression for spectrum deconvolution |
@@ -45,7 +45,6 @@ INPUT
 PHASE 1: INITIALIZATION
   ├─ Load spectral library (DIA-NN TSV, elib, or blib)
   ├─ Generate decoys (enzyme-aware reversal)
-  ├─ Pre-bin library spectra (f32, one-time cost)
   └─ Build m/z index for candidate lookup
   │
   ▼
@@ -53,8 +52,8 @@ PHASE 2: CALIBRATION DISCOVERY (first file only)
   ├─ Calculate library-to-measured RT mapping
   ├─ Set wide RT tolerance (20-50% of gradient)
   ├─ Score all peptides against all spectra:
-  │     ├─ XCorr (BLAS-accelerated) → find best RT per peptide
-  │     ├─ LibCosine (ppm matching) → score at best RT only
+  │     ├─ XCorr (unit resolution bins, BLAS sdot) → find best RT per peptide
+  │     ├─ Top-3 fragment matching (binary search) → MS2 mass errors
   │     └─ E-value from XCorr survival function
   ├─ Target-decoy competition → 1% FDR filtering
   ├─ Fit LOESS RT calibration from confident targets
@@ -163,17 +162,19 @@ Osprey uses **two-level FDR control** via Mokapot:
 
 ## Phase 2: Calibration Scoring (Quick Pass)
 
-The calibration phase is a **fast scoring pass** designed to establish RT and mass calibration before the main search. It does NOT use ridge regression.
+The calibration phase is a **fast scoring pass** designed to establish RT and mass calibration before the main search. It does NOT use ridge regression. Calibration always uses **unit resolution XCorr** (2001 bins, 1.0005 Da) regardless of data type, providing ~50x faster scoring for HRAM data.
 
 ### How Calibration Scoring Works
 
-Calibration uses a **hybrid XCorr + LibCosine** strategy for speed and accuracy:
+1. **Pre-filter** (top-3 fragment match): Binary search check — at least 1 of the top-3 most intense library fragments must be present in the observed spectrum. Eliminates candidates with no spectral evidence before expensive XCorr preprocessing. O(3 × log n) per candidate.
 
-1. **XCorr via BLAS** (fast, all spectra): Preprocess library and spectra into f32 vectors, score all pairs via matrix multiplication. XCorr is used to find the best-matching spectrum RT for each peptide. This is computationally cheap because it uses BLAS batched operations.
+2. **XCorr** (all passing spectra): Preprocess experimental spectrum with sqrt, windowing normalization, and flanking bin subtraction. Score against all spectra in RT window via BLAS sdot. Used to find the best-matching RT for each peptide.
 
-2. **LibCosine** (accurate, one spectrum): Once XCorr identifies the best RT, LibCosine is computed at that single spectrum using ppm-based fragment matching (no binning). This provides a high-quality score and mass error measurements.
+3. **Top-3 fragment matching** (at best XCorr spectrum): Binary search the top-3 most intense library fragments in the best XCorr spectrum. Returns signed mass errors (ppm) for MS2 mass calibration.
 
-3. **E-value** (significance): Calculated from the XCorr survival function (Comet-style) to estimate the probability of a match occurring by chance.
+4. **E-value** (significance): Calculated from the XCorr survival function (Comet-style) — fit log-linear regression to survival counts. Used for target-decoy competition.
+
+5. **MS1 isotope envelope** (at best XCorr spectrum): Extract monoisotopic peak from nearest MS1 spectrum. Returns MS1 mass error (ppm) for precursor mass calibration.
 
 See: [Spectral Scoring](spectral-scoring.md), [XCorr Scoring](xcorr-scoring.md)
 
@@ -266,9 +267,9 @@ See: [FDR Control](fdr-control.md)
 |--------|----------------------|---------------------------|
 | **Purpose** | Establish RT/mass calibration | Determine peptide detections |
 | **Uses regression?** | No | Yes (scores the deconvoluted result) |
-| **Primary score** | LibCosine (with XCorr for RT) | All 30 features |
-| **Fragment matching** | ppm-based (pyXcorrDIA-style) | ppm-based at apex spectrum |
-| **FDR method** | Simple target-decoy (1% for calibration) | Mokapot semi-supervised ML |
+| **Primary score** | XCorr + E-value | All 30 features |
+| **Fragment matching** | Top-3 binary search (mass errors for calibration) | ppm-based at apex spectrum |
+| **FDR method** | Target-decoy competition on E-value (1% FDR) | Mokapot semi-supervised ML |
 | **Output** | RT curve + mass calibration | Peptide detections with q-values |
 | **Scope** | First file only, wide tolerance | All files, tight calibrated tolerance |
 | **Speed** | BLAS-accelerated batch scoring | Per-precursor feature extraction |
@@ -322,10 +323,11 @@ osprey/
 │   └── calibration/          # LOESS RT calibration, mass calibration, I/O
 │
 ├── osprey-regression/        # Ridge regression engine
-│   ├── optimized.rs          # Pre-binned library, f32 solver, spectra cache
-│   ├── ridge.rs              # Dense NNLS solver (f64)
-│   ├── sparse.rs             # Sparse HRAM solver
-│   └── binning.rs            # m/z binning
+│   ├── solver.rs             # Unified f32 CD-NNLS solver (unit res + HRAM)
+│   ├── cd_nnls.rs            # Coordinate Descent NNLS algorithm
+│   ├── ridge.rs              # Dense NNLS solver (f64, reference)
+│   ├── binning.rs            # m/z binning (Comet BIN macro)
+│   └── matrix.rs             # Design matrix construction
 │
 ├── osprey-fdr/               # FDR control
 │   ├── lib.rs                # Target-decoy competition, q-values

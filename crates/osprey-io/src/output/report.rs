@@ -124,6 +124,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Verifies that a regression result with positive and zero coefficients is written to a TSV file.
     #[test]
     fn test_write_result() {
         let dir = tempdir().unwrap();
