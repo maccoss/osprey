@@ -617,6 +617,8 @@ pub struct FeatureSet {
     pub peak_sharpness: f64,
     /// Peak prominence (apex / baseline)
     pub peak_prominence: f64,
+    /// Signal-to-noise ratio (peak apex vs background)
+    pub signal_to_noise: f64,
 
     // Spectral features (from mixed/observed spectrum at apex)
     /// X!Tandem-style hyperscore: log(n_b!) + log(n_y!) + Σlog(I_f+1)

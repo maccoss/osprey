@@ -24,9 +24,8 @@ pub fn train_and_score_calibration(
     }
 
     log::info!(
-        "Training LDA with 3-fold cross-validation on {} calibration matches ({} features)",
-        matches.len(),
-        if use_isotope_feature { 5 } else { 4 }
+        "Training LDA with 3-fold cross-validation on {} calibration matches (4 features)",
+        matches.len()
     );
 
     // 1. Extract feature matrix
@@ -50,6 +49,29 @@ pub fn train_and_score_calibration(
     // 7. Sort by discriminant score descending (best matches first)
     matches.sort_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
 
+    // DEBUG: Log discriminant score distributions
+    let target_scores: Vec<f64> = matches.iter()
+        .filter(|m| !m.is_decoy)
+        .map(|m| m.discriminant_score)
+        .collect();
+    let decoy_scores: Vec<f64> = matches.iter()
+        .filter(|m| m.is_decoy)
+        .map(|m| m.discriminant_score)
+        .collect();
+
+    if !target_scores.is_empty() && !decoy_scores.is_empty() {
+        let target_mean = target_scores.iter().sum::<f64>() / target_scores.len() as f64;
+        let decoy_mean = decoy_scores.iter().sum::<f64>() / decoy_scores.len() as f64;
+        let target_max = target_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let target_min = target_scores.iter().cloned().fold(f64::INFINITY, f64::min);
+        let decoy_max = decoy_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let decoy_min = decoy_scores.iter().cloned().fold(f64::INFINITY, f64::min);
+
+        log::info!("  Discriminant scores: target_mean={:.3}, decoy_mean={:.3}", target_mean, decoy_mean);
+        log::info!("  Discriminant ranges: targets=[{:.3}, {:.3}], decoys=[{:.3}, {:.3}]",
+            target_min, target_max, decoy_min, decoy_max);
+    }
+
     // 8. Calculate q-values using target-decoy competition
     let is_decoy: Vec<bool> = matches.iter().map(|m| m.is_decoy).collect();
     let mut q_values = vec![0.0; matches.len()];
@@ -59,6 +81,11 @@ pub fn train_and_score_calibration(
     for (i, m) in matches.iter_mut().enumerate() {
         m.q_value = q_values[i];
     }
+
+    // DEBUG: Log q-value statistics
+    let min_q = q_values.iter().cloned().fold(f64::INFINITY, f64::min);
+    let first_10_q: Vec<f64> = q_values.iter().take(10).cloned().collect();
+    log::info!("  Q-value stats: min_q={:.4}, first_10={:?}", min_q, first_10_q);
 
     log::info!(
         "LDA scoring complete: {} matches passing 1% FDR",
@@ -83,7 +110,7 @@ pub fn train_and_score_calibration(
 fn train_lda_with_cross_validation(
     features: &Matrix,
     decoy_labels: &[bool],
-    use_isotope_feature: bool,
+    _use_isotope_feature: bool,
 ) -> Result<Vec<f64>, OspreyError> {
     const N_FOLDS: usize = 3;
     let n_samples = features.rows;
@@ -94,11 +121,7 @@ fn train_lda_with_cross_validation(
     // Storage for cross-validated predictions
     let mut cv_discriminants = vec![0.0; n_samples];
 
-    let feature_names = if use_isotope_feature {
-        vec!["correlation", "libcosine", "top6", "snr", "isotope"]
-    } else {
-        vec!["correlation", "libcosine", "top6", "snr"]
-    };
+    let feature_names = vec!["correlation", "libcosine", "top6", "snr"];
 
     // Train and predict for each fold
     for fold_idx in 0..N_FOLDS {
@@ -240,17 +263,17 @@ fn extract_rows(matrix: &Matrix, row_indices: &[usize]) -> Matrix {
 /// - libcosine_apex: 0-1 (already normalized)
 /// - top6_matched_apex: 0-1 (count 0-6, divided by 6)
 /// - signal_to_noise: ~0-1 (ln(x+1) transform, typical max ~100 → ln~5)
-/// - isotope_cosine: 0-1 (optional, HRAM only)
 ///
-/// Note: hyperscore is NOT used in calibration LDA as it dominates target-decoy
-/// discrimination but doesn't correlate with RT quality
-fn extract_feature_matrix(matches: &[CalibrationMatch], use_isotope_feature: bool) -> Matrix {
-    let n_features = if use_isotope_feature { 5 } else { 4 };
+/// Note: hyperscore and isotope are NOT used in calibration LDA:
+/// - hyperscore dominates target-decoy discrimination but doesn't correlate with RT quality
+/// - isotope shows negative correlation and doesn't help RT calibration
+fn extract_feature_matrix(matches: &[CalibrationMatch], _use_isotope_feature: bool) -> Matrix {
+    let n_features = 4;
 
     let features: Vec<f64> = matches
         .iter()
         .flat_map(|m| {
-            let mut feats = vec![
+            vec![
                 // Normalize correlation score (typical range 0-6)
                 (m.correlation_score / 6.0).clamp(0.0, 1.0),
                 // LibCosine already 0-1
@@ -259,14 +282,7 @@ fn extract_feature_matrix(matches: &[CalibrationMatch], use_isotope_feature: boo
                 (m.top6_matched_apex as f64 / 6.0).clamp(0.0, 1.0),
                 // Signal-to-noise with log transform (typical range 1-100+)
                 (m.signal_to_noise.ln_1p() / 5.0).clamp(0.0, 1.0),
-            ];
-
-            // Add isotope feature for HRAM mode
-            if use_isotope_feature {
-                feats.push(m.isotope_cosine_score.unwrap_or(0.0).clamp(0.0, 1.0));
-            }
-
-            feats
+            ]
         })
         .collect();
 
@@ -366,15 +382,15 @@ mod tests {
             make_test_match(1.5, 0.5, 3, 5.0, Some(0.7), true),
         ];
 
-        // Test 4 features (no isotope): correlation, libcosine, top6, snr
+        // Test 4 features: correlation, libcosine, top6, snr (isotope not used in LDA)
         let matrix = extract_feature_matrix(&matches, false);
         assert_eq!(matrix.rows, 2);
         assert_eq!(matrix.cols, 4);
 
-        // Test 5 features (with isotope): correlation, libcosine, top6, snr, isotope
+        // Even with isotope flag, still 4 features (isotope removed from LDA)
         let matrix = extract_feature_matrix(&matches, true);
         assert_eq!(matrix.rows, 2);
-        assert_eq!(matrix.cols, 5);
+        assert_eq!(matrix.cols, 4);
 
         // Check normalization (correlation 3.0 -> 0.5)
         let corr_norm = matrix[(0, 0)];

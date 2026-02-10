@@ -1093,6 +1093,7 @@ fn get_feature_header() -> String {
         "coefficient_stability",
         "relative_coefficient",
         "explained_intensity",
+        "signal_to_noise",
         // Spectral matching features (mixed/observed at apex spectrum)
         "hyperscore",
         "xcorr",
@@ -1140,7 +1141,7 @@ fn format_charge_features(charge: u8) -> String {
 /// Format features for PIN output
 fn format_features(features: &FeatureSet) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         // Ridge regression features (chromatographic profile)
         features.peak_apex,
         features.peak_area,
@@ -1149,6 +1150,7 @@ fn format_features(features: &FeatureSet) -> String {
         features.coefficient_stability,
         features.relative_coefficient,
         features.explained_intensity,
+        features.signal_to_noise,
         // Spectral matching features (mixed/observed at apex spectrum)
         features.hyperscore,
         features.xcorr,

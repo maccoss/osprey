@@ -2066,6 +2066,11 @@ impl FeatureExtractor {
             // FR-5.1.11: Peak prominence (apex / baseline)
             features.peak_prominence = self.compute_peak_prominence(coefficient_series, apex_value);
 
+            // FR-5.1.12: Signal-to-noise ratio
+            if let Some(snr) = self.compute_signal_to_noise(coefficient_series, apex_idx, apex_value) {
+                features.signal_to_noise = snr;
+            }
+
             // FR-5.1.3: EMG fit quality (simplified - use symmetry as proxy)
             // Full EMG fitting would go here, but for now use a heuristic
             features.emg_fit_quality = self.estimate_emg_quality(coefficient_series, apex_idx);
@@ -2343,6 +2348,86 @@ impl FeatureExtractor {
         } else {
             0.0
         }
+    }
+
+    /// Calculate signal-to-noise ratio from coefficient series
+    ///
+    /// Uses FWHM-based peak boundaries (±1.96σ) to define the peak region.
+    /// Background is measured from 3-5 points on each side outside these boundaries.
+    fn compute_signal_to_noise(
+        &self,
+        series: &[(f64, f64)],
+        apex_idx: usize,
+        apex_value: f64,
+    ) -> Option<f64> {
+        if series.len() < 10 || apex_value <= 0.0 {
+            return None;
+        }
+
+        // Calculate FWHM to determine peak boundaries
+        let (fwhm, _, _) = compute_fwhm_interpolated(series)?;
+
+        // Peak boundaries: ±1.96σ where σ = FWHM / 2.355
+        let sigma = fwhm / 2.355;
+        let boundary_width = 1.96 * sigma;
+        let apex_rt = series[apex_idx].0;
+        let left_boundary = apex_rt - boundary_width;
+        let right_boundary = apex_rt + boundary_width;
+
+        // Collect background points outside peak boundaries
+        let mut background_values = Vec::new();
+
+        // Left side: points before left boundary
+        for (rt, coef) in series.iter().take(apex_idx) {
+            if *rt < left_boundary {
+                background_values.push(*coef);
+            }
+        }
+        // Take last 5 on left
+        if background_values.len() > 5 {
+            background_values = background_values
+                .into_iter()
+                .rev()
+                .take(5)
+                .collect();
+        }
+
+        // Right side: points after right boundary
+        let mut right_bg = Vec::new();
+        for (rt, coef) in series.iter().skip(apex_idx + 1) {
+            if *rt > right_boundary {
+                right_bg.push(*coef);
+                if right_bg.len() >= 5 {
+                    break;
+                }
+            }
+        }
+        background_values.extend(right_bg);
+
+        // Need at least 4 background points
+        if background_values.len() < 4 {
+            return None;
+        }
+
+        // Calculate background mean and SD
+        let n = background_values.len() as f64;
+        let bg_mean = background_values.iter().sum::<f64>() / n;
+        let bg_variance = background_values
+            .iter()
+            .map(|x| (x - bg_mean).powi(2))
+            .sum::<f64>()
+            / n;
+        let bg_sd = bg_variance.sqrt();
+
+        if bg_sd <= 1e-10 {
+            return None;
+        }
+
+        // S/N = (signal - background) / noise
+        let signal = apex_value - bg_mean;
+        let snr = signal / bg_sd;
+
+        Some(snr.max(0.0))
     }
 
     /// Estimate EMG fit quality (heuristic based on peak shape)
