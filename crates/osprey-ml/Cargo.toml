@@ -1,0 +1,13 @@
+[package]
+name = "osprey-ml"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Machine learning for Osprey (LDA, KDE, q-value calculation)"
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+rayon = { workspace = true }
+log = { workspace = true }

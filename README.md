@@ -37,10 +37,11 @@ sudo apt-get install libopenblas-dev libssl-dev cmake pkg-config python3-pip
 
 Install mokapot:
 ```bash
-pip install mokapot
+# Note: mokapot 0.10.0 requires pandas 2.x and numpy <2.0
+pip install mokapot 'pandas>=2.0,<3.0' 'numpy<2.0'
 
 # Or install for your user only (recommended)
-pip install --user mokapot
+pip install --user mokapot 'pandas>=2.0,<3.0' 'numpy<2.0'
 ```
 
 Verify mokapot installation:
@@ -82,7 +83,7 @@ osprey -i *.mzML -l library.tsv -o results.blib
 # With TSV report
 osprey -i sample.mzML -l library.tsv -o results.blib --report results.tsv
 
-# High-resolution mode (HRAM)
+# High-resolution mode (HRAM) - uses ppm-based fragment matching
 osprey -i sample.mzML -l library.tsv -o results.blib --resolution hram --hram-tolerance 20
 ```
 
@@ -114,15 +115,13 @@ library_source:
 output_blib: results.blib
 output_report: results.tsv
 
-# Resolution mode
-resolution_mode: Auto
-# Options: Auto, UnitResolution, or HRAM with tolerance_ppm
-# resolution_mode:
-#   HRAM:
-#     tolerance_ppm: 20.0
+# Resolution mode (controls tolerance units and fragment matching)
+resolution_mode: Auto  # Auto uses config defaults (ppm)
+# Options: Auto, UnitResolution (Th units), or HRAM (ppm units)
+# Ridge regression always uses ~1 Th bins; HRAM applies ppm matching in scoring
 
 # Candidate selection (precursor filtering uses isolation window from mzML)
-max_candidates_per_spectrum: 200
+max_candidates_per_spectrum: 5250  # Use 0 for unlimited
 
 # RT Calibration
 rt_calibration:
@@ -154,23 +153,73 @@ decoys_in_library: false
 
 ```
 Options:
-  -c, --config <CONFIG>           Configuration file (YAML format)
-      --generate-config <FILE>    Generate a template configuration file
-  -i, --input <INPUT>...          Input mzML file(s)
-  -l, --library <LIBRARY>         Spectral library file (.tsv, .blib, or .elib)
-  -o, --output <OUTPUT>           Output results file (.blib)
-      --resolution <MODE>         Resolution mode: auto, unit, hram [default: auto]
-      --hram-tolerance <PPM>      HRAM tolerance in ppm [default: 20.0]
-      --rt-tolerance <MINUTES>    Fallback RT tolerance [default: 2.0]
-      --no-rt-calibration         Disable RT calibration
-      --lambda <VALUE>            Fixed regularization parameter
-      --max-candidates <N>        Maximum candidates per spectrum [default: 200]
-      --run-fdr <THRESHOLD>       Run-level FDR threshold [default: 0.01]
-      --threads <N>               Number of threads (default: all)
-      --report <FILE>             Write TSV report
-  -v, --verbose                   Verbose output
-  -h, --help                      Print help
-  -V, --version                   Print version
+  -c, --config <CONFIG>
+          Configuration file (YAML format)
+
+      --generate-config <FILE>
+          Generate a template configuration file
+
+  -i, --input <INPUT>...
+          Input mzML file(s)
+
+  -l, --library <LIBRARY>
+          Spectral library file (.tsv for DIA-NN, .blib, or .elib)
+
+  -o, --output <OUTPUT>
+          Output results file (.blib format for Skyline)
+
+      --resolution <MODE>
+          Resolution mode: unit, hram, auto [default: auto]
+          - auto: Use config defaults (ppm tolerances)
+          - unit: Use Th (Dalton) tolerances for low-res data
+          - hram: Use ppm tolerances for high-res data
+          Note: Ridge regression always uses ~1 Th bins for memory efficiency.
+          HRAM precision is applied via ppm-based fragment matching in scoring.
+
+      --fragment-tolerance <VALUE>
+          Fragment m/z tolerance (e.g., 10 for 10 ppm, or 0.3 for 0.3 Th)
+
+      --fragment-unit <UNIT>
+          Fragment tolerance unit: ppm, mz (Thompson)
+
+      --precursor-tolerance <VALUE>
+          Precursor m/z tolerance (e.g., 10 for 10 ppm, or 1.0 for 1.0 Th)
+
+      --precursor-unit <UNIT>
+          Precursor tolerance unit: ppm, mz (Thompson)
+
+      --rt-tolerance <MINUTES>
+          RT tolerance in minutes (fallback when calibration disabled) [default: 2]
+
+      --no-rt-calibration
+          Disable RT calibration (use fixed rt_tolerance instead)
+
+      --lambda <VALUE>
+          Fixed regularization parameter lambda
+
+      --max-candidates <N>
+          Maximum candidates per spectrum (use 0 for unlimited) [default: 5250]
+
+      --run-fdr <THRESHOLD>
+          Run-level FDR threshold [default: 0.01]
+
+      --threads <N>
+          Number of threads (default: all available)
+
+      --report <FILE>
+          Write TSV report to this file
+
+      --export-coefficients
+          Export coefficient time series to parquet file(s)
+
+  -v, --verbose
+          Verbose output
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ## Output
@@ -254,13 +303,29 @@ For each MS2 spectrum:
 3. Solve regularized least squares: minimize ‖Ax - b‖² + λ‖x‖²
 4. Non-negative coefficients indicate peptide contributions
 
-### HRAM Mode
+### Resolution Modes
 
-For high-resolution data:
-- Sparse matrix operations (CSC format via sprs crate)
-- ppm-based peak matching instead of unit bins
-- Conjugate gradient solver for large problems (>200 candidates)
-- Dense Cholesky for smaller problems
+**Ridge regression always uses unit resolution binning (~1 Th bins, ~2000 bins)** for memory efficiency. Using 0.02 Th bins (100K bins) would create impractically large matrices (~400MB per spectrum per thread).
+
+Resolution mode controls where high-resolution precision is applied:
+
+**Unit Resolution Mode** (`--resolution unit`):
+- Fragment tolerances default to Th (Dalton) units
+- Suitable for low-resolution instruments (e.g., Stellar)
+- Fragment matching uses binned intensities
+
+**HRAM Mode** (`--resolution hram`):
+- Fragment tolerances default to ppm units
+- Suitable for high-resolution instruments (e.g., Astral, Orbitrap)
+- ppm-based fragment matching in:
+  - Fragment pre-filter (has_top3_fragment_match)
+  - Spectral scoring (dot product, XCorr)
+  - Mass accuracy feature calculation
+- Sparse matrix operations for efficient ppm-based scoring
+
+**Auto Mode** (`--resolution auto`, default):
+- Uses tolerance settings from config file (defaults to ppm)
+- Does not auto-detect instrument type
 
 ## Development
 

@@ -60,7 +60,18 @@
       "Read(//mnt/c/Users/macco/Documents/github/maccoss/osprey/**)",
       "Read(//home/maccoss/github/maccoss/osprey/docs/**)",
       "Read(//mnt/c/Users/macco/Documents/github/maccoss/osprey/docs/**)",
-      "Bash(sudo apt-get:*)"
+      "Bash(sudo apt-get:*)",
+      "Bash(.venv/bin/pip:*)",
+      "Read(//mnt/c/Users/macco/Documents/github/diann-1.8/**)",
+      "Read(//home/maccoss/github/lazear/sage/**)",
+      "Read(//mnt/c/Users/macco/Documents/github/lazear/sage/**)",
+      "WebFetch(domain:crates.io)",
+      "Bash(cargo new:*)",
+      "Bash(python:*)",
+      "Bash(pip uninstall:*)",
+      "Read(//home/maccoss/.cargo/bin/**)",
+      "Bash(/home/maccoss/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo build:*)",
+      "Bash(export PATH=\"$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH\")"
     ]
   }
 }

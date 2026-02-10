@@ -68,12 +68,6 @@ pub struct OspreyConfig {
     // Output options
     /// Export coefficient time series to parquet
     pub export_coefficients: bool,
-
-    // Processing mode
-    /// Use streaming mode for memory-efficient processing
-    /// When enabled, spectra are processed as they stream in from the mzML file
-    /// rather than loading everything into memory first
-    pub streaming: bool,
 }
 
 impl Default for OspreyConfig {
@@ -99,7 +93,6 @@ impl Default for OspreyConfig {
             n_threads: num_cpus(),
             memory_limit_gb: None,
             export_coefficients: false,
-            streaming: false,
         }
     }
 }
@@ -236,9 +229,6 @@ n_threads: 0  # 0 = auto-detect
 
 # Output options
 export_coefficients: false  # Export coefficient time series to parquet
-
-# Processing mode
-streaming: false  # Use streaming mode for memory-efficient processing (requires streaming feature)
 "#;
 
         fs::write(path.as_ref(), template).map_err(|e| {
@@ -283,9 +273,6 @@ streaming: false  # Use streaming mode for memory-efficient processing (requires
         if args.verbose {
             // Logging level would be handled separately
         }
-        if args.streaming {
-            self.streaming = true;
-        }
         if let Some(tol) = args.fragment_tolerance {
             self.fragment_tolerance.tolerance = tol;
         }
@@ -314,7 +301,6 @@ pub struct ConfigOverrides {
     pub lambda: Option<f64>,
     pub verbose: bool,
     pub disable_rt_calibration: bool,
-    pub streaming: bool,
     pub fragment_tolerance: Option<f64>,
     pub fragment_unit: Option<ToleranceUnit>,
     pub precursor_tolerance: Option<f64>,

@@ -36,12 +36,5 @@ pathdiff = "0.2"
 arrow = "57"
 parquet = "57"
 
-# Optional streaming dependencies
-tokio = { workspace = true, optional = true }
-
 [dev-dependencies]
 tempfile = { workspace = true }
-
-[features]
-default = []
-streaming = ["tokio", "osprey-io/streaming", "osprey-scoring/streaming"]

@@ -40,6 +40,7 @@
 //! ```
 
 pub mod batch;
+pub mod calibration_ml;
 pub mod pipeline;
 
 use osprey_core::{
@@ -116,6 +117,62 @@ pub fn has_top3_fragment_match(
     }
 
     false
+}
+
+/// Get indices of top N fragments by intensity
+///
+/// Returns indices sorted by intensity (highest first), limited to N fragments.
+/// If the library has fewer than N fragments, returns all indices.
+///
+/// # Arguments
+/// * `library_fragments` - Library fragment ions
+/// * `n` - Number of top fragments to return
+pub fn get_top_n_fragment_indices(
+    library_fragments: &[LibraryFragment],
+    n: usize,
+) -> Vec<usize> {
+    if library_fragments.len() <= n {
+        return (0..library_fragments.len()).collect();
+    }
+
+    let mut indexed: Vec<(usize, f32)> = library_fragments
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (i, f.relative_intensity))
+        .collect();
+    indexed.sort_by(|a, b| b.1.total_cmp(&a.1)); // Sort by intensity descending
+    indexed.iter().take(n).map(|(i, _)| *i).collect()
+}
+
+/// Check if a library m/z has a matching peak in the spectrum
+///
+/// Uses binary search for O(log n) performance.
+///
+/// # Arguments
+/// * `lib_mz` - Library fragment m/z
+/// * `spectrum_mzs` - Sorted observed m/z values
+/// * `tolerance` - Tolerance value
+/// * `unit` - Tolerance unit (ppm or Th)
+///
+/// # Returns
+/// `true` if there is at least one observed peak within tolerance
+pub fn has_match_within_tolerance(
+    lib_mz: f64,
+    spectrum_mzs: &[f64],
+    tolerance: f64,
+    unit: ToleranceUnit,
+) -> bool {
+    let tol_da = match unit {
+        ToleranceUnit::Ppm => lib_mz * tolerance / 1e6,
+        ToleranceUnit::Mz => tolerance,
+    };
+
+    let lower = lib_mz - tol_da;
+    let upper = lib_mz + tol_da;
+
+    // Binary search for first m/z >= lower bound
+    let start_idx = spectrum_mzs.partition_point(|&mz| mz < lower);
+    start_idx < spectrum_mzs.len() && spectrum_mzs[start_idx] <= upper
 }
 
 /// Check if any top-3 library fragment matches an observed peak, and collect mass errors.
@@ -3522,5 +3579,176 @@ mod tests {
         // PEPTIDEK with cycle=2: PTIDEPEK
         let (cycled, _) = generator.cycle_sequence("PEPTIDEK", 2);
         assert_eq!(cycled, "PTIDEPEK");
+    }
+
+    #[test]
+    fn test_get_top_n_fragment_indices() {
+        // Create test library fragments with varying intensities
+        let fragments = vec![
+            LibraryFragment {
+                mz: 100.0,
+                relative_intensity: 0.5,
+                annotation: FragmentAnnotation {
+                    ion_type: IonType::Y,
+                    ordinal: 1,
+                    charge: 1,
+                    neutral_loss: None,
+                },
+            },
+            LibraryFragment {
+                mz: 200.0,
+                relative_intensity: 1.0, // Highest
+                annotation: FragmentAnnotation {
+                    ion_type: IonType::Y,
+                    ordinal: 2,
+                    charge: 1,
+                    neutral_loss: None,
+                },
+            },
+            LibraryFragment {
+                mz: 300.0,
+                relative_intensity: 0.2, // Lowest
+                annotation: FragmentAnnotation {
+                    ion_type: IonType::B,
+                    ordinal: 1,
+                    charge: 1,
+                    neutral_loss: None,
+                },
+            },
+            LibraryFragment {
+                mz: 400.0,
+                relative_intensity: 0.8, // Second highest
+                annotation: FragmentAnnotation {
+                    ion_type: IonType::Y,
+                    ordinal: 3,
+                    charge: 1,
+                    neutral_loss: None,
+                },
+            },
+        ];
+
+        // Get top 2 fragments
+        let top2 = get_top_n_fragment_indices(&fragments, 2);
+        assert_eq!(top2.len(), 2);
+        assert_eq!(top2[0], 1); // Index of fragment with intensity 1.0
+        assert_eq!(top2[1], 3); // Index of fragment with intensity 0.8
+
+        // Get top 6 (more than available)
+        let top6 = get_top_n_fragment_indices(&fragments, 6);
+        assert_eq!(top6.len(), 4); // Returns all 4 fragments
+
+        // Get top 0
+        let top0 = get_top_n_fragment_indices(&fragments, 0);
+        assert_eq!(top0.len(), 0);
+    }
+
+    #[test]
+    fn test_has_match_within_tolerance_ppm() {
+        // Spectrum with m/z values
+        let spectrum_mzs = vec![100.0, 200.0, 300.0, 400.0, 500.0];
+
+        // Test exact match
+        assert!(has_match_within_tolerance(
+            200.0,
+            &spectrum_mzs,
+            10.0, // 10 ppm
+            ToleranceUnit::Ppm
+        ));
+
+        // Test match within tolerance
+        // 200.0 ± 10 ppm = 200.0 ± 0.002 = [199.998, 200.002]
+        assert!(has_match_within_tolerance(
+            200.001,
+            &spectrum_mzs,
+            10.0,
+            ToleranceUnit::Ppm
+        ));
+
+        // Test no match (too far)
+        assert!(!has_match_within_tolerance(
+            210.0, // 10 Da away, way more than 10 ppm
+            &spectrum_mzs,
+            10.0,
+            ToleranceUnit::Ppm
+        ));
+
+        // Test match at lower end
+        assert!(has_match_within_tolerance(
+            100.0,
+            &spectrum_mzs,
+            10.0,
+            ToleranceUnit::Ppm
+        ));
+
+        // Test no match below range
+        assert!(!has_match_within_tolerance(
+            50.0,
+            &spectrum_mzs,
+            10.0,
+            ToleranceUnit::Ppm
+        ));
+
+        // Test no match above range
+        assert!(!has_match_within_tolerance(
+            600.0,
+            &spectrum_mzs,
+            10.0,
+            ToleranceUnit::Ppm
+        ));
+    }
+
+    #[test]
+    fn test_has_match_within_tolerance_mz() {
+        let spectrum_mzs = vec![100.0, 200.0, 300.0, 400.0, 500.0];
+
+        // Test exact match
+        assert!(has_match_within_tolerance(
+            200.0,
+            &spectrum_mzs,
+            0.5, // 0.5 Da
+            ToleranceUnit::Mz
+        ));
+
+        // Test match within tolerance
+        assert!(has_match_within_tolerance(
+            200.3,
+            &spectrum_mzs,
+            0.5,
+            ToleranceUnit::Mz
+        ));
+
+        assert!(has_match_within_tolerance(
+            199.7,
+            &spectrum_mzs,
+            0.5,
+            ToleranceUnit::Mz
+        ));
+
+        // Test no match (outside tolerance)
+        assert!(!has_match_within_tolerance(
+            200.6,
+            &spectrum_mzs,
+            0.5,
+            ToleranceUnit::Mz
+        ));
+
+        assert!(!has_match_within_tolerance(
+            199.4,
+            &spectrum_mzs,
+            0.5,
+            ToleranceUnit::Mz
+        ));
+    }
+
+    #[test]
+    fn test_has_match_empty_spectrum() {
+        let empty_spectrum: Vec<f64> = vec![];
+
+        assert!(!has_match_within_tolerance(
+            200.0,
+            &empty_spectrum,
+            10.0,
+            ToleranceUnit::Ppm
+        ));
     }
 }

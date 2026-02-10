@@ -58,9 +58,6 @@ use osprey_scoring::{
     DecoyGenerator, DecoyMethod, Enzyme, FeatureExtractor, has_top3_fragment_match,
 };
 
-#[cfg(feature = "streaming")]
-use osprey_scoring::pipeline::PipelineConfig;
-
 /// Wrapper to implement MS1SpectrumLookup for MS1Index
 struct MS1IndexWrapper<'a>(&'a MS1Index);
 
@@ -348,15 +345,45 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         config.input_files.len()
     );
 
+    // Filter out empty files (mokapot can't handle empty PIN files)
+    let non_empty_files: Vec<(String, Vec<ScoredEntry>)> = per_file_scored
+        .into_iter()
+        .filter(|(name, entries)| {
+            if entries.is_empty() {
+                log::warn!("Skipping file '{}' with 0 scored entries for FDR control", name);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let non_empty_pin_files: HashMap<String, std::path::PathBuf> = pin_files
+        .into_iter()
+        .filter(|(name, _)| non_empty_files.iter().any(|(n, _)| n == name))
+        .collect();
+
+    if non_empty_files.is_empty() {
+        return Err(OspreyError::config(
+            "No scored entries found across all files. Cannot perform FDR control."
+        ));
+    }
+
+    log::info!(
+        "====== Beginning Mokapot Post-Processing on {} Files ======",
+        non_empty_files.len()
+    );
+    log::info!("Using {} pre-written PIN files", non_empty_pin_files.len());
+
     // Run two-level FDR control (run-level + experiment-level)
     // PIN files are already written, pass them to avoid regeneration
     let experiment_entries = run_two_level_fdr(
-        &mut per_file_scored,
+        &mut non_empty_files.clone(),
         &library,
         config.run_fdr,
         config.experiment_fdr,
         output_dir,
-        Some(pin_files),
+        Some(non_empty_pin_files),
     )?;
 
     // Filter to passing entries for blib output
@@ -503,31 +530,6 @@ fn process_file_with_calibration(
     }
 
     // Run calibration using appropriate method based on mode and library size
-    #[cfg(feature = "streaming")]
-    let calibration_result = if config.streaming {
-        // Use streaming pipeline for memory-efficient calibration
-        log::info!("Using streaming mode for calibration discovery");
-        run_calibration_discovery_streaming(path, library, config)
-    } else if use_windowed_scoring {
-        // Use windowed scoring for large libraries (memory-efficient)
-        run_calibration_discovery_windowed(library, &spectra, &ms1_index, config)
-    } else if let Some(preproc_lib) = preprocessed_library {
-        // Preprocess spectra for batch scoring (reused later)
-        log::info!("Preprocessing {} spectra for batch scoring...", spectra.len());
-        let preprocessed_spectra = batch_scorer.preprocess_spectra(&spectra);
-
-        run_calibration_discovery_with_cache(
-            library,
-            preproc_lib,
-            &preprocessed_spectra,
-            config,
-        )
-    } else {
-        // Fallback: use windowed scoring
-        run_calibration_discovery_windowed(library, &spectra, &ms1_index, config)
-    };
-
-    #[cfg(not(feature = "streaming"))]
     let calibration_result = if use_windowed_scoring {
         // Use windowed scoring for large libraries (memory-efficient)
         run_calibration_discovery_windowed(library, &spectra, &ms1_index, config)
@@ -1044,29 +1046,61 @@ fn run_calibration_discovery_windowed(
             log::debug!("Wrote paired calibration debug CSV to: {}", debug_path.display());
         }
 
-        // Target-decoy competition at 1% FDR on accumulated matches
-        // Co-elution score is higher-is-better
+        // LDA-based scoring on accumulated matches
+        // Only use isotope feature for HRAM mode (isotopes not separated at unit resolution)
+        let use_isotope_feature = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM) && has_ms1;
         let calibration_fdr = 0.01;
-        let fdr_controller = FdrController::new(calibration_fdr);
 
-        let competition_input = accumulated_matches.values().map(|m| {
-            (m.clone(), m.score, m.is_decoy, m.entry_id)
-        });
+        // Convert to Vec for LDA training
+        let mut all_matches: Vec<CalibrationMatch> = accumulated_matches.values().cloned().collect();
 
-        let competition_result = fdr_controller.compete_and_filter(competition_input);
+        // Train LDA and score
+        let _n_passing = osprey_scoring::calibration_ml::train_and_score_calibration(
+            &mut all_matches,
+            use_isotope_feature,
+        )?;
+
+        // Filter to passing targets (q-value <= 1% FDR, not decoys)
+        // CRITICAL: Also require minimum correlation score for RT calibration quality
+        // LDA may select peptides with good spectral scores but poor RT correlation
+        const MIN_CORRELATION_FOR_RT_CAL: f64 = 2.5; // Require reasonable XIC co-elution
+
+        let passing_targets: Vec<&CalibrationMatch> = all_matches
+            .iter()
+            .filter(|m| {
+                !m.is_decoy
+                    && m.q_value <= calibration_fdr
+                    && m.correlation_score >= MIN_CORRELATION_FOR_RT_CAL
+            })
+            .collect();
+
+        // Count wins for logging
+        let n_target_wins = all_matches.iter().filter(|m| !m.is_decoy && m.q_value <= calibration_fdr).count();
+        let n_decoy_wins = all_matches.iter().filter(|m| m.is_decoy && m.q_value <= calibration_fdr).count();
 
         log::info!(
             "Competition: {} target wins, {} decoy wins",
-            competition_result.n_target_wins,
-            competition_result.n_decoy_wins
+            n_target_wins,
+            n_decoy_wins
         );
+
+        // Log correlation filter impact
+        if passing_targets.len() < n_target_wins {
+            log::info!(
+                "  RT quality filter: {} → {} peptides (removed {} with correlation < {:.1})",
+                n_target_wins,
+                passing_targets.len(),
+                n_target_wins - passing_targets.len(),
+                MIN_CORRELATION_FOR_RT_CAL
+            );
+        }
 
         // Extract calibration points + mass errors from passing targets
         let mut library_rts_detected: Vec<f64> = Vec::new();
         let mut measured_rts_detected: Vec<f64> = Vec::new();
         let mut mz_qc_data = MzQCData::new(config.fragment_tolerance.unit);
 
-        for m in &competition_result.passing_targets {
+        for m in &passing_targets {
             library_rts_detected.push(m.library_rt);
             measured_rts_detected.push(m.measured_rt);
 
@@ -1084,13 +1118,17 @@ fn run_calibration_discovery_windowed(
             "Calibration: {} peptides at {:.0}% FDR (from {} target wins, {} decoy wins)",
             num_confident_peptides,
             calibration_fdr * 100.0,
-            competition_result.n_target_wins,
-            competition_result.n_decoy_wins
+            n_target_wins,
+            n_decoy_wins
         );
 
         // Check if we have enough calibration points
+        // Absolute minimum for LOESS to work (regardless of config setting)
+        const ABSOLUTE_MIN_CALIBRATION_POINTS: usize = 50;
+
         if num_confident_peptides < rt_config.min_calibration_points {
             if attempt < max_attempts {
+                // Not the final attempt - retry with more targets
                 // Determine next sample size
                 if attempt + 1 == max_attempts {
                     // Final attempt always uses ALL library entries
@@ -1113,21 +1151,33 @@ fn run_calibration_discovery_windowed(
                     if current_sample_size == 0 { "ALL".to_string() } else { current_sample_size.to_string() }
                 );
                 continue;
-            } else {
-                return Err(OspreyError::ConfigError(format!(
-                    "Insufficient calibration points: {} < {} required (after {} attempts)",
+            } else if num_confident_peptides >= ABSOLUTE_MIN_CALIBRATION_POINTS {
+                // Final attempt: Use what we have if >= absolute minimum
+                log::warn!(
+                    "Calibration: Using {} peptides (below target of {} but above minimum of {})",
                     num_confident_peptides,
                     rt_config.min_calibration_points,
+                    ABSOLUTE_MIN_CALIBRATION_POINTS
+                );
+                // Continue to calibration with reduced point count
+            } else {
+                // Final attempt: Not enough points even for absolute minimum
+                return Err(OspreyError::ConfigError(format!(
+                    "Insufficient calibration points: {} < {} absolute minimum (after {} attempts)",
+                    num_confident_peptides,
+                    ABSOLUTE_MIN_CALIBRATION_POINTS,
                     attempt
                 )));
             }
         }
 
         // Fit LOESS RT calibration
+        // Use actual number of points or config minimum, whichever is smaller
+        let effective_min_points = num_confident_peptides.min(rt_config.min_calibration_points);
         let calibrator_config = RTCalibratorConfig {
             bandwidth: rt_config.loess_bandwidth,
             degree: 1,
-            min_points: rt_config.min_calibration_points,
+            min_points: effective_min_points,
             robustness_iter: 2,
         };
         let calibrator = RTCalibrator::with_config(calibrator_config);
@@ -2089,11 +2139,8 @@ fn run_two_level_fdr(
     }
 
     // ========== Run two-step mokapot analysis ==========
-    log::info!("====== Beginning Mokapot Post-Processing on {} Files ======", per_file_results.len());
-
     // Use pre-written PIN files if provided, otherwise generate them
     let pin_files = if let Some(files) = pin_files {
-        log::info!("Using {} pre-written PIN files", files.len());
         files
     } else {
         // Fallback: collect PSM features and write PIN files
@@ -3418,161 +3465,6 @@ fn write_calibration_debug_csv_unpaired(
     }
 
     Ok(())
-}
-
-/// Run calibration discovery using streaming pipeline
-///
-/// This is a memory-efficient alternative that streams spectra from the mzML file
-/// instead of loading all spectra into memory at once.
-///
-/// Requires the `streaming` feature.
-#[cfg(feature = "streaming")]
-fn run_calibration_discovery_streaming(
-    path: &std::path::Path,
-    library: &[LibraryEntry],
-    config: &OspreyConfig,
-) -> Result<(RTCalibration, CalibrationParams)> {
-    use tokio::runtime::Runtime;
-
-    let rt_config = &config.rt_calibration;
-
-    // Calculate library RT range
-    let library_rts: Vec<f64> = library
-        .iter()
-        .filter(|e| !e.is_decoy)
-        .map(|e| e.retention_time)
-        .collect();
-    let min_rt = library_rts.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_rt = library_rts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let rt_range = max_rt - min_rt;
-
-    // For streaming, use 20% RT tolerance (conservative default)
-    // We don't have mzML RT range until after streaming, so we assume similar scales
-    let tolerance_fraction = 0.2;
-    let initial_tolerance = rt_range * tolerance_fraction;
-
-    let n_targets = library.iter().filter(|e| !e.is_decoy && !e.fragments.is_empty()).count();
-    let n_decoys = library.iter().filter(|e| e.is_decoy && !e.fragments.is_empty()).count();
-
-    log::info!(
-        "Streaming calibration: scoring {} targets + {} decoys (RT range: {:.1}-{:.1} min)",
-        n_targets,
-        n_decoys,
-        min_rt,
-        max_rt
-    );
-
-    // Use full library for calibration (XCorr via BLAS is fast enough)
-    let calibration_library: Vec<LibraryEntry> = library.to_vec();
-    log::info!(
-        "Using full library for streaming calibration ({} entries)",
-        calibration_library.len()
-    );
-
-    // Configure streaming pipeline
-    let pipeline_config = PipelineConfig {
-        num_preprocessing_threads: config.n_threads,
-        channel_buffer_size: config.n_threads * 2,
-        rt_tolerance: initial_tolerance,
-        ..Default::default()
-    };
-
-    // Run streaming pipeline in tokio runtime
-    let rt = Runtime::new().map_err(|e| {
-        OspreyError::InternalError(format!("Failed to create tokio runtime: {}", e))
-    })?;
-
-    let matches = rt.block_on(async {
-        osprey_scoring::pipeline::run_streaming_pipeline(path, &calibration_library, pipeline_config).await
-    }).map_err(|e| {
-        OspreyError::InternalError(format!("Streaming pipeline failed: {}", e))
-    })?;
-
-    log::info!("Streaming calibration: {} matches found", matches.len());
-
-    // Count targets and decoys
-    let n_target_matches = matches.iter().filter(|m| !m.is_decoy).count();
-    let n_decoy_matches = matches.iter().filter(|m| m.is_decoy).count();
-
-    log::info!(
-        "Streaming results: {} targets, {} decoys with scores > 0",
-        n_target_matches,
-        n_decoy_matches
-    );
-
-    // Target-decoy competition at 1% FDR using E-value (lower is better → negate)
-    let calibration_fdr = 0.01;
-    let fdr_controller = FdrController::new(calibration_fdr);
-
-    let competition_input = matches.iter().map(|m| {
-        (m.clone(), -m.evalue, m.is_decoy, m.entry_id)
-    });
-
-    let competition_result = fdr_controller.compete_and_filter(competition_input);
-
-    log::info!(
-        "Competition: {} target wins, {} decoy wins",
-        competition_result.n_target_wins,
-        competition_result.n_decoy_wins
-    );
-
-    // Extract calibration points from passing targets
-    let mut library_rts_detected: Vec<f64> = Vec::new();
-    let mut measured_rts_detected: Vec<f64> = Vec::new();
-
-    for m in &competition_result.passing_targets {
-        library_rts_detected.push(m.library_rt);
-        measured_rts_detected.push(m.measured_rt);
-    }
-
-    let num_confident_peptides = library_rts_detected.len();
-
-    log::info!(
-        "Streaming calibration: {} peptides at {:.0}% FDR",
-        num_confident_peptides,
-        calibration_fdr * 100.0
-    );
-
-    if num_confident_peptides < rt_config.min_calibration_points {
-        return Err(OspreyError::ConfigError(format!(
-            "Insufficient calibration points: {} < {} required",
-            num_confident_peptides,
-            rt_config.min_calibration_points
-        )));
-    }
-
-    // Fit LOESS RT calibration
-    let calibrator_config = RTCalibratorConfig {
-        bandwidth: rt_config.loess_bandwidth,
-        degree: 1,
-        min_points: rt_config.min_calibration_points,
-        robustness_iter: 2,
-    };
-    let calibrator = RTCalibrator::with_config(calibrator_config);
-    let rt_calibration = calibrator.fit(&library_rts_detected, &measured_rts_detected)?;
-    let rt_stats = rt_calibration.stats();
-
-    // Build CalibrationParams (mass calibration not available in streaming mode)
-    let calibration_params = CalibrationParams {
-        metadata: CalibrationMetadata {
-            num_confident_peptides,
-            num_sampled_precursors: matches.len(),
-            calibration_successful: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            isolation_scheme: None,
-        },
-        ms1_calibration: MzCalibration::uncalibrated(),
-        ms2_calibration: MzCalibration::uncalibrated(),
-        rt_calibration: RTCalibrationParams {
-            method: RTCalibrationMethod::LOESS,
-            residual_sd: rt_stats.residual_std,
-            n_points: rt_stats.n_points,
-            r_squared: rt_stats.r_squared,
-            model_params: Some(rt_calibration.export_model_params()),
-        },
-    };
-
-    Ok((rt_calibration, calibration_params))
 }
 
 #[cfg(test)]

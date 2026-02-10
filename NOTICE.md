@@ -1,38 +1,17 @@
 # Third-Party Notices
 
-Osprey includes code and algorithmic ideas from the following projects.
+Osprey includes code, libraries, and algorithmic ideas from the following projects.
 
 ---
 
-## Sage
+## mzdata
 
-**Project:** https://github.com/lazear/sage
-**Copyright:** (c) 2022 Michael Lazear
-**License:** MIT
+**Project:** https://github.com/mobiusklein/mzdata
+**Author:** Joshua Klein
+**License:** Apache-2.0
 
-The streaming mzML parser (`crates/osprey-io/src/mzml/streaming.rs`) is adapted
-from Sage's mzML parser with modifications for Osprey (f64 precision, Osprey
-Spectrum types, channel-based output).
-
-### MIT License
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Osprey uses the mzdata crate for parsing mzML files and reading mass spectrometry
+data formats.
 
 ---
 
@@ -61,3 +40,26 @@ DIA-NN's approach. Specifically:
 
 No source code was directly copied from DIA-NN. These are independent Rust
 implementations inspired by the published algorithmic concepts.
+
+---
+
+## Sage
+
+**Project:** https://github.com/lazear/sage
+**Author:** Michael Lazear
+**License:** MIT
+**Copyright:** Copyright (c) 2022 Michael Lazear
+
+Osprey incorporates machine learning modules from Sage for linear discriminant
+analysis, kernel density estimation, and q-value calculation. These modules
+enable data-driven scoring and FDR control for peptide identification.
+
+The following modules were adapted from Sage:
+- `osprey-ml/src/linear_discriminant.rs` - Linear Discriminant Analysis for target-decoy separation
+- `osprey-ml/src/matrix.rs` - Matrix operations for scatter matrix computation
+- `osprey-ml/src/gauss.rs` - Gauss-Jordan elimination for solving linear systems
+- `osprey-ml/src/kde.rs` - Kernel Density Estimation for posterior error probabilities
+- `osprey-ml/src/qvalue.rs` - Q-value calculation via target-decoy competition
+
+The MIT License permits use, modification, and distribution with proper attribution.
+Full license text is included in the source files.

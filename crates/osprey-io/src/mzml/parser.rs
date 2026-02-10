@@ -4,7 +4,7 @@
 //!
 //! ## MS1 Spectra for Mass Calibration
 //!
-//! pyXcorrDIA extracts the M+0 isotope peak from MS1 spectra for accurate mass calibration.
+//! Extracts the M+0 isotope peak from MS1 spectra for accurate mass calibration.
 //! This module provides:
 //! - `load_all_spectra()` - Load both MS1 and MS2 spectra in a single pass (most efficient)
 //! - `load_ms1_spectra()` - Load only MS1 spectra for isotope extraction
@@ -174,7 +174,7 @@ impl SpectrumSource for MzmlReader {
 }
 
 // ============================================================================
-// MS1 Spectra Loading (for MS1 mass calibration - pyXcorrDIA compatible)
+// MS1 Spectra Loading (for MS1 mass calibration)
 // ============================================================================
 
 /// Index of MS1 spectra sorted by retention time for efficient lookup

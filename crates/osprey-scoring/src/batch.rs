@@ -27,7 +27,7 @@ extern crate openblas_src;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::{Array1, Array2};
-use osprey_core::{FragmentToleranceConfig, IsotopeEnvelope, LibraryEntry, MS1Spectrum, Spectrum, peptide_isotope_cosine};
+use osprey_core::{FragmentToleranceConfig, IsotopeEnvelope, LibraryEntry, LibraryFragment, MS1Spectrum, Spectrum, peptide_isotope_cosine};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -902,6 +902,25 @@ pub struct CalibrationMatch {
     pub n_b_ions: u32,
     /// Number of matched y-ions (from hyperscore computation)
     pub n_y_ions: u32,
+
+    // === NEW: ML Scoring Features ===
+    /// Fragment XIC co-elution correlation (sum of positive correlations)
+    pub correlation_score: f64,
+    /// LibCosine spectral similarity at apex
+    pub libcosine_apex: f64,
+    /// Number of top-6 library fragments matched at apex (0-6)
+    pub top6_matched_apex: u8,
+    /// Hyperscore calculated at apex
+    pub hyperscore_apex: f64,
+    /// Signal-to-noise ratio of reference XIC peak
+    /// Signal = apex - background_mean, Noise = background_SD
+    pub signal_to_noise: f64,
+    /// Linear discriminant score (weighted combination of features)
+    pub discriminant_score: f64,
+    /// Posterior error probability from KDE
+    pub posterior_error: f64,
+    /// Q-value from target-decoy competition
+    pub q_value: f64,
 }
 
 /// Calculate Comet-style E-value from XCorr scores
@@ -1719,6 +1738,16 @@ pub fn run_windowed_calibration_scoring(
                         hyperscore: 0.0,
                         n_b_ions: 0,
                         n_y_ions: 0,
+
+                        // ML scoring features (placeholder values)
+                        correlation_score: 0.0,
+                        libcosine_apex: 0.0,
+                        top6_matched_apex: 0,
+                        hyperscore_apex: 0.0,
+                        signal_to_noise: 0.0,
+                        discriminant_score: score,
+                        posterior_error: 0.0,
+                        q_value: 1.0,
                     })
                 })
                 .collect()
@@ -1850,6 +1879,16 @@ pub fn run_calibration_scoring(
                 hyperscore: 0.0,
                 n_b_ions: 0,
                 n_y_ions: 0,
+
+                // ML scoring features (placeholder values)
+                correlation_score: 0.0,
+                libcosine_apex: 0.0,
+                top6_matched_apex: 0,
+                hyperscore_apex: 0.0,
+                signal_to_noise: 0.0,
+                discriminant_score: score,
+                posterior_error: 0.0,
+                q_value: 1.0,
             })
         })
         .collect();
@@ -2103,6 +2142,16 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                             hyperscore: 0.0,
                             n_b_ions: 0,
                             n_y_ions: 0,
+
+                            // ML scoring features (placeholder values)
+                            correlation_score: 0.0,
+                            libcosine_apex: 0.0,
+                            top6_matched_apex: 0,
+                            hyperscore_apex: 0.0,
+                            signal_to_noise: 0.0,
+                            discriminant_score: best_xcorr,
+                            posterior_error: 0.0,
+                            q_value: 1.0,
                         });
                     }
                     pb.inc(1);
@@ -2249,6 +2298,16 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                             hyperscore: 0.0,
                             n_b_ions: 0,
                             n_y_ions: 0,
+
+                            // ML scoring features (placeholder values)
+                            correlation_score: 0.0,
+                            libcosine_apex: 0.0,
+                            top6_matched_apex: 0,
+                            hyperscore_apex: 0.0,
+                            signal_to_noise: 0.0,
+                            discriminant_score: best_xcorr,
+                            posterior_error: 0.0,
+                            q_value: 1.0,
                         });
                     }
                     pb.inc(1);
@@ -2317,6 +2376,28 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
 /// Fewer than 3 time points makes Pearson correlation unreliable.
 const MIN_COELUTION_SPECTRA: usize = 3;
 
+/// Count how many of the top-6 library fragments have matches at apex
+///
+/// Helper function for calibration feature extraction.
+fn count_top6_matched_at_apex(
+    library_fragments: &[LibraryFragment],
+    spectrum_mzs: &[f64],
+    tolerance: FragmentToleranceConfig,
+) -> u8 {
+    // Get top 6 fragments by intensity
+    let top6_indices = super::get_top_n_fragment_indices(library_fragments, 6);
+
+    // Count matches using binary search
+    let mut count = 0u8;
+    for &idx in &top6_indices {
+        let lib_mz = library_fragments[idx].mz;
+        if super::has_match_within_tolerance(lib_mz, spectrum_mzs, tolerance.tolerance, tolerance.unit) {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Run calibration scoring using fragment co-elution correlation.
 ///
 /// Inspired by DIA-NN's fragment co-elution scoring approach (Demichev et al.,
@@ -2332,6 +2413,94 @@ const MIN_COELUTION_SPECTRA: usize = 3;
 /// 1. Filter candidate spectra by precursor window, RT tolerance, and top-2-of-6 fragment match
 /// 2. Extract XICs for top 6 fragments (binary search per spectrum)
 /// 3. Select the reference XIC (fragment with highest total intensity), Savitzky-Golay 5-point smooth
+/// Calculate signal-to-noise ratio for a chromatographic peak
+///
+/// Uses peak boundaries at ±1.96σ (where σ = FWHM / 2.355) to define the peak region.
+/// Background is measured from 3-5 points on each side outside these boundaries.
+///
+/// # Arguments
+/// * `xic` - Time series of (RT, intensity) pairs
+/// * `apex_idx` - Index of the apex point
+/// * `apex_intensity` - Intensity at apex
+///
+/// # Returns
+/// Signal-to-noise ratio, or None if calculation fails
+fn calculate_signal_to_noise(
+    xic: &[(f64, f64)],
+    apex_idx: usize,
+    apex_intensity: f64,
+) -> Option<f64> {
+    if xic.len() < 10 || apex_intensity <= 0.0 {
+        return None;
+    }
+
+    // Calculate FWHM to determine peak boundaries
+    let (fwhm, _, _) = super::compute_fwhm_interpolated(xic)?;
+
+    // Peak boundaries: ±1.96σ where σ = FWHM / 2.355
+    // This gives 95% of Gaussian peak (same as used for blib peak boundaries)
+    let sigma = fwhm / 2.355;
+    let boundary_width = 1.96 * sigma;
+    let apex_rt = xic[apex_idx].0;
+    let left_boundary = apex_rt - boundary_width;
+    let right_boundary = apex_rt + boundary_width;
+
+    // Collect background points outside peak boundaries (3-5 points on each side)
+    let mut background_intensities = Vec::new();
+
+    // Left side: 3-5 points before left boundary
+    for (rt, intensity) in xic.iter().take(apex_idx) {
+        if *rt < left_boundary {
+            background_intensities.push(*intensity);
+        }
+    }
+    // Take last 5 points on left side
+    if background_intensities.len() > 5 {
+        background_intensities = background_intensities
+            .into_iter()
+            .rev()
+            .take(5)
+            .collect();
+    }
+
+    // Right side: 3-5 points after right boundary
+    let mut right_bg = Vec::new();
+    for (rt, intensity) in xic.iter().skip(apex_idx + 1) {
+        if *rt > right_boundary {
+            right_bg.push(*intensity);
+            if right_bg.len() >= 5 {
+                break;
+            }
+        }
+    }
+    background_intensities.extend(right_bg);
+
+    // Need at least 4 background points for reliable statistics
+    if background_intensities.len() < 4 {
+        return None;
+    }
+
+    // Calculate background mean and SD
+    let n = background_intensities.len() as f64;
+    let bg_mean = background_intensities.iter().sum::<f64>() / n;
+    let bg_variance = background_intensities
+        .iter()
+        .map(|x| (x - bg_mean).powi(2))
+        .sum::<f64>()
+        / n;
+    let bg_sd = bg_variance.sqrt();
+
+    if bg_sd <= 1e-10 {
+        return None; // No noise, can't calculate S/N
+    }
+
+    // S/N = (signal - background) / noise
+    let signal = apex_intensity - bg_mean;
+    let snr = signal / bg_sd;
+
+    Some(snr.max(0.0)) // Clamp to non-negative
+}
+
 /// 4. Correlate each other fragment XIC against the smoothed reference (Pearson)
 /// 5. Score = sum of positive correlations
 /// 6. Apex RT = RT at the maximum of the reference XIC
@@ -2469,12 +2638,17 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
         }
 
         // Apex RT = RT at the maximum of the reference XIC
-        let (_apex_local_idx, (apex_rt, _)) = ref_xic
+        let (apex_local_idx, (apex_rt, apex_intensity)) = ref_xic
             .iter()
             .enumerate()
             .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))?;
 
         let apex_rt = *apex_rt;
+        let apex_intensity = *apex_intensity;
+
+        // Calculate signal-to-noise ratio from reference XIC
+        let signal_to_noise = calculate_signal_to_noise(&ref_xic, apex_local_idx, apex_intensity)
+            .unwrap_or(0.0);
 
         // Find the spectrum closest to apex for mass errors and scan number
         let apex_spec_local_idx = candidate_spectra
@@ -2535,6 +2709,31 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             (Some(error), Some(iso_center), None)
         };
 
+        // === NEW: Calculate scoring features at apex ===
+
+        // 1. LibCosine score at apex
+        let libcosine_scorer = LibCosineScorer::with_tolerance(fragment_tolerance);
+        let match_result = libcosine_scorer.match_fragments(entry, apex_spec);
+        let libcosine_apex = libcosine_scorer.calculate_score(&match_result);
+
+        // 2. Count top-6 matched ions at apex
+        let top6_matched_apex = count_top6_matched_at_apex(
+            &entry.fragments,
+            &apex_spec.mzs,
+            fragment_tolerance,
+        );
+
+        // 3. Hyperscore at apex
+        // Convert intensities from f32 to f64 for hyperscore calculation
+        let apex_intensities_f64: Vec<f64> = apex_spec.intensities.iter().map(|&x| x as f64).collect();
+        let hyperscore_result = super::compute_hyperscore(
+            &entry.fragments,
+            &apex_spec.mzs,
+            &apex_intensities_f64,
+            fragment_tolerance.tolerance,
+            fragment_tolerance.unit,
+        );
+
         Some(CalibrationMatch {
             entry_id: entry.id,
             is_decoy: entry.is_decoy,
@@ -2557,6 +2756,16 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             hyperscore: 0.0,
             n_b_ions: 0,
             n_y_ions: 0,
+
+            // ML scoring features
+            correlation_score: coelution_sum,
+            libcosine_apex,
+            top6_matched_apex,
+            hyperscore_apex: hyperscore_result.score,
+            signal_to_noise,
+            discriminant_score: coelution_sum, // Initially use correlation, will be replaced by LDA
+            posterior_error: 0.0,               // Will be filled by LDA
+            q_value: 1.0,                       // Will be filled by LDA
         })
     };
 
@@ -3011,5 +3220,93 @@ mod tests {
             "Expected ~0 ppm, got {} ppm",
             match_result.mass_errors[0]
         );
+    }
+
+    #[test]
+    fn test_count_top6_matched_at_apex() {
+        use osprey_core::ToleranceUnit;
+
+        // Create test library fragments with varying intensities
+        let fragments = vec![
+            LibraryFragment {
+                mz: 100.0,
+                relative_intensity: 0.5,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 200.0,
+                relative_intensity: 1.0, // Top 1
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 300.0,
+                relative_intensity: 0.2, // Not in top 6
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 400.0,
+                relative_intensity: 0.8, // Top 2
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 500.0,
+                relative_intensity: 0.7, // Top 3
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 600.0,
+                relative_intensity: 0.6, // Top 4
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 700.0,
+                relative_intensity: 0.55, // Top 5
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 800.0,
+                relative_intensity: 0.51, // Top 6
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+
+        // Spectrum with peaks matching some of the top-6 fragments
+        // Matches: 200.0, 400.0, 500.0, 600.0 (4 out of top 6)
+        let spectrum_mzs = vec![200.0, 350.0, 400.0, 500.0, 600.0];
+
+        let tolerance_config = FragmentToleranceConfig {
+            tolerance: 10.0,
+            unit: ToleranceUnit::Ppm,
+        };
+
+        let count = count_top6_matched_at_apex(&fragments, &spectrum_mzs, tolerance_config);
+        assert_eq!(count, 4); // 200, 400, 500, 600 matched
+
+        // Test with no matches
+        let empty_spectrum: Vec<f64> = vec![];
+        let count = count_top6_matched_at_apex(&fragments, &empty_spectrum, tolerance_config);
+        assert_eq!(count, 0);
+
+        // Test with all top-6 matched
+        let all_matched_spectrum = vec![200.0, 400.0, 500.0, 600.0, 700.0, 800.0];
+        let count = count_top6_matched_at_apex(&fragments, &all_matched_spectrum, tolerance_config);
+        assert_eq!(count, 6);
+
+        // Test with fewer than 6 fragments total
+        let few_fragments = vec![
+            LibraryFragment {
+                mz: 100.0,
+                relative_intensity: 1.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 200.0,
+                relative_intensity: 0.8,
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+        let few_spectrum = vec![100.0, 200.0];
+        let count = count_top6_matched_at_apex(&few_fragments, &few_spectrum, tolerance_config);
+        assert_eq!(count, 2); // All 2 fragments matched
     }
 }

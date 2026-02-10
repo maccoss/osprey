@@ -160,10 +160,6 @@ struct Args {
     #[arg(long)]
     export_coefficients: bool,
 
-    /// Use streaming mode for memory-efficient processing (requires streaming feature)
-    #[arg(long)]
-    streaming: bool,
-
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -242,7 +238,6 @@ fn main() -> Result<()> {
         lambda: args.lambda,
         verbose: args.verbose,
         disable_rt_calibration: args.no_rt_calibration,
-        streaming: args.streaming,
         fragment_tolerance: args.fragment_tolerance,
         fragment_unit,
         precursor_tolerance: args.precursor_tolerance,
@@ -297,18 +292,6 @@ fn main() -> Result<()> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build_global()?;
-    }
-
-    // Check streaming mode
-    #[cfg(feature = "streaming")]
-    if config.streaming {
-        log::info!("Streaming mode enabled");
-    }
-
-    #[cfg(not(feature = "streaming"))]
-    if args.streaming {
-        log::warn!("Streaming mode requested but 'streaming' feature not compiled. Ignoring.");
-        // Don't set config.streaming since we already merged args
     }
 
     // Log reproducibility header

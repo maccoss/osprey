@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 osprey-core = { workspace = true }
 osprey-io = { workspace = true, optional = true }
+osprey-ml = { workspace = true }
 ndarray = { workspace = true }
 blas-src = { workspace = true }
 openblas-src = { workspace = true }
@@ -19,13 +20,5 @@ indicatif = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 
-# Optional streaming dependencies
-crossbeam = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-
 [dev-dependencies]
 approx = { workspace = true }
-
-[features]
-default = []
-streaming = ["crossbeam", "tokio", "osprey-io/streaming"]

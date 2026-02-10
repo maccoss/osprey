@@ -7,6 +7,7 @@ members = [
     "crates/osprey-chromatography",
     "crates/osprey-scoring",
     "crates/osprey-fdr",
+    "crates/osprey-ml",
     "crates/osprey",
 ]
 
@@ -27,6 +28,7 @@ osprey-regression = { path = "crates/osprey-regression" }
 osprey-chromatography = { path = "crates/osprey-chromatography" }
 osprey-scoring = { path = "crates/osprey-scoring" }
 osprey-fdr = { path = "crates/osprey-fdr" }
+osprey-ml = { path = "crates/osprey-ml" }
 
 # Core dependencies
 ndarray = { version = "0.16", features = ["rayon", "blas"] }
@@ -37,16 +39,10 @@ rayon = "1.10"
 
 # File I/O
 mzdata = "0.63"
-quick-xml = { version = "0.37", features = ["async-tokio"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 csv = "1.3"
 flate2 = "1.0"
 base64 = "0.22"
-
-# Async/Streaming (optional)
-tokio = { version = "1.0", features = ["fs", "io-util", "rt", "macros", "rt-multi-thread"] }
-async-compression = { version = "0.4", features = ["tokio", "zlib"] }
-crossbeam = "0.8"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
