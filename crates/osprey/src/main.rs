@@ -6,6 +6,7 @@ use osprey::{run_analysis, ConfigOverrides, OspreyConfig, ResolutionMode, Tolera
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Instant;
 
 /// Writer that tees output to both stderr and a log file
 struct TeeWriter {
@@ -24,6 +25,40 @@ impl Write for TeeWriter {
         self.stderr.flush()?;
         self.file.lock().unwrap().flush()?;
         Ok(())
+    }
+}
+
+/// Format duration into human-readable string
+fn format_duration(duration: std::time::Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let days = total_seconds / 86400;
+    let hours = (total_seconds % 86400) / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    let millis = duration.subsec_millis();
+
+    if days > 0 {
+        if hours > 0 {
+            format!("{} days {} hours", days, hours)
+        } else {
+            format!("{} days", days)
+        }
+    } else if hours > 0 {
+        if minutes > 0 {
+            format!("{} hours {} minutes", hours, minutes)
+        } else {
+            format!("{} hours", hours)
+        }
+    } else if minutes > 0 {
+        if seconds > 0 {
+            format!("{} minutes {} seconds", minutes, seconds)
+        } else {
+            format!("{} minutes", minutes)
+        }
+    } else if seconds > 0 {
+        format!("{}.{:03} seconds", seconds, millis)
+    } else {
+        format!("{} ms", millis)
     }
 }
 
@@ -286,10 +321,13 @@ fn main() -> Result<()> {
     }
 
     // Run analysis
+    let start_time = Instant::now();
 
     run_analysis(config)?;
 
-    log::info!("Analysis complete.");
+    let elapsed = start_time.elapsed();
+    let elapsed_str = format_duration(elapsed);
+    log::info!("Analysis complete in {}", elapsed_str);
 
     Ok(())
 }
