@@ -473,9 +473,9 @@ impl BlibWriter {
         // because Skyline expects mass values, not UniMod references
         let clean_mod_seq = convert_unimod_to_mass(&strip_flanking_chars(peptide_mod_seq));
 
-        // Convert peaks to blobs - mz is zlib-compressed, intensities are raw f32
-        let mz_blob = compress_f64_blob(mzs);
-        let int_blob = f32_vec_to_blob(intensities);
+        // Convert peaks to blobs - zlib-compressed when it reduces size
+        let mz_blob = compress_bytes(f64_vec_to_bytes(mzs));
+        let int_blob = compress_bytes(f32_vec_to_bytes(intensities));
 
         let spec_id_in_file = self.next_spec_id.to_string();
         self.next_spec_id += 1;
@@ -764,18 +764,25 @@ impl Drop for BlibWriter {
     }
 }
 
-/// Compress f64 vector to zlib-compressed byte blob (little-endian)
+/// Zlib-compress a byte buffer, returning raw bytes if compression doesn't help.
 ///
-/// BiblioSpec stores peak m/z values as zlib-compressed f64 arrays.
-fn compress_f64_blob(values: &[f64]) -> Vec<u8> {
-    let raw = f64_vec_to_blob(values);
+/// BiblioSpec readers determine whether a blob is compressed by comparing its
+/// length to the expected uncompressed size (numPeaks * sizeof(type)). If the
+/// sizes match, the blob is treated as raw bytes. This means we must store the
+/// uncompressed bytes whenever compression does not reduce the size.
+fn compress_bytes(raw: Vec<u8>) -> Vec<u8> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&raw).expect("zlib compression failed");
-    encoder.finish().expect("zlib finish failed")
+    let compressed = encoder.finish().expect("zlib finish failed");
+    if compressed.len() >= raw.len() {
+        raw
+    } else {
+        compressed
+    }
 }
 
-/// Convert f64 vector to byte blob (little-endian)
-fn f64_vec_to_blob(values: &[f64]) -> Vec<u8> {
+/// Convert f64 vector to little-endian bytes
+fn f64_vec_to_bytes(values: &[f64]) -> Vec<u8> {
     let mut blob = Vec::with_capacity(values.len() * 8);
     for v in values {
         blob.extend_from_slice(&v.to_le_bytes());
@@ -783,8 +790,8 @@ fn f64_vec_to_blob(values: &[f64]) -> Vec<u8> {
     blob
 }
 
-/// Convert f32 vector to byte blob (little-endian)
-fn f32_vec_to_blob(values: &[f32]) -> Vec<u8> {
+/// Convert f32 vector to little-endian bytes
+fn f32_vec_to_bytes(values: &[f32]) -> Vec<u8> {
     let mut blob = Vec::with_capacity(values.len() * 4);
     for v in values {
         blob.extend_from_slice(&v.to_le_bytes());
@@ -965,25 +972,39 @@ mod tests {
         writer.finalize().unwrap();
     }
 
-    /// Verifies that f64 blobs are zlib-compressed and f32 blobs are raw.
+    /// Verifies that compress_bytes produces valid zlib or falls back to raw.
     #[test]
     fn test_blob_compression() {
-        let values = vec![1.0f64, 2.0, 3.0];
-        let compressed = compress_f64_blob(&values);
-        // Compressed should be smaller or similar to raw (24 bytes)
-        assert!(!compressed.is_empty());
-
-        // Verify we can decompress back
         use flate2::read::ZlibDecoder;
         use std::io::Read;
-        let mut decoder = ZlibDecoder::new(&compressed[..]);
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed).unwrap();
-        assert_eq!(decompressed.len(), 24); // 3 * 8 bytes
 
-        let float_values = vec![1.0f32, 2.0, 3.0];
-        let float_blob = f32_vec_to_blob(&float_values);
-        assert_eq!(float_blob.len(), 12); // 3 * 4 bytes (raw, not compressed)
+        // f64 blob: with enough values, compression should reduce size
+        let values: Vec<f64> = (0..100).map(|i| i as f64 * 1.5).collect();
+        let raw = f64_vec_to_bytes(&values);
+        let blob = compress_bytes(f64_vec_to_bytes(&values));
+        if blob.len() < raw.len() {
+            // Compressed — verify we can decompress back
+            let mut decoder = ZlibDecoder::new(&blob[..]);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).unwrap();
+            assert_eq!(decompressed.len(), raw.len());
+        } else {
+            // Fell back to raw — sizes must match
+            assert_eq!(blob.len(), raw.len());
+        }
+
+        // f32 blob: same logic
+        let float_values: Vec<f32> = (0..100).map(|i| i as f32 * 0.5).collect();
+        let raw_f32 = f32_vec_to_bytes(&float_values);
+        let blob_f32 = compress_bytes(f32_vec_to_bytes(&float_values));
+        if blob_f32.len() < raw_f32.len() {
+            let mut decoder = ZlibDecoder::new(&blob_f32[..]);
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).unwrap();
+            assert_eq!(decompressed.len(), raw_f32.len());
+        } else {
+            assert_eq!(blob_f32.len(), raw_f32.len());
+        }
     }
 
     /// Verifies that modifications are written with 1-based positions.
