@@ -86,7 +86,8 @@
       "Bash(sqlite3:*)",
       "Bash(apt-get install:*)",
       "Bash(RUST_LOG=info,osprey=debug target/release/osprey:*)",
-      "Bash(RUST_LOG=info,osprey=warn target/release/osprey:*)"
+      "Bash(RUST_LOG=info,osprey=warn target/release/osprey:*)",
+      "Read(//mnt/c/Users/macco/**)"
     ],
     "additionalDirectories": [
       "/mnt/c/Users/macco/Documents/github/maccoss/osprey/example_test_data/astral"

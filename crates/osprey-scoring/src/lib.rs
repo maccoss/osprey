@@ -3563,7 +3563,7 @@ mod tests {
         let aggregator = SpectrumAggregator::new().with_tolerance_da(0.5);
 
         // Create test spectra at different RTs
-        let spectra = vec![
+        let spectra = [
             Spectrum {
                 scan_number: 1,
                 retention_time: 9.5,
@@ -3619,7 +3619,7 @@ mod tests {
         let aggregator = SpectrumAggregator::new().with_tolerance_da(0.5);
 
         // Create test spectra with corresponding coefficients
-        let spectra = vec![
+        let spectra = [
             Spectrum {
                 scan_number: 1,
                 retention_time: 9.5,

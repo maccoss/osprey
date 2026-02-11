@@ -3980,7 +3980,7 @@ mod tests {
         let bin_contains = |bin: i32, idx: usize| -> bool {
             index
                 .get(bin)
-                .map_or(false, |entries| entries.iter().any(|&(_, i)| i == idx))
+                .is_some_and(|entries| entries.iter().any(|&(_, i)| i == idx))
         };
 
         // Entry at 500.0 should appear in bins 499, 500, 501
