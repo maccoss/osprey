@@ -343,33 +343,65 @@ impl RTCalibration {
             .unwrap_or_else(|i| i);
 
         if idx == 0 {
-            // Extrapolate below range
-            if n > 1 {
-                let slope = (self.fitted_values[1] - self.fitted_values[0])
-                    / (self.library_rts[1] - self.library_rts[0]);
-                self.fitted_values[0] + slope * (library_rt - self.library_rts[0])
-            } else {
-                self.fitted_values[0]
-            }
+            // Extrapolate below range — find first pair with non-zero denominator
+            self.extrapolate_below(library_rt)
         } else if idx >= n {
-            // Extrapolate above range
-            if n > 1 {
-                let slope = (self.fitted_values[n - 1] - self.fitted_values[n - 2])
-                    / (self.library_rts[n - 1] - self.library_rts[n - 2]);
-                self.fitted_values[n - 1] + slope * (library_rt - self.library_rts[n - 1])
-            } else {
-                self.fitted_values[n - 1]
-            }
+            // Extrapolate above range — find last pair with non-zero denominator
+            self.extrapolate_above(library_rt)
         } else {
             // Interpolate between idx-1 and idx
             let x0 = self.library_rts[idx - 1];
             let x1 = self.library_rts[idx];
-            let y0 = self.fitted_values[idx - 1];
-            let y1 = self.fitted_values[idx];
 
-            let t = (library_rt - x0) / (x1 - x0);
-            y0 + t * (y1 - y0)
+            if (x1 - x0).abs() < 1e-12 {
+                // Duplicate library_rts — average the fitted values to avoid NaN
+                let y0 = self.fitted_values[idx - 1];
+                let y1 = self.fitted_values[idx];
+                (y0 + y1) / 2.0
+            } else {
+                let y0 = self.fitted_values[idx - 1];
+                let y1 = self.fitted_values[idx];
+                let t = (library_rt - x0) / (x1 - x0);
+                y0 + t * (y1 - y0)
+            }
         }
+    }
+
+    /// Extrapolate below the calibration range, skipping duplicate points
+    fn extrapolate_below(&self, library_rt: f64) -> f64 {
+        let n = self.library_rts.len();
+        if n < 2 {
+            return self.fitted_values[0];
+        }
+        // Find first pair with distinct library_rts for a valid slope
+        for i in 0..n - 1 {
+            let dx = self.library_rts[i + 1] - self.library_rts[i];
+            if dx.abs() > 1e-12 {
+                let slope = (self.fitted_values[i + 1] - self.fitted_values[i]) / dx;
+                return self.fitted_values[i] + slope * (library_rt - self.library_rts[i]);
+            }
+        }
+        // All points have the same library_rt — return average fitted value
+        self.fitted_values[0]
+    }
+
+    /// Extrapolate above the calibration range, skipping duplicate points
+    fn extrapolate_above(&self, library_rt: f64) -> f64 {
+        let n = self.library_rts.len();
+        if n < 2 {
+            return self.fitted_values[n - 1];
+        }
+        // Find last pair with distinct library_rts for a valid slope
+        for i in (0..n - 1).rev() {
+            let dx = self.library_rts[i + 1] - self.library_rts[i];
+            if dx.abs() > 1e-12 {
+                let slope = (self.fitted_values[i + 1] - self.fitted_values[i]) / dx;
+                return self.fitted_values[i + 1]
+                    + slope * (library_rt - self.library_rts[i + 1]);
+            }
+        }
+        // All points have the same library_rt — return average fitted value
+        self.fitted_values[n - 1]
     }
 
     /// Get the residual standard deviation
@@ -425,8 +457,13 @@ impl RTCalibration {
             let r0 = self.smoothed_abs_residual(idx - 1);
             let r1 = self.smoothed_abs_residual(idx);
 
-            let t = (library_rt - x0) / (x1 - x0);
-            r0 + t * (r1 - r0)
+            if (x1 - x0).abs() < 1e-12 {
+                // Duplicate library_rts — average the residuals
+                (r0 + r1) / 2.0
+            } else {
+                let t = (library_rt - x0) / (x1 - x0);
+                r0 + t * (r1 - r0)
+            }
         }
     }
 
@@ -978,6 +1015,98 @@ mod tests {
             (tol - 1.5).abs() < 0.01,
             "Should use uniform residual_std when abs_residuals empty, got {}",
             tol
+        );
+    }
+
+    #[test]
+    fn test_predict_with_duplicate_library_rts() {
+        // Regression test: duplicate library_rts caused division by zero (NaN)
+        // in predict(), which silently bypassed binary search in MzRTIndex
+        let library_rts = vec![5.0, 10.0, 10.0, 15.0, 20.0];
+        let fitted_values = vec![5.1, 10.2, 10.3, 15.1, 20.0];
+        let abs_residuals = vec![0.1, 0.2, 0.3, 0.1, 0.0];
+
+        let cal = RTCalibration {
+            library_rts: library_rts.clone(),
+            measured_rts: fitted_values.clone(), // For test, measured ≈ fitted
+            fitted_values: fitted_values.clone(),
+            abs_residuals,
+            residual_std: 0.5,
+            bandwidth: 0.3,
+            degree: 1,
+        };
+
+        // Test prediction at duplicate point — should NOT return NaN
+        let pred = cal.predict(10.0);
+        assert!(
+            !pred.is_nan(),
+            "predict() must not return NaN for duplicate library_rts"
+        );
+        // Should average the two fitted values at x=10.0: (10.2 + 10.3) / 2
+        assert!(
+            (pred - 10.25).abs() < 0.01,
+            "Expected ~10.25 for duplicate point, got {}",
+            pred
+        );
+
+        // Test prediction between duplicate and next point — normal interpolation
+        let pred_12 = cal.predict(12.0);
+        assert!(
+            !pred_12.is_nan(),
+            "predict() must not return NaN near duplicate points"
+        );
+
+        // Test prediction near duplicate point
+        let pred_10_1 = cal.predict(10.1);
+        assert!(
+            !pred_10_1.is_nan(),
+            "predict() must not return NaN near duplicate points"
+        );
+
+        // Test local_tolerance at duplicate point — should not return NaN
+        let tol = cal.local_tolerance(10.0, 3.0, 0.1);
+        assert!(
+            !tol.is_nan(),
+            "local_tolerance() must not return NaN for duplicate library_rts"
+        );
+        assert!(tol >= 0.1, "local_tolerance should be at least min_tolerance");
+
+        // Test extrapolation with duplicates at boundaries
+        let boundary_rts = vec![5.0, 5.0, 10.0, 15.0];
+        let boundary_fitted = vec![5.1, 5.2, 10.1, 15.0];
+        let boundary_residuals = vec![0.1, 0.2, 0.1, 0.0];
+        let cal2 = RTCalibration {
+            library_rts: boundary_rts,
+            fitted_values: boundary_fitted,
+            abs_residuals: boundary_residuals,
+            residual_std: 0.5,
+            bandwidth: 0.3,
+            degree: 1,
+        };
+
+        let pred_below = cal2.predict(3.0);
+        assert!(
+            !pred_below.is_nan(),
+            "Extrapolation below range with duplicate first points must not return NaN"
+        );
+
+        // Test extrapolation above with duplicates at end
+        let end_rts = vec![5.0, 10.0, 15.0, 15.0];
+        let end_fitted = vec![5.1, 10.1, 15.0, 15.1];
+        let end_residuals = vec![0.1, 0.1, 0.0, 0.1];
+        let cal3 = RTCalibration {
+            library_rts: end_rts,
+            fitted_values: end_fitted,
+            abs_residuals: end_residuals,
+            residual_std: 0.5,
+            bandwidth: 0.3,
+            degree: 1,
+        };
+
+        let pred_above = cal3.predict(20.0);
+        assert!(
+            !pred_above.is_nan(),
+            "Extrapolation above range with duplicate last points must not return NaN"
         );
     }
 }

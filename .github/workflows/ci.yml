@@ -120,6 +120,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           vcpkg install openblas:x64-windows openssl:x64-windows
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}

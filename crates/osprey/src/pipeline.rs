@@ -1712,6 +1712,18 @@ fn process_spectra_optimized(
                 } else {
                     entry.retention_time
                 };
+                // Check for NaN expected_rt (would bypass normal comparison checks)
+                if expected_rt.is_nan() {
+                    let count = rt_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count < 10 {
+                        log::warn!(
+                            "RT violation #{} (NaN!): {} (idx={}, id={}) expected_rt=NaN lib_rt={:.4} spectrum_rt={:.4} scan={}",
+                            count + 1, entry.modified_sequence, idx, entry.id,
+                            entry.retention_time, spectrum.retention_time, spectrum.scan_number
+                        );
+                    }
+                    continue;
+                }
                 let rt_diff = (expected_rt - spectrum.retention_time).abs();
                 if rt_diff > search_tolerance + 0.01 {
                     let count = rt_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1944,19 +1956,36 @@ fn score_run(
     let mut entry_data: HashMap<u32, Vec<(f64, f64)>> = HashMap::new(); // (RT, coef)
     let mut entry_result_indices: HashMap<u32, Vec<usize>> = HashMap::new(); // indices into results
     let mut aggregation_violations = 0u64;
+    let mut aggregation_violations_total = 0u64;
+    // Build a temporary RT calibration for expected_rt computation if calibration available
+    let rt_cal_for_diag: Option<RTCalibration> = calibration.and_then(|cal| {
+        if cal.rt_calibration.has_model_data() {
+            let model_params = cal.rt_calibration.model_params.as_ref()?;
+            RTCalibration::from_model_params(model_params, cal.rt_calibration.residual_sd).ok()
+        } else {
+            None
+        }
+    });
     for (result_idx, result) in results.iter().enumerate() {
         for (lib_id, coef) in result.library_ids.iter().zip(result.coefficients.iter()) {
             // Diagnostic: verify that each lib_id's expected_rt is near this result's RT
             if let Some(&lib_idx) = id_to_index.get(lib_id) {
                 let entry = &library[lib_idx];
                 let rt_diff = (entry.retention_time - result.retention_time).abs();
-                if rt_diff > 5.0 && aggregation_violations < 20 {
-                    aggregation_violations += 1;
-                    log::warn!(
-                        "AGGREGATION MISMATCH #{}: lib_id={} ({}) lib_rt={:.3} result_rt={:.3} diff={:.2} coef={:.4} scan={}",
-                        aggregation_violations, lib_id, entry.modified_sequence,
-                        entry.retention_time, result.retention_time, rt_diff, coef, result.scan_number
-                    );
+                if rt_diff > 5.0 {
+                    aggregation_violations_total += 1;
+                    if aggregation_violations < 20 {
+                        aggregation_violations += 1;
+                        let expected_rt = rt_cal_for_diag.as_ref()
+                            .map(|cal| cal.predict(entry.retention_time))
+                            .unwrap_or(entry.retention_time);
+                        log::warn!(
+                            "AGGREGATION MISMATCH #{}: lib_id={} ({}) lib_rt={:.3} expected_rt={:.3} result_rt={:.3} diff={:.2} coef={:.4} scan={} n_candidates={}",
+                            aggregation_violations, lib_id, entry.modified_sequence,
+                            entry.retention_time, expected_rt, result.retention_time, rt_diff, coef, result.scan_number,
+                            result.n_candidates
+                        );
+                    }
                 }
             }
             entry_data
@@ -1969,24 +1998,10 @@ fn score_run(
                 .push(result_idx);
         }
     }
-    if aggregation_violations > 0 {
-        // Count total
-        let _total_violations: u64 = results
-            .iter()
-            .flat_map(|r| r.library_ids.iter().zip(r.coefficients.iter()))
-            .filter(|(lib_id, _coef)| {
-                if let Some(&_lib_idx) = id_to_index.get(lib_id) {
-                    // Use a wider tolerance to check: can't compare to search_tolerance here but
-                    // 5 min should be well beyond any legitimate tolerance
-                    false // placeholder: just counted above
-                } else {
-                    false
-                }
-            })
-            .count() as u64;
+    if aggregation_violations_total > 0 {
         log::warn!(
             "Total aggregation mismatches (|lib_rt - result_rt| > 5 min): {} (showed first 20)",
-            aggregation_violations
+            aggregation_violations_total
         );
     }
 
@@ -3589,6 +3604,32 @@ impl MzRTIndex {
         // Sort each bin by expected RT for binary search
         for entries in bins.values_mut() {
             entries.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
+
+        // Diagnostic: check for NaN/Inf expected_rt values
+        let mut nan_count = 0usize;
+        let mut inf_count = 0usize;
+        for entries in bins.values() {
+            for &(rt, idx) in entries {
+                if rt.is_nan() {
+                    nan_count += 1;
+                    if nan_count <= 5 {
+                        log::warn!(
+                            "MzRTIndex NaN: idx={} seq={} lib_rt={:.3} precursor_mz={:.4}",
+                            idx, library[idx].modified_sequence, library[idx].retention_time,
+                            library[idx].precursor_mz
+                        );
+                    }
+                } else if rt.is_infinite() {
+                    inf_count += 1;
+                }
+            }
+        }
+        if nan_count > 0 || inf_count > 0 {
+            log::warn!(
+                "MzRTIndex contains {} NaN and {} Inf expected_rt entries (out of {} total). NaN entries may bypass binary search!",
+                nan_count, inf_count, bins.values().map(|v| v.len()).sum::<usize>()
+            );
         }
 
         MzRTIndex { bins }
