@@ -7,5 +7,5 @@
 mod blib;
 mod report;
 
-pub use blib::BlibWriter;
+pub use blib::{unimod_id_to_mass, BlibWriter};
 pub use report::{write_coefficient_summary, ReportWriter};

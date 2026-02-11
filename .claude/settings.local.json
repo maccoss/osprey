@@ -82,7 +82,14 @@
       "Bash(cargo clippy:*)",
       "Bash(head:*)",
       "Bash(git -C /mnt/c/Users/macco/Documents/github/maccoss/osprey diff crates/osprey/src/pipeline.rs)",
-      "Bash(git -C /mnt/c/Users/macco/Documents/github/maccoss/osprey diff --stat HEAD)"
+      "Bash(git -C /mnt/c/Users/macco/Documents/github/maccoss/osprey diff --stat HEAD)",
+      "Bash(sqlite3:*)",
+      "Bash(apt-get install:*)",
+      "Bash(RUST_LOG=info,osprey=debug target/release/osprey:*)",
+      "Bash(RUST_LOG=info,osprey=warn target/release/osprey:*)"
+    ],
+    "additionalDirectories": [
+      "/mnt/c/Users/macco/Documents/github/maccoss/osprey/example_test_data/astral"
     ]
   }
 }

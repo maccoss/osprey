@@ -464,7 +464,7 @@ fn parse_modifications(modified: &str) -> Vec<Modification> {
                 if let Some(mass) = parse_mod_mass(&mod_str) {
                     modifications.push(Modification {
                         position,
-                        unimod_id: None,
+                        unimod_id: parse_unimod_id(&mod_str),
                         mass_delta: mass,
                         name: Some(mod_str),
                     });
@@ -510,22 +510,30 @@ fn parse_mod_mass(s: &str) -> Option<f64> {
         }
     }
 
-    // Known modifications
+    // Try UniMod notation (e.g., "UniMod:4" or "UNIMOD:4")
+    let unimod_prefix = if s.starts_with("UniMod:") {
+        Some(&s[7..])
+    } else if s.starts_with("UNIMOD:") {
+        Some(&s[7..])
+    } else {
+        None
+    };
+    if let Some(id_str) = unimod_prefix {
+        if let Ok(id) = id_str.parse::<u32>() {
+            if let Some(mass) = crate::output::unimod_id_to_mass(id) {
+                return Some(mass);
+            }
+        }
+    }
+
+    // Known modifications by name
     match s.to_uppercase().as_str() {
         "OXIDATION" => Some(15.9949),
         "CARBAMIDOMETHYL" | "CAM" => Some(57.0215),
         "PHOSPHO" => Some(79.9663),
         "ACETYL" => Some(42.0106),
         "DEAMIDATED" | "DEAMIDATION" => Some(0.9840),
-        _ => {
-            // Try to extract UniMod mass
-            if s.contains("UniMod:") {
-                // Would need a UniMod database lookup
-                None
-            } else {
-                None
-            }
-        }
+        _ => None,
     }
 }
 

@@ -1674,6 +1674,10 @@ fn process_spectra_optimized(
             .progress_chars("#>-"),
     );
 
+    // Diagnostic counters: verify candidate selection respects RT tolerance
+    let rt_violations = std::sync::atomic::AtomicU64::new(0);
+    let rt_violation_max = std::sync::atomic::AtomicU64::new(0); // stored as f64 bits
+
     // Process spectra in parallel (using calibrated m/z values)
     // Each spectrum: bin observed → filter candidates → bin candidates on-the-fly → solve
     let results: Vec<RegressionResult> = calibrated_spectra
@@ -1696,6 +1700,39 @@ fn process_spectra_optimized(
             if candidates.is_empty() {
                 pb.inc(1);
                 return None;
+            }
+
+            // Diagnostic: verify all candidates are within RT tolerance
+            for &idx in &candidates {
+                let entry = &library[idx];
+                let expected_rt = if let Some(cal) = calibration {
+                    cal.predict(entry.retention_time)
+                } else {
+                    entry.retention_time
+                };
+                let rt_diff = (expected_rt - spectrum.retention_time).abs();
+                if rt_diff > search_tolerance + 0.01 {
+                    let count = rt_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Track max violation
+                    let bits = rt_diff.to_bits();
+                    rt_violation_max.fetch_max(bits, std::sync::atomic::Ordering::Relaxed);
+                    // Log first 10 violations with full detail
+                    if count < 10 {
+                        log::warn!(
+                            "RT violation #{}: {} (idx={}, id={}) expected_rt={:.4} lib_rt={:.4} spectrum_rt={:.4} diff={:.4} tol={:.4} scan={}",
+                            count + 1,
+                            entry.modified_sequence,
+                            idx,
+                            entry.id,
+                            expected_rt,
+                            entry.retention_time,
+                            spectrum.retention_time,
+                            rt_diff,
+                            search_tolerance,
+                            spectrum.scan_number
+                        );
+                    }
+                }
             }
 
             // Bin observed spectrum
@@ -1764,6 +1801,22 @@ fn process_spectra_optimized(
         .collect();
 
     pb.finish_with_message("Done");
+
+    // Report RT tolerance violations (diagnostic)
+    let n_violations = rt_violations.load(std::sync::atomic::Ordering::Relaxed);
+    if n_violations > 0 {
+        let max_bits = rt_violation_max.load(std::sync::atomic::Ordering::Relaxed);
+        let max_diff = f64::from_bits(max_bits);
+        log::warn!(
+            "RT TOLERANCE VIOLATION: {} candidates selected outside search_tolerance ({:.2} min). Max RT diff: {:.2} min. Bug in candidate selection!",
+            n_violations, search_tolerance, max_diff
+        );
+    } else {
+        log::info!(
+            "RT tolerance check: all candidates within {:.2} min tolerance (no violations)",
+            search_tolerance
+        );
+    }
 
     log::info!(
         "Generated {} regression results with non-zero coefficients",
@@ -1857,8 +1910,22 @@ fn score_run(
     // Store both (RT, coef) pairs and indices to RegressionResults for context building
     let mut entry_data: HashMap<u32, Vec<(f64, f64)>> = HashMap::new(); // (RT, coef)
     let mut entry_result_indices: HashMap<u32, Vec<usize>> = HashMap::new(); // indices into results
+    let mut aggregation_violations = 0u64;
     for (result_idx, result) in results.iter().enumerate() {
         for (lib_id, coef) in result.library_ids.iter().zip(result.coefficients.iter()) {
+            // Diagnostic: verify that each lib_id's expected_rt is near this result's RT
+            if let Some(&lib_idx) = id_to_index.get(lib_id) {
+                let entry = &library[lib_idx];
+                let rt_diff = (entry.retention_time - result.retention_time).abs();
+                if rt_diff > 5.0 && aggregation_violations < 20 {
+                    aggregation_violations += 1;
+                    log::warn!(
+                        "AGGREGATION MISMATCH #{}: lib_id={} ({}) lib_rt={:.3} result_rt={:.3} diff={:.2} coef={:.4} scan={}",
+                        aggregation_violations, lib_id, entry.modified_sequence,
+                        entry.retention_time, result.retention_time, rt_diff, coef, result.scan_number
+                    );
+                }
+            }
             entry_data
                 .entry(*lib_id)
                 .or_default()
@@ -1868,6 +1935,26 @@ fn score_run(
                 .or_default()
                 .push(result_idx);
         }
+    }
+    if aggregation_violations > 0 {
+        // Count total
+        let total_violations: u64 = results.iter()
+            .flat_map(|r| r.library_ids.iter().zip(r.coefficients.iter()))
+            .filter(|(lib_id, _coef)| {
+                if let Some(&lib_idx) = id_to_index.get(lib_id) {
+                    let entry = &library[lib_idx];
+                    // Use a wider tolerance to check: can't compare to search_tolerance here but
+                    // 5 min should be well beyond any legitimate tolerance
+                    false // placeholder: just counted above
+                } else {
+                    false
+                }
+            })
+            .count() as u64;
+        log::warn!(
+            "Total aggregation mismatches (|lib_rt - result_rt| > 5 min): {} (showed first 20)",
+            aggregation_violations
+        );
     }
 
     // Extract features and create scored entries (parallelized)
@@ -2080,6 +2167,30 @@ fn score_run(
 
                 // Generate PSM ID for matching with Mokapot results
                 let psm_id = format!("{}_{}", file_name, lib_id);
+
+                // Log extreme RT deviations for debugging
+                if features.rt_deviation.abs() > 5.0 && !is_decoy {
+                    let rt_min_data = sorted_data.iter().map(|(rt, _)| *rt).fold(f64::INFINITY, f64::min);
+                    let rt_max_data = sorted_data.iter().map(|(rt, _)| *rt).fold(f64::NEG_INFINITY, f64::max);
+                    let coef_max = sorted_data.iter().map(|(_, c)| *c).fold(f64::NEG_INFINITY, f64::max);
+                    log::warn!(
+                        "RT outlier: {} (id={}, lib_idx={}) apex_rt={:.3} lib_rt={:.3} rt_dev={:.2} scan={} n_scans={} coef_series_rt=[{:.3}..{:.3}] max_coef={:.4} mass_acc={:.1}",
+                        entry.modified_sequence, lib_id, lib_idx, apex_rt,
+                        entry.retention_time, features.rt_deviation,
+                        apex_scan_number, sorted_data.len(),
+                        rt_min_data, rt_max_data, coef_max,
+                        features.mass_accuracy_mean
+                    );
+                    // For first few outliers, log all data points
+                    if sorted_data.len() <= 10 {
+                        for (i, (rt, coef)) in sorted_data.iter().enumerate() {
+                            log::warn!(
+                                "  data[{}]: rt={:.4} coef={:.6}",
+                                i, rt, coef
+                            );
+                        }
+                    }
+                }
 
                 Some(ScoredEntry {
                     lib_idx,
@@ -2871,7 +2982,72 @@ fn apply_simple_fdr_experiment(entries: &mut [ScoredEntry], fdr_threshold: f64) 
     Ok(())
 }
 
+/// Compute peak boundaries and apex for a scored entry, ensuring apex is within bounds
+fn compute_peak_boundaries(scored: &ScoredEntry) -> Option<(f64, f64, f64)> {
+    // Find apex from coefficient time series
+    let (coef_apex_rt, apex_coef) = scored
+        .rt_coef_pairs
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(rt, c)| (*rt, *c))
+        .unwrap_or((0.0, 0.0));
+
+    if apex_coef <= 0.0 {
+        return None;
+    }
+
+    let (start_rt, end_rt) = if let Some((start, end, _fwhm)) = scored.fragment_peak_bounds {
+        // Fragment-based boundaries from co-eluting XICs (preferred)
+        (start, end)
+    } else if let Some((fwhm, _, _)) =
+        osprey_scoring::compute_fwhm_interpolated(&scored.rt_coef_pairs)
+    {
+        // Fallback: coefficient series FWHM with 95% Gaussian boundaries
+        let sigma = fwhm / 2.355;
+        (coef_apex_rt - 1.96 * sigma, coef_apex_rt + 1.96 * sigma)
+    } else {
+        // Final fallback: use first/last non-zero coefficient as boundaries
+        let first_rt = scored
+            .rt_coef_pairs
+            .iter()
+            .find(|(_, c)| *c > 0.0)
+            .map(|(rt, _)| *rt)
+            .unwrap_or(coef_apex_rt);
+        let last_rt = scored
+            .rt_coef_pairs
+            .iter()
+            .rev()
+            .find(|(_, c)| *c > 0.0)
+            .map(|(rt, _)| *rt)
+            .unwrap_or(coef_apex_rt);
+        (first_rt, last_rt)
+    };
+
+    // Ensure apex RT is within [startTime, endTime]
+    // If coefficient apex falls outside fragment bounds, use the highest-coefficient
+    // point within the bounds, or clamp to the midpoint
+    let apex_rt = if coef_apex_rt >= start_rt && coef_apex_rt <= end_rt {
+        coef_apex_rt
+    } else {
+        // Find the highest coefficient within the bounds
+        scored
+            .rt_coef_pairs
+            .iter()
+            .filter(|(rt, _)| *rt >= start_rt && *rt <= end_rt)
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(rt, _)| *rt)
+            .unwrap_or((start_rt + end_rt) / 2.0)
+    };
+
+    Some((apex_rt, start_rt, end_rt))
+}
+
 /// Write scored results to blib format for Skyline
+///
+/// Groups entries by precursor (lib_idx) to produce one RefSpectra row per unique
+/// precursor, with per-run data in the RetentionTimes table. The best-scoring run's
+/// data is used for the RefSpectra entry. Entries from each run where the precursor
+/// passed run-level FDR are included in RetentionTimes.
 fn write_blib_output_with_scores(
     config: &OspreyConfig,
     library: &[LibraryEntry],
@@ -2889,13 +3065,26 @@ fn write_blib_output_with_scores(
     writer.add_metadata("run_fdr", &config.run_fdr.to_string())?;
     writer.add_metadata("fdr_method", "target_decoy_competition")?;
 
-    // Add source files - build lookup by filename string for matching with ScoredEntry.file_name
+    // Determine library name for idFileName in SpectrumSourceFiles
+    let library_name = config
+        .library_source
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("library")
+        .to_string();
+
+    // Add source files - build lookup by file stem for matching with ScoredEntry.file_name
     // Use relative paths from blib location for cross-platform compatibility (WSL2 → Windows)
     let blib_dir = config.output_blib.parent();
-    let mut file_name_to_id: HashMap<String, i64> = HashMap::new();
+    let mut file_stem_to_id: HashMap<String, i64> = HashMap::new();
     for input_file in input_files {
         let file_name = input_file
             .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let file_stem = input_file
+            .file_stem()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
         // Compute relative path from blib directory to mzML file
@@ -2907,59 +3096,49 @@ fn write_blib_output_with_scores(
         } else {
             file_name.to_string()
         };
-        let file_id = writer.add_source_file(&source_path)?;
-        file_name_to_id.insert(file_name.to_string(), file_id);
+        let file_id = writer.add_source_file(&source_path, &library_name, config.run_fdr)?;
+        file_stem_to_id.insert(file_stem.to_string(), file_id);
     }
 
     // Begin batch transaction for much faster writes
     writer.begin_batch()?;
 
-    // Write spectra for passing entries
+    // Group passing entries by precursor (lib_idx) so we write one RefSpectra per
+    // unique precursor, with per-run entries in RetentionTimes
+    let mut precursor_entries: HashMap<usize, Vec<&ScoredEntry>> = HashMap::new();
     for scored in scored_entries {
-        let entry = &library[scored.lib_idx];
+        precursor_entries
+            .entry(scored.lib_idx)
+            .or_default()
+            .push(scored);
+    }
 
-        // Find peak boundaries using FWHM with linear interpolation
-        // Then derive 95% Gaussian boundaries: apex ± 1.96σ where σ = FWHM / 2.355
-        let (apex_rt, _apex_coef) = scored
-            .rt_coef_pairs
+    let mut n_written = 0usize;
+
+    for (lib_idx, entries) in &precursor_entries {
+        let entry = &library[*lib_idx];
+
+        // Find the best-scoring run for this precursor (lowest run q-value)
+        let best = entries
             .iter()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(rt, c)| (*rt, *c))
-            .unwrap_or((0.0, 0.0));
+            .min_by(|a, b| a.run_qvalue.total_cmp(&b.run_qvalue))
+            .unwrap();
 
-        if _apex_coef <= 0.0 {
-            continue;
-        }
-
-        let (start_rt, end_rt) = if let Some((start, end, _fwhm)) = scored.fragment_peak_bounds {
-            // Fragment-based boundaries from co-eluting XICs (preferred)
-            (start, end)
-        } else if let Some((fwhm, _, _)) =
-            osprey_scoring::compute_fwhm_interpolated(&scored.rt_coef_pairs)
-        {
-            // Fallback: coefficient series FWHM with 95% Gaussian boundaries
-            let sigma = fwhm / 2.355;
-            (apex_rt - 1.96 * sigma, apex_rt + 1.96 * sigma)
-        } else {
-            // Final fallback: use first/last non-zero coefficient as boundaries
-            let first_rt = scored
-                .rt_coef_pairs
-                .iter()
-                .find(|(_, c)| *c > 0.0)
-                .map(|(rt, _)| *rt)
-                .unwrap_or(apex_rt);
-            let last_rt = scored
-                .rt_coef_pairs
-                .iter()
-                .rev()
-                .find(|(_, c)| *c > 0.0)
-                .map(|(rt, _)| *rt)
-                .unwrap_or(apex_rt);
-            (first_rt, last_rt)
+        // Compute boundaries for the best run
+        let (apex_rt, start_rt, end_rt) = match compute_peak_boundaries(best) {
+            Some(bounds) => bounds,
+            None => continue,
         };
 
-        // Look up file_id from the entry's file_name
-        let file_id = *file_name_to_id.get(&scored.file_name).unwrap_or(&1);
+        // Count runs where this precursor passed run-level FDR
+        let runs_passing: Vec<&&ScoredEntry> = entries
+            .iter()
+            .filter(|e| e.run_qvalue <= config.run_fdr)
+            .collect();
+        let n_runs_detected = runs_passing.len() as i32;
+
+        // Look up file_id for the best run
+        let file_id = *file_stem_to_id.get(&best.file_name).unwrap_or(&1);
 
         // Get fragment peaks from library entry
         let mzs: Vec<f64> = entry.fragments.iter().map(|f| f.mz).collect();
@@ -2969,9 +3148,14 @@ fn write_blib_output_with_scores(
             .map(|f| f.relative_intensity)
             .collect();
 
-        // Use 1 - q_value as the score (higher is better, blib convention)
-        let blib_score = 1.0 - scored.experiment_qvalue;
+        // Compute total ion current as sum of log intensities (matching DIA-NN convention)
+        let total_ion_current: f64 = intensities
+            .iter()
+            .filter(|&&i| i > 0.0)
+            .map(|&i| (i as f64).ln())
+            .sum();
 
+        // Score is the raw q-value (lower is better) — Skyline GENERIC Q-VALUE convention
         let ref_id = writer.add_spectrum(
             &entry.sequence,
             &entry.modified_sequence,
@@ -2982,8 +3166,10 @@ fn write_blib_output_with_scores(
             end_rt,
             &mzs,
             &intensities,
-            blib_score,
+            best.experiment_qvalue,
             file_id,
+            n_runs_detected,
+            total_ion_current,
         )?;
 
         // Add modifications if present
@@ -2996,46 +3182,69 @@ fn write_blib_output_with_scores(
             writer.add_protein_mapping(ref_id, &entry.protein_ids)?;
         }
 
-        // Add peak boundaries - use file_name from the scored entry
+        // Write RetentionTimes entries for each run where this precursor passed run FDR
+        for scored in &runs_passing {
+            let run_file_id = *file_stem_to_id.get(&scored.file_name).unwrap_or(&1);
+            let is_best: bool = {
+                let a: *const ScoredEntry = **scored;
+                let b: *const ScoredEntry = *best;
+                std::ptr::eq(a, b)
+            };
+
+            if let Some((run_apex, run_start, run_end)) = compute_peak_boundaries(scored) {
+                writer.add_retention_time(
+                    ref_id,
+                    run_file_id,
+                    run_apex,
+                    run_start,
+                    run_end,
+                    scored.run_qvalue,
+                    is_best,
+                )?;
+            }
+        }
+
+        // Add peak boundaries to Osprey extension table
         let boundaries = osprey_core::PeakBoundaries {
             start_rt,
             end_rt,
             apex_rt,
-            apex_coefficient: scored.score,
-            integrated_area: scored.features.peak_area,
+            apex_coefficient: best.score,
+            integrated_area: best.features.peak_area,
             peak_quality: osprey_core::PeakQuality::default(),
         };
+        writer.add_peak_boundaries(ref_id, &best.file_name, &boundaries)?;
 
-        writer.add_peak_boundaries(ref_id, &scored.file_name, &boundaries)?;
-
-        // Add run scores - use run_qvalue for per-file q-value, not experiment q-value
-        // run_qvalue: per-file FDR control result
-        // experiment_qvalue: experiment-level FDR (used for filtering what goes in blib)
-        // blib_score: 1 - experiment_qvalue (used as RefSpectra.score)
+        // Add run scores for best run
         writer.add_run_scores(
             ref_id,
-            &scored.file_name,
-            scored.run_qvalue, // Run-level q-value
-            scored.score,      // Discriminant score
-            scored.pep,        // Posterior error probability
+            &best.file_name,
+            best.run_qvalue,
+            best.score,
+            best.pep,
         )?;
 
         // Add experiment-level scores
-        // For now, n_runs_detected = 1 since we only have the detection from one file
-        // TODO: Track detections across files when multi-file per-file tracking is implemented
         writer.add_experiment_scores(
             ref_id,
-            scored.experiment_qvalue,
-            1,                        // n_runs_detected (currently always 1)
-            input_files.len() as i32, // n_runs_searched
+            best.experiment_qvalue,
+            n_runs_detected,
+            input_files.len() as i32,
         )?;
+
+        n_written += 1;
     }
 
     // Commit the batch transaction
     writer.commit()?;
     writer.finalize()?;
 
-    log::info!("Wrote {} spectra to blib", scored_entries.len());
+    log::info!(
+        "Wrote {} unique precursors to blib (from {} total entries across {} files)",
+        n_written,
+        scored_entries.len(),
+        input_files.len()
+    );
 
     Ok(())
 }
@@ -3180,7 +3389,7 @@ fn write_blib_output(
         } else {
             file_name.to_string()
         };
-        let file_id = writer.add_source_file(&source_path)?;
+        let file_id = writer.add_source_file(&source_path, &source_path, 0.0)?;
         file_ids.insert(input_file.clone(), file_id);
     }
 
@@ -3274,6 +3483,8 @@ fn write_blib_output(
             &intensities,
             score,
             file_id,
+            1,   // copies
+            0.0, // total_ion_current
         )?;
 
         // Add modifications if present
