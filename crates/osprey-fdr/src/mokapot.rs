@@ -1124,6 +1124,12 @@ fn get_feature_header() -> String {
         // Per-fragment mass accuracy
         "mass_accuracy_mean",
         "mass_accuracy_std",
+        // Percolator-style features
+        "abs_rt_deviation",
+        "peptide_length",
+        "missed_cleavages",
+        "ln_num_candidates",
+        "delta_score",
     ]
     .join("\t")
 }
@@ -1144,7 +1150,7 @@ fn format_charge_features(charge: u8) -> String {
 /// Format features for PIN output
 fn format_features(features: &FeatureSet) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         // Ridge regression features (chromatographic profile)
         features.peak_apex,
         features.peak_area,
@@ -1181,6 +1187,12 @@ fn format_features(features: &FeatureSet) -> String {
         // Per-fragment mass accuracy
         features.mass_accuracy_mean,
         features.mass_accuracy_std,
+        // Percolator-style features
+        features.abs_rt_deviation,
+        features.peptide_length,
+        features.missed_cleavages,
+        features.ln_num_candidates,
+        features.delta_score,
     )
 }
 

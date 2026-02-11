@@ -105,26 +105,7 @@ pub fn train_and_score_calibration(
         m.q_value = q_values[i];
     }
 
-    // DEBUG: Log q-value statistics
-    let min_q = q_values.iter().cloned().fold(f64::INFINITY, f64::min);
-    let first_10_q: Vec<f64> = q_values.iter().take(10).cloned().collect();
-    log::info!(
-        "  Q-value stats: min_q={:.4}, first_10={:?}",
-        min_q,
-        first_10_q
-    );
-
     log::info!("LDA scoring complete: {} matches passing 1% FDR", n_passing);
-
-    // DIAGNOSTIC: Compare LDA performance to correlation-only
-    // Note: The LDA training already tracks the best single feature internally
-    // and guarantees the result is at least as good as the best single feature.
-    let n_passing_corr_only = compare_to_correlation_only(matches);
-    log::info!(
-        "  Comparison: Correlation-only would yield {} matches passing 1% FDR (LDA: {})",
-        n_passing_corr_only,
-        n_passing
-    );
 
     // Log median feature values for diagnostics
     log_median_features(matches, use_isotope_feature);
@@ -714,36 +695,6 @@ fn extract_feature_matrix(matches: &[CalibrationMatch], _use_isotope_feature: bo
         .collect();
 
     Matrix::new(features, matches.len(), n_features)
-}
-
-/// Compare LDA performance to correlation-only scoring
-///
-/// Returns the number of matches that would pass 1% FDR using correlation score alone
-fn compare_to_correlation_only(matches: &[CalibrationMatch]) -> usize {
-    // Create a sorted copy by correlation_score
-    let mut indices: Vec<usize> = (0..matches.len()).collect();
-    indices.sort_by(|&a, &b| {
-        matches[b]
-            .correlation_score
-            .total_cmp(&matches[a].correlation_score)
-    });
-
-    // Build is_decoy array in correlation-sorted order
-    let is_decoy_corr: Vec<bool> = indices.iter().map(|&i| matches[i].is_decoy).collect();
-
-    // Calculate q-values for correlation-only ranking
-    let mut q_values_corr = vec![0.0; matches.len()];
-    let n_passing_corr = qvalue::calculate_q_values(&is_decoy_corr, &mut q_values_corr);
-
-    // DEBUG: Log correlation-only statistics
-    let min_q_corr = q_values_corr.iter().cloned().fold(f64::INFINITY, f64::min);
-    log::debug!(
-        "  Correlation-only: min_q={:.4}, n_passing={}",
-        min_q_corr,
-        n_passing_corr
-    );
-
-    n_passing_corr
 }
 
 /// Log median feature values for diagnostics

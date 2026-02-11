@@ -2029,6 +2029,66 @@ fn score_run(
                     FeatureExtractor::apply_regression_context(&mut features, ctx);
                 }
 
+                // Delta score: this peptide's coefficient relative to the max in its
+                // apex ± 2 spectra, averaged. In DIA, many peptides share each spectrum,
+                // so the DDA deltCn concept doesn't apply — instead we measure how dominant
+                // this peptide is vs the most abundant peptide in the local neighborhood.
+                // Values near 1.0 = dominant, near 0.0 = minor contributor.
+                if let Some(result_indices) = entry_result_indices.get(lib_id) {
+                    // Sort data point indices by RT to find apex neighbors
+                    let mut rt_sorted: Vec<usize> = (0..data_points.len()).collect();
+                    rt_sorted.sort_by(|&a, &b| {
+                        data_points[a].0.total_cmp(&data_points[b].0)
+                    });
+
+                    // Find apex position in RT-sorted order
+                    let apex_dp_idx = data_points
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    let apex_sorted_pos = rt_sorted
+                        .iter()
+                        .position(|&i| i == apex_dp_idx)
+                        .unwrap_or(0);
+
+                    // Gather apex ± 2 indices (up to 5 spectra)
+                    let start = apex_sorted_pos.saturating_sub(2);
+                    let end = (apex_sorted_pos + 3).min(rt_sorted.len());
+
+                    let mut ratio_sum = 0.0;
+                    let mut ratio_count = 0u32;
+                    for &sorted_idx in &rt_sorted[start..end] {
+                        let result = &results[result_indices[sorted_idx]];
+
+                        let my_coef = result
+                            .coefficients
+                            .iter()
+                            .zip(result.library_ids.iter())
+                            .find(|(_, id)| *id == lib_id)
+                            .map(|(c, _)| *c)
+                            .unwrap_or(0.0);
+
+                        let max_coef = result
+                            .coefficients
+                            .iter()
+                            .cloned()
+                            .fold(0.0f64, f64::max);
+
+                        if max_coef > 1e-10 {
+                            ratio_sum += my_coef / max_coef;
+                            ratio_count += 1;
+                        }
+                    }
+
+                    features.delta_score = if ratio_count > 0 {
+                        ratio_sum / ratio_count as f64
+                    } else {
+                        0.0
+                    };
+                }
+
                 // Fragment co-elution correlation: correlate raw fragment XICs against
                 // the regression coefficient time series (deconvolved elution profile)
                 let (coelution_sum, coelution_min, n_coeluting) =

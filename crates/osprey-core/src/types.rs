@@ -694,6 +694,18 @@ pub struct FeatureSet {
     pub mass_accuracy_mean: f64,
     /// Standard deviation of mass errors across matched fragments at apex
     pub mass_accuracy_std: f64,
+
+    // Percolator-style features
+    /// Absolute RT deviation (|apex_rt - expected_rt|, minutes)
+    pub abs_rt_deviation: f64,
+    /// Peptide sequence length (unmodified)
+    pub peptide_length: u32,
+    /// Number of missed tryptic cleavages (internal K/R)
+    pub missed_cleavages: u32,
+    /// ln(number of candidates in regression)
+    pub ln_num_candidates: f64,
+    /// Coefficient relative to max in apex spectrum (1.0 = dominant peptide)
+    pub delta_score: f64,
 }
 
 #[cfg(test)]

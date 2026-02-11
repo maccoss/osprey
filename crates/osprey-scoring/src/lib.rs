@@ -2044,6 +2044,15 @@ impl FeatureExtractor {
     ) -> FeatureSet {
         let mut features = FeatureSet::default();
 
+        // Percolator-style sequence features
+        features.peptide_length = entry.sequence.len() as u32;
+        let seq_bytes = entry.sequence.as_bytes();
+        features.missed_cleavages = seq_bytes
+            .iter()
+            .take(seq_bytes.len().saturating_sub(1)) // exclude C-terminal
+            .filter(|&&b| b == b'K' || b == b'R')
+            .count() as u32;
+
         // Chromatographic features from coefficient series (FR-5.1.*)
         if !coefficient_series.is_empty() {
             // FR-5.1.1: Peak apex coefficient (maximum value)
@@ -2078,6 +2087,7 @@ impl FeatureExtractor {
             // FR-5.1.6 & FR-5.1.7: RT deviation
             if let Some(expected) = expected_rt.or(Some(entry.retention_time)) {
                 features.rt_deviation = apex_rt - expected;
+                features.abs_rt_deviation = features.rt_deviation.abs();
                 // Normalized deviation (use FWHM as uncertainty proxy)
                 if features.peak_width > 0.0 {
                     features.rt_deviation_normalized = features.rt_deviation / features.peak_width;
@@ -2245,6 +2255,9 @@ impl FeatureExtractor {
 
         // FR-5.3.5: Regression residual (average across contributing spectra)
         features.regression_residual = context.avg_residual;
+
+        // Percolator-style: ln(number of candidates) — lnNumSP analog
+        features.ln_num_candidates = (context.max_n_competitors.max(1) as f64).ln();
     }
 
     /// Extract features with full context (chromatographic, spectral, and contextual)
