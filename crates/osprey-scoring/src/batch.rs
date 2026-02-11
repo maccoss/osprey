@@ -989,8 +989,11 @@ pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_x
             found_first_nonzero = true;
         }
         // Look for consecutive zeros after we've seen data
-        if histogram[i] == 0 && found_first_nonzero && i >= 5
-            && i + 1 < HISTO_SIZE && (histogram[i + 1] == 0 || i + 1 == max_corr)
+        if histogram[i] == 0
+            && found_first_nonzero
+            && i >= 5
+            && i + 1 < HISTO_SIZE
+            && (histogram[i + 1] == 0 || i + 1 == max_corr)
         {
             next_corr = if i > 0 { i - 1 } else { 0 };
             break;
@@ -1065,7 +1068,12 @@ pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_x
     let mut sx = 0.0f64; // Sum of squared deviations
     let mut sxy = 0.0f64; // Sum of cross products
 
-    for (i, &log_cum_val) in log_cumulative.iter().enumerate().take(next_corr + 1).skip(start_corr) {
+    for (i, &log_cum_val) in log_cumulative
+        .iter()
+        .enumerate()
+        .take(next_corr + 1)
+        .skip(start_corr)
+    {
         if log_cum_val > 0.0 {
             let dx = i as f64 - mean_x;
             let dy = log_cum_val - mean_y;
@@ -1157,8 +1165,11 @@ pub fn calculate_evalue_from_score_distribution(
         if histogram[i] > 0 {
             found_first_nonzero = true;
         }
-        if histogram[i] == 0 && found_first_nonzero && i >= 5
-            && i + 1 < HISTO_SIZE && (histogram[i + 1] == 0 || i + 1 == max_corr)
+        if histogram[i] == 0
+            && found_first_nonzero
+            && i >= 5
+            && i + 1 < HISTO_SIZE
+            && (histogram[i + 1] == 0 || i + 1 == max_corr)
         {
             next_corr = if i > 0 { i - 1 } else { 0 };
             break;
@@ -1227,7 +1238,12 @@ pub fn calculate_evalue_from_score_distribution(
     let mut sx = 0.0f64;
     let mut sxy = 0.0f64;
 
-    for (i, &log_cum_val) in log_cumulative.iter().enumerate().take(next_corr + 1).skip(start_corr) {
+    for (i, &log_cum_val) in log_cumulative
+        .iter()
+        .enumerate()
+        .take(next_corr + 1)
+        .skip(start_corr)
+    {
         if log_cum_val > 0.0 {
             let dx = i as f64 - mean_x;
             let dy = log_cum_val - mean_y;

@@ -1901,12 +1901,43 @@ fn score_run(
     use osprey_core::ToleranceUnit;
     use osprey_scoring::{RegressionContext, SpectralScorer};
 
-    // Build ID-to-index map
+    // Build ID-to-index map and check for duplicate IDs
     let id_to_index: HashMap<u32, usize> = library
         .iter()
         .enumerate()
         .map(|(idx, entry)| (entry.id, idx))
         .collect();
+
+    // Diagnostic: check if any IDs are duplicated (which would cause id_to_index to lose entries)
+    if id_to_index.len() != library.len() {
+        let mut id_counts: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (idx, entry) in library.iter().enumerate() {
+            id_counts.entry(entry.id).or_default().push(idx);
+        }
+        let duplicates: Vec<_> = id_counts
+            .iter()
+            .filter(|(_, indices)| indices.len() > 1)
+            .take(10)
+            .collect();
+        log::error!(
+            "DUPLICATE IDS: library has {} entries but only {} unique IDs ({} collisions). First duplicates:",
+            library.len(), id_to_index.len(), library.len() - id_to_index.len()
+        );
+        for (id, indices) in &duplicates {
+            let entries_info: Vec<String> = indices
+                .iter()
+                .map(|&idx| {
+                    format!(
+                        "idx={} seq={} rt={:.3}",
+                        idx, library[idx].modified_sequence, library[idx].retention_time
+                    )
+                })
+                .collect();
+            log::error!("  id={}: [{}]", id, entries_info.join(", "));
+        }
+    } else {
+        log::info!("ID uniqueness check: all {} IDs are unique", library.len());
+    }
 
     // Aggregate results by library entry ID
     // Store both (RT, coef) pairs and indices to RegressionResults for context building
@@ -1940,7 +1971,8 @@ fn score_run(
     }
     if aggregation_violations > 0 {
         // Count total
-        let _total_violations: u64 = results.iter()
+        let _total_violations: u64 = results
+            .iter()
             .flat_map(|r| r.library_ids.iter().zip(r.coefficients.iter()))
             .filter(|(lib_id, _coef)| {
                 if let Some(&_lib_idx) = id_to_index.get(lib_id) {

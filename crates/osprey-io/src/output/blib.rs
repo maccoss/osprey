@@ -301,26 +301,98 @@ impl BlibWriter {
         // Insert all standard BiblioSpec score types (matching Skyline's schema)
         let score_types = [
             (0, "UNKNOWN", "NOT_A_PROBABILITY_VALUE"),
-            (1, "PERCOLATOR QVALUE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (2, "PEPTIDE PROPHET SOMETHING", "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT"),
+            (
+                1,
+                "PERCOLATOR QVALUE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                2,
+                "PEPTIDE PROPHET SOMETHING",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT",
+            ),
             (3, "SPECTRUM MILL", "NOT_A_PROBABILITY_VALUE"),
-            (4, "IDPICKER FDR", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (5, "MASCOT IONS SCORE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (6, "TANDEM EXPECTATION VALUE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (7, "PROTEIN PILOT CONFIDENCE", "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT"),
-            (8, "SCAFFOLD SOMETHING", "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT"),
+            (
+                4,
+                "IDPICKER FDR",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                5,
+                "MASCOT IONS SCORE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                6,
+                "TANDEM EXPECTATION VALUE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                7,
+                "PROTEIN PILOT CONFIDENCE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT",
+            ),
+            (
+                8,
+                "SCAFFOLD SOMETHING",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT",
+            ),
             (9, "WATERS MSE PEPTIDE SCORE", "NOT_A_PROBABILITY_VALUE"),
-            (10, "OMSSA EXPECTATION SCORE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (11, "PROTEIN PROSPECTOR EXPECTATION SCORE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (12, "SEQUEST XCORR", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (13, "MAXQUANT SCORE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (14, "MORPHEUS SCORE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (15, "MSGF+ SCORE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (16, "PEAKS CONFIDENCE SCORE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (17, "BYONIC SCORE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (18, "PEPTIDE SHAKER CONFIDENCE", "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT"),
-            (19, "GENERIC Q-VALUE", "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT"),
-            (20, "HARDKLOR IDOTP", "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT"),
+            (
+                10,
+                "OMSSA EXPECTATION SCORE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                11,
+                "PROTEIN PROSPECTOR EXPECTATION SCORE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                12,
+                "SEQUEST XCORR",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                13,
+                "MAXQUANT SCORE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                14,
+                "MORPHEUS SCORE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                15,
+                "MSGF+ SCORE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                16,
+                "PEAKS CONFIDENCE SCORE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                17,
+                "BYONIC SCORE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                18,
+                "PEPTIDE SHAKER CONFIDENCE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT",
+            ),
+            (
+                19,
+                "GENERIC Q-VALUE",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_INCORRECT",
+            ),
+            (
+                20,
+                "HARDKLOR IDOTP",
+                "PROBABILITY_THAT_IDENTIFICATION_IS_CORRECT",
+            ),
         ];
         for (id, name, prob_type) in score_types {
             self.conn
