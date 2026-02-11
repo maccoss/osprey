@@ -127,11 +127,13 @@ def generate_report(df, output_path, cols_per_row=4, n_bins=50):
         subplot_titles.append("")
 
     # Create figure with subplots
+    # Scale spacing inversely with row count to avoid whitespace dominating
+    v_spacing = max(0.02, 0.4 / n_rows) if n_rows > 1 else 0.1
     fig = make_subplots(
         rows=n_rows,
         cols=cols_per_row,
         subplot_titles=subplot_titles,
-        vertical_spacing=0.12,
+        vertical_spacing=v_spacing,
         horizontal_spacing=0.03,
     )
 

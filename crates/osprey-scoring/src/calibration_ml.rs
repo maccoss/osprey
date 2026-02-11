@@ -103,25 +103,13 @@ pub fn train_and_score_calibration(
     );
 
     // DIAGNOSTIC: Compare LDA performance to correlation-only
+    // Note: The LDA training already tracks the best single feature internally
+    // and guarantees the result is at least as good as the best single feature.
     let n_passing_corr_only = compare_to_correlation_only(matches);
     log::info!(
         "  Comparison: Correlation-only would yield {} matches passing 1% FDR (LDA: {})",
         n_passing_corr_only, n_passing
     );
-
-    // SAFETY CHECK: If LDA performs significantly worse than correlation-only, fall back
-    if n_passing_corr_only > 100 && n_passing < n_passing_corr_only / 10 {
-        log::warn!(
-            "LDA yielded {}x fewer matches than correlation-only ({} vs {}) - falling back to correlation scoring",
-            n_passing_corr_only / n_passing.max(1),
-            n_passing,
-            n_passing_corr_only
-        );
-        log::warn!("This suggests LDA learned incorrect feature weights for this dataset");
-
-        // Re-score using correlation only
-        return fallback_to_correlation_only(matches);
-    }
 
     // Log median feature values for diagnostics
     log_median_features(matches, use_isotope_feature);
@@ -205,22 +193,28 @@ fn train_lda_single_model(
     Ok(discriminants)
 }
 
-/// Train LDA with 3-fold cross-validation and non-negative weight constraints
+/// Train LDA with target selection and 3-fold cross-validation
 ///
-/// Follows Mokapot/Percolator methodology:
-/// - 3-fold stratified CV for unbiased FDR estimates
-/// - Non-negative weights applied to each fold (clip and renormalize)
-/// - Peptides grouped by sequence (Percolator-RESET: keeps charge states together)
-/// - Returns out-of-fold predictions for all samples
+/// Uses Percolator-style methodology with best-iteration tracking:
+/// 1. Evaluate all single features, pick the best as baseline
+/// 2. Select high-confidence targets (q < train_fdr) as positive training set
+/// 3. Train LDA on selected targets vs ALL decoys using 3-fold CV
+/// 4. Score all data with consensus weights
+/// 5. Keep the best result across iterations (revert if LDA degrades)
+/// 6. Stop early if 2 consecutive iterations fail to improve
+///
+/// Key insight: iterating with updated target selection causes selection bias
+/// (the LDA drifts weight away from the initial best feature). We cap iterations
+/// and always revert to the best result seen.
 ///
 /// # Arguments
-/// * `features` - Full feature matrix
+/// * `features` - Full feature matrix (normalized)
 /// * `decoy_labels` - Target/decoy labels (true = decoy)
-/// * `sequences` - Peptide sequences (for grouping charge states together)
-/// * `use_isotope_feature` - Whether isotope feature is included (for logging only, not used in features)
+/// * `sequences` - Peptide sequences (for grouping charge states in folds)
+/// * `_use_isotope_feature` - Reserved for future use
 ///
 /// # Returns
-/// Discriminant scores for all samples from cross-validation
+/// Discriminant scores for all samples (from the best iteration)
 fn train_lda_with_nonnegative_cv(
     features: &Matrix,
     decoy_labels: &[bool],
@@ -228,80 +222,111 @@ fn train_lda_with_nonnegative_cv(
     _use_isotope_feature: bool,
 ) -> Result<Vec<f64>, OspreyError> {
     const N_FOLDS: usize = 3;
-    const MAX_ITERATIONS: usize = 10;
-    const CONVERGENCE_THRESHOLD: f64 = 0.2; // CV < 0.2 for all features = converged
+    const MAX_ITERATIONS: usize = 3;
+    const TRAIN_FDR: f64 = 0.01;
+    const MIN_POSITIVE_EXAMPLES: usize = 50;
 
     let n_samples = features.rows;
-    let feature_names = vec!["correlation", "libcosine", "top6", "snr"];
+    let n_features = features.cols;
+    let feature_names = ["correlation", "libcosine", "top6", "snr"];
 
-    // Storage for weights across iterations to check convergence
-    let mut iteration_weights: Vec<Vec<f64>> = Vec::new();
-    let mut best_discriminants = vec![0.0; n_samples];
+    // Create fold assignments (stable across iterations - Percolator-RESET grouping)
+    let fold_assignments = create_stratified_folds_by_peptide(
+        decoy_labels,
+        sequences,
+        N_FOLDS,
+    );
 
-    // Iterate until convergence or max iterations
+    // Find the best single feature to use as baseline (like Percolator)
+    let mut best_feat_idx = 0;
+    let mut best_feat_passing = 0;
+    for feat_idx in 0..n_features {
+        let feat_scores: Vec<f64> = (0..n_samples)
+            .map(|i| features[(i, feat_idx)])
+            .collect();
+        let n_pass = count_passing_targets(&feat_scores, decoy_labels, 0.01);
+        log::info!("  Initial feature '{}': {} pass 1% FDR", feature_names[feat_idx], n_pass);
+        if n_pass > best_feat_passing {
+            best_feat_passing = n_pass;
+            best_feat_idx = feat_idx;
+        }
+    }
+
+    // Initialize with best single feature as both current and best-so-far
+    let baseline_scores: Vec<f64> = (0..n_samples)
+        .map(|i| features[(i, best_feat_idx)])
+        .collect();
+
+    log::info!(
+        "  Baseline: '{}' = {} pass 1% FDR",
+        feature_names[best_feat_idx], best_feat_passing
+    );
+
+    // Best-so-far tracking: always revert to the iteration with the most passing targets
+    let mut best_scores = baseline_scores.clone();
+    let mut best_passing = best_feat_passing;
+    let mut best_iteration = 0; // 0 = baseline
+
+    // Current scores used for target selection in next iteration
+    let mut current_scores = baseline_scores;
+
+    // Track history for logging
+    let mut iteration_passing: Vec<usize> = vec![best_feat_passing];
+    let mut consecutive_no_improve = 0;
+
     for iteration in 0..MAX_ITERATIONS {
-        log::debug!("  === LDA Iteration {}/{} ===", iteration + 1, MAX_ITERATIONS);
-
-        // Create fold indices (stratified by target/decoy, grouped by peptide sequence)
-        // Re-shuffle folds each iteration for robustness
-        let fold_assignments = create_stratified_folds_by_peptide_shuffled(
-            decoy_labels,
-            sequences,
-            N_FOLDS,
-            iteration,
-        );
-
-        // Storage for cross-validated predictions
-        let mut cv_discriminants = vec![0.0; n_samples];
-
-        // Storage for fold weights within this iteration
         let mut fold_weights: Vec<Vec<f64>> = Vec::new();
+        let mut total_selected_targets = 0;
 
-        // Train and predict for each fold
+        // Phase 1: Use CV to estimate stable weights
         for fold_idx in 0..N_FOLDS {
-            // Split into train and test sets
-            let (train_features, test_features, train_labels, test_indices) =
-                split_fold(features, decoy_labels, &fold_assignments, fold_idx);
+            let train_indices: Vec<usize> = (0..n_samples)
+                .filter(|&i| fold_assignments[i] != fold_idx)
+                .collect();
 
-            // Train LDA on training set
+            // Select high-confidence targets from TRAIN set using current scores
+            let selected_target_indices = select_positive_training_set(
+                &current_scores,
+                decoy_labels,
+                &train_indices,
+                TRAIN_FDR,
+                MIN_POSITIVE_EXAMPLES,
+            );
+
+            total_selected_targets += selected_target_indices.len();
+
+            // Collect ALL decoy indices from train set
+            let decoy_indices: Vec<usize> = train_indices.iter()
+                .filter(|&&i| decoy_labels[i])
+                .copied()
+                .collect();
+
+            // Build training set: selected targets + all decoys
+            let mut training_indices = selected_target_indices.clone();
+            training_indices.extend_from_slice(&decoy_indices);
+
+            let train_features = extract_rows(features, &training_indices);
+            let train_labels: Vec<bool> = training_indices.iter()
+                .map(|&i| decoy_labels[i])
+                .collect();
+
+            log::debug!(
+                "    Fold {}/{}: {} selected targets + {} decoys = {} training samples",
+                fold_idx + 1, N_FOLDS,
+                selected_target_indices.len(),
+                decoy_indices.len(),
+                training_indices.len()
+            );
+
+            // Train LDA on clean training set
             let lda = LinearDiscriminantAnalysis::fit(&train_features, &train_labels)
                 .ok_or_else(|| OspreyError::config(
                     format!("LDA training failed on fold {}/{}", fold_idx + 1, N_FOLDS)
                 ))?;
 
-            // Get weights and apply non-negative constraint
-            let mut weights = lda.eigenvector().to_vec();
+            let weights = lda.eigenvector().to_vec();
 
-            // Count negative weights before clipping
-            let n_negative = weights.iter().filter(|&w| *w < 0.0).count();
-            if n_negative > 0 {
-                log::debug!("    Fold {}/{}: Clipping {} negative weights", fold_idx + 1, N_FOLDS, n_negative);
-            }
-
-            // Clip to non-negative
-            for w in weights.iter_mut() {
-                if *w < 0.0 {
-                    *w = 0.0;
-                }
-            }
-
-            // Renormalize to unit length
-            let norm: f64 = weights.iter().map(|w| w * w).sum::<f64>().sqrt();
-            if norm > 1e-10 {
-                for w in weights.iter_mut() {
-                    *w /= norm;
-                }
-            } else {
-                // If all weights were negative, use equal weights
-                log::warn!("    Fold {}/{}: All weights negative - using equal weights", fold_idx + 1, N_FOLDS);
-                let equal_weight = 1.0 / (weights.len() as f64).sqrt();
-                for w in weights.iter_mut() {
-                    *w = equal_weight;
-                }
-            }
-
-            // Log fold weights
-            log::debug!("    Fold {}/{} LDA weights: {}",
+            log::debug!("    Fold {}/{} weights: {}",
                 fold_idx + 1, N_FOLDS,
                 feature_names.iter().enumerate()
                     .map(|(i, name)| format!("{}={:.3}", name, weights[i]))
@@ -309,66 +334,209 @@ fn train_lda_with_nonnegative_cv(
                     .join(", ")
             );
 
-            // Store weights for convergence check within iteration
-            fold_weights.push(weights.clone());
+            fold_weights.push(weights);
+        }
 
-            // Create LDA with non-negative weights
-            let lda_nonneg = LinearDiscriminantAnalysis::from_weights(weights)
-                .map_err(|e| OspreyError::config(e))?;
+        // Phase 2: Average weights across folds → consensus weights
+        let mut consensus_weights = average_weights(&fold_weights);
 
-            // Score test set
-            let fold_predictions = lda_nonneg.predict(&test_features);
-
-            // Store predictions in original order
-            for (i, &original_idx) in test_indices.iter().enumerate() {
-                cv_discriminants[original_idx] = fold_predictions[i];
+        // Clip negative weights to zero (non-negative constraint)
+        let n_negative = consensus_weights.iter().filter(|&&w| w < 0.0).count();
+        if n_negative > 0 {
+            log::debug!("    Clipping {} negative consensus weights to zero", n_negative);
+            for w in consensus_weights.iter_mut() {
+                if *w < 0.0 {
+                    *w = 0.0;
+                }
+            }
+            // Renormalize
+            let norm: f64 = consensus_weights.iter().map(|w| w * w).sum::<f64>().sqrt();
+            if norm > 1e-10 {
+                for w in consensus_weights.iter_mut() {
+                    *w /= norm;
+                }
             }
         }
 
-        // Average weights across folds for this iteration
-        let avg_weights = average_weights(&fold_weights);
-        iteration_weights.push(avg_weights.clone());
+        // Phase 3: Score ALL data with consensus weights
+        let lda_consensus = LinearDiscriminantAnalysis::from_weights(consensus_weights.clone())
+            .map_err(|e| OspreyError::config(e))?;
+        let new_scores = lda_consensus.predict(features);
 
-        // Log iteration summary
-        log::debug!("  Iteration {} avg weights: {}",
+        let n_passing = count_passing_targets(&new_scores, decoy_labels, 0.01);
+
+        log::info!(
+            "  Iteration {}: weights=[{}], selected {} train targets, {} pass 1% FDR",
             iteration + 1,
             feature_names.iter().enumerate()
-                .map(|(i, name)| format!("{}={:.3}", name, avg_weights[i]))
+                .map(|(i, name)| format!("{}={:.3}", name, consensus_weights[i]))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            total_selected_targets / N_FOLDS,
+            n_passing,
         );
 
-        // Store best discriminants from this iteration
-        best_discriminants = cv_discriminants;
+        iteration_passing.push(n_passing);
 
-        // Check convergence across iterations (need at least 2 iterations)
-        if iteration >= 1 {
-            let converged = check_iteration_convergence(&iteration_weights, &feature_names, CONVERGENCE_THRESHOLD);
-            if converged {
-                log::info!("  LDA converged after {} iterations", iteration + 1);
+        // Track best iteration: keep scores from whichever iteration gave the most passing
+        if n_passing > best_passing {
+            best_scores = new_scores.clone();
+            best_passing = n_passing;
+            best_iteration = iteration + 1;
+            consecutive_no_improve = 0;
+            log::info!("    -> New best: {} pass 1% FDR (iteration {})", best_passing, best_iteration);
+        } else {
+            consecutive_no_improve += 1;
+            log::info!(
+                "    -> No improvement (best remains {} from iteration {}, {} consecutive non-improvements)",
+                best_passing, best_iteration, consecutive_no_improve
+            );
+        }
+
+        // Update current scores for next iteration's target selection
+        current_scores = new_scores;
+
+        // Stop early if 2 consecutive iterations didn't improve
+        if consecutive_no_improve >= 2 {
+            log::info!(
+                "  Stopping early: {} consecutive iterations without improvement",
+                consecutive_no_improve
+            );
+            break;
+        }
+    }
+
+    // Log final result
+    log::info!("  Iteration history (pass 1% FDR): {:?}", iteration_passing);
+    log::info!(
+        "  Using iteration {} ({} pass 1% FDR)",
+        best_iteration, best_passing
+    );
+
+    Ok(best_scores)
+}
+
+/// Select high-confidence targets from a subset of data for positive training set
+///
+/// This is the key Percolator/Mokapot innovation: don't train on all targets (noisy),
+/// train only on targets that pass an FDR threshold (clean positive examples).
+///
+/// # Arguments
+/// * `scores` - Current discriminant scores for ALL samples
+/// * `decoy_labels` - Target/decoy labels for ALL samples
+/// * `subset_indices` - Indices of samples to consider (train set)
+/// * `fdr_threshold` - Q-value threshold for selecting targets (e.g., 0.01)
+/// * `min_targets` - Minimum number of targets to select
+///
+/// # Returns
+/// Indices (into the original arrays) of selected high-confidence targets
+fn select_positive_training_set(
+    scores: &[f64],
+    decoy_labels: &[bool],
+    subset_indices: &[usize],
+    fdr_threshold: f64,
+    min_targets: usize,
+) -> Vec<usize> {
+    // Sort subset by score descending
+    let mut sorted_indices: Vec<usize> = subset_indices.to_vec();
+    sorted_indices.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+
+    // Calculate q-values using target-decoy competition within subset
+    let mut targets_so_far = 0usize;
+    let mut decoys_so_far = 0usize;
+    let mut q_values = vec![1.0; sorted_indices.len()];
+
+    for (rank, &idx) in sorted_indices.iter().enumerate() {
+        if decoy_labels[idx] {
+            decoys_so_far += 1;
+        } else {
+            targets_so_far += 1;
+        }
+
+        if targets_so_far > 0 {
+            q_values[rank] = decoys_so_far as f64 / targets_so_far as f64;
+        }
+    }
+
+    // Make q-values monotonically non-decreasing from the bottom
+    let mut min_q = f64::INFINITY;
+    for q in q_values.iter_mut().rev() {
+        if *q < min_q {
+            min_q = *q;
+        } else {
+            *q = min_q;
+        }
+    }
+
+    // Select targets with q < threshold
+    let mut selected: Vec<usize> = Vec::new();
+    for (rank, &idx) in sorted_indices.iter().enumerate() {
+        if !decoy_labels[idx] && q_values[rank] <= fdr_threshold {
+            selected.push(idx);
+        }
+    }
+
+    // If too few, relax threshold progressively
+    if selected.len() < min_targets {
+        let relaxed_thresholds = [0.05, 0.10, 0.25, 0.50];
+        for &threshold in &relaxed_thresholds {
+            selected.clear();
+            for (rank, &idx) in sorted_indices.iter().enumerate() {
+                if !decoy_labels[idx] && q_values[rank] <= threshold {
+                    selected.push(idx);
+                }
+            }
+            if selected.len() >= min_targets {
+                log::debug!("      Relaxed training FDR to {:.0}% to get {} targets", threshold * 100.0, selected.len());
                 break;
             }
         }
     }
 
-    // Final check: warn if didn't converge
-    if iteration_weights.len() >= MAX_ITERATIONS {
-        log::warn!("  LDA did not converge after {} iterations - using final iteration weights", MAX_ITERATIONS);
+    selected
+}
+
+/// Count targets passing a given FDR threshold
+fn count_passing_targets(scores: &[f64], decoy_labels: &[bool], fdr_threshold: f64) -> usize {
+    // Sort by score descending
+    let mut indices: Vec<usize> = (0..scores.len()).collect();
+    indices.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+
+    let mut targets = 0usize;
+    let mut decoys = 0usize;
+    let mut n_passing = 0usize;
+    let mut min_q = f64::INFINITY;
+
+    // Forward pass to compute q-values and count passing
+    let mut q_values = vec![1.0; indices.len()];
+    for (rank, &idx) in indices.iter().enumerate() {
+        if decoy_labels[idx] {
+            decoys += 1;
+        } else {
+            targets += 1;
+        }
+        if targets > 0 {
+            q_values[rank] = decoys as f64 / targets as f64;
+        }
     }
 
-    // Log final consensus weights (average across all iterations)
-    let consensus_weights = average_weights(&iteration_weights);
-    log::info!("  Cross-validated LDA complete ({}-fold, {} iterations, non-negative constraints)",
-        N_FOLDS, iteration_weights.len()
-    );
-    log::info!("  Final model feature weights: {}",
-        feature_names.iter().enumerate()
-            .map(|(i, name)| format!("{}={:.3}", name, consensus_weights[i]))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    // Make monotonic from bottom
+    for q in q_values.iter_mut().rev() {
+        if *q < min_q {
+            min_q = *q;
+        } else {
+            *q = min_q;
+        }
+    }
 
-    Ok(best_discriminants)
+    // Count targets passing
+    for (rank, &idx) in indices.iter().enumerate() {
+        if !decoy_labels[idx] && q_values[rank] <= fdr_threshold {
+            n_passing += 1;
+        }
+    }
+
+    n_passing
 }
 
 /// Average feature weights across multiple models
@@ -402,54 +570,16 @@ fn average_weights(weights_list: &[Vec<f64>]) -> Vec<f64> {
     avg
 }
 
-/// Check convergence of feature weights across iterations
-///
-/// Returns true if all features have CV < threshold across iterations
-fn check_iteration_convergence(
-    iteration_weights: &[Vec<f64>],
-    feature_names: &[&str],
-    threshold: f64,
-) -> bool {
-    if iteration_weights.len() < 2 {
-        return false;
-    }
-
-    let n_features = iteration_weights[0].len();
-    let n_iterations = iteration_weights.len();
-    let mut all_converged = true;
-
-    // Calculate coefficient of variation for each feature across iterations
-    for feat_idx in 0..n_features {
-        let weights: Vec<f64> = iteration_weights.iter().map(|w| w[feat_idx]).collect();
-        let mean = weights.iter().sum::<f64>() / n_iterations as f64;
-        let variance = weights.iter().map(|w| (w - mean).powi(2)).sum::<f64>() / n_iterations as f64;
-        let std_dev = variance.sqrt();
-        let cv = if mean > 1e-10 { std_dev / mean } else { 0.0 };
-
-        if cv > threshold && mean > 0.05 {
-            all_converged = false;
-            log::debug!(
-                "    Feature '{}' not yet converged: CV={:.3} (threshold={:.2})",
-                feature_names[feat_idx], cv, threshold
-            );
-        }
-    }
-
-    all_converged
-}
-
-/// Create stratified fold assignments for cross-validation with shuffling
+/// Create stratified fold assignments for cross-validation
 ///
 /// Implements Percolator-RESET approach:
 /// - Groups PSMs by peptide sequence (keeps charge states together)
 /// - Stratified by target/decoy to maintain class balance
-/// - Shuffles fold assignments based on iteration for robustness
-/// - Minimizes leakage between folds
-fn create_stratified_folds_by_peptide_shuffled(
+/// - Deterministic assignment for stability across iterations
+fn create_stratified_folds_by_peptide(
     labels: &[bool],
     sequences: &[String],
     n_folds: usize,
-    iteration: usize,
 ) -> Vec<usize> {
     use std::collections::HashMap;
 
@@ -461,9 +591,9 @@ fn create_stratified_folds_by_peptide_shuffled(
 
     for (i, (seq, &is_decoy)) in sequences.iter().zip(labels).enumerate() {
         if is_decoy {
-            decoy_peptides.entry(seq.clone()).or_insert_with(Vec::new).push(i);
+            decoy_peptides.entry(seq.clone()).or_default().push(i);
         } else {
-            target_peptides.entry(seq.clone()).or_insert_with(Vec::new).push(i);
+            target_peptides.entry(seq.clone()).or_default().push(i);
         }
     }
 
@@ -471,31 +601,27 @@ fn create_stratified_folds_by_peptide_shuffled(
     let mut target_groups: Vec<(String, Vec<usize>)> = target_peptides.into_iter().collect();
     let mut decoy_groups: Vec<(String, Vec<usize>)> = decoy_peptides.into_iter().collect();
 
-    // Sort by sequence for deterministic ordering
     target_groups.sort_by(|a, b| a.0.cmp(&b.0));
     decoy_groups.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Assign target peptide groups to folds with rotation based on iteration
-    // This changes fold assignments each iteration while keeping peptides together
+    // Assign peptide groups to folds round-robin
     for (i, (_seq, indices)) in target_groups.iter().enumerate() {
-        let fold = (i + iteration) % n_folds;
+        let fold = i % n_folds;
         for &idx in indices {
             fold_assignments[idx] = fold;
         }
     }
 
-    // Assign decoy peptide groups to folds with rotation
     for (i, (_seq, indices)) in decoy_groups.iter().enumerate() {
-        let fold = (i + iteration) % n_folds;
+        let fold = i % n_folds;
         for &idx in indices {
             fold_assignments[idx] = fold;
         }
     }
 
     log::debug!(
-        "    Created {} folds (iteration {}): {} target peptides ({} PSMs), {} decoy peptides ({} PSMs)",
+        "  Created {} folds: {} target peptides ({} PSMs), {} decoy peptides ({} PSMs)",
         n_folds,
-        iteration + 1,
         target_groups.len(),
         target_groups.iter().map(|(_, v)| v.len()).sum::<usize>(),
         decoy_groups.len(),
@@ -503,43 +629,6 @@ fn create_stratified_folds_by_peptide_shuffled(
     );
 
     fold_assignments
-}
-
-/// Split data into train and test sets for a specific fold
-///
-/// # Returns
-/// (train_features, test_features, train_labels, test_indices)
-fn split_fold(
-    features: &Matrix,
-    labels: &[bool],
-    fold_assignments: &[usize],
-    test_fold: usize,
-) -> (Matrix, Matrix, Vec<bool>, Vec<usize>) {
-    let mut train_rows = Vec::new();
-    let mut test_rows = Vec::new();
-    let mut train_labels = Vec::new();
-    let mut test_indices = Vec::new();
-
-    for (i, &fold) in fold_assignments.iter().enumerate() {
-        if fold == test_fold {
-            test_rows.push(i);
-            test_indices.push(i);
-        } else {
-            train_rows.push(i);
-            train_labels.push(labels[i]);
-        }
-    }
-
-    // Extract rows for train and test sets
-    let train_features = extract_rows(features, &train_rows);
-    let test_features = extract_rows(features, &test_rows);
-
-    log::debug!(
-        "  Fold {}: {} train, {} test",
-        test_fold + 1, train_rows.len(), test_rows.len()
-    );
-
-    (train_features, test_features, train_labels, test_indices)
 }
 
 /// Extract specific rows from a matrix
@@ -586,34 +675,6 @@ fn extract_feature_matrix(matches: &[CalibrationMatch], _use_isotope_feature: bo
         .collect();
 
     Matrix::new(features, matches.len(), n_features)
-}
-
-/// Fall back to correlation-only scoring when LDA fails
-///
-/// Sorts by correlation, calculates q-values, and updates match scores
-fn fallback_to_correlation_only(matches: &mut [CalibrationMatch]) -> Result<usize, OspreyError> {
-    // Sort by correlation_score descending
-    matches.sort_by(|a, b| b.correlation_score.total_cmp(&a.correlation_score));
-
-    // Build is_decoy array
-    let is_decoy: Vec<bool> = matches.iter().map(|m| m.is_decoy).collect();
-
-    // Calculate q-values
-    let mut q_values = vec![0.0; matches.len()];
-    let n_passing = qvalue::calculate_q_values(&is_decoy, &mut q_values);
-
-    // Update matches with correlation-based scores and q-values
-    for (i, m) in matches.iter_mut().enumerate() {
-        m.discriminant_score = m.correlation_score; // Use correlation as discriminant
-        m.q_value = q_values[i];
-    }
-
-    log::info!(
-        "Correlation-only scoring: {} matches passing 1% FDR",
-        n_passing
-    );
-
-    Ok(n_passing)
 }
 
 /// Compare LDA performance to correlation-only scoring
@@ -756,16 +817,21 @@ mod tests {
     #[test]
     fn test_lda_training() {
         // Create synthetic data: targets have higher scores
+        // Use distinct sequences so fold assignment distributes across folds
         let mut matches = vec![];
 
-        // 10 good targets
-        for _ in 0..10 {
-            matches.push(make_test_match(4.0, 0.9, 6, 15.0, Some(0.95), false));
+        // 10 good targets with distinct sequences
+        for i in 0..10 {
+            let mut m = make_test_match(4.0, 0.9, 6, 15.0, Some(0.95), false);
+            m.sequence = format!("TARGET{}", i);
+            matches.push(m);
         }
 
-        // 10 poor decoys
-        for _ in 0..10 {
-            matches.push(make_test_match(1.0, 0.3, 2, 3.0, Some(0.5), true));
+        // 10 poor decoys with distinct sequences
+        for i in 0..10 {
+            let mut m = make_test_match(1.0, 0.3, 2, 3.0, Some(0.5), true);
+            m.sequence = format!("DECOY{}", i);
+            matches.push(m);
         }
 
         let result = train_and_score_calibration(&mut matches, true);
