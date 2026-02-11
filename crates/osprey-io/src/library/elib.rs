@@ -106,10 +106,16 @@ impl ElibLoader {
             .map_err(|e| OspreyError::LibraryLoadError(format!("Query error: {}", e)))?;
 
         for row_result in rows {
-            let (peptide_mod_seq, precursor_charge, precursor_mz, rt_seconds, protein, mass_array, intensity_array) =
-                row_result.map_err(|e| {
-                    OspreyError::LibraryLoadError(format!("Row read error: {}", e))
-                })?;
+            let (
+                peptide_mod_seq,
+                precursor_charge,
+                precursor_mz,
+                rt_seconds,
+                protein,
+                mass_array,
+                intensity_array,
+            ) = row_result
+                .map_err(|e| OspreyError::LibraryLoadError(format!("Row read error: {}", e)))?;
 
             // Parse sequence and modifications
             let (sequence, modifications) = parse_modified_sequence(&peptide_mod_seq)?;

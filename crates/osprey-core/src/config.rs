@@ -141,9 +141,8 @@ impl OspreyConfig {
 
     /// Save configuration to a YAML file
     pub fn to_yaml<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content = serde_yaml::to_string(self).map_err(|e| {
-            OspreyError::ConfigError(format!("Failed to serialize config: {}", e))
-        })?;
+        let content = serde_yaml::to_string(self)
+            .map_err(|e| OspreyError::ConfigError(format!("Failed to serialize config: {}", e)))?;
 
         fs::write(path.as_ref(), content).map_err(|e| {
             OspreyError::ConfigError(format!(
@@ -156,9 +155,8 @@ impl OspreyConfig {
 
     /// Convert configuration to YAML string
     pub fn to_yaml_string(&self) -> Result<String> {
-        serde_yaml::to_string(self).map_err(|e| {
-            OspreyError::ConfigError(format!("Failed to serialize config: {}", e))
-        })
+        serde_yaml::to_string(self)
+            .map_err(|e| OspreyError::ConfigError(format!("Failed to serialize config: {}", e)))
     }
 
     /// Create a template configuration file with comments
@@ -232,10 +230,7 @@ export_coefficients: false  # Export coefficient time series to parquet
 "#;
 
         fs::write(path.as_ref(), template).map_err(|e| {
-            OspreyError::ConfigError(format!(
-                "Failed to write template config: {}",
-                e
-            ))
+            OspreyError::ConfigError(format!("Failed to write template config: {}", e))
         })
     }
 
@@ -528,7 +523,7 @@ pub enum ToleranceUnit {
     /// Parts per million (relative to m/z)
     Ppm,
     /// m/z units (Thomson, Th) - absolute tolerance in mass-to-charge
-    #[serde(alias = "Da")]  // Accept "Da" for backwards compatibility
+    #[serde(alias = "Da")] // Accept "Da" for backwards compatibility
     Mz,
 }
 
@@ -738,7 +733,10 @@ mod tests {
 
         // Verify it's valid YAML that can be parsed back
         let parsed: OspreyConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(parsed.rt_calibration.fallback_rt_tolerance, config.rt_calibration.fallback_rt_tolerance);
+        assert_eq!(
+            parsed.rt_calibration.fallback_rt_tolerance,
+            config.rt_calibration.fallback_rt_tolerance
+        );
         assert_eq!(parsed.run_fdr, config.run_fdr);
     }
 
@@ -803,7 +801,7 @@ mod tests {
         assert!((config.tolerance_da(1000.0) - 0.3).abs() < 1e-10);
 
         // Test within_tolerance
-        assert!(config.within_tolerance(500.0, 500.29));  // 0.29 Da
+        assert!(config.within_tolerance(500.0, 500.29)); // 0.29 Da
         assert!(!config.within_tolerance(500.0, 500.31)); // 0.31 Da
 
         // Test mass_error calculation

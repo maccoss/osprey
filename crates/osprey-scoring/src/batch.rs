@@ -27,7 +27,10 @@ extern crate openblas_src;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::{Array1, Array2};
-use osprey_core::{FragmentToleranceConfig, IsotopeEnvelope, LibraryEntry, LibraryFragment, MS1Spectrum, Spectrum, peptide_isotope_cosine};
+use osprey_core::{
+    peptide_isotope_cosine, FragmentToleranceConfig, IsotopeEnvelope, LibraryEntry,
+    LibraryFragment, MS1Spectrum, Spectrum,
+};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -679,7 +682,11 @@ impl BatchScorer {
     }
 
     /// Preprocess a library for batch scoring with logging context
-    pub fn preprocess_library_with_context(&self, entries: &[LibraryEntry], context: Option<&str>) -> PreprocessedLibrary {
+    pub fn preprocess_library_with_context(
+        &self,
+        entries: &[LibraryEntry],
+        context: Option<&str>,
+    ) -> PreprocessedLibrary {
         PreprocessedLibrary::from_entries_with_config_and_context(
             entries,
             self.num_bins,
@@ -695,7 +702,11 @@ impl BatchScorer {
     }
 
     /// Preprocess spectra for batch scoring with logging context
-    pub fn preprocess_spectra_with_context(&self, spectra: &[Spectrum], context: Option<&str>) -> PreprocessedSpectra {
+    pub fn preprocess_spectra_with_context(
+        &self,
+        spectra: &[Spectrum],
+        context: Option<&str>,
+    ) -> PreprocessedSpectra {
         PreprocessedSpectra::from_spectra_with_config_and_context(
             spectra,
             self.num_bins,
@@ -749,10 +760,8 @@ impl BatchScorer {
             .enumerate()
             .filter_map(|(lib_row, &entry_id)| {
                 let row = scores.row(lib_row);
-                let (best_col, &best_score) = row
-                    .iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))?;
+                let (best_col, &best_score) =
+                    row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
 
                 if best_score > 0.0 {
                     let spec_idx = spectra.spectrum_indices[best_col];
@@ -846,7 +855,7 @@ impl BatchScorer {
             .map(|(row, &score)| {
                 let spec_idx = spectra.spectrum_indices[row];
                 let rt = spectra.retention_times[row];
-                (spec_idx, score as f64, rt)  // Cast f32 score to f64 for API compatibility
+                (spec_idx, score as f64, rt) // Cast f32 score to f64 for API compatibility
             })
             .collect();
 
@@ -941,9 +950,9 @@ pub struct CalibrationMatch {
 /// # Returns
 /// E-value (lower is better, represents expected random matches at this score level)
 pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_xcorr: f64) -> f64 {
-    const BAD_EVALUE: f64 = 999.0;  // Comet's sentinel for bad fits
-    const HISTO_SIZE: usize = 152;  // Same as Comet
-    const MIN_POINTS_FOR_FIT: usize = 10;  // Need reasonable number for stable fit
+    const BAD_EVALUE: f64 = 999.0; // Comet's sentinel for bad fits
+    const HISTO_SIZE: usize = 152; // Same as Comet
+    const MIN_POINTS_FOR_FIT: usize = 10; // Need reasonable number for stable fit
 
     // Need enough scores for a meaningful distribution
     if all_xcorr_scores.len() < MIN_POINTS_FOR_FIT {
@@ -963,7 +972,7 @@ pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_x
             if bin < HISTO_SIZE {
                 histogram[bin] += 1;
             } else {
-                histogram[HISTO_SIZE - 1] += 1;  // Cap at max bin
+                histogram[HISTO_SIZE - 1] += 1; // Cap at max bin
             }
         }
     }
@@ -1059,7 +1068,7 @@ pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_x
     let mean_y = sum_y / n_points as f64;
 
     // Calculate slope and intercept
-    let mut sx = 0.0f64;  // Sum of squared deviations
+    let mut sx = 0.0f64; // Sum of squared deviations
     let mut sxy = 0.0f64; // Sum of cross products
 
     for i in start_corr..=next_corr {
@@ -1075,8 +1084,8 @@ pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_x
         return BAD_EVALUE;
     }
 
-    let slope = sxy / sx;  // b in log10(cumulative) = a + b * bin_index
-    let intercept = mean_y - slope * mean_x;  // a
+    let slope = sxy / sx; // b in log10(cumulative) = a + b * bin_index
+    let intercept = mean_y - slope * mean_x; // a
 
     // Comet checks: if slope >= 0, the fit is bad (we expect negative slope)
     // Higher bins should have fewer matches, so slope should be negative
@@ -1113,7 +1122,11 @@ pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_x
 ///
 /// **Important**: scale must be FIXED (not derived from per-peptide data) to preserve
 /// discrimination between targets and decoys.
-pub fn calculate_evalue_from_score_distribution(all_scores: &[f64], best_score: f64, scale: f64) -> f64 {
+pub fn calculate_evalue_from_score_distribution(
+    all_scores: &[f64],
+    best_score: f64,
+    scale: f64,
+) -> f64 {
     const BAD_EVALUE: f64 = 999.0;
     const HISTO_SIZE: usize = 152;
     const MIN_POINTS_FOR_FIT: usize = 10;
@@ -1442,15 +1455,17 @@ pub fn sample_library_for_calibration(
     let decoys: Vec<&LibraryEntry> = library.iter().filter(|e| e.is_decoy).collect();
 
     if targets.len() <= sample_size {
-        log::debug!("Library has {} targets, using all (sample_size={})", targets.len(), sample_size);
+        log::debug!(
+            "Library has {} targets, using all (sample_size={})",
+            targets.len(),
+            sample_size
+        );
         return library.to_vec();
     }
 
     // Build target_id → decoy map (decoy_id = target_id | 0x80000000)
-    let decoy_map: HashMap<u32, &LibraryEntry> = decoys
-        .iter()
-        .map(|d| (d.id & 0x7FFFFFFF, *d))
-        .collect();
+    let decoy_map: HashMap<u32, &LibraryEntry> =
+        decoys.iter().map(|d| (d.id & 0x7FFFFFFF, *d)).collect();
 
     // 2D stratified sampling: divide RT × m/z space into a grid
     // Use ~sqrt(sample_size)/2 bins per axis for good 2D coverage
@@ -1479,11 +1494,16 @@ pub fn sample_library_for_calibration(
     }
 
     // Count non-empty cells and compute per-cell quota
-    let n_occupied: usize = grid.iter()
+    let n_occupied: usize = grid
+        .iter()
         .flat_map(|row| row.iter())
         .filter(|cell| !cell.is_empty())
         .count();
-    let per_cell = if n_occupied > 0 { sample_size / n_occupied } else { 1 };
+    let per_cell = if n_occupied > 0 {
+        sample_size / n_occupied
+    } else {
+        1
+    };
     let per_cell = per_cell.max(1);
 
     // Deterministic stride sampling from each cell
@@ -1584,17 +1604,13 @@ pub fn group_spectra_by_isolation_window(spectra: &[Spectrum]) -> Vec<((f64, f64
         let lower_key = (iso.lower_bound() * 10.0) as i64;
         let upper_key = (iso.upper_bound() * 10.0) as i64;
 
-        windows.entry((lower_key, upper_key))
-            .or_default()
-            .push(idx);
+        windows.entry((lower_key, upper_key)).or_default().push(idx);
     }
 
     // Convert back to f64 windows with spectrum indices
     windows
         .into_iter()
-        .map(|((lower, upper), indices)| {
-            ((lower as f64 / 10.0, upper as f64 / 10.0), indices)
-        })
+        .map(|((lower, upper), indices)| ((lower as f64 / 10.0, upper as f64 / 10.0), indices))
         .collect()
 }
 
@@ -1665,10 +1681,13 @@ pub fn run_windowed_calibration_scoring(
 
             // Preprocess only the entries in this window
             let scorer = BatchScorer::new();
-            let cloned_entries: Vec<LibraryEntry> = window_entries.iter().map(|e| (*e).clone()).collect();
+            let cloned_entries: Vec<LibraryEntry> =
+                window_entries.iter().map(|e| (*e).clone()).collect();
             let window_context = format!("window {:.1}-{:.1} m/z", lower, upper);
-            let preprocessed_library = scorer.preprocess_library_with_context(&cloned_entries, Some(&window_context));
-            let preprocessed_spectra = scorer.preprocess_spectra_with_context(&window_spectra, Some(&window_context));
+            let preprocessed_library =
+                scorer.preprocess_library_with_context(&cloned_entries, Some(&window_context));
+            let preprocessed_spectra =
+                scorer.preprocess_spectra_with_context(&window_spectra, Some(&window_context));
 
             // Get library RTs in the same order as preprocessed rows
             let library_rts: Vec<f64> = preprocessed_library
@@ -1699,9 +1718,8 @@ pub fn run_windowed_calibration_scoring(
                     };
 
                     // Calculate MS1 error in configured unit (ppm for HRAM, Th for unit resolution)
-                    let ms1_error = observed_precursor_mz.map(|obs_mz| {
-                        fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
-                    });
+                    let ms1_error = observed_precursor_mz
+                        .map(|obs_mz| fragment_tolerance.mass_error(entry.precursor_mz, obs_mz));
 
                     // Get scan number from spectrum
                     let scan_number = if spec_idx < window_spectra.len() {
@@ -1797,7 +1815,10 @@ pub fn run_calibration_scoring(
     let scorer = BatchScorer::new();
 
     // Preprocess library and spectra
-    log::info!("Preprocessing {} library entries for batch scoring", library.len());
+    log::info!(
+        "Preprocessing {} library entries for batch scoring",
+        library.len()
+    );
     let preprocessed_library = scorer.preprocess_library(library);
 
     log::info!("Preprocessing {} spectra for batch scoring", spectra.len());
@@ -1807,7 +1828,12 @@ pub fn run_calibration_scoring(
     let library_rts: Vec<f64> = preprocessed_library
         .entry_ids
         .iter()
-        .filter_map(|id| library.iter().find(|e| e.id == *id).map(|e| e.retention_time))
+        .filter_map(|id| {
+            library
+                .iter()
+                .find(|e| e.id == *id)
+                .map(|e| e.retention_time)
+        })
         .collect();
 
     log::info!(
@@ -1841,9 +1867,8 @@ pub fn run_calibration_scoring(
             };
 
             // Calculate MS1 error in configured unit (ppm for HRAM, Th for unit resolution)
-            let ms1_error = observed_precursor_mz.map(|obs_mz| {
-                fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
-            });
+            let ms1_error = observed_precursor_mz
+                .map(|obs_mz| fragment_tolerance.mass_error(entry.precursor_mz, obs_mz));
 
             // Get scan number from spectrum
             let scan_number = if spec_idx < spectra.len() {
@@ -1955,12 +1980,8 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
         window_groups.len(),
         ms1_available
     );
-    log::info!(
-        "  - XCorr: unit resolution bins (2001 bins) for all data types"
-    );
-    log::info!(
-        "  - E-value: Comet-style survival function from XCorr distribution"
-    );
+    log::info!("  - XCorr: unit resolution bins (2001 bins) for all data types");
+    log::info!("  - E-value: Comet-style survival function from XCorr distribution");
 
     // Always use unit resolution bins for calibration XCorr (fast: 2001 bins vs 100K for HRAM)
     let xcorr_scorer = SpectralScorer::new();
@@ -1996,10 +2017,8 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                 }
 
                 // Extract spectra for this window
-                let window_spectra: Vec<&Spectrum> = spectrum_indices
-                    .iter()
-                    .map(|&idx| &spectra[idx])
-                    .collect();
+                let window_spectra: Vec<&Spectrum> =
+                    spectrum_indices.iter().map(|&idx| &spectra[idx]).collect();
 
                 if window_spectra.is_empty() {
                     return Vec::new();
@@ -2052,8 +2071,8 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                     // Score against spectra that passed RT + top3 filters
                     let mut all_xcorr_scores: Vec<f64> = Vec::new();
                     let mut best_xcorr = 0.0f64;
-                    let mut best_local_idx = 0usize;  // Index into window_spectra
-                    let mut best_spec_idx = 0usize;   // Index into global spectra
+                    let mut best_local_idx = 0usize; // Index into window_spectra
+                    let mut best_spec_idx = 0usize; // Index into global spectra
                     let mut best_measured_rt = 0.0f64;
 
                     for &local_idx in &candidate_indices {
@@ -2089,28 +2108,33 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                         let n_matched = ms2_errors.len();
 
                         // Extract M+0 from MS1 spectrum (pyXcorrDIA approach)
-                        let (ms1_error, observed_precursor_mz, isotope_cosine_score) = if let Some(ms1_spec) = ms1.find_nearest(best_measured_rt) {
-                            let envelope = IsotopeEnvelope::extract(
-                                ms1_spec,
-                                entry.precursor_mz,
-                                entry.charge,
-                                precursor_tolerance_ppm,
-                            );
+                        let (ms1_error, observed_precursor_mz, isotope_cosine_score) =
+                            if let Some(ms1_spec) = ms1.find_nearest(best_measured_rt) {
+                                let envelope = IsotopeEnvelope::extract(
+                                    ms1_spec,
+                                    entry.precursor_mz,
+                                    entry.charge,
+                                    precursor_tolerance_ppm,
+                                );
 
-                            if envelope.has_m0() {
-                                let isotope_score = peptide_isotope_cosine(&entry.sequence, &envelope.intensities);
-                                let error = envelope.m0_observed_mz.map(|obs_mz| {
-                                    fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
-                                });
-                                (error, envelope.m0_observed_mz, isotope_score)
+                                if envelope.has_m0() {
+                                    let isotope_score = peptide_isotope_cosine(
+                                        &entry.sequence,
+                                        &envelope.intensities,
+                                    );
+                                    let error = envelope.m0_observed_mz.map(|obs_mz| {
+                                        fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
+                                    });
+                                    (error, envelope.m0_observed_mz, isotope_score)
+                                } else {
+                                    (None, None, None)
+                                }
                             } else {
-                                (None, None, None)
-                            }
-                        } else {
-                            let iso_center = spectra[best_spec_idx].isolation_window.center;
-                            let error = fragment_tolerance.mass_error(entry.precursor_mz, iso_center);
-                            (Some(error), Some(iso_center), None)
-                        };
+                                let iso_center = spectra[best_spec_idx].isolation_window.center;
+                                let error =
+                                    fragment_tolerance.mass_error(entry.precursor_mz, iso_center);
+                                (Some(error), Some(iso_center), None)
+                            };
 
                         let avg_ms2_error = if !ms2_errors.is_empty() {
                             Some(ms2_errors.iter().sum::<f64>() / ms2_errors.len() as f64)
@@ -2118,7 +2142,8 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                             None
                         };
 
-                        let evalue = calculate_evalue_from_xcorr_distribution(&all_xcorr_scores, best_xcorr);
+                        let evalue =
+                            calculate_evalue_from_xcorr_distribution(&all_xcorr_scores, best_xcorr);
 
                         window_matches.push(CalibrationMatch {
                             entry_id: entry.id,
@@ -2174,10 +2199,8 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                     return Vec::new();
                 }
 
-                let window_spectra: Vec<&Spectrum> = spectrum_indices
-                    .iter()
-                    .map(|&idx| &spectra[idx])
-                    .collect();
+                let window_spectra: Vec<&Spectrum> =
+                    spectrum_indices.iter().map(|&idx| &spectra[idx]).collect();
 
                 if window_spectra.is_empty() {
                     return Vec::new();
@@ -2263,7 +2286,8 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                         );
                         let n_matched = ms2_errors.len();
 
-                        let observed_precursor_mz = Some(spectra[best_spec_idx].isolation_window.center);
+                        let observed_precursor_mz =
+                            Some(spectra[best_spec_idx].isolation_window.center);
                         let ms1_error = observed_precursor_mz.map(|obs_mz| {
                             fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
                         });
@@ -2274,7 +2298,8 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                             None
                         };
 
-                        let evalue = calculate_evalue_from_xcorr_distribution(&all_xcorr_scores, best_xcorr);
+                        let evalue =
+                            calculate_evalue_from_xcorr_distribution(&all_xcorr_scores, best_xcorr);
 
                         window_matches.push(CalibrationMatch {
                             entry_id: entry.id,
@@ -2346,11 +2371,19 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
     // Calculate median XCorr and E-value for summary
     let mut xcorrs: Vec<f64> = results.iter().map(|m| m.xcorr_score).collect();
     xcorrs.sort_by(|a, b| a.total_cmp(b));
-    let median_xcorr = if xcorrs.is_empty() { 0.0 } else { xcorrs[xcorrs.len() / 2] };
+    let median_xcorr = if xcorrs.is_empty() {
+        0.0
+    } else {
+        xcorrs[xcorrs.len() / 2]
+    };
 
     let mut evalues: Vec<f64> = results.iter().map(|m| m.evalue).collect();
     evalues.sort_by(|a, b| a.total_cmp(b));
-    let median_evalue = if evalues.is_empty() { 1.0 } else { evalues[evalues.len() / 2] };
+    let median_evalue = if evalues.is_empty() {
+        1.0
+    } else {
+        evalues[evalues.len() / 2]
+    };
 
     log::info!(
         "Scoring complete: {} matches ({} targets, {} decoys)",
@@ -2391,7 +2424,12 @@ fn count_top6_matched_at_apex(
     let mut count = 0u8;
     for &idx in &top6_indices {
         let lib_mz = library_fragments[idx].mz;
-        if super::has_match_within_tolerance(lib_mz, spectrum_mzs, tolerance.tolerance, tolerance.unit) {
+        if super::has_match_within_tolerance(
+            lib_mz,
+            spectrum_mzs,
+            tolerance.tolerance,
+            tolerance.unit,
+        ) {
             count += 1;
         }
     }
@@ -2456,11 +2494,7 @@ fn calculate_signal_to_noise(
     }
     // Take last 5 points on left side
     if background_intensities.len() > 5 {
-        background_intensities = background_intensities
-            .into_iter()
-            .rev()
-            .take(5)
-            .collect();
+        background_intensities = background_intensities.into_iter().rev().take(5).collect();
     }
 
     // Right side: 3-5 points after right boundary
@@ -2532,12 +2566,15 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
     log::info!(
         "  - Fragment co-elution: top-6 XIC correlation ({} {} tolerance)",
         fragment_tolerance.tolerance,
-        match fragment_tolerance.unit { osprey_core::ToleranceUnit::Ppm => "ppm", osprey_core::ToleranceUnit::Mz => "Th" }
+        match fragment_tolerance.unit {
+            osprey_core::ToleranceUnit::Ppm => "ppm",
+            osprey_core::ToleranceUnit::Mz => "Th",
+        }
     );
 
     let tol_da = match fragment_tolerance.unit {
         osprey_core::ToleranceUnit::Mz => fragment_tolerance.tolerance,
-        osprey_core::ToleranceUnit::Ppm => 0.0,  // ppm computed per-fragment
+        osprey_core::ToleranceUnit::Ppm => 0.0, // ppm computed per-fragment
     };
     let tol_ppm = match fragment_tolerance.unit {
         osprey_core::ToleranceUnit::Ppm => fragment_tolerance.tolerance,
@@ -2566,13 +2603,8 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
         }
 
         // Extract XICs for top 6 fragments
-        let xics = super::extract_fragment_xics(
-            &entry.fragments,
-            candidate_spectra,
-            tol_da,
-            tol_ppm,
-            6,
-        );
+        let xics =
+            super::extract_fragment_xics(&entry.fragments, candidate_spectra, tol_da, tol_ppm, 6);
 
         if xics.len() < 2 {
             return None; // Need at least 2 fragment XICs for co-elution
@@ -2647,8 +2679,8 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
         let apex_intensity = *apex_intensity;
 
         // Calculate signal-to-noise ratio from reference XIC
-        let signal_to_noise = calculate_signal_to_noise(&ref_xic, apex_local_idx, apex_intensity)
-            .unwrap_or(0.0);
+        let signal_to_noise =
+            calculate_signal_to_noise(&ref_xic, apex_local_idx, apex_intensity).unwrap_or(0.0);
 
         // Find the spectrum closest to apex for mass errors and scan number
         let apex_spec_local_idx = candidate_spectra
@@ -2681,7 +2713,8 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
         };
 
         // MS1 extraction
-        let (ms1_error, observed_precursor_mz, isotope_cosine_score) = if let Some(ms1) = ms1_index {
+        let (ms1_error, observed_precursor_mz, isotope_cosine_score) = if let Some(ms1) = ms1_index
+        {
             if let Some(ms1_spec) = ms1.find_nearest(apex_rt) {
                 let envelope = IsotopeEnvelope::extract(
                     ms1_spec,
@@ -2690,10 +2723,11 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
                     precursor_tolerance_ppm,
                 );
                 if envelope.has_m0() {
-                    let isotope_score = peptide_isotope_cosine(&entry.sequence, &envelope.intensities);
-                    let error = envelope.m0_observed_mz.map(|obs_mz| {
-                        fragment_tolerance.mass_error(entry.precursor_mz, obs_mz)
-                    });
+                    let isotope_score =
+                        peptide_isotope_cosine(&entry.sequence, &envelope.intensities);
+                    let error = envelope
+                        .m0_observed_mz
+                        .map(|obs_mz| fragment_tolerance.mass_error(entry.precursor_mz, obs_mz));
                     (error, envelope.m0_observed_mz, isotope_score)
                 } else {
                     (None, None, None)
@@ -2717,15 +2751,13 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
         let libcosine_apex = libcosine_scorer.calculate_score(&match_result);
 
         // 2. Count top-6 matched ions at apex
-        let top6_matched_apex = count_top6_matched_at_apex(
-            &entry.fragments,
-            &apex_spec.mzs,
-            fragment_tolerance,
-        );
+        let top6_matched_apex =
+            count_top6_matched_at_apex(&entry.fragments, &apex_spec.mzs, fragment_tolerance);
 
         // 3. Hyperscore at apex
         // Convert intensities from f32 to f64 for hyperscore calculation
-        let apex_intensities_f64: Vec<f64> = apex_spec.intensities.iter().map(|&x| x as f64).collect();
+        let apex_intensities_f64: Vec<f64> =
+            apex_spec.intensities.iter().map(|&x| x as f64).collect();
         let hyperscore_result = super::compute_hyperscore(
             &entry.fragments,
             &apex_spec.mzs,
@@ -2764,8 +2796,8 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             hyperscore_apex: hyperscore_result.score,
             signal_to_noise,
             discriminant_score: coelution_sum, // Initially use correlation, will be replaced by LDA
-            posterior_error: 0.0,               // Will be filled by LDA
-            q_value: 1.0,                       // Will be filled by LDA
+            posterior_error: 0.0,              // Will be filled by LDA
+            q_value: 1.0,                      // Will be filled by LDA
         })
     };
 
@@ -2782,10 +2814,8 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
                 return Vec::new();
             }
 
-            let window_spectra: Vec<&Spectrum> = spectrum_indices
-                .iter()
-                .map(|&idx| &spectra[idx])
-                .collect();
+            let window_spectra: Vec<&Spectrum> =
+                spectrum_indices.iter().map(|&idx| &spectra[idx]).collect();
 
             if window_spectra.is_empty() {
                 return Vec::new();
@@ -2820,10 +2850,18 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
 
                 // Sort by RT for XIC extraction
                 let mut sorted_pairs = candidate_pairs;
-                sorted_pairs.sort_by(|a, b| a.1.retention_time.partial_cmp(&b.1.retention_time).unwrap_or(std::cmp::Ordering::Equal));
+                sorted_pairs.sort_by(|a, b| {
+                    a.1.retention_time
+                        .partial_cmp(&b.1.retention_time)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
 
-                let candidate_spectra: Vec<&Spectrum> = sorted_pairs.iter().map(|(_, s)| *s).collect();
-                let candidate_global_indices: Vec<usize> = sorted_pairs.iter().map(|(local_idx, _)| spectrum_indices[*local_idx]).collect();
+                let candidate_spectra: Vec<&Spectrum> =
+                    sorted_pairs.iter().map(|(_, s)| *s).collect();
+                let candidate_global_indices: Vec<usize> = sorted_pairs
+                    .iter()
+                    .map(|(local_idx, _)| spectrum_indices[*local_idx])
+                    .collect();
 
                 if let Some(m) = score_entry(entry, &candidate_spectra, &candidate_global_indices) {
                     window_matches.push(m);
@@ -2862,7 +2900,11 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
 
     let mut scores: Vec<f64> = results.iter().map(|m| m.score).collect();
     scores.sort_by(|a, b| a.total_cmp(b));
-    let median_score = if scores.is_empty() { 0.0 } else { scores[scores.len() / 2] };
+    let median_score = if scores.is_empty() {
+        0.0
+    } else {
+        scores[scores.len() / 2]
+    };
 
     log::info!(
         "Scoring complete: {} matches ({} targets, {} decoys)",
@@ -2870,10 +2912,7 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
         targets,
         decoys
     );
-    log::info!(
-        "  - Median co-elution score: {:.3}",
-        median_score,
-    );
+    log::info!("  - Median co-elution score: {:.3}", median_score,);
     log::info!(
         "  - MS1 calibrated: {}, Total MS2 fragment matches: {}",
         ms1_calibrated,
@@ -2888,7 +2927,12 @@ mod tests {
     use super::*;
     use osprey_core::{FragmentAnnotation, IsolationWindow, LibraryFragment};
 
-    fn make_test_library_entry(id: u32, mz: f64, rt: f64, fragments: Vec<(f64, f32)>) -> LibraryEntry {
+    fn make_test_library_entry(
+        id: u32,
+        mz: f64,
+        rt: f64,
+        fragments: Vec<(f64, f32)>,
+    ) -> LibraryEntry {
         let mut entry = LibraryEntry::new(id, "PEPTIDE".into(), "PEPTIDE".into(), 2, mz, rt);
         entry.fragments = fragments
             .into_iter()
@@ -2968,7 +3012,11 @@ mod tests {
         let scores = scorer.score_all(&lib, &spec);
 
         // Perfect match should give score close to 1.0
-        assert!(scores[[0, 0]] > 0.99, "Expected ~1.0, got {}", scores[[0, 0]]);
+        assert!(
+            scores[[0, 0]] > 0.99,
+            "Expected ~1.0, got {}",
+            scores[[0, 0]]
+        );
     }
 
     /// Verifies that batch XCorr scoring returns a score near 0.0 when library and observed spectra have no overlapping peaks.
@@ -2995,7 +3043,11 @@ mod tests {
         let scores = scorer.score_all(&lib, &spec);
 
         // No overlap should give score close to 0.0
-        assert!(scores[[0, 0]] < 0.01, "Expected ~0.0, got {}", scores[[0, 0]]);
+        assert!(
+            scores[[0, 0]] < 0.01,
+            "Expected ~0.0, got {}",
+            scores[[0, 0]]
+        );
     }
 
     /// Verifies that find_best_matches correctly pairs each library entry with its highest-scoring observed spectrum.
@@ -3064,11 +3116,8 @@ mod tests {
         );
 
         // Spectrum with EXACT same peaks
-        let spectrum = make_test_spectrum(
-            1,
-            10.0,
-            vec![(300.0, 100.0), (400.0, 50.0), (500.0, 75.0)],
-        );
+        let spectrum =
+            make_test_spectrum(1, 10.0, vec![(300.0, 100.0), (400.0, 50.0), (500.0, 75.0)]);
 
         let scorer = LibCosineScorer::hram(10.0); // 10 ppm
         let score = scorer.score(&entry, &spectrum);
@@ -3112,7 +3161,11 @@ mod tests {
         // With tighter tolerance (5 ppm), should NOT match
         let scorer_tight = LibCosineScorer::hram(5.0);
         let score_tight = scorer_tight.score(&entry, &spectrum);
-        assert!(score_tight < 0.01, "Expected no match at 5 ppm, got {}", score_tight);
+        assert!(
+            score_tight < 0.01,
+            "Expected no match at 5 ppm, got {}",
+            score_tight
+        );
     }
 
     /// Verifies that score_with_errors returns accurate per-fragment mass errors in PPM units.
@@ -3151,12 +3204,20 @@ mod tests {
         // 0.3 Da tolerance should match
         let scorer_loose = LibCosineScorer::unit_resolution(0.3);
         let score_loose = scorer_loose.score(&entry, &spectrum);
-        assert!(score_loose > 0.99, "Expected match at 0.3 Da, got {}", score_loose);
+        assert!(
+            score_loose > 0.99,
+            "Expected match at 0.3 Da, got {}",
+            score_loose
+        );
 
         // 0.2 Da tolerance should NOT match
         let scorer_tight = LibCosineScorer::unit_resolution(0.2);
         let score_tight = scorer_tight.score(&entry, &spectrum);
-        assert!(score_tight < 0.01, "Expected no match at 0.2 Da, got {}", score_tight);
+        assert!(
+            score_tight < 0.01,
+            "Expected no match at 0.2 Da, got {}",
+            score_tight
+        );
     }
 
     /// Verifies that match_fragments correctly identifies matched and unmatched library fragments and reports per-fragment mass errors.
@@ -3198,8 +3259,8 @@ mod tests {
             retention_time: 10.0,
             precursor_mz: 500.0,
             isolation_window: IsolationWindow::symmetric(500.0, 12.5),
-            mzs: vec![499.996, 500.000, 500.004],     // All within 10 ppm
-            intensities: vec![200.0, 50.0, 150.0],    // 200 is highest, but 50 is closest
+            mzs: vec![499.996, 500.000, 500.004], // All within 10 ppm
+            intensities: vec![200.0, 50.0, 150.0], // 200 is highest, but 50 is closest
         };
 
         let scorer = LibCosineScorer::hram(10.0);

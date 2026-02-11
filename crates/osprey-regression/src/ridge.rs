@@ -41,7 +41,12 @@ impl RidgeSolver {
     /// Given design matrix A (m × k) and observed vector b (m × 1),
     /// returns coefficient vector x (k × 1) that minimizes:
     ///   ‖Ax - b‖² + λ‖x‖²
-    pub fn solve(&self, a: &Array2<f64>, b: &Array1<f64>, lambda: Option<f64>) -> Result<Array1<f64>> {
+    pub fn solve(
+        &self,
+        a: &Array2<f64>,
+        b: &Array1<f64>,
+        lambda: Option<f64>,
+    ) -> Result<Array1<f64>> {
         let lambda = lambda.unwrap_or(self.default_lambda);
 
         // Check dimensions
@@ -99,7 +104,7 @@ impl RidgeSolver {
                 if i == j {
                     if sum <= 0.0 {
                         return Err(OspreyError::RegressionError(
-                            "Matrix is not positive definite".into()
+                            "Matrix is not positive definite".into(),
                         ));
                     }
                     l[[i, j]] = sum.sqrt();
@@ -254,11 +259,7 @@ mod tests {
         // Verify that NNLS produces a better solution than naive projection
         let solver = RidgeSolver::new(0.1);
 
-        let a = array![
-            [1.0, 0.8, 0.1],
-            [0.8, 1.0, 0.2],
-            [0.1, 0.2, 1.0],
-        ];
+        let a = array![[1.0, 0.8, 0.1], [0.8, 1.0, 0.2], [0.1, 0.2, 1.0],];
         let b = array![1.0, -0.5, 0.8];
 
         // Get proper NNLS solution

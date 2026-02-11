@@ -266,7 +266,7 @@ impl IsotopeEnvelope {
     pub fn calculate_isotope_mzs(precursor_mz: f64, charge: u8) -> [f64; 5] {
         let isotope_gap = Self::NEUTRON_MASS / charge as f64;
         [
-            precursor_mz - isotope_gap,      // M-1
+            precursor_mz - isotope_gap,       // M-1
             precursor_mz,                     // M+0 (monoisotopic)
             precursor_mz + isotope_gap,       // M+1
             precursor_mz + 2.0 * isotope_gap, // M+2
@@ -284,12 +284,7 @@ impl IsotopeEnvelope {
     /// * `precursor_mz` - Theoretical monoisotopic precursor m/z
     /// * `charge` - Precursor charge state
     /// * `tolerance_ppm` - m/z matching tolerance in ppm (default: 10)
-    pub fn extract(
-        ms1: &MS1Spectrum,
-        precursor_mz: f64,
-        charge: u8,
-        tolerance_ppm: f64,
-    ) -> Self {
+    pub fn extract(ms1: &MS1Spectrum, precursor_mz: f64, charge: u8, tolerance_ppm: f64) -> Self {
         let expected_mzs = Self::calculate_isotope_mzs(precursor_mz, charge);
         let mut intensities = [0.0f64; 5];
         let mut m0_observed_mz = None;
@@ -762,7 +757,7 @@ mod tests {
         let gap = IsotopeEnvelope::NEUTRON_MASS / 2.0; // ~0.501434
 
         assert!((mzs[0] - (500.0 - gap)).abs() < 1e-6); // M-1
-        assert!((mzs[1] - 500.0).abs() < 1e-6);         // M+0
+        assert!((mzs[1] - 500.0).abs() < 1e-6); // M+0
         assert!((mzs[2] - (500.0 + gap)).abs() < 1e-6); // M+1
         assert!((mzs[3] - (500.0 + 2.0 * gap)).abs() < 1e-6); // M+2
         assert!((mzs[4] - (500.0 + 3.0 * gap)).abs() < 1e-6); // M+3
@@ -790,11 +785,11 @@ mod tests {
         let envelope = IsotopeEnvelope::extract(&ms1, 500.0, 2, 10.0);
 
         // Check intensities
-        assert!((envelope.intensities[0] - 10.0).abs() < 0.1);  // M-1
+        assert!((envelope.intensities[0] - 10.0).abs() < 0.1); // M-1
         assert!((envelope.intensities[1] - 100.0).abs() < 0.1); // M+0
-        assert!((envelope.intensities[2] - 80.0).abs() < 0.1);  // M+1
-        assert!((envelope.intensities[3] - 40.0).abs() < 0.1);  // M+2
-        assert!((envelope.intensities[4] - 15.0).abs() < 0.1);  // M+3
+        assert!((envelope.intensities[2] - 80.0).abs() < 0.1); // M+1
+        assert!((envelope.intensities[3] - 40.0).abs() < 0.1); // M+2
+        assert!((envelope.intensities[4] - 15.0).abs() < 0.1); // M+3
 
         // Check M+0 was detected
         assert!(envelope.has_m0());

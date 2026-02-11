@@ -46,9 +46,9 @@ pub trait RegressionSolver: Send + Sync {
     fn solve(
         &self,
         design_matrix: &[f64], // Flattened row-major m×k matrix
-        observed: &[f64],       // m-element observed spectrum
-        n_bins: usize,          // m
-        n_candidates: usize,    // k
+        observed: &[f64],      // m-element observed spectrum
+        n_bins: usize,         // m
+        n_candidates: usize,   // k
         lambda: f64,
     ) -> Result<Vec<f64>>;
 
@@ -99,11 +99,7 @@ pub trait FdrController: Send + Sync {
     /// Compute q-values for target scores
     ///
     /// Given target scores and decoy scores, returns q-values for each target.
-    fn compute_qvalues(
-        &self,
-        target_scores: &[f64],
-        decoy_scores: &[f64],
-    ) -> Result<Vec<f64>>;
+    fn compute_qvalues(&self, target_scores: &[f64], decoy_scores: &[f64]) -> Result<Vec<f64>>;
 }
 
 #[cfg(test)]

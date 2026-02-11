@@ -44,8 +44,8 @@ pub mod calibration_ml;
 pub mod pipeline;
 
 use osprey_core::{
-    BinConfig, FeatureSet, FragmentAnnotation, IonType, LibraryEntry, LibraryFragment, Modification,
-    Result, Spectrum, ToleranceUnit,
+    BinConfig, FeatureSet, FragmentAnnotation, IonType, LibraryEntry, LibraryFragment,
+    Modification, Result, Spectrum, ToleranceUnit,
 };
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -127,10 +127,7 @@ pub fn has_top3_fragment_match(
 /// # Arguments
 /// * `library_fragments` - Library fragment ions
 /// * `n` - Number of top fragments to return
-pub fn get_top_n_fragment_indices(
-    library_fragments: &[LibraryFragment],
-    n: usize,
-) -> Vec<usize> {
+pub fn get_top_n_fragment_indices(library_fragments: &[LibraryFragment], n: usize) -> Vec<usize> {
     if library_fragments.len() <= n {
         return (0..library_fragments.len()).collect();
     }
@@ -265,8 +262,8 @@ pub fn top3_fragment_match_with_errors(
 /// and count of fragments with positive correlation.
 pub fn compute_fragment_coelution(
     library_fragments: &[LibraryFragment],
-    coefficient_series: &[(f64, f64)],  // (RT, coefficient) pairs
-    spectra: &[&Spectrum],              // peak region spectra (sorted by RT)
+    coefficient_series: &[(f64, f64)], // (RT, coefficient) pairs
+    spectra: &[&Spectrum],             // peak region spectra (sorted by RT)
     tolerance_da: f64,
     tolerance_ppm: f64,
 ) -> (f64, f64, u32) {
@@ -307,13 +304,20 @@ pub fn compute_fragment_coelution(
 
         for &(rt, coef) in coefficient_series {
             // Find the spectrum closest to this RT
-            let spec_idx = match spec_rts.binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal)) {
+            let spec_idx = match spec_rts
+                .binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal))
+            {
                 Ok(i) => i,
                 Err(i) => {
-                    if i == 0 { 0 }
-                    else if i >= spec_rts.len() { spec_rts.len() - 1 }
-                    else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() { i }
-                    else { i - 1 }
+                    if i == 0 {
+                        0
+                    } else if i >= spec_rts.len() {
+                        spec_rts.len() - 1
+                    } else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() {
+                        i
+                    } else {
+                        i - 1
+                    }
                 }
             };
 
@@ -377,10 +381,7 @@ pub fn compute_fragment_coelution(
 ///
 /// # Returns
 /// `(mean_abs_error, std_error)` in the configured unit
-pub fn compute_mass_accuracy(
-    matches: &[FragmentMatch],
-    unit: ToleranceUnit,
-) -> (f64, f64) {
+pub fn compute_mass_accuracy(matches: &[FragmentMatch], unit: ToleranceUnit) -> (f64, f64) {
     if matches.is_empty() {
         return (0.0, 0.0);
     }
@@ -400,7 +401,11 @@ pub fn compute_mass_accuracy(
 
     // Standard deviation of signed errors
     let mean_signed: f64 = errors.iter().sum::<f64>() / n;
-    let variance: f64 = errors.iter().map(|e| (e - mean_signed).powi(2)).sum::<f64>() / n;
+    let variance: f64 = errors
+        .iter()
+        .map(|e| (e - mean_signed).powi(2))
+        .sum::<f64>()
+        / n;
     let std_dev = variance.sqrt();
 
     (mean_abs, std_dev)
@@ -439,7 +444,11 @@ pub fn extract_fragment_xics(
             .map(|(i, f)| (i, f.relative_intensity))
             .collect();
         indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-        indexed.iter().take(max_fragments).map(|(i, _)| *i).collect()
+        indexed
+            .iter()
+            .take(max_fragments)
+            .map(|(i, _)| *i)
+            .collect()
     };
 
     let mut results = Vec::with_capacity(n_top);
@@ -531,13 +540,20 @@ pub fn compute_fragment_fwhm(
         let mut coefs: Vec<f64> = Vec::with_capacity(coefficient_series.len());
 
         for &(rt, coef) in coefficient_series {
-            let spec_idx = match spec_rts.binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal)) {
+            let spec_idx = match spec_rts
+                .binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal))
+            {
                 Ok(i) => i,
                 Err(i) => {
-                    if i == 0 { 0 }
-                    else if i >= spec_rts.len() { spec_rts.len() - 1 }
-                    else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() { i }
-                    else { i - 1 }
+                    if i == 0 {
+                        0
+                    } else if i >= spec_rts.len() {
+                        spec_rts.len() - 1
+                    } else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() {
+                        i
+                    } else {
+                        i - 1
+                    }
                 }
             };
             xic_aligned.push(xic[spec_idx].1);
@@ -556,7 +572,8 @@ pub fn compute_fragment_fwhm(
 
     // Build consensus XIC: normalize each co-eluting XIC to max=1, then sum
     let n_points = coeluting_xics[0].len();
-    let mut consensus: Vec<(f64, f64)> = coeluting_xics[0].iter().map(|&(rt, _)| (rt, 0.0)).collect();
+    let mut consensus: Vec<(f64, f64)> =
+        coeluting_xics[0].iter().map(|&(rt, _)| (rt, 0.0)).collect();
 
     for xic in &coeluting_xics {
         let max_val = xic.iter().map(|(_, v)| *v).fold(0.0f64, f64::max);
@@ -606,7 +623,9 @@ pub fn pearson_correlation_raw(x: &[f64], y: &[f64]) -> f64 {
         sxy += xi * yi;
     }
 
-    let denom = ((dn * sx2 - sx * sx) * (dn * sy2 - sy * sy)).max(1e-30).sqrt();
+    let denom = ((dn * sx2 - sx * sx) * (dn * sy2 - sy * sy))
+        .max(1e-30)
+        .sqrt();
     (dn * sxy - sx * sy) / denom
 }
 
@@ -722,7 +741,13 @@ pub fn compute_hyperscore(
     let mut mass_errors = Vec::new();
 
     if library_fragments.is_empty() || spectrum_mzs.is_empty() {
-        return HyperscoreResult { score: 0.0, n_b: 0, n_y: 0, n_matched: 0, mass_errors };
+        return HyperscoreResult {
+            score: 0.0,
+            n_b: 0,
+            n_y: 0,
+            n_matched: 0,
+            mass_errors,
+        };
     }
 
     for frag in library_fragments {
@@ -785,7 +810,13 @@ pub fn compute_hyperscore(
         0.0
     };
 
-    HyperscoreResult { score, n_b, n_y, n_matched, mass_errors }
+    HyperscoreResult {
+        score,
+        n_b,
+        n_y,
+        n_matched,
+        mass_errors,
+    }
 }
 
 /// Spectral similarity scorer implementing LibCosine, XCorr, and Hyperscore
@@ -808,7 +839,7 @@ pub struct SpectralScorer {
 impl Default for SpectralScorer {
     fn default() -> Self {
         Self {
-            tolerance_da: 0.5, // For unit resolution
+            tolerance_da: 0.5,   // For unit resolution
             tolerance_ppm: 20.0, // For HRAM
             bin_config: BinConfig::unit_resolution(),
         }
@@ -941,7 +972,8 @@ impl SpectralScorer {
         let sequence_coverage = self.compute_sequence_coverage(library, &matches);
 
         // Compute base peak rank
-        let base_peak_rank = self.compute_base_peak_rank(&matches, &lib_intensities, &obs_intensities);
+        let base_peak_rank =
+            self.compute_base_peak_rank(&matches, &lib_intensities, &obs_intensities);
 
         // Compute top-3 matches
         let top6_matches = self.compute_top6_matches(library, &matches);
@@ -1229,7 +1261,8 @@ impl SpectralScorer {
         // XCorr = sum of preprocessed experimental values at fragment bin positions
         // This matches Comet exactly: score = sum(experimental_preprocessed[frag_bins]) * 0.005
         // Directly sum at fragment positions — O(n_fragments) instead of O(n_bins)
-        let xcorr_raw: f32 = library.fragments
+        let xcorr_raw: f32 = library
+            .fragments
             .iter()
             .filter_map(|frag| self.bin_config.mz_to_bin(frag.mz))
             .map(|bin| xcorr_preprocessed[bin])
@@ -1361,7 +1394,11 @@ impl SpectralScorer {
     ///
     /// Uses binary search on sorted observed m/z values for O(n_fragments × log(n_peaks))
     /// instead of O(n_fragments × n_peaks) linear scan.
-    pub fn match_fragments(&self, observed: &Spectrum, library: &LibraryEntry) -> Vec<FragmentMatch> {
+    pub fn match_fragments(
+        &self,
+        observed: &Spectrum,
+        library: &LibraryEntry,
+    ) -> Vec<FragmentMatch> {
         let mut matches = Vec::new();
 
         for frag in &library.fragments {
@@ -1525,7 +1562,10 @@ impl SpectralScorer {
     /// Uses ndarray dot product which dispatches to BLAS sdot for contiguous f32 slices.
     /// Returns f64 for compatibility with scoring pipelines.
     #[inline]
-    pub fn xcorr_from_preprocessed(spectrum_preprocessed: &[f32], library_preprocessed: &[f32]) -> f64 {
+    pub fn xcorr_from_preprocessed(
+        spectrum_preprocessed: &[f32],
+        library_preprocessed: &[f32],
+    ) -> f64 {
         use ndarray::ArrayView1;
 
         let min_len = spectrum_preprocessed.len().min(library_preprocessed.len());
@@ -1865,10 +1905,7 @@ pub struct RegressionContext {
 
 impl RegressionContext {
     /// Build regression context from regression results for a specific peptide
-    pub fn from_results(
-        results: &[&osprey_core::RegressionResult],
-        lib_id: u32,
-    ) -> Self {
+    pub fn from_results(results: &[&osprey_core::RegressionResult], lib_id: u32) -> Self {
         if results.is_empty() {
             return Self::default();
         }
@@ -1979,11 +2016,9 @@ impl FeatureExtractor {
             .unwrap_or(entry.retention_time);
 
         // Aggregate spectra around apex (FR-5.2.1)
-        let aggregated = self.spectrum_aggregator.aggregate_weighted(
-            spectra,
-            coefficient_series,
-            apex_rt,
-        );
+        let aggregated =
+            self.spectrum_aggregator
+                .aggregate_weighted(spectra, coefficient_series, apex_rt);
 
         // Extract features using the aggregated spectrum
         self.extract_with_expected_rt(entry, coefficient_series, Some(&aggregated), expected_rt)
@@ -2029,16 +2064,17 @@ impl FeatureExtractor {
                 .unwrap_or((0, 0.0));
             features.peak_apex = apex_value;
 
-            let apex_rt = coefficient_series.get(apex_idx).map(|(rt, _)| *rt).unwrap_or(0.0);
+            let apex_rt = coefficient_series
+                .get(apex_idx)
+                .map(|(rt, _)| *rt)
+                .unwrap_or(0.0);
 
             // FR-5.1.2: Integrated peak area (AUC of coefficients)
             features.peak_area = coefficient_series.iter().map(|(_, c)| c).sum();
 
             // FR-5.1.8: Number of contributing scans
-            features.n_contributing_scans = coefficient_series
-                .iter()
-                .filter(|(_, c)| *c > 0.0)
-                .count() as u32;
+            features.n_contributing_scans =
+                coefficient_series.iter().filter(|(_, c)| *c > 0.0).count() as u32;
 
             // FR-5.1.4: Peak width (FWHM with linear interpolation)
             if let Some((fwhm, _, _)) = compute_fwhm_interpolated(coefficient_series) {
@@ -2058,7 +2094,8 @@ impl FeatureExtractor {
             }
 
             // FR-5.1.9: Coefficient stability (variance near apex)
-            features.coefficient_stability = self.compute_coefficient_stability(coefficient_series, apex_idx);
+            features.coefficient_stability =
+                self.compute_coefficient_stability(coefficient_series, apex_idx);
 
             // FR-5.1.10: Peak boundary sharpness
             features.peak_sharpness = self.compute_peak_sharpness(coefficient_series, apex_idx);
@@ -2067,7 +2104,9 @@ impl FeatureExtractor {
             features.peak_prominence = self.compute_peak_prominence(coefficient_series, apex_value);
 
             // FR-5.1.12: Signal-to-noise ratio
-            if let Some(snr) = self.compute_signal_to_noise(coefficient_series, apex_idx, apex_value) {
+            if let Some(snr) =
+                self.compute_signal_to_noise(coefficient_series, apex_idx, apex_value)
+            {
                 features.signal_to_noise = snr;
             }
 
@@ -2088,8 +2127,9 @@ impl FeatureExtractor {
             features.dot_product_smz = spectral_score.lib_cosine_smz;
 
             // FR-5.2.3: Normalized spectral contrast angle
-            features.spectral_contrast_angle =
-                (spectral_score.lib_cosine.clamp(-1.0, 1.0)).acos().to_degrees();
+            features.spectral_contrast_angle = (spectral_score.lib_cosine.clamp(-1.0, 1.0))
+                .acos()
+                .to_degrees();
 
             // FR-5.2.7: Fragment coverage (fraction detected)
             features.fragment_coverage = spectral_score.fragment_coverage;
@@ -2168,21 +2208,15 @@ impl FeatureExtractor {
             .copied();
 
         // First, extract features with mixed (apex) spectrum
-        let mut features = self.extract_with_expected_rt(
-            entry,
-            coefficient_series,
-            apex_spectrum,
-            expected_rt,
-        );
+        let mut features =
+            self.extract_with_expected_rt(entry, coefficient_series, apex_spectrum, expected_rt);
 
         // Now compute deconvoluted features from coefficient-weighted aggregated spectrum
         if !spectra.is_empty() && !coefficient_series.is_empty() {
             // Aggregate spectra weighted by coefficients (apex ± 2 scans)
-            let deconv_spectrum = self.spectrum_aggregator.aggregate_weighted(
-                spectra,
-                coefficient_series,
-                apex_rt,
-            );
+            let deconv_spectrum =
+                self.spectrum_aggregator
+                    .aggregate_weighted(spectra, coefficient_series, apex_rt);
 
             // Compute spectral scores on the deconvoluted spectrum
             let deconv_score = self.spectral_scorer.xcorr(&deconv_spectrum, entry);
@@ -2233,12 +2267,8 @@ impl FeatureExtractor {
         expected_rt: Option<f64>,
         context: Option<&RegressionContext>,
     ) -> FeatureSet {
-        let mut features = self.extract_with_expected_rt(
-            entry,
-            coefficient_series,
-            apex_spectrum,
-            expected_rt,
-        );
+        let mut features =
+            self.extract_with_expected_rt(entry, coefficient_series, apex_spectrum, expected_rt);
 
         if let Some(ctx) = context {
             Self::apply_regression_context(&mut features, ctx);
@@ -2278,7 +2308,8 @@ impl FeatureExtractor {
 
         let window: Vec<f64> = series[start..end].iter().map(|(_, c)| *c).collect();
         let mean: f64 = window.iter().sum::<f64>() / window.len() as f64;
-        let variance: f64 = window.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / window.len() as f64;
+        let variance: f64 =
+            window.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / window.len() as f64;
 
         // Return inverse of coefficient of variation (higher = more stable)
         if mean > 1e-10 {
@@ -2339,7 +2370,11 @@ impl FeatureExtractor {
             .map(|(_, c)| *c)
             .collect();
 
-        let baseline = edge_values.iter().cloned().fold(f64::MAX, f64::min).max(0.0);
+        let baseline = edge_values
+            .iter()
+            .cloned()
+            .fold(f64::MAX, f64::min)
+            .max(0.0);
 
         if baseline > 1e-10 {
             apex_value / baseline
@@ -2385,11 +2420,7 @@ impl FeatureExtractor {
         }
         // Take last 5 on left
         if background_values.len() > 5 {
-            background_values = background_values
-                .into_iter()
-                .rev()
-                .take(5)
-                .collect();
+            background_values = background_values.into_iter().rev().take(5).collect();
         }
 
         // Right side: points after right boundary
@@ -2784,10 +2815,7 @@ impl DecoyGenerator {
         let mut mod_masses: HashMap<usize, f64> = HashMap::new();
         for m in &target.modifications {
             // Find new position for this modification
-            if let Some(new_pos) = position_mapping
-                .iter()
-                .position(|&old| old == m.position)
-            {
+            if let Some(new_pos) = position_mapping.iter().position(|&old| old == m.position) {
                 mod_masses.insert(new_pos, m.mass_delta);
             }
         }
@@ -2883,7 +2911,7 @@ impl DecoyGenerator {
 
         // Sum amino acid masses
         let (start, end) = match ion_type {
-            IonType::B => (0, ordinal),           // b-ions: N-terminal fragment
+            IonType::B => (0, ordinal),                 // b-ions: N-terminal fragment
             IonType::Y => (seq_len - ordinal, seq_len), // y-ions: C-terminal fragment
             _ => return None,
         };
@@ -2950,14 +2978,11 @@ impl DecoyGenerator {
         use std::collections::HashSet;
 
         // Build set of all target sequences for collision detection
-        let target_sequences: HashSet<&str> = targets
-            .iter()
-            .map(|t| t.sequence.as_str())
-            .collect();
+        let target_sequences: HashSet<&str> = targets.iter().map(|t| t.sequence.as_str()).collect();
 
         // Result type for each parallel task
         enum DecoyResult {
-            Reversed(LibraryEntry, LibraryEntry),      // (target, decoy)
+            Reversed(LibraryEntry, LibraryEntry),        // (target, decoy)
             CyclingFallback(LibraryEntry, LibraryEntry), // (target, decoy)
             SkippedNoFragments,
             FailedFragmentCalculation,
@@ -2979,7 +3004,9 @@ impl DecoyGenerator {
                 // Check if reversed sequence is valid:
                 // 1. Different from original (not palindromic)
                 // 2. Not in target database (no collision)
-                if reversed_seq != target.sequence && !target_sequences.contains(reversed_seq.as_str()) {
+                if reversed_seq != target.sequence
+                    && !target_sequences.contains(reversed_seq.as_str())
+                {
                     // Reversal succeeded - create decoy
                     match self.create_decoy_from_mapping(target, &reversed_seq, &position_mapping) {
                         Ok(decoy) => {
@@ -2995,10 +3022,13 @@ impl DecoyGenerator {
                 let max_retries = target.sequence.len().min(10);
 
                 for cycle_length in 1..=max_retries {
-                    let (cycled_seq, cycle_mapping) = self.cycle_sequence(&target.sequence, cycle_length);
+                    let (cycled_seq, cycle_mapping) =
+                        self.cycle_sequence(&target.sequence, cycle_length);
 
                     // Check if cycled sequence is valid
-                    if cycled_seq != target.sequence && !target_sequences.contains(cycled_seq.as_str()) {
+                    if cycled_seq != target.sequence
+                        && !target_sequences.contains(cycled_seq.as_str())
+                    {
                         match self.create_decoy_from_mapping(target, &cycled_seq, &cycle_mapping) {
                             Ok(decoy) => {
                                 return DecoyResult::CyclingFallback(target.clone(), decoy);
@@ -3046,17 +3076,29 @@ impl DecoyGenerator {
 
         // Log statistics
         log::info!("Decoy generation statistics:");
-        log::info!("  Reversed: {} ({:.1}%)", stats.reversed,
-            100.0 * stats.reversed as f64 / targets.len() as f64);
-        log::info!("  Cycling fallback: {} ({:.1}%)", stats.cycling_fallback,
-            100.0 * stats.cycling_fallback as f64 / targets.len() as f64);
-        log::info!("  Excluded (no unique decoy): {} ({:.1}%)", stats.excluded_no_unique_decoy,
-            100.0 * stats.excluded_no_unique_decoy as f64 / targets.len() as f64);
+        log::info!(
+            "  Reversed: {} ({:.1}%)",
+            stats.reversed,
+            100.0 * stats.reversed as f64 / targets.len() as f64
+        );
+        log::info!(
+            "  Cycling fallback: {} ({:.1}%)",
+            stats.cycling_fallback,
+            100.0 * stats.cycling_fallback as f64 / targets.len() as f64
+        );
+        log::info!(
+            "  Excluded (no unique decoy): {} ({:.1}%)",
+            stats.excluded_no_unique_decoy,
+            100.0 * stats.excluded_no_unique_decoy as f64 / targets.len() as f64
+        );
         if stats.skipped_no_fragments > 0 {
             log::info!("  Skipped (no fragments): {}", stats.skipped_no_fragments);
         }
         if stats.failed_fragment_calculation > 0 {
-            log::warn!("  Failed fragment calculation: {}", stats.failed_fragment_calculation);
+            log::warn!(
+                "  Failed fragment calculation: {}",
+                stats.failed_fragment_calculation
+            );
         }
 
         (valid_targets, decoys, stats)
@@ -3233,7 +3275,11 @@ mod tests {
         let score = scorer.lib_cosine(&spectrum, &entry);
 
         // Perfect match should give cosine close to 1.0
-        assert!(score.lib_cosine > 0.99, "LibCosine should be ~1.0 for perfect match, got {}", score.lib_cosine);
+        assert!(
+            score.lib_cosine > 0.99,
+            "LibCosine should be ~1.0 for perfect match, got {}",
+            score.lib_cosine
+        );
         assert_eq!(score.n_matched, 3);
         assert!((score.fragment_coverage - 1.0).abs() < 1e-6);
     }
@@ -3284,7 +3330,10 @@ mod tests {
         assert_eq!(score.n_matched, 2);
         assert!((score.fragment_coverage - 0.5).abs() < 1e-6);
         // LibCosine should still be reasonable for the matched fragments
-        assert!(score.lib_cosine > 0.9, "LibCosine should be high for matched fragments");
+        assert!(
+            score.lib_cosine > 0.9,
+            "LibCosine should be high for matched fragments"
+        );
     }
 
     /// Verifies that LibCosine scorer returns zero score and zero coverage when no peaks overlap.
@@ -3294,13 +3343,11 @@ mod tests {
 
         // Create a library entry with fragments
         let mut entry = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
-        entry.fragments = vec![
-            LibraryFragment {
-                mz: 300.0,
-                relative_intensity: 100.0,
-                annotation: FragmentAnnotation::default(),
-            },
-        ];
+        entry.fragments = vec![LibraryFragment {
+            mz: 300.0,
+            relative_intensity: 100.0,
+            annotation: FragmentAnnotation::default(),
+        }];
 
         // Create an observed spectrum with no matching peaks
         let spectrum = Spectrum {
@@ -3354,7 +3401,10 @@ mod tests {
         // XCorr should be computed
         // The exact value depends on the preprocessing, but it should be non-zero
         // for matching spectra
-        assert!(score.xcorr != 0.0 || score.lib_cosine > 0.9, "Should have some score");
+        assert!(
+            score.xcorr != 0.0 || score.lib_cosine > 0.9,
+            "Should have some score"
+        );
     }
 
     /// Verifies that FeatureExtractor computes both chromatographic and spectral features when given an apex spectrum.
@@ -3394,8 +3444,14 @@ mod tests {
         assert!((features.peak_apex - 1.0).abs() < 1e-6);
 
         // Spectral features should be computed
-        assert!(features.dot_product > 0.9, "Dot product should be high for matching spectrum");
-        assert!((features.fragment_coverage - 1.0).abs() < 1e-6, "All fragments should match");
+        assert!(
+            features.dot_product > 0.9,
+            "Dot product should be high for matching spectrum"
+        );
+        assert!(
+            (features.fragment_coverage - 1.0).abs() < 1e-6,
+            "All fragments should match"
+        );
     }
 
     /// Verifies that trypsin-aware decoy generation reverses the peptide sequence while preserving the C-terminal residue.
@@ -3554,8 +3610,16 @@ mod tests {
         // 400.0: 25 + 50 + 35 = 110
         let int_300 = aggregated.intensities[0];
         let int_400 = aggregated.intensities[1];
-        assert!((int_300 - 225.0).abs() < 1.0, "Expected ~225, got {}", int_300);
-        assert!((int_400 - 110.0).abs() < 1.0, "Expected ~110, got {}", int_400);
+        assert!(
+            (int_300 - 225.0).abs() < 1.0,
+            "Expected ~225, got {}",
+            int_300
+        );
+        assert!(
+            (int_400 - 110.0).abs() < 1.0,
+            "Expected ~110, got {}",
+            int_400
+        );
     }
 
     /// Verifies that weighted spectrum aggregation applies coefficient-based weights and normalizes correctly.
@@ -3621,7 +3685,8 @@ mod tests {
             }];
         }
 
-        let (valid_targets, decoys, stats) = generator.generate_all_with_collision_detection(&targets);
+        let (valid_targets, decoys, stats) =
+            generator.generate_all_with_collision_detection(&targets);
 
         // PEPTIDEK can't use reversal (would collide with EDITPEPK)
         // It should either use cycling or be excluded
@@ -3642,7 +3707,8 @@ mod tests {
         assert_eq!(valid_targets.len(), stats.total_pairs());
 
         // Verify no decoy sequence matches any target sequence
-        let target_seqs: std::collections::HashSet<&str> = valid_targets.iter().map(|t| t.sequence.as_str()).collect();
+        let target_seqs: std::collections::HashSet<&str> =
+            valid_targets.iter().map(|t| t.sequence.as_str()).collect();
         for decoy in &decoys {
             assert!(
                 !target_seqs.contains(decoy.sequence.as_str()),

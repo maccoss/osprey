@@ -26,24 +26,23 @@ use std::path::Path;
 /// save_calibration(&calibration, Path::new("output.calibration.json"))
 ///     .expect("Failed to save calibration");
 /// ```
-pub fn save_calibration(
-    calibration: &CalibrationParams,
-    output_path: &Path,
-) -> Result<()> {
-    let file = File::create(output_path)
-        .map_err(|e| osprey_core::OspreyError::OutputError(format!(
+pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> Result<()> {
+    let file = File::create(output_path).map_err(|e| {
+        osprey_core::OspreyError::OutputError(format!(
             "Failed to create calibration file {}: {}",
             output_path.display(),
             e
-        )))?;
+        ))
+    })?;
 
     let writer = BufWriter::new(file);
 
-    serde_json::to_writer_pretty(writer, calibration)
-        .map_err(|e| osprey_core::OspreyError::OutputError(format!(
+    serde_json::to_writer_pretty(writer, calibration).map_err(|e| {
+        osprey_core::OspreyError::OutputError(format!(
             "Failed to serialize calibration parameters: {}",
             e
-        )))?;
+        ))
+    })?;
 
     log::info!("Saved calibration to: {}", output_path.display());
 
@@ -69,20 +68,22 @@ pub fn save_calibration(
 /// println!("MS1 offset: {:.2} ppm", calibration.ms1_calibration.mean);
 /// ```
 pub fn load_calibration(input_path: &Path) -> Result<CalibrationParams> {
-    let file = File::open(input_path)
-        .map_err(|e| osprey_core::OspreyError::FileNotFound(format!(
+    let file = File::open(input_path).map_err(|e| {
+        osprey_core::OspreyError::FileNotFound(format!(
             "Failed to open calibration file {}: {}",
             input_path.display(),
             e
-        )))?;
+        ))
+    })?;
 
     let reader = BufReader::new(file);
 
-    let calibration: CalibrationParams = serde_json::from_reader(reader)
-        .map_err(|e| osprey_core::OspreyError::ConfigError(format!(
+    let calibration: CalibrationParams = serde_json::from_reader(reader).map_err(|e| {
+        osprey_core::OspreyError::ConfigError(format!(
             "Failed to deserialize calibration parameters: {}",
             e
-        )))?;
+        ))
+    })?;
 
     log::info!("Loaded calibration from: {}", input_path.display());
 
@@ -154,7 +155,9 @@ pub fn calibration_path_for_input(input_path: &Path, output_dir: &Path) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibration::{CalibrationMetadata, MzCalibration, RTCalibrationParams, RTCalibrationMethod};
+    use crate::calibration::{
+        CalibrationMetadata, MzCalibration, RTCalibrationMethod, RTCalibrationParams,
+    };
 
     #[allow(dead_code)]
     fn create_test_calibration() -> CalibrationParams {
@@ -202,7 +205,10 @@ mod tests {
     #[test]
     fn test_calibration_filename() {
         assert_eq!(calibration_filename("results"), "results.calibration.json");
-        assert_eq!(calibration_filename("my_search"), "my_search.calibration.json");
+        assert_eq!(
+            calibration_filename("my_search"),
+            "my_search.calibration.json"
+        );
         assert_eq!(calibration_filename("test"), "test.calibration.json");
     }
 

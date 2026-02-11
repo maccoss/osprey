@@ -25,7 +25,7 @@ pub fn calculate_q_values(is_decoy: &[bool], q_values: &mut [f64]) -> usize {
         "is_decoy and q_values must have same length"
     );
 
-    let mut decoy = 0;  // Count actual decoys (not conservative +1)
+    let mut decoy = 0; // Count actual decoys (not conservative +1)
     let mut target = 0;
 
     // Calculate FDR for each position

@@ -111,7 +111,10 @@ impl FdrController {
         let mut missing_decoy_count = 0usize;
 
         for (target_id, (item, target_score)) in target_scores {
-            let decoy_score = decoy_scores.get(&target_id).copied().unwrap_or(f64::NEG_INFINITY);
+            let decoy_score = decoy_scores
+                .get(&target_id)
+                .copied()
+                .unwrap_or(f64::NEG_INFINITY);
 
             if decoy_scores.get(&target_id).is_none() {
                 missing_decoy_count += 1;
@@ -141,8 +144,16 @@ impl FdrController {
         // Log score ranges and first decoy position for diagnostics
         if !winners.is_empty() {
             let first_decoy_rank = winners.iter().position(|(_, is_target, _)| !*is_target);
-            let target_scores: Vec<f64> = winners.iter().filter(|(_, is_t, _)| *is_t).map(|(s, _, _)| *s).collect();
-            let decoy_scores: Vec<f64> = winners.iter().filter(|(_, is_t, _)| !*is_t).map(|(s, _, _)| *s).collect();
+            let target_scores: Vec<f64> = winners
+                .iter()
+                .filter(|(_, is_t, _)| *is_t)
+                .map(|(s, _, _)| *s)
+                .collect();
+            let decoy_scores: Vec<f64> = winners
+                .iter()
+                .filter(|(_, is_t, _)| !*is_t)
+                .map(|(s, _, _)| *s)
+                .collect();
 
             log::debug!(
                 "FDR walk: {} winners, first decoy at rank {} | target scores: [{:.2}, {:.2}] | decoy scores: [{:.2}, {:.2}]",
@@ -215,11 +226,7 @@ impl FdrController {
     /// independent pools.
     ///
     /// Returns q-values for each target (in same order as input)
-    pub fn compute_qvalues(
-        &self,
-        target_scores: &[f64],
-        decoy_scores: &[f64],
-    ) -> Result<Vec<f64>> {
+    pub fn compute_qvalues(&self, target_scores: &[f64], decoy_scores: &[f64]) -> Result<Vec<f64>> {
         if target_scores.is_empty() {
             return Ok(Vec::new());
         }
@@ -274,11 +281,7 @@ impl FdrController {
     }
 
     /// Filter targets by q-value threshold
-    pub fn filter_by_qvalue<T: Clone>(
-        &self,
-        items: &[T],
-        qvalues: &[f64],
-    ) -> Vec<T> {
+    pub fn filter_by_qvalue<T: Clone>(&self, items: &[T], qvalues: &[f64]) -> Vec<T> {
         items
             .iter()
             .zip(qvalues.iter())
@@ -375,7 +378,7 @@ mod tests {
         // Format: (item, score, is_decoy, entry_id)
         // Target ID = 1, Decoy ID = 1 | 0x80000000
         let matches = vec![
-            ("target_1", 0.9, false, 1),           // Target, score 0.9
+            ("target_1", 0.9, false, 1),            // Target, score 0.9
             ("decoy_1", 0.7, true, 1 | 0x80000000), // Decoy, score 0.7
         ];
 
@@ -475,9 +478,12 @@ mod tests {
         let controller = FdrController::new(0.01); // 1% FDR
 
         let matches = vec![
-            ("t1", 0.9, false, 1), ("d1", 0.1, true, 1 | 0x80000000),
-            ("t2", 0.8, false, 2), ("d2", 0.2, true, 2 | 0x80000000),
-            ("t3", 0.7, false, 3), ("d3", 0.3, true, 3 | 0x80000000),
+            ("t1", 0.9, false, 1),
+            ("d1", 0.1, true, 1 | 0x80000000),
+            ("t2", 0.8, false, 2),
+            ("d2", 0.2, true, 2 | 0x80000000),
+            ("t3", 0.7, false, 3),
+            ("d3", 0.3, true, 3 | 0x80000000),
         ];
 
         let result = controller.compete_and_filter(matches);
@@ -496,9 +502,12 @@ mod tests {
         let controller = FdrController::new(0.01);
 
         let matches = vec![
-            ("t1", 0.1, false, 1), ("d1", 0.9, true, 1 | 0x80000000),
-            ("t2", 0.2, false, 2), ("d2", 0.8, true, 2 | 0x80000000),
-            ("t3", 0.3, false, 3), ("d3", 0.7, true, 3 | 0x80000000),
+            ("t1", 0.1, false, 1),
+            ("d1", 0.9, true, 1 | 0x80000000),
+            ("t2", 0.2, false, 2),
+            ("d2", 0.8, true, 2 | 0x80000000),
+            ("t3", 0.3, false, 3),
+            ("d3", 0.7, true, 3 | 0x80000000),
         ];
 
         let result = controller.compete_and_filter(matches);
@@ -590,8 +599,18 @@ mod tests {
         // Add 10 more target winners with scores 0.90 down to 0.81
         for i in 4..=13 {
             let score = 0.90 - (i - 4) as f64 * 0.01;
-            matches.push((Box::leak(format!("target_{}", i).into_boxed_str()), score, false, i as u32));
-            matches.push((Box::leak(format!("decoy_{}", i).into_boxed_str()), 0.05, true, (i as u32) | 0x80000000));
+            matches.push((
+                Box::leak(format!("target_{}", i).into_boxed_str()),
+                score,
+                false,
+                i as u32,
+            ));
+            matches.push((
+                Box::leak(format!("decoy_{}", i).into_boxed_str()),
+                0.05,
+                true,
+                (i as u32) | 0x80000000,
+            ));
         }
 
         let result = controller.compete_and_filter(matches);
@@ -612,7 +631,7 @@ mod tests {
         // - 0.81(T): 12T, 1D -> FDR = 8.3% ✓
 
         assert_eq!(result.n_target_wins, 12); // All 12 targets won
-        assert_eq!(result.n_decoy_wins, 1);   // 1 decoy won
+        assert_eq!(result.n_decoy_wins, 1); // 1 decoy won
 
         // OLD BUGGY BEHAVIOR: Only 2 targets would pass (before decoy spike)
         // NEW CORRECT BEHAVIOR: 12 targets pass (max cumulative at FDR <= 10%)

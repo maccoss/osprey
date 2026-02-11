@@ -125,10 +125,7 @@ impl PreprocessingWorker {
             let end = ((w + 1) * window_size).min(n_bins);
 
             // Find max in this window
-            let max_val = result[start..end]
-                .iter()
-                .cloned()
-                .fold(0.0f32, f32::max);
+            let max_val = result[start..end].iter().cloned().fold(0.0f32, f32::max);
 
             if max_val > 0.0 {
                 let threshold = max_val * 0.05;
@@ -198,17 +195,17 @@ mod tests {
     #[test]
     fn test_preprocessing_worker() {
         let worker = PreprocessingWorker::new();
-        let spectrum = make_test_spectrum(
-            1,
-            10.0,
-            vec![(300.0, 100.0), (400.0, 50.0), (500.0, 75.0)],
-        );
+        let spectrum =
+            make_test_spectrum(1, 10.0, vec![(300.0, 100.0), (400.0, 50.0), (500.0, 75.0)]);
 
         let preprocessed = worker.process(&spectrum);
 
         assert_eq!(preprocessed.scan_number, 1);
         assert!((preprocessed.retention_time - 10.0).abs() < 0.001);
-        assert_eq!(preprocessed.xcorr_vector.len(), worker.config.bin_config.n_bins);
+        assert_eq!(
+            preprocessed.xcorr_vector.len(),
+            worker.config.bin_config.n_bins
+        );
     }
 
     /// Verifies that preprocessing an empty spectrum produces an all-zero XCorr vector without errors.

@@ -149,11 +149,7 @@ impl BlibLoader {
     }
 
     /// Load protein mappings from RefSpectraProteins table
-    fn load_protein_mappings(
-        &self,
-        conn: &Connection,
-        entries: &mut [LibraryEntry],
-    ) -> Result<()> {
+    fn load_protein_mappings(&self, conn: &Connection, entries: &mut [LibraryEntry]) -> Result<()> {
         if !self.table_exists(conn, "RefSpectraProteins")? {
             return Ok(());
         }
@@ -288,7 +284,11 @@ fn identify_modification(mass: f64, is_nterm: bool) -> (f64, Option<u32>, Option
     };
 
     if (mass_delta - CARBAMIDOMETHYL).abs() < tolerance {
-        (CARBAMIDOMETHYL, Some(4), Some("Carbamidomethyl".to_string()))
+        (
+            CARBAMIDOMETHYL,
+            Some(4),
+            Some("Carbamidomethyl".to_string()),
+        )
     } else if (mass_delta - OXIDATION).abs() < tolerance {
         (OXIDATION, Some(35), Some("Oxidation".to_string()))
     } else if (mass_delta - ACETYL).abs() < tolerance && is_nterm {

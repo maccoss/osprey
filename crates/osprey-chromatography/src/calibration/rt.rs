@@ -6,8 +6,8 @@
 //! The calibration uses LOESS (Locally Estimated Scatterplot Smoothing)
 //! which fits local polynomial regressions weighted by distance.
 
-use osprey_core::{OspreyError, Result};
 use super::RTModelParams;
+use osprey_core::{OspreyError, Result};
 
 /// RT calibration configuration
 #[derive(Debug, Clone)]
@@ -73,11 +73,7 @@ impl RTCalibrator {
     ///
     /// # Returns
     /// A fitted `RTCalibration` that can predict measured RT from library RT
-    pub fn fit(
-        &self,
-        library_rts: &[f64],
-        measured_rts: &[f64],
-    ) -> Result<RTCalibration> {
+    pub fn fit(&self, library_rts: &[f64], measured_rts: &[f64]) -> Result<RTCalibration> {
         if library_rts.len() != measured_rts.len() {
             return Err(OspreyError::ConfigError(format!(
                 "RT arrays must have same length: {} vs {}",
@@ -164,12 +160,7 @@ impl RTCalibrator {
     }
 
     /// Perform LOESS fit
-    fn loess_fit(
-        &self,
-        x: &[f64],
-        y: &[f64],
-        weights: Option<&[f64]>,
-    ) -> Result<Vec<f64>> {
+    fn loess_fit(&self, x: &[f64], y: &[f64], weights: Option<&[f64]>) -> Result<Vec<f64>> {
         let n = x.len();
         let k = (self.config.bandwidth * n as f64).ceil() as usize;
         let k = k.max(self.config.degree + 2).min(n); // Ensure enough points for polynomial
@@ -465,8 +456,16 @@ impl RTCalibration {
         if self.measured_rts.is_empty() {
             return (0.0, 0.0);
         }
-        let min = self.measured_rts.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = self.measured_rts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let min = self
+            .measured_rts
+            .iter()
+            .cloned()
+            .fold(f64::INFINITY, f64::min);
+        let max = self
+            .measured_rts
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         (min, max)
     }
 
@@ -490,9 +489,17 @@ impl RTCalibration {
 
         // Compute R²
         let y_mean: f64 = self.measured_rts.iter().sum::<f64>() / n as f64;
-        let ss_tot: f64 = self.measured_rts.iter().map(|&y| (y - y_mean).powi(2)).sum();
+        let ss_tot: f64 = self
+            .measured_rts
+            .iter()
+            .map(|&y| (y - y_mean).powi(2))
+            .sum();
         let ss_res: f64 = residuals.iter().map(|r| r.powi(2)).sum();
-        let r_squared = if ss_tot > 1e-10 { 1.0 - ss_res / ss_tot } else { 0.0 };
+        let r_squared = if ss_tot > 1e-10 {
+            1.0 - ss_res / ss_tot
+        } else {
+            0.0
+        };
 
         RTCalibrationStats {
             n_points: n,
@@ -546,7 +553,7 @@ impl RTCalibration {
 
         if params.library_rts.is_empty() {
             return Err(OspreyError::ConfigError(
-                "Model params have no calibration points".to_string()
+                "Model params have no calibration points".to_string(),
             ));
         }
 
@@ -556,7 +563,7 @@ impl RTCalibration {
 
         if sorted_library != params.library_rts {
             return Err(OspreyError::ConfigError(
-                "Model params library_rts are not sorted".to_string()
+                "Model params library_rts are not sorted".to_string(),
             ));
         }
 
@@ -732,15 +739,26 @@ mod tests {
 
         // Test prediction
         let pred = calibration.predict(25.0);
-        assert!((pred - 55.0).abs() < 0.5, "Prediction at 25 should be ~55, got {}", pred);
+        assert!(
+            (pred - 55.0).abs() < 0.5,
+            "Prediction at 25 should be ~55, got {}",
+            pred
+        );
 
         // Test extrapolation
         let pred_extrap = calibration.predict(60.0);
-        assert!((pred_extrap - 125.0).abs() < 5.0, "Extrapolation at 60 should be ~125, got {}", pred_extrap);
+        assert!(
+            (pred_extrap - 125.0).abs() < 5.0,
+            "Extrapolation at 60 should be ~125, got {}",
+            pred_extrap
+        );
 
         // Test stats
         let stats = calibration.stats();
-        assert!(stats.r_squared > 0.99, "R² should be > 0.99 for linear data");
+        assert!(
+            stats.r_squared > 0.99,
+            "R² should be > 0.99 for linear data"
+        );
     }
 
     /// Verifies LOESS calibration captures a sinusoidal nonlinear RT relationship with R-squared above 0.9.
@@ -758,7 +776,11 @@ mod tests {
 
         // LOESS should capture nonlinearity
         let stats = calibration.stats();
-        assert!(stats.r_squared > 0.9, "R² should be > 0.9 for smooth nonlinear data, got {}", stats.r_squared);
+        assert!(
+            stats.r_squared > 0.9,
+            "R² should be > 0.9 for smooth nonlinear data, got {}",
+            stats.r_squared
+        );
     }
 
     /// Verifies the RT stratified sampler distributes samples evenly across all bins.
@@ -774,7 +796,10 @@ mod tests {
         let sampled = sampler.sample(&rts);
 
         // Should sample from all bins
-        assert!(sampled.len() <= 500, "Should sample at most 500 (10 bins × 50 each)");
+        assert!(
+            sampled.len() <= 500,
+            "Should sample at most 500 (10 bins × 50 each)"
+        );
         assert!(sampled.len() >= 100, "Should sample at least 100 entries");
 
         // Check distribution across bins
@@ -823,7 +848,11 @@ mod tests {
     fn test_std_dev() {
         let vals = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
         let sd = std_dev(&vals);
-        assert!((sd - 2.138).abs() < 0.01, "std dev should be ~2.138, got {}", sd);
+        assert!(
+            (sd - 2.138).abs() < 0.01,
+            "std dev should be ~2.138, got {}",
+            sd
+        );
     }
 
     /// Verifies that local RT tolerance values are computed and respect the minimum floor across the RT range.
@@ -833,7 +862,8 @@ mod tests {
         // Simulate a case where early RTs have better prediction accuracy
         let library_rts: Vec<f64> = (0..50).map(|i| i as f64).collect();
         // Add noise that increases with RT
-        let measured_rts: Vec<f64> = library_rts.iter()
+        let measured_rts: Vec<f64> = library_rts
+            .iter()
             .map(|&x| x + 0.1 * (x / 10.0).sin() * (x / 50.0 + 0.1))
             .collect();
 
@@ -862,7 +892,11 @@ mod tests {
 
         // Local tolerance should respect minimum floor
         let tol = calibration.local_tolerance(25.0, 3.0, 0.25);
-        assert!((tol - 0.25).abs() < 0.01, "Tolerance should be at minimum floor 0.25, got {}", tol);
+        assert!(
+            (tol - 0.25).abs() < 0.01,
+            "Tolerance should be at minimum floor 0.25, got {}",
+            tol
+        );
     }
 
     /// Verifies that local tolerance returns valid values when queried outside the calibration RT range.
@@ -880,8 +914,14 @@ mod tests {
         let tol_above = calibration.local_tolerance(50.0, 3.0, 0.25);
 
         // Both should be valid (at least minimum floor)
-        assert!(tol_below >= 0.25, "Below-range tolerance should be at least 0.25");
-        assert!(tol_above >= 0.25, "Above-range tolerance should be at least 0.25");
+        assert!(
+            tol_below >= 0.25,
+            "Below-range tolerance should be at least 0.25"
+        );
+        assert!(
+            tol_above >= 0.25,
+            "Above-range tolerance should be at least 0.25"
+        );
     }
 
     /// Verifies that absolute residuals survive an export/import roundtrip and produce matching local tolerances.
@@ -889,22 +929,33 @@ mod tests {
     fn test_model_params_roundtrip_with_abs_residuals() {
         // Test that abs_residuals are preserved through export/import
         let library_rts: Vec<f64> = (0..30).map(|i| i as f64).collect();
-        let measured_rts: Vec<f64> = library_rts.iter().map(|&x| x + 0.3 * (x / 15.0).sin()).collect();
+        let measured_rts: Vec<f64> = library_rts
+            .iter()
+            .map(|&x| x + 0.3 * (x / 15.0).sin())
+            .collect();
 
         let calibrator = RTCalibrator::new().with_bandwidth(0.3);
         let calibration = calibrator.fit(&library_rts, &measured_rts).unwrap();
 
         // Export model params
         let params = calibration.export_model_params();
-        assert_eq!(params.abs_residuals.len(), params.library_rts.len(), "abs_residuals should have same length as library_rts");
+        assert_eq!(
+            params.abs_residuals.len(),
+            params.library_rts.len(),
+            "abs_residuals should have same length as library_rts"
+        );
 
         // Reconstruct calibration
-        let reconstructed = RTCalibration::from_model_params(&params, calibration.residual_std()).unwrap();
+        let reconstructed =
+            RTCalibration::from_model_params(&params, calibration.residual_std()).unwrap();
 
         // Check that local_tolerance works on reconstructed calibration
         let orig_tol = calibration.local_tolerance(15.0, 3.0, 0.25);
         let recon_tol = reconstructed.local_tolerance(15.0, 3.0, 0.25);
-        assert!((orig_tol - recon_tol).abs() < 0.01, "Reconstructed calibration should give same local tolerance");
+        assert!(
+            (orig_tol - recon_tol).abs() < 0.01,
+            "Reconstructed calibration should give same local tolerance"
+        );
     }
 
     /// Verifies that loading old model params without abs_residuals falls back to uniform residual_std for tolerance.
@@ -923,6 +974,10 @@ mod tests {
         // Should fall back to uniform residual_std for local tolerance
         let tol = calibration.local_tolerance(15.0, 3.0, 0.25);
         // Expected: residual_std * factor = 0.5 * 3.0 = 1.5
-        assert!((tol - 1.5).abs() < 0.01, "Should use uniform residual_std when abs_residuals empty, got {}", tol);
+        assert!(
+            (tol - 1.5).abs() < 0.01,
+            "Should use uniform residual_std when abs_residuals empty, got {}",
+            tol
+        );
     }
 }

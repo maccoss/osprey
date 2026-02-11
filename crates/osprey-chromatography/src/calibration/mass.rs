@@ -123,9 +123,7 @@ fn calculate_single_calibration(errors: &[f64], unit: ToleranceUnit) -> MzCalibr
 
     // Calculate standard deviation
     let variance = if errors.len() > 1 {
-        errors.iter()
-            .map(|x| (x - mean).powi(2))
-            .sum::<f64>() / (errors.len() - 1) as f64
+        errors.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (errors.len() - 1) as f64
     } else {
         0.0
     };
@@ -239,7 +237,8 @@ pub fn apply_spectrum_calibration(spectrum: &Spectrum, calibration: &MzCalibrati
     }
 
     // Correct each m/z value
-    let corrected_mzs: Vec<f64> = spectrum.mzs
+    let corrected_mzs: Vec<f64> = spectrum
+        .mzs
         .iter()
         .map(|&mz| apply_mz_calibration(mz, calibration))
         .collect();
@@ -502,15 +501,30 @@ mod tests {
         // Observed with -2.5 ppm error (exactly at mean) should be within tolerance
         let theoretical = 500.0;
         let observed_at_mean = theoretical * (1.0 - 2.5 / 1e6);
-        assert!(is_within_calibrated_tolerance(observed_at_mean, theoretical, &calibration, 10.0));
+        assert!(is_within_calibrated_tolerance(
+            observed_at_mean,
+            theoretical,
+            &calibration,
+            10.0
+        ));
 
         // Observed with -6.0 ppm error (3.5 ppm from mean) should be within tolerance
         let observed_within = theoretical * (1.0 - 6.0 / 1e6);
-        assert!(is_within_calibrated_tolerance(observed_within, theoretical, &calibration, 10.0));
+        assert!(is_within_calibrated_tolerance(
+            observed_within,
+            theoretical,
+            &calibration,
+            10.0
+        ));
 
         // Observed with +5.0 ppm error (7.5 ppm from mean) should be outside tolerance
         let observed_outside = theoretical * (1.0 + 5.0 / 1e6);
-        assert!(!is_within_calibrated_tolerance(observed_outside, theoretical, &calibration, 10.0));
+        assert!(!is_within_calibrated_tolerance(
+            observed_outside,
+            theoretical,
+            &calibration,
+            10.0
+        ));
     }
 
     /// Verifies histogram bin structure and total count consistency for a set of m/z errors.

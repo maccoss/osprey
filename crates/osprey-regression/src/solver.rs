@@ -418,10 +418,13 @@ impl OptimizedProcessor {
         let observed_norm = observed.dot(&observed);
 
         // Extract design matrix from pre-binned library
-        let (design_matrix, library_ids) = self.binned_library.extract_design_matrix(candidate_indices);
+        let (design_matrix, library_ids) =
+            self.binned_library.extract_design_matrix(candidate_indices);
 
         // Solve regression
-        let coefficients = self.solver.solve_nonnegative(&design_matrix, &observed, None)?;
+        let coefficients = self
+            .solver
+            .solve_nonnegative(&design_matrix, &observed, None)?;
         let coefficient_sum: f32 = coefficients.iter().sum();
 
         // Compute residual
@@ -429,7 +432,8 @@ impl OptimizedProcessor {
         let residual = (&observed - &predicted).mapv(|x| x * x).sum();
 
         // Filter to non-zero coefficients
-        let mut result = OptimizedRegressionResult::empty(spectrum.scan_number, spectrum.retention_time);
+        let mut result =
+            OptimizedRegressionResult::empty(spectrum.scan_number, spectrum.retention_time);
         result.n_candidates = candidate_indices.len() as u32;
         result.coefficient_sum = coefficient_sum;
         result.observed_norm = observed_norm;
@@ -449,9 +453,9 @@ impl OptimizedProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
     use approx::assert_abs_diff_eq;
-    use osprey_core::{FragmentAnnotation, LibraryFragment, IsolationWindow};
+    use ndarray::array;
+    use osprey_core::{FragmentAnnotation, IsolationWindow, LibraryFragment};
 
     fn make_test_entry(id: u32, fragments: Vec<(f64, f32)>) -> LibraryEntry {
         let mut entry = LibraryEntry::new(
@@ -522,11 +526,7 @@ mod tests {
     fn test_optimized_solver_nonnegative() {
         let solver = OptimizedSolver::new(0.1);
 
-        let a = array![
-            [1.0_f32, 0.5, 0.2],
-            [0.5, 1.0, 0.3],
-            [0.2, 0.3, 1.0],
-        ];
+        let a = array![[1.0_f32, 0.5, 0.2], [0.5, 1.0, 0.3], [0.2, 0.3, 1.0],];
         let b = array![1.0_f32, 0.5, 0.8];
 
         let x = solver.solve_nonnegative(&a, &b, None).unwrap();

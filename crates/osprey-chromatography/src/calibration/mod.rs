@@ -11,9 +11,9 @@
 //! 4. Calculate calibration parameters from confident matches
 //! 5. Apply corrections during main search
 
+pub mod io;
 pub mod mass;
 pub mod rt;
-pub mod io;
 
 use serde::{Deserialize, Serialize};
 
@@ -220,19 +220,9 @@ impl MzCalibration {
 
                 let bar: String = "█".repeat(bar_width);
                 if is_th {
-                    log::info!(
-                        "{:>7.3} | {:6} | {}",
-                        bin_center,
-                        count,
-                        bar
-                    );
+                    log::info!("{:>7.3} | {:6} | {}", bin_center, count, bar);
                 } else {
-                    log::info!(
-                        "{:>7.1} | {:6} | {}",
-                        bin_center,
-                        count,
-                        bar
-                    );
+                    log::info!("{:>7.1} | {:6} | {}", bin_center, count, bar);
                 }
             }
             if is_th {
@@ -309,7 +299,8 @@ impl RTCalibrationParams {
 
     /// Check if this calibration has model data for reconstruction
     pub fn has_model_data(&self) -> bool {
-        self.model_params.as_ref()
+        self.model_params
+            .as_ref()
             .map(|m| !m.library_rts.is_empty() && m.library_rts.len() == m.fitted_rts.len())
             .unwrap_or(false)
     }
@@ -327,9 +318,17 @@ pub enum RTCalibrationMethod {
 }
 
 // Re-export key types and functions from submodules
-pub use mass::{calculate_mz_calibration, apply_mz_calibration, apply_spectrum_calibration, calibrated_tolerance_ppm, calibrated_tolerance, calculate_ppm_error, MzQCData};
-pub use rt::{RTCalibration, RTCalibrationStats, RTCalibrator, RTCalibratorConfig, RTStratifiedSampler};
-pub use io::{save_calibration, load_calibration, calibration_filename, calibration_filename_for_input, calibration_path_for_input};
+pub use io::{
+    calibration_filename, calibration_filename_for_input, calibration_path_for_input,
+    load_calibration, save_calibration,
+};
+pub use mass::{
+    apply_mz_calibration, apply_spectrum_calibration, calculate_mz_calibration,
+    calculate_ppm_error, calibrated_tolerance, calibrated_tolerance_ppm, MzQCData,
+};
+pub use rt::{
+    RTCalibration, RTCalibrationStats, RTCalibrator, RTCalibratorConfig, RTStratifiedSampler,
+};
 
 #[cfg(test)]
 mod tests {

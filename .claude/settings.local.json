@@ -73,7 +73,9 @@
       "Bash(/home/maccoss/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo build:*)",
       "Bash(export PATH=\"$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH\")",
       "Read(//home/**)",
-      "Bash(bash -c:*)"
+      "Bash(bash -c:*)",
+      "Bash(gh run view:*)",
+      "Bash(cargo fmt:*)"
     ]
   }
 }

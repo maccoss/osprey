@@ -65,7 +65,10 @@ fn format_duration(duration: std::time::Duration) -> String {
 /// Osprey: Peptide-centric DIA analysis tool
 #[derive(Parser, Debug)]
 #[command(name = "osprey")]
-#[command(version, about = "Peptide-centric DIA analysis with Skyline integration")]
+#[command(
+    version,
+    about = "Peptide-centric DIA analysis with Skyline integration"
+)]
 #[command(long_about = r#"
 Osprey is an open-source tool for peptide detection and quantification
 in data-independent acquisition (DIA) mass spectrometry data.
@@ -170,7 +173,10 @@ fn main() -> Result<()> {
 
     // Initialize logging — tee to both stderr and a log file in the current directory
     let log_level = if args.verbose { "debug" } else { "info" };
-    let log_filename = format!("osprey_{}.log", chrono::Local::now().format("%Y-%m-%d_%H%M%S"));
+    let log_filename = format!(
+        "osprey_{}.log",
+        chrono::Local::now().format("%Y-%m-%d_%H%M%S")
+    );
     let log_file = std::fs::File::create(&log_filename)?;
     let tee = TeeWriter {
         stderr: std::io::stderr(),
@@ -182,9 +188,15 @@ fn main() -> Result<()> {
 
     // Handle --generate-config
     if let Some(config_path) = args.generate_config {
-        log::info!("Generating template configuration file: {}", config_path.display());
+        log::info!(
+            "Generating template configuration file: {}",
+            config_path.display()
+        );
         OspreyConfig::create_template(&config_path)?;
-        log::info!("Template created. Edit the file and run with --config {}", config_path.display());
+        log::info!(
+            "Template created. Edit the file and run with --config {}",
+            config_path.display()
+        );
         return Ok(());
     }
 
@@ -204,27 +216,29 @@ fn main() -> Result<()> {
     };
 
     // Parse tolerance units if provided
-    let fragment_unit = args.fragment_unit.as_ref().map(|s| {
-        match s.to_lowercase().as_str() {
+    let fragment_unit = args
+        .fragment_unit
+        .as_ref()
+        .map(|s| match s.to_lowercase().as_str() {
             "ppm" => ToleranceUnit::Ppm,
             "mz" | "th" | "da" => ToleranceUnit::Mz,
             _ => {
                 log::warn!("Unknown fragment unit '{}', defaulting to ppm", s);
                 ToleranceUnit::Ppm
             }
-        }
-    });
+        });
 
-    let precursor_unit = args.precursor_unit.as_ref().map(|s| {
-        match s.to_lowercase().as_str() {
+    let precursor_unit = args
+        .precursor_unit
+        .as_ref()
+        .map(|s| match s.to_lowercase().as_str() {
             "ppm" => ToleranceUnit::Ppm,
             "mz" | "th" | "da" => ToleranceUnit::Mz,
             _ => {
                 log::warn!("Unknown precursor unit '{}', defaulting to ppm", s);
                 ToleranceUnit::Ppm
             }
-        }
-    });
+        });
 
     // Create overrides from CLI args (these take precedence over config file)
     let overrides = ConfigOverrides {
@@ -274,9 +288,13 @@ fn main() -> Result<()> {
             }
         }
 
-        log::info!("Unit resolution mode: MS1 {:.2} {:?}, MS2 {:.2} {:?}",
-            config.precursor_tolerance.tolerance, config.precursor_tolerance.unit,
-            config.fragment_tolerance.tolerance, config.fragment_tolerance.unit);
+        log::info!(
+            "Unit resolution mode: MS1 {:.2} {:?}, MS2 {:.2} {:?}",
+            config.precursor_tolerance.tolerance,
+            config.precursor_tolerance.unit,
+            config.fragment_tolerance.tolerance,
+            config.fragment_tolerance.unit
+        );
     }
 
     // Set max candidates
@@ -296,7 +314,10 @@ fn main() -> Result<()> {
 
     // Log reproducibility header
     log::info!("Osprey v{}", env!("CARGO_PKG_VERSION"));
-    log::info!("Command: {}", std::env::args().collect::<Vec<_>>().join(" "));
+    log::info!(
+        "Command: {}",
+        std::env::args().collect::<Vec<_>>().join(" ")
+    );
     log::info!("Log file: {}", log_filename);
     match config.to_yaml_string() {
         Ok(yaml) => log::info!("Resolved configuration:\n{}", yaml),

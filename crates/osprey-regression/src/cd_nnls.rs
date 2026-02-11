@@ -467,7 +467,10 @@ mod tests {
         sorted_x.sort_by(|a, b| b.partial_cmp(a).unwrap());
 
         // Top 5 coefficients should be significant (true peptides)
-        assert!(sorted_x[0] > 0.1, "Largest coefficient should be significant");
+        assert!(
+            sorted_x[0] > 0.1,
+            "Largest coefficient should be significant"
+        );
         assert!(sorted_x[4] > 0.05, "5th largest should be significant too");
 
         // The true peptides should have non-zero coefficients

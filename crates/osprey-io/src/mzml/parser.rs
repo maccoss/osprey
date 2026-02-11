@@ -243,10 +243,13 @@ impl MS1Index {
     /// Find the nearest MS1 spectrum within a maximum RT tolerance
     ///
     /// Returns None if no MS1 spectrum is within the tolerance.
-    pub fn find_nearest_within(&self, retention_time: f64, max_delta_rt: f64) -> Option<&MS1Spectrum> {
-        self.find_nearest(retention_time).filter(|s| {
-            (s.retention_time - retention_time).abs() <= max_delta_rt
-        })
+    pub fn find_nearest_within(
+        &self,
+        retention_time: f64,
+        max_delta_rt: f64,
+    ) -> Option<&MS1Spectrum> {
+        self.find_nearest(retention_time)
+            .filter(|s| (s.retention_time - retention_time).abs() <= max_delta_rt)
     }
 
     /// Get RT range of MS1 spectra

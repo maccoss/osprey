@@ -22,5 +22,5 @@ pub mod solver;
 pub use binning::Binner;
 pub use cd_nnls::CdNnlsParams;
 pub use matrix::DesignMatrixBuilder;
-pub use solver::OptimizedSolver;
 pub use ridge::RidgeSolver;
+pub use solver::OptimizedSolver;

@@ -76,27 +76,27 @@ pub fn amino_acid_composition(aa: char) -> Option<ElementalComposition> {
     // Amino acid residue compositions (formula - H2O for peptide bond)
     // Reference: NIST Chemistry WebBook
     let comp = match aa.to_ascii_uppercase() {
-        'A' => ElementalComposition::new(3, 5, 1, 1, 0),   // Alanine: C3H5NO
-        'C' => ElementalComposition::new(3, 5, 1, 1, 1),   // Cysteine: C3H5NOS
-        'D' => ElementalComposition::new(4, 5, 1, 3, 0),   // Aspartic acid: C4H5NO3
-        'E' => ElementalComposition::new(5, 7, 1, 3, 0),   // Glutamic acid: C5H7NO3
-        'F' => ElementalComposition::new(9, 9, 1, 1, 0),   // Phenylalanine: C9H9NO
-        'G' => ElementalComposition::new(2, 3, 1, 1, 0),   // Glycine: C2H3NO
-        'H' => ElementalComposition::new(6, 7, 3, 1, 0),   // Histidine: C6H7N3O
-        'I' => ElementalComposition::new(6, 11, 1, 1, 0),  // Isoleucine: C6H11NO
-        'K' => ElementalComposition::new(6, 12, 2, 1, 0),  // Lysine: C6H12N2O
-        'L' => ElementalComposition::new(6, 11, 1, 1, 0),  // Leucine: C6H11NO
-        'M' => ElementalComposition::new(5, 9, 1, 1, 1),   // Methionine: C5H9NOS
-        'N' => ElementalComposition::new(4, 6, 2, 2, 0),   // Asparagine: C4H6N2O2
-        'P' => ElementalComposition::new(5, 7, 1, 1, 0),   // Proline: C5H7NO
-        'Q' => ElementalComposition::new(5, 8, 2, 2, 0),   // Glutamine: C5H8N2O2
-        'R' => ElementalComposition::new(6, 12, 4, 1, 0),  // Arginine: C6H12N4O
-        'S' => ElementalComposition::new(3, 5, 1, 2, 0),   // Serine: C3H5NO2
-        'T' => ElementalComposition::new(4, 7, 1, 2, 0),   // Threonine: C4H7NO2
-        'V' => ElementalComposition::new(5, 9, 1, 1, 0),   // Valine: C5H9NO
+        'A' => ElementalComposition::new(3, 5, 1, 1, 0), // Alanine: C3H5NO
+        'C' => ElementalComposition::new(3, 5, 1, 1, 1), // Cysteine: C3H5NOS
+        'D' => ElementalComposition::new(4, 5, 1, 3, 0), // Aspartic acid: C4H5NO3
+        'E' => ElementalComposition::new(5, 7, 1, 3, 0), // Glutamic acid: C5H7NO3
+        'F' => ElementalComposition::new(9, 9, 1, 1, 0), // Phenylalanine: C9H9NO
+        'G' => ElementalComposition::new(2, 3, 1, 1, 0), // Glycine: C2H3NO
+        'H' => ElementalComposition::new(6, 7, 3, 1, 0), // Histidine: C6H7N3O
+        'I' => ElementalComposition::new(6, 11, 1, 1, 0), // Isoleucine: C6H11NO
+        'K' => ElementalComposition::new(6, 12, 2, 1, 0), // Lysine: C6H12N2O
+        'L' => ElementalComposition::new(6, 11, 1, 1, 0), // Leucine: C6H11NO
+        'M' => ElementalComposition::new(5, 9, 1, 1, 1), // Methionine: C5H9NOS
+        'N' => ElementalComposition::new(4, 6, 2, 2, 0), // Asparagine: C4H6N2O2
+        'P' => ElementalComposition::new(5, 7, 1, 1, 0), // Proline: C5H7NO
+        'Q' => ElementalComposition::new(5, 8, 2, 2, 0), // Glutamine: C5H8N2O2
+        'R' => ElementalComposition::new(6, 12, 4, 1, 0), // Arginine: C6H12N4O
+        'S' => ElementalComposition::new(3, 5, 1, 2, 0), // Serine: C3H5NO2
+        'T' => ElementalComposition::new(4, 7, 1, 2, 0), // Threonine: C4H7NO2
+        'V' => ElementalComposition::new(5, 9, 1, 1, 0), // Valine: C5H9NO
         'W' => ElementalComposition::new(11, 10, 2, 1, 0), // Tryptophan: C11H10N2O
-        'Y' => ElementalComposition::new(9, 9, 1, 2, 0),   // Tyrosine: C9H9NO2
-        'U' => ElementalComposition::new(3, 5, 1, 1, 0),   // Selenocysteine (approx as Cys-S)
+        'Y' => ElementalComposition::new(9, 9, 1, 2, 0), // Tyrosine: C9H9NO2
+        'U' => ElementalComposition::new(3, 5, 1, 1, 0), // Selenocysteine (approx as Cys-S)
         _ => return None,
     };
     Some(comp)
@@ -111,8 +111,15 @@ pub fn peptide_composition(sequence: &str) -> Option<ElementalComposition> {
 
     // Sum up all amino acid residue compositions
     for aa in sequence.chars() {
-        if aa == '[' || aa == ']' || aa == '(' || aa == ')' || aa.is_ascii_digit()
-            || aa == '+' || aa == '-' || aa == '.' {
+        if aa == '['
+            || aa == ']'
+            || aa == '('
+            || aa == ')'
+            || aa.is_ascii_digit()
+            || aa == '+'
+            || aa == '-'
+            || aa == '.'
+        {
             // Skip modification notation characters
             continue;
         }
@@ -285,7 +292,12 @@ fn convolve_sulfur(dist: &[f64; 5], n: usize) -> [f64; 5] {
                 let prob = multinomial_prob(
                     n,
                     &[n32, n33, n34, n36],
-                    &[abundances::S32, abundances::S33, abundances::S34, abundances::S36],
+                    &[
+                        abundances::S32,
+                        abundances::S33,
+                        abundances::S34,
+                        abundances::S36,
+                    ],
                 );
 
                 // Convolve
@@ -514,11 +526,11 @@ mod tests {
 
         // Create observed that matches theoretical
         let observed = [
-            0.0,              // M-1
-            theoretical[0],   // M+0
-            theoretical[1],   // M+1
-            theoretical[2],   // M+2
-            theoretical[3],   // M+3
+            0.0,            // M-1
+            theoretical[0], // M+0
+            theoretical[1], // M+1
+            theoretical[2], // M+2
+            theoretical[3], // M+3
         ];
 
         let score = peptide_isotope_cosine(sequence, &observed).unwrap();

@@ -40,12 +40,8 @@ pub fn train_and_score_calibration(
     let sequences: Vec<String> = matches.iter().map(|m| m.sequence.clone()).collect();
 
     // 4. Train LDA with cross-validation and non-negative constraints
-    let discriminants = train_lda_with_nonnegative_cv(
-        &features,
-        &decoy_labels,
-        &sequences,
-        use_isotope_feature
-    )?;
+    let discriminants =
+        train_lda_with_nonnegative_cv(&features, &decoy_labels, &sequences, use_isotope_feature)?;
 
     // 5. KDE for posterior error probabilities
     let kde_model = kde::Builder::default().build(&discriminants, &decoy_labels);
@@ -60,11 +56,13 @@ pub fn train_and_score_calibration(
     matches.sort_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
 
     // DEBUG: Log discriminant score distributions
-    let target_scores: Vec<f64> = matches.iter()
+    let target_scores: Vec<f64> = matches
+        .iter()
         .filter(|m| !m.is_decoy)
         .map(|m| m.discriminant_score)
         .collect();
-    let decoy_scores: Vec<f64> = matches.iter()
+    let decoy_scores: Vec<f64> = matches
+        .iter()
         .filter(|m| m.is_decoy)
         .map(|m| m.discriminant_score)
         .collect();
@@ -72,14 +70,29 @@ pub fn train_and_score_calibration(
     if !target_scores.is_empty() && !decoy_scores.is_empty() {
         let target_mean = target_scores.iter().sum::<f64>() / target_scores.len() as f64;
         let decoy_mean = decoy_scores.iter().sum::<f64>() / decoy_scores.len() as f64;
-        let target_max = target_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let target_max = target_scores
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         let target_min = target_scores.iter().cloned().fold(f64::INFINITY, f64::min);
-        let decoy_max = decoy_scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let decoy_max = decoy_scores
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         let decoy_min = decoy_scores.iter().cloned().fold(f64::INFINITY, f64::min);
 
-        log::info!("  Discriminant scores: target_mean={:.3}, decoy_mean={:.3}", target_mean, decoy_mean);
-        log::info!("  Discriminant ranges: targets=[{:.3}, {:.3}], decoys=[{:.3}, {:.3}]",
-            target_min, target_max, decoy_min, decoy_max);
+        log::info!(
+            "  Discriminant scores: target_mean={:.3}, decoy_mean={:.3}",
+            target_mean,
+            decoy_mean
+        );
+        log::info!(
+            "  Discriminant ranges: targets=[{:.3}, {:.3}], decoys=[{:.3}, {:.3}]",
+            target_min,
+            target_max,
+            decoy_min,
+            decoy_max
+        );
     }
 
     // 8. Calculate q-values using target-decoy competition
@@ -95,12 +108,13 @@ pub fn train_and_score_calibration(
     // DEBUG: Log q-value statistics
     let min_q = q_values.iter().cloned().fold(f64::INFINITY, f64::min);
     let first_10_q: Vec<f64> = q_values.iter().take(10).cloned().collect();
-    log::info!("  Q-value stats: min_q={:.4}, first_10={:?}", min_q, first_10_q);
-
     log::info!(
-        "LDA scoring complete: {} matches passing 1% FDR",
-        n_passing
+        "  Q-value stats: min_q={:.4}, first_10={:?}",
+        min_q,
+        first_10_q
     );
+
+    log::info!("LDA scoring complete: {} matches passing 1% FDR", n_passing);
 
     // DIAGNOSTIC: Compare LDA performance to correlation-only
     // Note: The LDA training already tracks the best single feature internally
@@ -108,7 +122,8 @@ pub fn train_and_score_calibration(
     let n_passing_corr_only = compare_to_correlation_only(matches);
     log::info!(
         "  Comparison: Correlation-only would yield {} matches passing 1% FDR (LDA: {})",
-        n_passing_corr_only, n_passing
+        n_passing_corr_only,
+        n_passing
     );
 
     // Log median feature values for diagnostics
@@ -176,16 +191,19 @@ fn train_lda_single_model(
         vec!["correlation", "libcosine", "top6", "snr"]
     };
 
-    log::info!("  LDA feature weights (non-negative): {}",
-        feature_names.iter().enumerate()
+    log::info!(
+        "  LDA feature weights (non-negative): {}",
+        feature_names
+            .iter()
+            .enumerate()
             .map(|(i, name)| format!("{}={:.3}", name, weights[i]))
             .collect::<Vec<_>>()
             .join(", ")
     );
 
     // Create new LDA with non-negative weights
-    let lda_nonneg = LinearDiscriminantAnalysis::from_weights(weights)
-        .map_err(|e| OspreyError::config(e))?;
+    let lda_nonneg =
+        LinearDiscriminantAnalysis::from_weights(weights).map_err(|e| OspreyError::config(e))?;
 
     // Score all samples
     let discriminants = lda_nonneg.predict(features);
@@ -231,21 +249,19 @@ fn train_lda_with_nonnegative_cv(
     let feature_names = ["correlation", "libcosine", "top6", "snr"];
 
     // Create fold assignments (stable across iterations - Percolator-RESET grouping)
-    let fold_assignments = create_stratified_folds_by_peptide(
-        decoy_labels,
-        sequences,
-        N_FOLDS,
-    );
+    let fold_assignments = create_stratified_folds_by_peptide(decoy_labels, sequences, N_FOLDS);
 
     // Find the best single feature to use as baseline (like Percolator)
     let mut best_feat_idx = 0;
     let mut best_feat_passing = 0;
     for feat_idx in 0..n_features {
-        let feat_scores: Vec<f64> = (0..n_samples)
-            .map(|i| features[(i, feat_idx)])
-            .collect();
+        let feat_scores: Vec<f64> = (0..n_samples).map(|i| features[(i, feat_idx)]).collect();
         let n_pass = count_passing_targets(&feat_scores, decoy_labels, 0.01);
-        log::info!("  Initial feature '{}': {} pass 1% FDR", feature_names[feat_idx], n_pass);
+        log::info!(
+            "  Initial feature '{}': {} pass 1% FDR",
+            feature_names[feat_idx],
+            n_pass
+        );
         if n_pass > best_feat_passing {
             best_feat_passing = n_pass;
             best_feat_idx = feat_idx;
@@ -259,7 +275,8 @@ fn train_lda_with_nonnegative_cv(
 
     log::info!(
         "  Baseline: '{}' = {} pass 1% FDR",
-        feature_names[best_feat_idx], best_feat_passing
+        feature_names[best_feat_idx],
+        best_feat_passing
     );
 
     // Best-so-far tracking: always revert to the iteration with the most passing targets
@@ -296,7 +313,8 @@ fn train_lda_with_nonnegative_cv(
             total_selected_targets += selected_target_indices.len();
 
             // Collect ALL decoy indices from train set
-            let decoy_indices: Vec<usize> = train_indices.iter()
+            let decoy_indices: Vec<usize> = train_indices
+                .iter()
                 .filter(|&&i| decoy_labels[i])
                 .copied()
                 .collect();
@@ -306,29 +324,38 @@ fn train_lda_with_nonnegative_cv(
             training_indices.extend_from_slice(&decoy_indices);
 
             let train_features = extract_rows(features, &training_indices);
-            let train_labels: Vec<bool> = training_indices.iter()
-                .map(|&i| decoy_labels[i])
-                .collect();
+            let train_labels: Vec<bool> =
+                training_indices.iter().map(|&i| decoy_labels[i]).collect();
 
             log::debug!(
                 "    Fold {}/{}: {} selected targets + {} decoys = {} training samples",
-                fold_idx + 1, N_FOLDS,
+                fold_idx + 1,
+                N_FOLDS,
                 selected_target_indices.len(),
                 decoy_indices.len(),
                 training_indices.len()
             );
 
             // Train LDA on clean training set
-            let lda = LinearDiscriminantAnalysis::fit(&train_features, &train_labels)
-                .ok_or_else(|| OspreyError::config(
-                    format!("LDA training failed on fold {}/{}", fold_idx + 1, N_FOLDS)
-                ))?;
+            let lda = LinearDiscriminantAnalysis::fit(&train_features, &train_labels).ok_or_else(
+                || {
+                    OspreyError::config(format!(
+                        "LDA training failed on fold {}/{}",
+                        fold_idx + 1,
+                        N_FOLDS
+                    ))
+                },
+            )?;
 
             let weights = lda.eigenvector().to_vec();
 
-            log::debug!("    Fold {}/{} weights: {}",
-                fold_idx + 1, N_FOLDS,
-                feature_names.iter().enumerate()
+            log::debug!(
+                "    Fold {}/{} weights: {}",
+                fold_idx + 1,
+                N_FOLDS,
+                feature_names
+                    .iter()
+                    .enumerate()
                     .map(|(i, name)| format!("{}={:.3}", name, weights[i]))
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -343,7 +370,10 @@ fn train_lda_with_nonnegative_cv(
         // Clip negative weights to zero (non-negative constraint)
         let n_negative = consensus_weights.iter().filter(|&&w| w < 0.0).count();
         if n_negative > 0 {
-            log::debug!("    Clipping {} negative consensus weights to zero", n_negative);
+            log::debug!(
+                "    Clipping {} negative consensus weights to zero",
+                n_negative
+            );
             for w in consensus_weights.iter_mut() {
                 if *w < 0.0 {
                     *w = 0.0;
@@ -368,7 +398,9 @@ fn train_lda_with_nonnegative_cv(
         log::info!(
             "  Iteration {}: weights=[{}], selected {} train targets, {} pass 1% FDR",
             iteration + 1,
-            feature_names.iter().enumerate()
+            feature_names
+                .iter()
+                .enumerate()
                 .map(|(i, name)| format!("{}={:.3}", name, consensus_weights[i]))
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -384,7 +416,11 @@ fn train_lda_with_nonnegative_cv(
             best_passing = n_passing;
             best_iteration = iteration + 1;
             consecutive_no_improve = 0;
-            log::info!("    -> New best: {} pass 1% FDR (iteration {})", best_passing, best_iteration);
+            log::info!(
+                "    -> New best: {} pass 1% FDR (iteration {})",
+                best_passing,
+                best_iteration
+            );
         } else {
             consecutive_no_improve += 1;
             log::info!(
@@ -410,7 +446,8 @@ fn train_lda_with_nonnegative_cv(
     log::info!("  Iteration history (pass 1% FDR): {:?}", iteration_passing);
     log::info!(
         "  Using iteration {} ({} pass 1% FDR)",
-        best_iteration, best_passing
+        best_iteration,
+        best_passing
     );
 
     Ok(best_scores)
@@ -487,7 +524,11 @@ fn select_positive_training_set(
                 }
             }
             if selected.len() >= min_targets {
-                log::debug!("      Relaxed training FDR to {:.0}% to get {} targets", threshold * 100.0, selected.len());
+                log::debug!(
+                    "      Relaxed training FDR to {:.0}% to get {} targets",
+                    threshold * 100.0,
+                    selected.len()
+                );
                 break;
             }
         }
@@ -636,9 +677,7 @@ fn extract_rows(matrix: &Matrix, row_indices: &[usize]) -> Matrix {
     let n_cols = matrix.cols;
     let data: Vec<f64> = row_indices
         .iter()
-        .flat_map(|&row| {
-            (0..n_cols).map(move |col| matrix[(row, col)])
-        })
+        .flat_map(|&row| (0..n_cols).map(move |col| matrix[(row, col)]))
         .collect();
 
     Matrix::new(data, row_indices.len(), n_cols)
@@ -684,13 +723,13 @@ fn compare_to_correlation_only(matches: &[CalibrationMatch]) -> usize {
     // Create a sorted copy by correlation_score
     let mut indices: Vec<usize> = (0..matches.len()).collect();
     indices.sort_by(|&a, &b| {
-        matches[b].correlation_score.total_cmp(&matches[a].correlation_score)
+        matches[b]
+            .correlation_score
+            .total_cmp(&matches[a].correlation_score)
     });
 
     // Build is_decoy array in correlation-sorted order
-    let is_decoy_corr: Vec<bool> = indices.iter()
-        .map(|&i| matches[i].is_decoy)
-        .collect();
+    let is_decoy_corr: Vec<bool> = indices.iter().map(|&i| matches[i].is_decoy).collect();
 
     // Calculate q-values for correlation-only ranking
     let mut q_values_corr = vec![0.0; matches.len()];
@@ -700,7 +739,8 @@ fn compare_to_correlation_only(matches: &[CalibrationMatch]) -> usize {
     let min_q_corr = q_values_corr.iter().cloned().fold(f64::INFINITY, f64::min);
     log::debug!(
         "  Correlation-only: min_q={:.4}, n_passing={}",
-        min_q_corr, n_passing_corr
+        min_q_corr,
+        n_passing_corr
     );
 
     n_passing_corr
@@ -785,7 +825,7 @@ mod tests {
             libcosine_apex: libcosine,
             top6_matched_apex: top6,
             hyperscore_apex: hyperscore,
-            signal_to_noise: 10.0,  // Default value for tests
+            signal_to_noise: 10.0, // Default value for tests
             discriminant_score: 0.0,
             posterior_error: 0.0,
             q_value: 1.0,

@@ -142,8 +142,9 @@ impl DiannTsvLoader {
         row_num: usize,
     ) -> Result<RowData> {
         let get_field = |idx: Option<usize>, name: &str| -> Result<&str> {
-            idx.and_then(|i| record.get(i))
-                .ok_or_else(|| OspreyError::LibraryLoadError(format!("Missing {} at row {}", name, row_num)))
+            idx.and_then(|i| record.get(i)).ok_or_else(|| {
+                OspreyError::LibraryLoadError(format!("Missing {} at row {}", name, row_num))
+            })
         };
 
         let parse_f64 = |s: &str, name: &str| -> Result<f64> {
@@ -175,8 +176,12 @@ impl DiannTsvLoader {
 
         // Required fields
         let precursor_mz = parse_f64(get_field(cols.precursor_mz, "PrecursorMz")?, "PrecursorMz")?;
-        let charge = parse_u8(get_field(cols.precursor_charge, "PrecursorCharge")?, "PrecursorCharge")?;
-        let modified_sequence = strip_flanking_chars(get_field(cols.modified_peptide, "ModifiedPeptide")?);
+        let charge = parse_u8(
+            get_field(cols.precursor_charge, "PrecursorCharge")?,
+            "PrecursorCharge",
+        )?;
+        let modified_sequence =
+            strip_flanking_chars(get_field(cols.modified_peptide, "ModifiedPeptide")?);
         let fragment_mz = parse_f64(get_field(cols.fragment_mz, "FragmentMz")?, "FragmentMz")?;
         let relative_intensity = parse_f32(
             get_field(cols.relative_intensity, "RelativeIntensity")?,
@@ -317,7 +322,11 @@ impl ColumnIndices {
             modified_peptide: find(&["ModifiedPeptide", "Modified.Peptide", "FullPeptideName"]),
             stripped_peptide: find(&["StrippedPeptide", "Stripped.Peptide", "PeptideSequence"]),
             fragment_mz: find(&["FragmentMz", "Fragment.Mz", "ProductMz", "Q3"]),
-            relative_intensity: find(&["RelativeIntensity", "Relative.Intensity", "LibraryIntensity"]),
+            relative_intensity: find(&[
+                "RelativeIntensity",
+                "Relative.Intensity",
+                "LibraryIntensity",
+            ]),
             fragment_type: find(&["FragmentType", "Fragment.Type", "IonType"]),
             fragment_series_number: find(&["FragmentSeriesNumber", "FragmentNumber", "IonNumber"]),
             fragment_charge: find(&["FragmentCharge", "Fragment.Charge", "ProductCharge"]),
@@ -524,7 +533,9 @@ fn parse_mod_mass(s: &str) -> Option<f64> {
 fn parse_unimod_id(s: &str) -> Option<u32> {
     if let Some(start) = s.find("UniMod:") {
         let rest = &s[start + 7..];
-        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
         rest[..end].parse().ok()
     } else {
         None

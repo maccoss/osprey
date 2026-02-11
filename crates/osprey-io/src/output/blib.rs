@@ -39,16 +39,18 @@ impl BlibWriter {
             })?;
         }
 
-        let conn = Connection::open(path).map_err(|e| {
-            OspreyError::SqliteError(format!("Failed to create blib file: {}", e))
-        })?;
+        let conn = Connection::open(path)
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to create blib file: {}", e)))?;
 
         // Enable WAL mode for better write performance
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         // Reduce sync frequency (still safe with WAL)
         conn.pragma_update(None, "synchronous", "NORMAL").ok();
 
-        let writer = Self { conn, in_transaction: false };
+        let writer = Self {
+            conn,
+            in_transaction: false,
+        };
         writer.create_schema()?;
 
         Ok(writer)
@@ -62,9 +64,9 @@ impl BlibWriter {
         if self.in_transaction {
             return Ok(()); // Already in a transaction
         }
-        self.conn.execute("BEGIN TRANSACTION", []).map_err(|e| {
-            OspreyError::SqliteError(format!("Failed to begin transaction: {}", e))
-        })?;
+        self.conn
+            .execute("BEGIN TRANSACTION", [])
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to begin transaction: {}", e)))?;
         self.in_transaction = true;
         Ok(())
     }
@@ -84,8 +86,9 @@ impl BlibWriter {
     /// Create the blib schema tables
     fn create_schema(&self) -> Result<()> {
         // Create standard BiblioSpec tables
-        self.conn.execute_batch(
-            r#"
+        self.conn
+            .execute_batch(
+                r#"
             -- Library metadata
             CREATE TABLE LibInfo (
                 libLSID TEXT PRIMARY KEY,
@@ -257,24 +260,29 @@ impl BlibWriter {
             CREATE INDEX idx_boundaries_refid ON OspreyPeakBoundaries(RefSpectraID);
             CREATE INDEX idx_runscores_refid ON OspreyRunScores(RefSpectraID);
             "#,
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to create schema: {}", e)))?;
+            )
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to create schema: {}", e)))?;
 
         // Insert initial metadata
-        self.conn.execute(
-            "INSERT INTO LibInfo (libLSID, createTime, numSpecs, majorVersion, minorVersion)
+        self.conn
+            .execute(
+                "INSERT INTO LibInfo (libLSID, createTime, numSpecs, majorVersion, minorVersion)
              VALUES (?, datetime('now'), 0, ?, ?)",
-            params![
-                format!("urn:lsid:osprey:blib:{}", uuid_simple()),
-                BLIB_MAJOR_VERSION,
-                BLIB_MINOR_VERSION
-            ],
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to insert LibInfo: {}", e)))?;
+                params![
+                    format!("urn:lsid:osprey:blib:{}", uuid_simple()),
+                    BLIB_MAJOR_VERSION,
+                    BLIB_MINOR_VERSION
+                ],
+            )
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to insert LibInfo: {}", e)))?;
 
         // Insert score types - use PERCOLATOR QVALUE which Skyline recognizes
-        self.conn.execute(
-            "INSERT INTO ScoreTypes (id, scoreType) VALUES (?, ?)",
-            params![SCORE_TYPE_PERCOLATOR_QVALUE, "PERCOLATOR QVALUE"],
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to insert ScoreTypes: {}", e)))?;
+        self.conn
+            .execute(
+                "INSERT INTO ScoreTypes (id, scoreType) VALUES (?, ?)",
+                params![SCORE_TYPE_PERCOLATOR_QVALUE, "PERCOLATOR QVALUE"],
+            )
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to insert ScoreTypes: {}", e)))?;
 
         // Insert ion mobility types
         for (id, name) in [
@@ -283,10 +291,14 @@ impl BlibWriter {
             (2, "inverseK0(Vsec/cm^2)"),
             (3, "compensation(V)"),
         ] {
-            self.conn.execute(
-                "INSERT INTO IonMobilityTypes (id, ionMobilityType) VALUES (?, ?)",
-                params![id, name],
-            ).map_err(|e| OspreyError::SqliteError(format!("Failed to insert IonMobilityTypes: {}", e)))?;
+            self.conn
+                .execute(
+                    "INSERT INTO IonMobilityTypes (id, ionMobilityType) VALUES (?, ?)",
+                    params![id, name],
+                )
+                .map_err(|e| {
+                    OspreyError::SqliteError(format!("Failed to insert IonMobilityTypes: {}", e))
+                })?;
         }
 
         Ok(())
@@ -328,8 +340,9 @@ impl BlibWriter {
         let mz_blob = f64_vec_to_blob(mzs);
         let int_blob = f32_vec_to_blob(intensities);
 
-        self.conn.execute(
-            r#"INSERT INTO RefSpectra (
+        self.conn
+            .execute(
+                r#"INSERT INTO RefSpectra (
                 peptideSeq, precursorMZ, precursorCharge, peptideModSeq,
                 prevAA, nextAA, copies, numPeaks, ionMobility,
                 collisionalCrossSectionSqA, ionMobilityHighEnergyOffset, ionMobilityType,
@@ -344,20 +357,21 @@ impl BlibWriter {
                 NULL, NULL, NULL, NULL, NULL,
                 ?, NULL, ?, ?
             )"#,
-            params![
-                clean_seq,
-                precursor_mz,
-                precursor_charge,
-                clean_mod_seq,
-                mzs.len() as i32,
-                retention_time,
-                start_time,
-                end_time,
-                file_id,
-                score,
-                SCORE_TYPE_PERCOLATOR_QVALUE
-            ],
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to add spectrum: {}", e)))?;
+                params![
+                    clean_seq,
+                    precursor_mz,
+                    precursor_charge,
+                    clean_mod_seq,
+                    mzs.len() as i32,
+                    retention_time,
+                    start_time,
+                    end_time,
+                    file_id,
+                    score,
+                    SCORE_TYPE_PERCOLATOR_QVALUE
+                ],
+            )
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to add spectrum: {}", e)))?;
 
         let ref_id = self.conn.last_insert_rowid();
 
@@ -376,10 +390,14 @@ impl BlibWriter {
     /// This is important for Skyline to display modification positions correctly.
     pub fn add_modifications(&self, ref_id: i64, modifications: &[Modification]) -> Result<()> {
         for modif in modifications {
-            self.conn.execute(
-                "INSERT INTO Modifications (RefSpectraID, position, mass) VALUES (?, ?, ?)",
-                params![ref_id, modif.position as i32, modif.mass_delta],
-            ).map_err(|e| OspreyError::SqliteError(format!("Failed to add modification: {}", e)))?;
+            self.conn
+                .execute(
+                    "INSERT INTO Modifications (RefSpectraID, position, mass) VALUES (?, ?, ?)",
+                    params![ref_id, modif.position as i32, modif.mass_delta],
+                )
+                .map_err(|e| {
+                    OspreyError::SqliteError(format!("Failed to add modification: {}", e))
+                })?;
         }
         Ok(())
     }
@@ -395,7 +413,8 @@ impl BlibWriter {
             }
 
             // Check if protein already exists
-            let existing_id: Option<i64> = self.conn
+            let existing_id: Option<i64> = self
+                .conn
                 .query_row(
                     "SELECT id FROM Proteins WHERE accession = ?",
                     params![accession],
@@ -407,18 +426,26 @@ impl BlibWriter {
                 id
             } else {
                 // Insert new protein
-                self.conn.execute(
-                    "INSERT INTO Proteins (accession) VALUES (?)",
-                    params![accession],
-                ).map_err(|e| OspreyError::SqliteError(format!("Failed to add protein: {}", e)))?;
+                self.conn
+                    .execute(
+                        "INSERT INTO Proteins (accession) VALUES (?)",
+                        params![accession],
+                    )
+                    .map_err(|e| {
+                        OspreyError::SqliteError(format!("Failed to add protein: {}", e))
+                    })?;
                 self.conn.last_insert_rowid()
             };
 
             // Create mapping
-            self.conn.execute(
-                "INSERT INTO RefSpectraProteins (RefSpectraID, ProteinID) VALUES (?, ?)",
-                params![ref_id, protein_id],
-            ).map_err(|e| OspreyError::SqliteError(format!("Failed to add protein mapping: {}", e)))?;
+            self.conn
+                .execute(
+                    "INSERT INTO RefSpectraProteins (RefSpectraID, ProteinID) VALUES (?, ?)",
+                    params![ref_id, protein_id],
+                )
+                .map_err(|e| {
+                    OspreyError::SqliteError(format!("Failed to add protein mapping: {}", e))
+                })?;
         }
         Ok(())
     }
@@ -430,20 +457,24 @@ impl BlibWriter {
         file_name: &str,
         boundaries: &PeakBoundaries,
     ) -> Result<()> {
-        self.conn.execute(
-            r#"INSERT INTO OspreyPeakBoundaries (
+        self.conn
+            .execute(
+                r#"INSERT INTO OspreyPeakBoundaries (
                 RefSpectraID, FileName, StartRT, EndRT, ApexRT, ApexIntensity, IntegratedArea
             ) VALUES (?, ?, ?, ?, ?, ?, ?)"#,
-            params![
-                ref_id,
-                file_name,
-                boundaries.start_rt,
-                boundaries.end_rt,
-                boundaries.apex_rt,
-                boundaries.apex_coefficient,
-                boundaries.integrated_area
-            ],
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to add peak boundaries: {}", e)))?;
+                params![
+                    ref_id,
+                    file_name,
+                    boundaries.start_rt,
+                    boundaries.end_rt,
+                    boundaries.apex_rt,
+                    boundaries.apex_coefficient,
+                    boundaries.integrated_area
+                ],
+            )
+            .map_err(|e| {
+                OspreyError::SqliteError(format!("Failed to add peak boundaries: {}", e))
+            })?;
 
         Ok(())
     }
@@ -457,12 +488,14 @@ impl BlibWriter {
         score: f64,
         pep: f64,
     ) -> Result<()> {
-        self.conn.execute(
-            r#"INSERT INTO OspreyRunScores (
+        self.conn
+            .execute(
+                r#"INSERT INTO OspreyRunScores (
                 RefSpectraID, FileName, RunQValue, DiscriminantScore, PosteriorErrorProb
             ) VALUES (?, ?, ?, ?, ?)"#,
-            params![ref_id, file_name, q_value, score, pep],
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to add run scores: {}", e)))?;
+                params![ref_id, file_name, q_value, score, pep],
+            )
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to add run scores: {}", e)))?;
 
         Ok(())
     }
@@ -475,12 +508,16 @@ impl BlibWriter {
         n_runs_detected: i32,
         n_runs_searched: i32,
     ) -> Result<()> {
-        self.conn.execute(
-            r#"INSERT INTO OspreyExperimentScores (
+        self.conn
+            .execute(
+                r#"INSERT INTO OspreyExperimentScores (
                 RefSpectraID, ExperimentQValue, NRunsDetected, NRunsSearched
             ) VALUES (?, ?, ?, ?)"#,
-            params![ref_id, experiment_q_value, n_runs_detected, n_runs_searched],
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to add experiment scores: {}", e)))?;
+                params![ref_id, experiment_q_value, n_runs_detected, n_runs_searched],
+            )
+            .map_err(|e| {
+                OspreyError::SqliteError(format!("Failed to add experiment scores: {}", e))
+            })?;
 
         Ok(())
     }
@@ -494,32 +531,38 @@ impl BlibWriter {
         rt: f64,
         coefficient: f64,
     ) -> Result<()> {
-        self.conn.execute(
-            r#"INSERT INTO OspreyCoefficients (
+        self.conn
+            .execute(
+                r#"INSERT INTO OspreyCoefficients (
                 RefSpectraID, FileName, ScanNumber, RT, Coefficient
             ) VALUES (?, ?, ?, ?, ?)"#,
-            params![ref_id, file_name, scan_number, rt, coefficient],
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to add coefficient: {}", e)))?;
+                params![ref_id, file_name, scan_number, rt, coefficient],
+            )
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to add coefficient: {}", e)))?;
 
         Ok(())
     }
 
     /// Add metadata key-value pair
     pub fn add_metadata(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO OspreyMetadata (Key, Value) VALUES (?, ?)",
-            params![key, value],
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to add metadata: {}", e)))?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO OspreyMetadata (Key, Value) VALUES (?, ?)",
+                params![key, value],
+            )
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to add metadata: {}", e)))?;
 
         Ok(())
     }
 
     /// Update the spectrum count in LibInfo
     pub fn finalize(&self) -> Result<()> {
-        self.conn.execute(
-            "UPDATE LibInfo SET numSpecs = (SELECT COUNT(*) FROM RefSpectra)",
-            [],
-        ).map_err(|e| OspreyError::SqliteError(format!("Failed to update LibInfo: {}", e)))?;
+        self.conn
+            .execute(
+                "UPDATE LibInfo SET numSpecs = (SELECT COUNT(*) FROM RefSpectra)",
+                [],
+            )
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to update LibInfo: {}", e)))?;
 
         Ok(())
     }
@@ -610,7 +653,9 @@ fn convert_unimod_to_mass(seq: &str) -> String {
         (385, 229.162932), // TMT6plex
         (737, 229.162932), // TMT6plex (alternate ID)
         (747, 304.207146), // TMTpro
-    ].into_iter().collect();
+    ]
+    .into_iter()
+    .collect();
 
     let mut result = String::with_capacity(seq.len());
     let mut chars = seq.chars().peekable();
@@ -675,19 +720,21 @@ mod tests {
         assert!(file_id > 0);
 
         // Add a spectrum
-        let ref_id = writer.add_spectrum(
-            "PEPTIDE",
-            "PEPTIDE",
-            500.0,
-            2,
-            10.0,
-            9.0,
-            11.0,
-            &[300.0, 400.0, 500.0],
-            &[100.0, 200.0, 300.0],
-            0.01,
-            file_id,
-        ).unwrap();
+        let ref_id = writer
+            .add_spectrum(
+                "PEPTIDE",
+                "PEPTIDE",
+                500.0,
+                2,
+                10.0,
+                9.0,
+                11.0,
+                &[300.0, 400.0, 500.0],
+                &[100.0, 200.0, 300.0],
+                0.01,
+                file_id,
+            )
+            .unwrap();
         assert!(ref_id > 0);
 
         // Add peak boundaries
@@ -699,7 +746,9 @@ mod tests {
             integrated_area: 1.5,
             peak_quality: Default::default(),
         };
-        writer.add_peak_boundaries(ref_id, "test.mzML", &boundaries).unwrap();
+        writer
+            .add_peak_boundaries(ref_id, "test.mzML", &boundaries)
+            .unwrap();
 
         // Add metadata
         writer.add_metadata("osprey_version", "0.1.0").unwrap();
@@ -739,7 +788,10 @@ mod tests {
         assert_eq!(strip_flanking_chars(".PEPTIDE."), "PEPTIDE");
 
         // Modified sequence with flanking chars
-        assert_eq!(strip_flanking_chars("_PEPTC[+57.021]IDE_"), "PEPTC[+57.021]IDE");
+        assert_eq!(
+            strip_flanking_chars("_PEPTC[+57.021]IDE_"),
+            "PEPTC[+57.021]IDE"
+        );
 
         // Dashes at ends
         assert_eq!(strip_flanking_chars("-PEPTIDE-"), "PEPTIDE");
@@ -752,7 +804,10 @@ mod tests {
         assert_eq!(convert_unimod_to_mass("PEPTIDE"), "PEPTIDE");
 
         // Already mass notation - should be unchanged
-        assert_eq!(convert_unimod_to_mass("PEPTC[+57.021]IDE"), "PEPTC[+57.021]IDE");
+        assert_eq!(
+            convert_unimod_to_mass("PEPTC[+57.021]IDE"),
+            "PEPTC[+57.021]IDE"
+        );
 
         // UniMod:4 (Carbamidomethyl)
         let result = convert_unimod_to_mass("PEPTC[UniMod:4]IDE");

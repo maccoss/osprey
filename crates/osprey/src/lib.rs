@@ -31,12 +31,12 @@
 pub use osprey_core::*;
 
 // Re-export I/O
-pub use osprey_io::{load_library, BlibLoader, DiannTsvLoader, ElibLoader, MzmlReader, ReportWriter};
+pub use osprey_io::{
+    load_library, BlibLoader, DiannTsvLoader, ElibLoader, MzmlReader, ReportWriter,
+};
 
 // Re-export regression
-pub use osprey_regression::{
-    Binner, DesignMatrixBuilder, RidgeSolver,
-};
+pub use osprey_regression::{Binner, DesignMatrixBuilder, RidgeSolver};
 
 // Re-export chromatography
 pub use osprey_chromatography::{
