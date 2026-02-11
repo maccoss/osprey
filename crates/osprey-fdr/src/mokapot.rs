@@ -281,8 +281,7 @@ impl MokapotRunner {
         })?;
 
         // Sanitize file name for use as PIN file name
-        let safe_name = file_name
-            .replace(['/', '\\', ' '], "_");
+        let safe_name = file_name.replace(['/', '\\', ' '], "_");
         let pin_path = out_dir.join(format!("{}.pin", safe_name));
 
         let file = std::fs::File::create(&pin_path)
@@ -386,8 +385,7 @@ impl MokapotRunner {
             let reader = BufReader::new(stderr);
             for line in reader.lines().filter_map(|r| r.ok()) {
                 // Log mokapot output so user can see progress
-                if line.contains("INFO") || line.contains("iter") || line.contains("Iteration")
-                {
+                if line.contains("INFO") || line.contains("iter") || line.contains("Iteration") {
                     log::info!("[mokapot] {}", line);
                 } else if line.contains("ERROR")
                     || line.contains("Error")
@@ -595,8 +593,7 @@ print("SUCCESS")
 
         for (file_name, psms) in psms_by_file {
             // Sanitize file name for use as PIN file name
-            let safe_name = file_name
-                .replace(['/', '\\', ' '], "_");
+            let safe_name = file_name.replace(['/', '\\', ' '], "_");
             let pin_path = out_dir.join(format!("{}.pin", safe_name));
 
             let file = std::fs::File::create(&pin_path).map_err(|e| {
@@ -961,8 +958,7 @@ print("SUCCESS")
                     continue;
                 }
 
-                if line.contains("INFO") || line.contains("iter") || line.contains("Iteration")
-                {
+                if line.contains("INFO") || line.contains("iter") || line.contains("Iteration") {
                     log::info!("[mokapot] {}", line);
                 } else if line.contains("ERROR")
                     || line.contains("Error")

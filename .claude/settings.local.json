@@ -79,7 +79,10 @@
       "Bash(pip3 list:*)",
       "Bash(/home/maccoss/github/maccoss/osprey/.venv/bin/pip list:*)",
       "Bash(/home/maccoss/github/maccoss/osprey/.venv/bin/python3:*)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "Bash(head:*)",
+      "Bash(git -C /mnt/c/Users/macco/Documents/github/maccoss/osprey diff crates/osprey/src/pipeline.rs)",
+      "Bash(git -C /mnt/c/Users/macco/Documents/github/maccoss/osprey diff --stat HEAD)"
     ]
   }
 }
