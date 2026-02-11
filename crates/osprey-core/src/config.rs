@@ -398,54 +398,39 @@ impl RTCalibrationConfig {
 }
 
 /// Resolution mode for spectrum binning
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum ResolutionMode {
     /// Unit resolution (~1.0005079 Th bins, 0.4 offset)
     UnitResolution,
     /// High-resolution accurate mass (0.02 Th bins, 0 offset)
     HRAM,
     /// Auto-detect from data
+    #[default]
     Auto,
 }
 
-impl Default for ResolutionMode {
-    fn default() -> Self {
-        ResolutionMode::Auto
-    }
-}
-
 /// Regularization parameter selection strategy
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum RegularizationSetting {
     /// Fixed lambda value
     Fixed(f64),
     /// Select via cross-validation
+    #[default]
     CrossValidated,
     /// Adaptive per spectrum
     Adaptive,
 }
 
-impl Default for RegularizationSetting {
-    fn default() -> Self {
-        RegularizationSetting::CrossValidated
-    }
-}
-
 /// Decoy generation method
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DecoyMethod {
     /// Reverse peptide sequence
+    #[default]
     Reverse,
     /// Shuffle peptide sequence
     Shuffle,
     /// Use decoys already in library
     FromLibrary,
-}
-
-impl Default for DecoyMethod {
-    fn default() -> Self {
-        DecoyMethod::Reverse
-    }
 }
 
 /// Fragment tolerance configuration for LibCosine scoring

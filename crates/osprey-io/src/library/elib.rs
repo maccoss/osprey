@@ -81,7 +81,6 @@ impl ElibLoader {
             .map_err(|e| OspreyError::LibraryLoadError(format!("SQL prepare error: {}", e)))?;
 
         let mut entries: Vec<LibraryEntry> = Vec::new();
-        let mut lib_id = 0u32;
 
         let rows = stmt
             .query_map([], |row| {
@@ -105,7 +104,7 @@ impl ElibLoader {
             })
             .map_err(|e| OspreyError::LibraryLoadError(format!("Query error: {}", e)))?;
 
-        for row_result in rows {
+        for (lib_id, row_result) in rows.enumerate() {
             let (
                 peptide_mod_seq,
                 precursor_charge,
@@ -132,7 +131,7 @@ impl ElibLoader {
             let rt_minutes = rt_seconds.map(|rt| rt / 60.0).unwrap_or(0.0);
 
             let entry = LibraryEntry {
-                id: lib_id,
+                id: lib_id as u32,
                 sequence: sequence.clone(),
                 modified_sequence: peptide_mod_seq,
                 modifications,
@@ -147,7 +146,6 @@ impl ElibLoader {
             };
 
             entries.push(entry);
-            lib_id += 1;
         }
 
         log::info!(
@@ -174,7 +172,6 @@ impl ElibLoader {
             .map_err(|e| OspreyError::LibraryLoadError(format!("SQL prepare error: {}", e)))?;
 
         let mut entries: Vec<LibraryEntry> = Vec::new();
-        let mut lib_id = 0u32;
 
         let rows = stmt
             .query_map([], |row| {
@@ -185,14 +182,14 @@ impl ElibLoader {
             })
             .map_err(|e| OspreyError::LibraryLoadError(format!("Query error: {}", e)))?;
 
-        for row_result in rows {
+        for (lib_id, row_result) in rows.enumerate() {
             let (peptide_mod_seq, precursor_charge, precursor_mz) = row_result
                 .map_err(|e| OspreyError::LibraryLoadError(format!("Row read error: {}", e)))?;
 
             let (sequence, modifications) = parse_modified_sequence(&peptide_mod_seq)?;
 
             let entry = LibraryEntry {
-                id: lib_id,
+                id: lib_id as u32,
                 sequence,
                 modified_sequence: peptide_mod_seq,
                 modifications,
@@ -207,7 +204,6 @@ impl ElibLoader {
             };
 
             entries.push(entry);
-            lib_id += 1;
         }
 
         log::info!(

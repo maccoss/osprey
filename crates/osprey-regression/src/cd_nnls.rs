@@ -79,6 +79,7 @@ impl CdNnlsParams {
 ///
 /// # Returns
 /// Coefficient vector x (k × 1) with x ≥ 0
+#[allow(clippy::needless_range_loop)]
 pub fn solve_cd_nnls_f32(
     a: &Array2<f32>,
     b: &Array1<f32>,
@@ -221,6 +222,7 @@ pub fn solve_cd_nnls_f32(
 ///
 /// # Returns
 /// Coefficient vector x (k × 1) with x ≥ 0
+#[allow(clippy::needless_range_loop)]
 pub fn solve_cd_nnls_f64(
     a: &Array2<f64>,
     b: &Array1<f64>,

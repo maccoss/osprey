@@ -114,7 +114,7 @@ mod tests {
         }
 
         fn supports_format(&self, path: &Path) -> bool {
-            path.extension().map_or(false, |e| e == "mock")
+            path.extension().is_some_and(|e| e == "mock")
         }
 
         fn format_name(&self) -> &'static str {

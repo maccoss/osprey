@@ -247,7 +247,7 @@ pub fn apply_spectrum_calibration(spectrum: &Spectrum, calibration: &MzCalibrati
         scan_number: spectrum.scan_number,
         retention_time: spectrum.retention_time,
         precursor_mz: spectrum.precursor_mz,
-        isolation_window: spectrum.isolation_window.clone(),
+        isolation_window: spectrum.isolation_window,
         mzs: corrected_mzs,
         intensities: spectrum.intensities.clone(),
     }

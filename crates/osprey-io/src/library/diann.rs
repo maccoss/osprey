@@ -227,7 +227,7 @@ impl DiannTsvLoader {
         let neutral_loss = cols
             .fragment_loss_type
             .and_then(|i| record.get(i))
-            .and_then(NeutralLoss::from_str);
+            .and_then(NeutralLoss::parse);
 
         let annotation = FragmentAnnotation {
             ion_type,
@@ -240,13 +240,13 @@ impl DiannTsvLoader {
         let protein_ids = cols
             .protein_id
             .and_then(|i| record.get(i))
-            .map(|s| split_list(s))
+            .map(split_list)
             .unwrap_or_default();
 
         let gene_names = cols
             .gene_name
             .and_then(|i| record.get(i))
-            .map(|s| split_list(s))
+            .map(split_list)
             .unwrap_or_default();
 
         Ok(RowData {
@@ -277,7 +277,7 @@ impl LibraryLoader for DiannTsvLoader {
 
     fn supports_format(&self, path: &Path) -> bool {
         path.extension()
-            .map_or(false, |ext| ext == "tsv" || ext == "txt" || ext == "csv")
+            .is_some_and(|ext| ext == "tsv" || ext == "txt" || ext == "csv")
     }
 
     fn format_name(&self) -> &'static str {
@@ -544,7 +544,7 @@ fn parse_unimod_id(s: &str) -> Option<u32> {
 
 /// Split a semicolon or comma separated list
 fn split_list(s: &str) -> Vec<String> {
-    s.split(|c| c == ';' || c == ',')
+    s.split([';', ','])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()

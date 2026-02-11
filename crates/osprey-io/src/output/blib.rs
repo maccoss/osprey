@@ -315,6 +315,7 @@ impl BlibWriter {
     }
 
     /// Add a detected peptide spectrum
+    #[allow(clippy::too_many_arguments)]
     pub fn add_spectrum(
         &self,
         peptide_seq: &str,

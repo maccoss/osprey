@@ -75,7 +75,11 @@
       "Read(//home/**)",
       "Bash(bash -c:*)",
       "Bash(gh run view:*)",
-      "Bash(cargo fmt:*)"
+      "Bash(cargo fmt:*)",
+      "Bash(pip3 list:*)",
+      "Bash(/home/maccoss/github/maccoss/osprey/.venv/bin/pip list:*)",
+      "Bash(/home/maccoss/github/maccoss/osprey/.venv/bin/python3:*)",
+      "Bash(cargo clippy:*)"
     ]
   }
 }

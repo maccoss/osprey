@@ -180,13 +180,11 @@ impl BlibLoader {
         let mut protein_map: std::collections::HashMap<u32, Vec<String>> =
             std::collections::HashMap::new();
 
-        for row_result in rows {
-            if let Ok((ref_id, accession)) = row_result {
-                protein_map
-                    .entry(ref_id as u32)
-                    .or_default()
-                    .push(accession);
-            }
+        for (ref_id, accession) in rows.filter_map(|r| r.ok()) {
+            protein_map
+                .entry(ref_id as u32)
+                .or_default()
+                .push(accession);
         }
 
         // Apply to entries

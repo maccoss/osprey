@@ -282,9 +282,7 @@ impl MokapotRunner {
 
         // Sanitize file name for use as PIN file name
         let safe_name = file_name
-            .replace('/', "_")
-            .replace('\\', "_")
-            .replace(' ', "_");
+            .replace(['/', '\\', ' '], "_");
         let pin_path = out_dir.join(format!("{}.pin", safe_name));
 
         let file = std::fs::File::create(&pin_path)
@@ -386,29 +384,27 @@ impl MokapotRunner {
         let mut error_lines: Vec<String> = Vec::new();
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    // Log mokapot output so user can see progress
-                    if line.contains("INFO") || line.contains("iter") || line.contains("Iteration")
-                    {
-                        log::info!("[mokapot] {}", line);
-                    } else if line.contains("ERROR")
-                        || line.contains("Error")
-                        || line.contains("error:")
-                        || line.contains("Exception")
-                        || line.contains("Traceback")
-                        || line.contains("Warning")
-                        || line.contains("failed")
-                        || line.contains("CRITICAL")
-                    {
-                        // Log errors/warnings at warn level so they're visible
-                        log::warn!("[mokapot] {}", line);
-                        error_lines.push(line);
-                    } else if !line.trim().is_empty() {
-                        log::debug!("[mokapot] {}", line);
-                        // Capture all non-empty lines in case they're part of a traceback
-                        error_lines.push(line);
-                    }
+            for line in reader.lines().filter_map(|r| r.ok()) {
+                // Log mokapot output so user can see progress
+                if line.contains("INFO") || line.contains("iter") || line.contains("Iteration")
+                {
+                    log::info!("[mokapot] {}", line);
+                } else if line.contains("ERROR")
+                    || line.contains("Error")
+                    || line.contains("error:")
+                    || line.contains("Exception")
+                    || line.contains("Traceback")
+                    || line.contains("Warning")
+                    || line.contains("failed")
+                    || line.contains("CRITICAL")
+                {
+                    // Log errors/warnings at warn level so they're visible
+                    log::warn!("[mokapot] {}", line);
+                    error_lines.push(line);
+                } else if !line.trim().is_empty() {
+                    log::debug!("[mokapot] {}", line);
+                    // Capture all non-empty lines in case they're part of a traceback
+                    error_lines.push(line);
                 }
             }
         }
@@ -600,9 +596,7 @@ print("SUCCESS")
         for (file_name, psms) in psms_by_file {
             // Sanitize file name for use as PIN file name
             let safe_name = file_name
-                .replace('/', "_")
-                .replace('\\', "_")
-                .replace(' ', "_");
+                .replace(['/', '\\', ' '], "_");
             let pin_path = out_dir.join(format!("{}.pin", safe_name));
 
             let file = std::fs::File::create(&pin_path).map_err(|e| {
@@ -960,32 +954,30 @@ print("SUCCESS")
         let mut error_lines: Vec<String> = Vec::new();
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                if let Ok(line) = line {
-                    // Skip Python FutureWarning/DeprecationWarning messages (not actionable)
-                    if line.contains("FutureWarning") || line.contains("DeprecationWarning") {
-                        log::debug!("[mokapot] {}", line);
-                        continue;
-                    }
+            for line in reader.lines().filter_map(|r| r.ok()) {
+                // Skip Python FutureWarning/DeprecationWarning messages (not actionable)
+                if line.contains("FutureWarning") || line.contains("DeprecationWarning") {
+                    log::debug!("[mokapot] {}", line);
+                    continue;
+                }
 
-                    if line.contains("INFO") || line.contains("iter") || line.contains("Iteration")
-                    {
-                        log::info!("[mokapot] {}", line);
-                    } else if line.contains("ERROR")
-                        || line.contains("Error")
-                        || line.contains("error:")
-                        || line.contains("Exception")
-                        || line.contains("Traceback")
-                        || line.contains("Warning")
-                        || line.contains("failed")
-                        || line.contains("CRITICAL")
-                    {
-                        log::warn!("[mokapot] {}", line);
-                        error_lines.push(line);
-                    } else if !line.trim().is_empty() {
-                        log::debug!("[mokapot] {}", line);
-                        error_lines.push(line);
-                    }
+                if line.contains("INFO") || line.contains("iter") || line.contains("Iteration")
+                {
+                    log::info!("[mokapot] {}", line);
+                } else if line.contains("ERROR")
+                    || line.contains("Error")
+                    || line.contains("error:")
+                    || line.contains("Exception")
+                    || line.contains("Traceback")
+                    || line.contains("Warning")
+                    || line.contains("failed")
+                    || line.contains("CRITICAL")
+                {
+                    log::warn!("[mokapot] {}", line);
+                    error_lines.push(line);
+                } else if !line.trim().is_empty() {
+                    log::debug!("[mokapot] {}", line);
+                    error_lines.push(line);
                 }
             }
         }

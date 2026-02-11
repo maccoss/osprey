@@ -116,7 +116,7 @@ impl FdrController {
                 .copied()
                 .unwrap_or(f64::NEG_INFINITY);
 
-            if decoy_scores.get(&target_id).is_none() {
+            if !decoy_scores.contains_key(&target_id) {
                 missing_decoy_count += 1;
             }
 

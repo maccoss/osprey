@@ -2315,11 +2315,6 @@ fn run_two_level_fdr(
     // Per-file results already reported by mokapot.rs, skip redundant output here
 
     // ========== Build experiment entries with Step 2 results ==========
-    log::info!("");
-    log::info!(
-        "=== Experiment-level FDR Control ({}%) ===",
-        (experiment_fdr * 100.0) as u32
-    );
 
     // Build PSM ID to q-value map from experiment results
     let experiment_result_map: HashMap<String, (f64, f64)> = experiment_mokapot_results
@@ -2344,9 +2339,6 @@ fn run_two_level_fdr(
             experiment_entries.push(entry_copy);
         }
     }
-
-    // Report experiment-level totals
-    report_experiment_statistics(&experiment_entries, library, experiment_fdr);
 
     Ok(experiment_entries)
 }

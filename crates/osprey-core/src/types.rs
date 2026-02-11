@@ -166,7 +166,9 @@ impl NeutralLoss {
     }
 
     /// Parse neutral loss from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    ///
+    /// Returns `None` for empty string or "NOLOSS" (indicating no neutral loss)
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "" | "NOLOSS" => None,
             "H2O" | "WATER" => Some(NeutralLoss::H2O),
