@@ -86,19 +86,13 @@ pub struct FragmentMatchResult {
 /// ```text
 /// score = (exp · lib) / (|exp| × |lib|)
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LibCosineScorer {
     /// Fragment tolerance configuration
     pub tolerance: FragmentToleranceConfig,
 }
 
-impl Default for LibCosineScorer {
-    fn default() -> Self {
-        Self {
-            tolerance: FragmentToleranceConfig::default(), // 10 ppm
-        }
-    }
-}
+// Default: 10 ppm fragment tolerance
 
 impl LibCosineScorer {
     /// Create a new LibCosine scorer with default 10 ppm tolerance
@@ -255,7 +249,7 @@ impl LibCosineScorer {
 
         let cos_angle = dot / (norm_a * norm_b);
         // Clamp to [0, 1] to handle floating point errors
-        cos_angle.max(0.0).min(1.0)
+        cos_angle.clamp(0.0, 1.0)
     }
 }
 
@@ -995,11 +989,11 @@ pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_x
             found_first_nonzero = true;
         }
         // Look for consecutive zeros after we've seen data
-        if histogram[i] == 0 && found_first_nonzero && i >= 5 {
-            if i + 1 < HISTO_SIZE && (histogram[i + 1] == 0 || i + 1 == max_corr) {
-                next_corr = if i > 0 { i - 1 } else { 0 };
-                break;
-            }
+        if histogram[i] == 0 && found_first_nonzero && i >= 5
+            && i + 1 < HISTO_SIZE && (histogram[i + 1] == 0 || i + 1 == max_corr)
+        {
+            next_corr = if i > 0 { i - 1 } else { 0 };
+            break;
         }
     }
 
@@ -1071,10 +1065,10 @@ pub fn calculate_evalue_from_xcorr_distribution(all_xcorr_scores: &[f64], best_x
     let mut sx = 0.0f64; // Sum of squared deviations
     let mut sxy = 0.0f64; // Sum of cross products
 
-    for i in start_corr..=next_corr {
-        if log_cumulative[i] > 0.0 {
+    for (i, &log_cum_val) in log_cumulative.iter().enumerate().take(next_corr + 1).skip(start_corr) {
+        if log_cum_val > 0.0 {
             let dx = i as f64 - mean_x;
-            let dy = log_cumulative[i] - mean_y;
+            let dy = log_cum_val - mean_y;
             sx += dx * dx;
             sxy += dx * dy;
         }
@@ -1163,11 +1157,11 @@ pub fn calculate_evalue_from_score_distribution(
         if histogram[i] > 0 {
             found_first_nonzero = true;
         }
-        if histogram[i] == 0 && found_first_nonzero && i >= 5 {
-            if i + 1 < HISTO_SIZE && (histogram[i + 1] == 0 || i + 1 == max_corr) {
-                next_corr = if i > 0 { i - 1 } else { 0 };
-                break;
-            }
+        if histogram[i] == 0 && found_first_nonzero && i >= 5
+            && i + 1 < HISTO_SIZE && (histogram[i + 1] == 0 || i + 1 == max_corr)
+        {
+            next_corr = if i > 0 { i - 1 } else { 0 };
+            break;
         }
     }
 
@@ -1233,10 +1227,10 @@ pub fn calculate_evalue_from_score_distribution(
     let mut sx = 0.0f64;
     let mut sxy = 0.0f64;
 
-    for i in start_corr..=next_corr {
-        if log_cumulative[i] > 0.0 {
+    for (i, &log_cum_val) in log_cumulative.iter().enumerate().take(next_corr + 1).skip(start_corr) {
+        if log_cum_val > 0.0 {
             let dx = i as f64 - mean_x;
-            let dy = log_cumulative[i] - mean_y;
+            let dy = log_cum_val - mean_y;
             sx += dx * dx;
             sxy += dx * dy;
         }
@@ -1511,9 +1505,8 @@ pub fn sample_library_for_calibration(
     let mut sampled_ids: HashSet<u32> = HashSet::new();
     let mut sampled: Vec<LibraryEntry> = Vec::with_capacity(sample_size * 2);
 
-    for rt_bin in 0..bins_per_axis {
-        for mz_bin in 0..bins_per_axis {
-            let cell = &grid[rt_bin][mz_bin];
+    for row in grid.iter().take(bins_per_axis) {
+        for cell in row.iter().take(bins_per_axis) {
             if cell.is_empty() {
                 continue;
             }
@@ -1544,9 +1537,8 @@ pub fn sample_library_for_calibration(
         let remaining = sample_size - sampled_ids.len();
         let extra_per_cell = (remaining / n_occupied.max(1)).max(1);
 
-        for rt_bin in 0..bins_per_axis {
-            for mz_bin in 0..bins_per_axis {
-                let cell = &grid[rt_bin][mz_bin];
+        'outer: for row in grid.iter().take(bins_per_axis) {
+            for cell in row.iter().take(bins_per_axis) {
                 if cell.is_empty() {
                     continue;
                 }
@@ -1569,11 +1561,8 @@ pub fn sample_library_for_calibration(
                 }
 
                 if sampled_ids.len() >= sample_size {
-                    break;
+                    break 'outer;
                 }
-            }
-            if sampled_ids.len() >= sample_size {
-                break;
             }
         }
     }
@@ -2436,22 +2425,7 @@ fn count_top6_matched_at_apex(
     count
 }
 
-/// Run calibration scoring using fragment co-elution correlation.
-///
-/// Inspired by DIA-NN's fragment co-elution scoring approach (Demichev et al.,
-/// Nature Methods, 2020). The core idea is that real fragment ions from the same
-/// peptide co-elute temporally, while interference fragments do not.
-///
-/// Instead of scoring individual spectra (XCorr/Hyperscore), this evaluates whether
-/// fragment ions co-elute across multiple spectra in the RT neighborhood. The key insight
-/// is that in mixed DIA spectra, real fragments from the same peptide co-elute (their XICs
-/// correlate), while interference fragments appear at random RTs and don't correlate.
-///
-/// For each library entry:
-/// 1. Filter candidate spectra by precursor window, RT tolerance, and top-2-of-6 fragment match
-/// 2. Extract XICs for top 6 fragments (binary search per spectrum)
-/// 3. Select the reference XIC (fragment with highest total intensity), Savitzky-Golay 5-point smooth
-/// Calculate signal-to-noise ratio for a chromatographic peak
+/// Calculate signal-to-noise ratio for a chromatographic peak.
 ///
 /// Uses peak boundaries at ±1.96σ (where σ = FWHM / 2.355) to define the peak region.
 /// Background is measured from 3-5 points on each side outside these boundaries.
@@ -2680,7 +2654,7 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
 
         // Calculate signal-to-noise ratio from reference XIC
         let signal_to_noise =
-            calculate_signal_to_noise(&ref_xic, apex_local_idx, apex_intensity).unwrap_or(0.0);
+            calculate_signal_to_noise(ref_xic, apex_local_idx, apex_intensity).unwrap_or(0.0);
 
         // Find the spectrum closest to apex for mass errors and scan number
         let apex_spec_local_idx = candidate_spectra

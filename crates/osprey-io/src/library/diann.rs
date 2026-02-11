@@ -511,13 +511,9 @@ fn parse_mod_mass(s: &str) -> Option<f64> {
     }
 
     // Try UniMod notation (e.g., "UniMod:4" or "UNIMOD:4")
-    let unimod_prefix = if s.starts_with("UniMod:") {
-        Some(&s[7..])
-    } else if s.starts_with("UNIMOD:") {
-        Some(&s[7..])
-    } else {
-        None
-    };
+    let unimod_prefix = s
+        .strip_prefix("UniMod:")
+        .or_else(|| s.strip_prefix("UNIMOD:"));
     if let Some(id_str) = unimod_prefix {
         if let Ok(id) = id_str.parse::<u32>() {
             if let Some(mass) = crate::output::unimod_id_to_mass(id) {

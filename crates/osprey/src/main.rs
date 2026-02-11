@@ -265,7 +265,7 @@ fn main() -> Result<()> {
     let resolution_mode = match args.resolution.to_lowercase().as_str() {
         "unit" => ResolutionMode::UnitResolution,
         "hram" => ResolutionMode::HRAM,
-        "auto" | _ => config.resolution_mode,
+        _ => config.resolution_mode,
     };
     config.resolution_mode = resolution_mode;
 

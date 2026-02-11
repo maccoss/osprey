@@ -383,7 +383,7 @@ impl MokapotRunner {
         let mut error_lines: Vec<String> = Vec::new();
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
-            for line in reader.lines().filter_map(|r| r.ok()) {
+            for line in reader.lines().map_while(|r| r.ok()) {
                 // Log mokapot output so user can see progress
                 if line.contains("INFO") || line.contains("iter") || line.contains("Iteration") {
                     log::info!("[mokapot] {}", line);
@@ -664,6 +664,7 @@ print("SUCCESS")
     /// Tuple of (per_file_results, experiment_results)
     /// - per_file_results: HashMap mapping file_name to Vec<MokapotResult>
     /// - experiment_results: Vec<MokapotResult> for experiment-level (empty for single file)
+    #[allow(clippy::type_complexity)]
     pub fn run_two_step_analysis<P: AsRef<Path>>(
         &self,
         pin_files: &HashMap<String, PathBuf>,
@@ -951,7 +952,7 @@ print("SUCCESS")
         let mut error_lines: Vec<String> = Vec::new();
         if let Some(stderr) = child.stderr.take() {
             let reader = BufReader::new(stderr);
-            for line in reader.lines().filter_map(|r| r.ok()) {
+            for line in reader.lines().map_while(|r| r.ok()) {
                 // Skip Python FutureWarning/DeprecationWarning messages (not actionable)
                 if line.contains("FutureWarning") || line.contains("DeprecationWarning") {
                     log::debug!("[mokapot] {}", line);

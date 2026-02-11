@@ -309,7 +309,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
             &file_spectra,
             &file_name,
             calibration_params,
-            binner.config().clone(),
+            *binner.config(),
         )?;
 
         log::info!(
@@ -449,6 +449,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
 /// - spectra are returned for spectral scoring in FDR computation
 /// - preprocessed_spectra is returned for reuse in subsequent scoring
 /// - calibration is returned only for first file
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn process_file_with_calibration(
     path: &std::path::Path,
     library: &[LibraryEntry],
@@ -487,7 +488,7 @@ fn process_file_with_calibration(
             config.rt_calibration.min_rt_tolerance,
             None,
             None,
-            config.fragment_tolerance.clone(),
+            config.fragment_tolerance,
         )?;
         return Ok((results, spectra, None, None));
     }
@@ -540,7 +541,7 @@ fn process_file_with_calibration(
                                     config.rt_calibration.min_rt_tolerance,
                                     Some(&rt_cal),
                                     Some(&cal_params.ms2_calibration),
-                                    config.fragment_tolerance.clone(),
+                                    config.fragment_tolerance,
                                 )?;
 
                                 return Ok((
@@ -642,7 +643,7 @@ fn process_file_with_calibration(
         config.rt_calibration.min_rt_tolerance,
         calibration_opt.as_ref(),
         ms2_cal_ref,
-        config.fragment_tolerance.clone(),
+        config.fragment_tolerance,
     )?;
 
     // Return calibration for this file (used during scoring)
@@ -1583,6 +1584,7 @@ fn run_calibration_discovery_with_cache(
 /// - Uses f32 instead of f64 (faster BLAS, less memory)
 /// - Caches binned observed spectra
 /// - Applies MS2 calibration to spectra before binning (if available)
+#[allow(clippy::too_many_arguments)]
 fn process_spectra_optimized(
     spectra: &[Spectrum],
     library: &[LibraryEntry],
@@ -1641,10 +1643,10 @@ fn process_spectra_optimized(
                 unit,
             }
         } else {
-            base_fragment_tolerance.clone()
+            base_fragment_tolerance
         }
     } else {
-        base_fragment_tolerance.clone()
+        base_fragment_tolerance
     };
 
     let n_bins = binner.n_bins();
@@ -1693,7 +1695,7 @@ fn process_spectra_optimized(
                 min_rt_tolerance,
                 None,
                 calibration,
-                Some(effective_fragment_tolerance.clone()),
+                Some(effective_fragment_tolerance),
                 search_tolerance,
             );
 
@@ -1938,11 +1940,10 @@ fn score_run(
     }
     if aggregation_violations > 0 {
         // Count total
-        let total_violations: u64 = results.iter()
+        let _total_violations: u64 = results.iter()
             .flat_map(|r| r.library_ids.iter().zip(r.coefficients.iter()))
             .filter(|(lib_id, _coef)| {
-                if let Some(&lib_idx) = id_to_index.get(lib_id) {
-                    let entry = &library[lib_idx];
+                if let Some(&_lib_idx) = id_to_index.get(lib_id) {
                     // Use a wider tolerance to check: can't compare to search_tolerance here but
                     // 5 min should be well beyond any legitimate tolerance
                     false // placeholder: just counted above
@@ -2325,7 +2326,7 @@ fn compute_fdr_with_mokapot(
 ///
 /// Returns all entries with both run-level and experiment-level q-values populated.
 fn run_two_level_fdr(
-    per_file_results: &mut Vec<(String, Vec<ScoredEntry>)>,
+    per_file_results: &mut [(String, Vec<ScoredEntry>)],
     library: &[LibraryEntry],
     run_fdr: f64,
     experiment_fdr: f64,
@@ -2589,10 +2590,10 @@ fn deduplicate_double_counting(
                 unit,
             }
         } else {
-            config.fragment_tolerance.clone()
+            config.fragment_tolerance
         }
     } else {
-        config.fragment_tolerance.clone()
+        config.fragment_tolerance
     };
 
     // 3. Compute median scan interval for "±5 spectra" RT neighborhood
@@ -2661,8 +2662,7 @@ fn deduplicate_double_counting(
             }
             let apex_a = apex_rts[idx_a];
 
-            for j_pos in (i_pos + 1)..window_indices.len() {
-                let idx_b = window_indices[j_pos];
+            for &idx_b in &window_indices[(i_pos + 1)..] {
                 if removed[idx_b] {
                     continue;
                 }
@@ -2940,11 +2940,9 @@ fn apply_simple_fdr(entries: &mut [ScoredEntry], fdr_threshold: f64) -> Result<(
 
     let mut target_idx = 0;
     for entry in entries.iter_mut() {
-        if !entry.is_decoy {
-            if target_idx < qvalues.len() {
-                entry.run_qvalue = qvalues[target_idx];
-                target_idx += 1;
-            }
+        if !entry.is_decoy && target_idx < qvalues.len() {
+            entry.run_qvalue = qvalues[target_idx];
+            target_idx += 1;
         }
     }
 
@@ -2971,11 +2969,9 @@ fn apply_simple_fdr_experiment(entries: &mut [ScoredEntry], fdr_threshold: f64) 
 
     let mut target_idx = 0;
     for entry in entries.iter_mut() {
-        if !entry.is_decoy {
-            if target_idx < qvalues.len() {
-                entry.experiment_qvalue = qvalues[target_idx];
-                target_idx += 1;
-            }
+        if !entry.is_decoy && target_idx < qvalues.len() {
+            entry.experiment_qvalue = qvalues[target_idx];
+            target_idx += 1;
         }
     }
 
@@ -3593,6 +3589,7 @@ fn build_mz_index(library: &[LibraryEntry]) -> MzRTIndex {
 ///
 /// The MzRTIndex stores entries sorted by expected_rt (calibrated if available),
 /// enabling O(log n + k) candidate selection instead of O(n) per m/z bin.
+#[allow(clippy::too_many_arguments)]
 fn select_candidates_with_calibration(
     spectrum: &Spectrum,
     library: &[LibraryEntry],

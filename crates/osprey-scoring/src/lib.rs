@@ -785,7 +785,7 @@ pub fn compute_hyperscore(
         // Record match
         n_matched += 1;
         let obs_intensity = spectrum_intensities[best_idx];
-        sum_log_intensity += (obs_intensity as f64 + 1.0).ln();
+        sum_log_intensity += (obs_intensity + 1.0).ln();
 
         // Count b/y ion types
         match frag.annotation.ion_type {
@@ -1455,9 +1455,9 @@ impl SpectralScorer {
 
             // Find max in this window
             let mut window_max = 0.0f32;
-            for i in start..end {
-                if spectrum[i] > window_max {
-                    window_max = spectrum[i];
+            for &val in &spectrum[start..end] {
+                if val > window_max {
+                    window_max = val;
                 }
             }
 
@@ -1494,7 +1494,7 @@ impl SpectralScorer {
 
         let mut result = vec![0.0f32; n];
         for i in 0..n {
-            let left = if i >= offset { i - offset } else { 0 };
+            let left = i.saturating_sub(offset);
             let right = if i + offset < n { i + offset + 1 } else { n };
             // Window sum including center
             let window_sum = prefix[right] - prefix[left];
@@ -1944,21 +1944,12 @@ impl RegressionContext {
 }
 
 /// Feature extractor for peptide candidates
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct FeatureExtractor {
     /// Spectral scorer for computing similarity metrics
     spectral_scorer: SpectralScorer,
     /// Spectrum aggregator for combining scans
     spectrum_aggregator: SpectrumAggregator,
-}
-
-impl Default for FeatureExtractor {
-    fn default() -> Self {
-        Self {
-            spectral_scorer: SpectralScorer::default(),
-            spectrum_aggregator: SpectrumAggregator::default(),
-        }
-    }
 }
 
 impl FeatureExtractor {
@@ -2483,8 +2474,8 @@ impl FeatureExtractor {
             }
         }
 
-        for i in apex_idx + 1..series.len() {
-            if series[i].1 < half_max {
+        for (i, entry) in series.iter().enumerate().skip(apex_idx + 1) {
+            if entry.1 < half_max {
                 right_half_idx = i;
                 break;
             }
@@ -2496,8 +2487,8 @@ impl FeatureExtractor {
 
         if left_half > 0 && right_half > 0 {
             // Ratio closer to 1.0 = more symmetric = better fit
-            let ratio = left_half.min(right_half) as f64 / left_half.max(right_half) as f64;
-            ratio // Value between 0 and 1
+            // Value between 0 and 1
+            left_half.min(right_half) as f64 / left_half.max(right_half) as f64
         } else {
             0.5 // Default if we can't measure
         }
@@ -2523,14 +2514,14 @@ fn ln_gamma(x: f64) -> f64 {
     // Coefficients from Numerical Recipes
     let g = 7.0;
     let c = [
-        0.99999999999980993,
+        0.999_999_999_999_809_9,
         676.5203681218851,
         -1259.1392167224028,
-        771.32342877765313,
-        -176.61502916214059,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
         12.507343278686905,
         -0.13857109526572012,
-        9.9843695780195716e-6,
+        9.984_369_578_019_572e-6,
         1.5056327351493116e-7,
     ];
 
@@ -2889,7 +2880,7 @@ impl DecoyGenerator {
                 ion_type: new_ion_type,
                 ordinal: new_ordinal,
                 charge: annotation.charge,
-                neutral_loss: annotation.neutral_loss.clone(),
+                neutral_loss: annotation.neutral_loss,
             },
         })
     }

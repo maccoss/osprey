@@ -85,7 +85,7 @@ impl PreprocessingWorker {
         PreprocessedSpectrum {
             scan_number: spectrum.scan_number,
             retention_time: spectrum.retention_time,
-            isolation_window: spectrum.isolation_window.clone(),
+            isolation_window: spectrum.isolation_window,
             xcorr_vector,
         }
     }
@@ -160,7 +160,7 @@ impl PreprocessingWorker {
 
         let mut result = vec![0.0f32; n];
         for i in 0..n {
-            let left = if i >= offset { i - offset } else { 0 };
+            let left = i.saturating_sub(offset);
             let right = if i + offset < n { i + offset + 1 } else { n };
             let window_sum = prefix[right] - prefix[left];
             let sum_excluding_center = window_sum - spectrum[i];

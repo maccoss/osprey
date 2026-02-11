@@ -203,7 +203,7 @@ fn train_lda_single_model(
 
     // Create new LDA with non-negative weights
     let lda_nonneg =
-        LinearDiscriminantAnalysis::from_weights(weights).map_err(|e| OspreyError::config(e))?;
+        LinearDiscriminantAnalysis::from_weights(weights).map_err(OspreyError::config)?;
 
     // Score all samples
     let discriminants = lda_nonneg.predict(features);
@@ -390,7 +390,7 @@ fn train_lda_with_nonnegative_cv(
 
         // Phase 3: Score ALL data with consensus weights
         let lda_consensus = LinearDiscriminantAnalysis::from_weights(consensus_weights.clone())
-            .map_err(|e| OspreyError::config(e))?;
+            .map_err(OspreyError::config)?;
         let new_scores = lda_consensus.predict(features);
 
         let n_passing = count_passing_targets(&new_scores, decoy_labels, 0.01);
