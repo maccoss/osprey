@@ -1676,10 +1676,6 @@ fn process_spectra_optimized(
             .progress_chars("#>-"),
     );
 
-    // Diagnostic counters: verify candidate selection respects RT tolerance
-    let rt_violations = std::sync::atomic::AtomicU64::new(0);
-    let rt_violation_max = std::sync::atomic::AtomicU64::new(0); // stored as f64 bits
-
     // Process spectra in parallel (using calibrated m/z values)
     // Each spectrum: bin observed → filter candidates → bin candidates on-the-fly → solve
     let results: Vec<RegressionResult> = calibrated_spectra
@@ -1702,51 +1698,6 @@ fn process_spectra_optimized(
             if candidates.is_empty() {
                 pb.inc(1);
                 return None;
-            }
-
-            // Diagnostic: verify all candidates are within RT tolerance
-            for &idx in &candidates {
-                let entry = &library[idx];
-                let expected_rt = if let Some(cal) = calibration {
-                    cal.predict(entry.retention_time)
-                } else {
-                    entry.retention_time
-                };
-                // Check for NaN expected_rt (would bypass normal comparison checks)
-                if expected_rt.is_nan() {
-                    let count = rt_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count < 10 {
-                        log::warn!(
-                            "RT violation #{} (NaN!): {} (idx={}, id={}) expected_rt=NaN lib_rt={:.4} spectrum_rt={:.4} scan={}",
-                            count + 1, entry.modified_sequence, idx, entry.id,
-                            entry.retention_time, spectrum.retention_time, spectrum.scan_number
-                        );
-                    }
-                    continue;
-                }
-                let rt_diff = (expected_rt - spectrum.retention_time).abs();
-                if rt_diff > search_tolerance + 0.01 {
-                    let count = rt_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // Track max violation
-                    let bits = rt_diff.to_bits();
-                    rt_violation_max.fetch_max(bits, std::sync::atomic::Ordering::Relaxed);
-                    // Log first 10 violations with full detail
-                    if count < 10 {
-                        log::warn!(
-                            "RT violation #{}: {} (idx={}, id={}) expected_rt={:.4} lib_rt={:.4} spectrum_rt={:.4} diff={:.4} tol={:.4} scan={}",
-                            count + 1,
-                            entry.modified_sequence,
-                            idx,
-                            entry.id,
-                            expected_rt,
-                            entry.retention_time,
-                            spectrum.retention_time,
-                            rt_diff,
-                            search_tolerance,
-                            spectrum.scan_number
-                        );
-                    }
-                }
             }
 
             // Bin observed spectrum
@@ -1815,22 +1766,6 @@ fn process_spectra_optimized(
         .collect();
 
     pb.finish_with_message("Done");
-
-    // Report RT tolerance violations (diagnostic)
-    let n_violations = rt_violations.load(std::sync::atomic::Ordering::Relaxed);
-    if n_violations > 0 {
-        let max_bits = rt_violation_max.load(std::sync::atomic::Ordering::Relaxed);
-        let max_diff = f64::from_bits(max_bits);
-        log::warn!(
-            "RT TOLERANCE VIOLATION: {} candidates selected outside search_tolerance ({:.2} min). Max RT diff: {:.2} min. Bug in candidate selection!",
-            n_violations, search_tolerance, max_diff
-        );
-    } else {
-        log::info!(
-            "RT tolerance check: all candidates within {:.2} min tolerance (no violations)",
-            search_tolerance
-        );
-    }
 
     log::info!(
         "Generated {} regression results with non-zero coefficients",
@@ -1913,81 +1848,19 @@ fn score_run(
     use osprey_core::ToleranceUnit;
     use osprey_scoring::{RegressionContext, SpectralScorer};
 
-    // Build ID-to-index map and check for duplicate IDs
+    // Build ID-to-index map
     let id_to_index: HashMap<u32, usize> = library
         .iter()
         .enumerate()
         .map(|(idx, entry)| (entry.id, idx))
         .collect();
 
-    // Diagnostic: check if any IDs are duplicated (which would cause id_to_index to lose entries)
-    if id_to_index.len() != library.len() {
-        let mut id_counts: HashMap<u32, Vec<usize>> = HashMap::new();
-        for (idx, entry) in library.iter().enumerate() {
-            id_counts.entry(entry.id).or_default().push(idx);
-        }
-        let duplicates: Vec<_> = id_counts
-            .iter()
-            .filter(|(_, indices)| indices.len() > 1)
-            .take(10)
-            .collect();
-        log::error!(
-            "DUPLICATE IDS: library has {} entries but only {} unique IDs ({} collisions). First duplicates:",
-            library.len(), id_to_index.len(), library.len() - id_to_index.len()
-        );
-        for (id, indices) in &duplicates {
-            let entries_info: Vec<String> = indices
-                .iter()
-                .map(|&idx| {
-                    format!(
-                        "idx={} seq={} rt={:.3}",
-                        idx, library[idx].modified_sequence, library[idx].retention_time
-                    )
-                })
-                .collect();
-            log::error!("  id={}: [{}]", id, entries_info.join(", "));
-        }
-    } else {
-        log::info!("ID uniqueness check: all {} IDs are unique", library.len());
-    }
-
     // Aggregate results by library entry ID
     // Store both (RT, coef) pairs and indices to RegressionResults for context building
     let mut entry_data: HashMap<u32, Vec<(f64, f64)>> = HashMap::new(); // (RT, coef)
     let mut entry_result_indices: HashMap<u32, Vec<usize>> = HashMap::new(); // indices into results
-    let mut aggregation_violations = 0u64;
-    let mut aggregation_violations_total = 0u64;
-    // Build a temporary RT calibration for expected_rt computation if calibration available
-    let rt_cal_for_diag: Option<RTCalibration> = calibration.and_then(|cal| {
-        if cal.rt_calibration.has_model_data() {
-            let model_params = cal.rt_calibration.model_params.as_ref()?;
-            RTCalibration::from_model_params(model_params, cal.rt_calibration.residual_sd).ok()
-        } else {
-            None
-        }
-    });
     for (result_idx, result) in results.iter().enumerate() {
         for (lib_id, coef) in result.library_ids.iter().zip(result.coefficients.iter()) {
-            // Diagnostic: verify that each lib_id's expected_rt is near this result's RT
-            if let Some(&lib_idx) = id_to_index.get(lib_id) {
-                let entry = &library[lib_idx];
-                let rt_diff = (entry.retention_time - result.retention_time).abs();
-                if rt_diff > 5.0 {
-                    aggregation_violations_total += 1;
-                    if aggregation_violations < 20 {
-                        aggregation_violations += 1;
-                        let expected_rt = rt_cal_for_diag.as_ref()
-                            .map(|cal| cal.predict(entry.retention_time))
-                            .unwrap_or(entry.retention_time);
-                        log::warn!(
-                            "AGGREGATION MISMATCH #{}: lib_id={} ({}) lib_rt={:.3} expected_rt={:.3} result_rt={:.3} diff={:.2} coef={:.4} scan={} n_candidates={}",
-                            aggregation_violations, lib_id, entry.modified_sequence,
-                            entry.retention_time, expected_rt, result.retention_time, rt_diff, coef, result.scan_number,
-                            result.n_candidates
-                        );
-                    }
-                }
-            }
             entry_data
                 .entry(*lib_id)
                 .or_default()
@@ -1997,12 +1870,6 @@ fn score_run(
                 .or_default()
                 .push(result_idx);
         }
-    }
-    if aggregation_violations_total > 0 {
-        log::warn!(
-            "Total aggregation mismatches (|lib_rt - result_rt| > 5 min): {} (showed first 20)",
-            aggregation_violations_total
-        );
     }
 
     // Extract features and create scored entries (parallelized)
@@ -2215,30 +2082,6 @@ fn score_run(
 
                 // Generate PSM ID for matching with Mokapot results
                 let psm_id = format!("{}_{}", file_name, lib_id);
-
-                // Log extreme RT deviations for debugging
-                if features.rt_deviation.abs() > 5.0 && !is_decoy {
-                    let rt_min_data = sorted_data.iter().map(|(rt, _)| *rt).fold(f64::INFINITY, f64::min);
-                    let rt_max_data = sorted_data.iter().map(|(rt, _)| *rt).fold(f64::NEG_INFINITY, f64::max);
-                    let coef_max = sorted_data.iter().map(|(_, c)| *c).fold(f64::NEG_INFINITY, f64::max);
-                    log::warn!(
-                        "RT outlier: {} (id={}, lib_idx={}) apex_rt={:.3} lib_rt={:.3} rt_dev={:.2} scan={} n_scans={} coef_series_rt=[{:.3}..{:.3}] max_coef={:.4} mass_acc={:.1}",
-                        entry.modified_sequence, lib_id, lib_idx, apex_rt,
-                        entry.retention_time, features.rt_deviation,
-                        apex_scan_number, sorted_data.len(),
-                        rt_min_data, rt_max_data, coef_max,
-                        features.mass_accuracy_mean
-                    );
-                    // For first few outliers, log all data points
-                    if sorted_data.len() <= 10 {
-                        for (i, (rt, coef)) in sorted_data.iter().enumerate() {
-                            log::warn!(
-                                "  data[{}]: rt={:.4} coef={:.6}",
-                                i, rt, coef
-                            );
-                        }
-                    }
-                }
 
                 Some(ScoredEntry {
                     lib_idx,
@@ -3606,30 +3449,20 @@ impl MzRTIndex {
             entries.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
 
-        // Diagnostic: check for NaN/Inf expected_rt values
-        let mut nan_count = 0usize;
-        let mut inf_count = 0usize;
-        for entries in bins.values() {
-            for &(rt, idx) in entries {
-                if rt.is_nan() {
-                    nan_count += 1;
-                    if nan_count <= 5 {
-                        log::warn!(
-                            "MzRTIndex NaN: idx={} seq={} lib_rt={:.3} precursor_mz={:.4}",
-                            idx, library[idx].modified_sequence, library[idx].retention_time,
-                            library[idx].precursor_mz
-                        );
-                    }
-                } else if rt.is_infinite() {
-                    inf_count += 1;
-                }
+        // Safety check: NaN expected_rt values would bypass binary search
+        // (fixed by handling duplicate library_rts in RTCalibration::predict)
+        if cfg!(debug_assertions) {
+            let nan_count: usize = bins
+                .values()
+                .flat_map(|v| v.iter())
+                .filter(|(rt, _)| rt.is_nan())
+                .count();
+            if nan_count > 0 {
+                log::error!(
+                    "MzRTIndex has {} NaN expected_rt entries — calibration predict() bug!",
+                    nan_count
+                );
             }
-        }
-        if nan_count > 0 || inf_count > 0 {
-            log::warn!(
-                "MzRTIndex contains {} NaN and {} Inf expected_rt entries (out of {} total). NaN entries may bypass binary search!",
-                nan_count, inf_count, bins.values().map(|v| v.len()).sum::<usize>()
-            );
         }
 
         MzRTIndex { bins }

@@ -88,7 +88,13 @@
       "Bash(RUST_LOG=info,osprey=debug target/release/osprey:*)",
       "Bash(RUST_LOG=info,osprey=warn target/release/osprey:*)",
       "Read(//mnt/c/Users/macco/**)",
-      "Bash(RUST_LOG=info,osprey=warn ./target/release/osprey:*)"
+      "Bash(RUST_LOG=info,osprey=warn ./target/release/osprey:*)",
+      "WebFetch(domain:pmc.ncbi.nlm.nih.gov)",
+      "WebFetch(domain:crux.ms)",
+      "WebFetch(domain:www.matrixscience.com)",
+      "WebFetch(domain:sage-docs.vercel.app)",
+      "WebFetch(domain:www.biorxiv.org)",
+      "WebFetch(domain:noble.gs.washington.edu)"
     ],
     "additionalDirectories": [
       "/mnt/c/Users/macco/Documents/github/maccoss/osprey/example_test_data/astral"

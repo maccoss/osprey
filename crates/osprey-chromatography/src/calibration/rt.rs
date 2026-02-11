@@ -396,8 +396,7 @@ impl RTCalibration {
             let dx = self.library_rts[i + 1] - self.library_rts[i];
             if dx.abs() > 1e-12 {
                 let slope = (self.fitted_values[i + 1] - self.fitted_values[i]) / dx;
-                return self.fitted_values[i + 1]
-                    + slope * (library_rt - self.library_rts[i + 1]);
+                return self.fitted_values[i + 1] + slope * (library_rt - self.library_rts[i + 1]);
             }
         }
         // All points have the same library_rt — return average fitted value
@@ -1069,7 +1068,10 @@ mod tests {
             !tol.is_nan(),
             "local_tolerance() must not return NaN for duplicate library_rts"
         );
-        assert!(tol >= 0.1, "local_tolerance should be at least min_tolerance");
+        assert!(
+            tol >= 0.1,
+            "local_tolerance should be at least min_tolerance"
+        );
 
         // Test extrapolation with duplicates at boundaries
         let boundary_rts = vec![5.0, 5.0, 10.0, 15.0];
@@ -1077,6 +1079,7 @@ mod tests {
         let boundary_residuals = vec![0.1, 0.2, 0.1, 0.0];
         let cal2 = RTCalibration {
             library_rts: boundary_rts,
+            measured_rts: boundary_fitted.clone(),
             fitted_values: boundary_fitted,
             abs_residuals: boundary_residuals,
             residual_std: 0.5,
@@ -1096,6 +1099,7 @@ mod tests {
         let end_residuals = vec![0.1, 0.1, 0.0, 0.1];
         let cal3 = RTCalibration {
             library_rts: end_rts,
+            measured_rts: end_fitted.clone(),
             fitted_values: end_fitted,
             abs_residuals: end_residuals,
             residual_std: 0.5,

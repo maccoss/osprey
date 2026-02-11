@@ -57,6 +57,18 @@ cargo run --release -- -i sample.mzML -l library.tsv -o results.blib
 cargo install --path crates/osprey
 ```
 
+## CI Requirements
+
+**IMPORTANT**: Before committing any Rust code, always run these checks locally:
+
+```bash
+cargo fmt          # Format code — CI rejects formatting diffs
+cargo clippy --all-targets --all-features -- -D warnings  # Lint — CI treats warnings as errors
+cargo test         # Run tests
+```
+
+CI runs `cargo fmt --check` and `cargo clippy -D warnings` (including test targets). Any formatting difference or clippy warning will fail the build. Always run `cargo fmt` after writing or editing code.
+
 ## Key Files
 
 - `docs/README.md` - Pipeline overview and algorithm documentation
