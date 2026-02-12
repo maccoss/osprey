@@ -65,7 +65,7 @@ use osprey_scoring::{
         run_coelution_calibration_scoring, sample_library_for_calibration, BatchScorer,
         MS1SpectrumLookup, PreprocessedLibrary, PreprocessedSpectra,
     },
-    has_top3_fragment_match, DecoyGenerator, DecoyMethod, Enzyme, FeatureExtractor,
+    has_topn_fragment_match, DecoyGenerator, DecoyMethod, Enzyme, FeatureExtractor,
 };
 
 /// Wrapper to implement MS1SpectrumLookup for MS1Index
@@ -205,7 +205,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
 
     // Ridge regression always uses unit resolution bins (~1 Th, 2000 bins).
     // HRAM precision (ppm-based matching) is applied separately in:
-    //   - Fragment pre-filter (has_top3_fragment_match with ppm tolerance)
+    //   - Fragment pre-filter (has_topn_fragment_match with ppm tolerance)
     //   - Spectral scoring (SpectralScorer with ppm tolerance)
     //   - Mass accuracy features (ppm-based error computation)
     // Using 0.02 Th bins (100K bins) for regression creates impractically large
@@ -286,7 +286,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
             .to_string();
 
         // Run regression for this file
-        let (file_results, file_spectra, _file_preprocessed_spectra, calibration_result) =
+        let (file_results, file_spectra, _file_preprocessed_spectra, calibration_result, ms1_index) =
             process_file_with_calibration(
                 input_file,
                 &library,
@@ -300,6 +300,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
 
         // Extract per-file CalibrationParams for m/z correction during scoring
         let calibration_params = calibration_result.as_ref().map(|(_, _, params)| params);
+        let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
 
         // === SCORE IMMEDIATELY after regression ===
         // This avoids keeping regression results in memory across all files
@@ -310,6 +311,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
             &file_name,
             calibration_params,
             *binner.config(),
+            &ms1_index,
+            is_hram,
         )?;
 
         log::info!(
@@ -403,17 +406,17 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         Some(non_empty_pin_files),
     )?;
 
-    // Filter to passing entries for blib output
+    // Filter to passing entries for blib output (experiment-level FDR)
     let passing_entries: Vec<ScoredEntry> = experiment_entries
         .iter()
-        .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.run_fdr)
+        .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
         .cloned()
         .collect();
 
     log::info!(
         "Final results: {} precursors passing {}% experiment-level FDR",
         passing_entries.len(),
-        config.run_fdr * 100.0
+        config.experiment_fdr * 100.0
     );
 
     // Write blib output with Mokapot q-values
@@ -464,12 +467,13 @@ fn process_file_with_calibration(
     Vec<Spectrum>,
     Option<PreprocessedSpectra>,
     Option<(RTCalibration, f64, CalibrationParams)>,
+    MS1Index,
 )> {
     // Load both MS1 and MS2 spectra in a single pass (more efficient than reading twice)
     let (spectra, ms1_index) = load_all_spectra(path)?;
 
     if spectra.is_empty() {
-        return Ok((Vec::new(), Vec::new(), None, None));
+        return Ok((Vec::new(), Vec::new(), None, None, ms1_index));
     }
 
     // Check if RT calibration is enabled
@@ -490,7 +494,7 @@ fn process_file_with_calibration(
             None,
             config.fragment_tolerance,
         )?;
-        return Ok((results, spectra, None, None));
+        return Ok((results, spectra, None, None, ms1_index));
     }
 
     // Run calibration discovery with ALL peptides
@@ -549,6 +553,7 @@ fn process_file_with_calibration(
                                     spectra,
                                     None,
                                     Some((rt_cal, tolerance, cal_params)),
+                                    ms1_index,
                                 ));
                             }
                             Err(e) => {
@@ -652,7 +657,7 @@ fn process_file_with_calibration(
         (Some(rt_cal), Some(cal_params)) => Some((rt_cal, rt_tolerance, cal_params)),
         _ => None,
     };
-    Ok((results, spectra, None, calibration_to_share))
+    Ok((results, spectra, None, calibration_to_share, ms1_index))
 }
 
 /// Run RT calibration discovery phase using BLAS-accelerated XCorr scoring
@@ -1626,7 +1631,7 @@ fn process_spectra_optimized(
         spectra.to_vec()
     };
 
-    // Determine fragment tolerance for top-3 pre-filter
+    // Determine fragment tolerance for top-N pre-filter
     // Use calibrated 3×SD when available, otherwise use base tolerance
     let effective_fragment_tolerance = if let Some(ms2_cal) = ms2_calibration {
         if ms2_cal.calibrated {
@@ -1829,6 +1834,26 @@ struct ExperimentPsm {
     n_runs_detected: u32,
 }
 
+/// Reverse m/z calibration: find where a theoretical m/z appears in uncalibrated data.
+///
+/// Since forward calibration corrects: corrected = observed - offset,
+/// the reverse gives: observed ≈ theoretical + offset.
+/// This avoids pre-calibrating all MS1 spectra (which would clone GBs of data).
+fn reverse_calibrate_mz(
+    theoretical_mz: f64,
+    calibration: &osprey_chromatography::calibration::MzCalibration,
+) -> f64 {
+    if !calibration.calibrated {
+        return theoretical_mz;
+    }
+    if calibration.unit == "Th" {
+        theoretical_mz + calibration.mean
+    } else {
+        // PPM: offset_da = observed * mean / 1e6 ≈ theoretical * mean / 1e6
+        theoretical_mz * (1.0 + calibration.mean / 1e6)
+    }
+}
+
 /// Score peptides and extract features for a single run
 ///
 /// Uses spectral similarity scoring (LibCosine) as the primary score.
@@ -1836,6 +1861,7 @@ struct ExperimentPsm {
 ///
 /// If calibration is provided, applies m/z correction to spectra and uses
 /// calibrated tolerance (3×SD) for fragment matching.
+#[allow(clippy::too_many_arguments)]
 fn score_run(
     library: &[LibraryEntry],
     results: &[RegressionResult],
@@ -1843,10 +1869,14 @@ fn score_run(
     file_name: &str,
     calibration: Option<&CalibrationParams>,
     bin_config: BinConfig,
+    ms1_index: &MS1Index,
+    is_hram: bool,
 ) -> Result<Vec<ScoredEntry>> {
-    use osprey_chromatography::calibration::{apply_spectrum_calibration, calibrated_tolerance};
+    use osprey_chromatography::calibration::{
+        apply_spectrum_calibration, calibrated_tolerance, calibrated_tolerance_ppm,
+    };
     use osprey_core::ToleranceUnit;
-    use osprey_scoring::{RegressionContext, SpectralScorer};
+    use osprey_scoring::SpectralScorer;
 
     // Build ID-to-index map
     let id_to_index: HashMap<u32, usize> = library
@@ -1889,17 +1919,18 @@ fn score_run(
         let scorer = match tol_unit {
             ToleranceUnit::Mz => {
                 log::debug!(
-                    "Using calibrated fragment tolerance: {:.4} Th (3×SD)",
+                    "Using calibrated fragment tolerance: {:.4} Th (3×SD), unit resolution XCorr bins",
                     tol_value
                 );
                 SpectralScorer::with_bin_config(bin_config).with_tolerance_da(tol_value)
             }
             ToleranceUnit::Ppm => {
+                // HRAM data: use 0.02 Th bins for XCorr (not the 1 Th regression bins)
                 log::debug!(
-                    "Using calibrated fragment tolerance: {:.2} ppm (3×SD)",
+                    "Using calibrated fragment tolerance: {:.2} ppm (3×SD), HRAM XCorr bins (0.02 Th)",
                     tol_value
                 );
-                SpectralScorer::with_bin_config(bin_config).with_tolerance_ppm(tol_value)
+                SpectralScorer::with_bin_config(BinConfig::hram()).with_tolerance_ppm(tol_value)
             }
         };
         (scorer, tol_unit)
@@ -2007,13 +2038,6 @@ fn score_run(
                     })
                     .collect();
 
-                // Build regression context from the RegressionResults that contain this peptide
-                let regression_context = entry_result_indices.get(lib_id).map(|indices| {
-                    let result_refs: Vec<&RegressionResult> =
-                        indices.iter().map(|&idx| &results[idx]).collect();
-                    RegressionContext::from_results(&result_refs, *lib_id)
-                });
-
                 // Extract features with both mixed and deconvoluted scoring
                 // - Mixed: spectral scores from raw observed spectrum at apex
                 // - Deconvoluted: spectral scores from coefficient-weighted aggregated spectrum (apex ± 2)
@@ -2024,22 +2048,14 @@ fn score_run(
                     Some(entry.retention_time),
                 );
 
-                // Apply contextual features from regression context
-                if let Some(ctx) = &regression_context {
-                    FeatureExtractor::apply_regression_context(&mut features, ctx);
-                }
-
-                // Delta score: this peptide's coefficient relative to the max in its
-                // apex ± 2 spectra, averaged. In DIA, many peptides share each spectrum,
-                // so the DDA deltCn concept doesn't apply — instead we measure how dominant
-                // this peptide is vs the most abundant peptide in the local neighborhood.
-                // Values near 1.0 = dominant, near 0.0 = minor contributor.
+                // Contextual features from regression results at apex and apex ± 2.
+                // All regression-derived features (z-score, relative_coefficient,
+                // n_competitors, ln_num_candidates) are computed at the apex spectrum
+                // to ensure they reflect the signal at the detected peak.
                 if let Some(result_indices) = entry_result_indices.get(lib_id) {
                     // Sort data point indices by RT to find apex neighbors
                     let mut rt_sorted: Vec<usize> = (0..data_points.len()).collect();
-                    rt_sorted.sort_by(|&a, &b| {
-                        data_points[a].0.total_cmp(&data_points[b].0)
-                    });
+                    rt_sorted.sort_by(|&a, &b| data_points[a].0.total_cmp(&data_points[b].0));
 
                     // Find apex position in RT-sorted order
                     let apex_dp_idx = data_points
@@ -2053,55 +2069,145 @@ fn score_run(
                         .position(|&i| i == apex_dp_idx)
                         .unwrap_or(0);
 
-                    // Gather apex ± 2 indices (up to 5 spectra)
-                    let start = apex_sorted_pos.saturating_sub(2);
-                    let end = (apex_sorted_pos + 3).min(rt_sorted.len());
+                    // --- Features at apex spectrum ---
+                    let apex_result = &results[result_indices[apex_dp_idx]];
+                    let apex_my_coef = data_points[apex_dp_idx].1;
 
-                    let mut ratio_sum = 0.0;
-                    let mut ratio_count = 0u32;
-                    for &sorted_idx in &rt_sorted[start..end] {
-                        let result = &results[result_indices[sorted_idx]];
+                    // Relative coefficient at apex (this peptide / sum of all)
+                    features.relative_coefficient = apex_result.relative_coefficient(*lib_id);
 
-                        let my_coef = result
+                    // Number of competitors at apex
+                    features.n_competitors = apex_result.n_candidates;
+                    features.ln_num_candidates = (apex_result.n_candidates.max(1) as f64).ln();
+
+                    // Z-score at apex spectrum
+                    let n_apex = apex_result.coefficients.len() as f64;
+                    if n_apex >= 2.0 {
+                        let mean = apex_result.coefficient_sum / n_apex;
+                        let var = apex_result
                             .coefficients
                             .iter()
-                            .zip(result.library_ids.iter())
-                            .find(|(_, id)| *id == lib_id)
-                            .map(|(c, _)| *c)
-                            .unwrap_or(0.0);
-
-                        let max_coef = result
-                            .coefficients
-                            .iter()
-                            .cloned()
-                            .fold(0.0f64, f64::max);
-
-                        if max_coef > 1e-10 {
-                            ratio_sum += my_coef / max_coef;
-                            ratio_count += 1;
-                        }
+                            .map(|c| (c - mean) * (c - mean))
+                            .sum::<f64>()
+                            / n_apex;
+                        let std = var.sqrt();
+                        features.coef_zscore = if std > 1e-12 {
+                            (apex_my_coef - mean) / std
+                        } else {
+                            0.0
+                        };
                     }
 
-                    features.delta_score = if ratio_count > 0 {
-                        ratio_sum / ratio_count as f64
-                    } else {
-                        0.0
-                    };
+                    // --- Averaged features across apex ± 2 spectra ---
+                    let start = apex_sorted_pos.saturating_sub(2);
+                    let end = (apex_sorted_pos + 3).min(rt_sorted.len());
+                    let mut zscore_sum = 0.0;
+                    let mut zscore_count = 0u32;
+                    let mut rel_coef_sum = 0.0;
+                    let mut rel_coef_count = 0u32;
+                    for &sorted_idx in &rt_sorted[start..end] {
+                        let result = &results[result_indices[sorted_idx]];
+                        let my_coef = data_points[sorted_idx].1;
+                        let n = result.coefficients.len() as f64;
+
+                        // Relative coefficient mean
+                        let rel = result.relative_coefficient(*lib_id);
+                        rel_coef_sum += rel;
+                        rel_coef_count += 1;
+
+                        // Z-score mean
+                        if n >= 2.0 {
+                            let mean = result.coefficient_sum / n;
+                            let var = result
+                                .coefficients
+                                .iter()
+                                .map(|c| (c - mean) * (c - mean))
+                                .sum::<f64>()
+                                / n;
+                            let std = var.sqrt();
+                            if std > 1e-12 {
+                                zscore_sum += (my_coef - mean) / std;
+                                zscore_count += 1;
+                            }
+                        }
+                    }
+                    if zscore_count > 0 {
+                        features.coef_zscore_mean = zscore_sum / zscore_count as f64;
+                    }
+                    if rel_coef_count > 0 {
+                        features.relative_coefficient_mean = rel_coef_sum / rel_coef_count as f64;
+                    }
                 }
 
+                // Find the peak that contains the apex RT for peak integration boundaries
+                let best_peak = peaks
+                    .iter()
+                    .find(|p| apex_rt >= p.start_rt && apex_rt <= p.end_rt)
+                    .or_else(|| {
+                        // Fallback: find peak with apex closest to our apex RT
+                        peaks.iter().min_by(|a, b| {
+                            (a.apex_rt - apex_rt)
+                                .abs()
+                                .partial_cmp(&(b.apex_rt - apex_rt).abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                    });
+                let (peak_start_rt, peak_end_rt) = best_peak
+                    .map(|p| (p.start_rt, p.end_rt))
+                    .unwrap_or((rt_min, rt_max));
+
                 // Fragment co-elution correlation: correlate raw fragment XICs against
-                // the regression coefficient time series (deconvolved elution profile)
-                let (coelution_sum, coelution_min, n_coeluting) =
-                    osprey_scoring::compute_fragment_coelution(
-                        &entry.fragments,
-                        &rt_coef_pairs,
-                        &peak_region_spectra,
-                        spectral_scorer.tolerance_da(),
-                        spectral_scorer.tolerance_ppm(),
-                    );
-                features.fragment_coelution_sum = coelution_sum;
-                features.fragment_coelution_min = coelution_min;
-                features.n_coeluting_fragments = n_coeluting;
+                // the regression coefficient time series (deconvolved elution profile).
+                // Restricted to peak integration boundaries to avoid flanking interference.
+                let coelution_result = osprey_scoring::compute_fragment_coelution(
+                    &entry.fragments,
+                    &rt_coef_pairs,
+                    &peak_region_spectra,
+                    spectral_scorer.tolerance_da(),
+                    spectral_scorer.tolerance_ppm(),
+                    peak_start_rt,
+                    peak_end_rt,
+                );
+                features.fragment_coelution_sum = coelution_result.coelution_sum;
+                features.fragment_coelution_min = coelution_result.coelution_min;
+                features.n_coeluting_fragments = coelution_result.n_positive;
+                features.fragment_corr_0 = coelution_result.per_fragment_corr[0];
+                features.fragment_corr_1 = coelution_result.per_fragment_corr[1];
+                features.fragment_corr_2 = coelution_result.per_fragment_corr[2];
+                features.fragment_corr_3 = coelution_result.per_fragment_corr[3];
+                features.fragment_corr_4 = coelution_result.per_fragment_corr[4];
+                features.fragment_corr_5 = coelution_result.per_fragment_corr[5];
+
+                // Elution-weighted cosine: cosine similarity at each scan within peak
+                // boundaries, weighted by coefficient², then averaged.
+                features.elution_weighted_cosine = osprey_scoring::compute_elution_weighted_cosine(
+                    &entry.fragments,
+                    &rt_coef_pairs,
+                    &peak_region_spectra,
+                    spectral_scorer.tolerance_da(),
+                    spectral_scorer.tolerance_ppm(),
+                    peak_start_rt,
+                    peak_end_rt,
+                );
+
+                // Compute SNR on the best-correlated fragment XIC
+                if let Some(ref xic) = coelution_result.best_xic {
+                    if let Some(xic_apex_idx) = xic
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                        .map(|(i, _)| i)
+                    {
+                        let xic_apex_value = xic[xic_apex_idx].1;
+                        if let Some(snr) = osprey_scoring::compute_signal_to_noise(
+                            xic,
+                            xic_apex_idx,
+                            xic_apex_value,
+                        ) {
+                            features.xic_signal_to_noise = snr;
+                        }
+                    }
+                }
 
                 // Compute fragment-based FWHM from co-eluting XICs for blib boundaries
                 let fragment_peak_bounds = osprey_scoring::compute_fragment_fwhm(
@@ -2123,10 +2229,65 @@ fn score_run(
                 // Per-fragment mass accuracy at apex spectrum
                 if let Some(spectrum) = apex_spectrum {
                     let matches = spectral_scorer.match_fragments(spectrum, entry);
-                    let (acc_mean, acc_std) =
+                    let (signed_mean, abs_mean, acc_std) =
                         osprey_scoring::compute_mass_accuracy(&matches, mass_accuracy_unit);
-                    features.mass_accuracy_mean = acc_mean;
+                    features.mass_accuracy_deviation_mean = signed_mean;
+                    features.abs_mass_accuracy_deviation_mean = abs_mean;
                     features.mass_accuracy_std = acc_std;
+                }
+
+                // MS1-based features (HRAM only)
+                if is_hram && !ms1_index.is_empty() {
+                    // Determine MS1 tolerance (ppm) and reverse-calibrated search m/z
+                    let ms1_tol_ppm = calibration
+                        .map(|cal| calibrated_tolerance_ppm(&cal.ms1_calibration, 10.0))
+                        .unwrap_or(10.0);
+                    let search_mz = calibration
+                        .map(|cal| reverse_calibrate_mz(entry.precursor_mz, &cal.ms1_calibration))
+                        .unwrap_or(entry.precursor_mz);
+
+                    // MS1 precursor co-elution: correlate coefficient series with
+                    // MS1 M+0 XIC within peak integration boundaries only
+                    let bounded_pairs: Vec<&(f64, f64)> = rt_coef_pairs
+                        .iter()
+                        .filter(|(rt, _)| *rt >= peak_start_rt && *rt <= peak_end_rt)
+                        .collect();
+                    if bounded_pairs.len() >= 3 {
+                        let mut ms1_intensities = Vec::with_capacity(bounded_pairs.len());
+                        let mut coefs = Vec::with_capacity(bounded_pairs.len());
+                        for &(rt, coef) in &bounded_pairs {
+                            if let Some(ms1) = ms1_index.find_nearest(*rt) {
+                                let intensity = ms1
+                                    .find_peak_ppm(search_mz, ms1_tol_ppm)
+                                    .map(|(_, int)| int as f64)
+                                    .unwrap_or(0.0);
+                                ms1_intensities.push(intensity);
+                                coefs.push(*coef);
+                            }
+                        }
+                        if ms1_intensities.len() >= 3 {
+                            features.ms1_precursor_coelution =
+                                osprey_scoring::pearson_correlation_raw(&ms1_intensities, &coefs);
+                        }
+                    }
+
+                    // MS1 isotope cosine at apex RT
+                    if let Some(apex_ms1) = ms1_index.find_nearest(apex_rt) {
+                        let envelope = osprey_core::IsotopeEnvelope::extract(
+                            apex_ms1,
+                            search_mz,
+                            entry.charge,
+                            ms1_tol_ppm,
+                        );
+                        if envelope.has_m0() {
+                            if let Some(cosine) = osprey_core::peptide_isotope_cosine(
+                                &entry.sequence,
+                                &envelope.intensities,
+                            ) {
+                                features.ms1_isotope_cosine = cosine;
+                            }
+                        }
+                    }
                 }
 
                 // Primary score is LibCosine from extract_with_deconvolution (already computed)
@@ -3076,12 +3237,9 @@ fn write_blib_output_with_scores(
             None => continue,
         };
 
-        // Count runs where this precursor passed run-level FDR
-        let runs_passing: Vec<&&ScoredEntry> = entries
-            .iter()
-            .filter(|e| e.run_qvalue <= config.run_fdr)
-            .collect();
-        let n_runs_detected = runs_passing.len() as i32;
+        // Include all runs where this precursor was scored (it passed experiment-level FDR,
+        // so we report boundaries for every run — Skyline needs RetentionTimes per run for IDs)
+        let n_runs_detected = entries.len() as i32;
 
         // Look up file_id for the best run
         let file_id = *file_stem_to_id.get(&best.file_name).unwrap_or(&1);
@@ -3128,14 +3286,12 @@ fn write_blib_output_with_scores(
             writer.add_protein_mapping(ref_id, &entry.protein_ids)?;
         }
 
-        // Write RetentionTimes entries for each run where this precursor passed run FDR
-        for scored in &runs_passing {
+        // Write RetentionTimes entries for every run where this precursor was scored
+        // (precursor already passed experiment-level FDR; Skyline needs per-run entries for IDs)
+        for scored in entries {
             let run_file_id = *file_stem_to_id.get(&scored.file_name).unwrap_or(&1);
-            let is_best: bool = {
-                let a: *const ScoredEntry = **scored;
-                let b: *const ScoredEntry = *best;
-                std::ptr::eq(a, b)
-            };
+            let is_best: bool =
+                std::ptr::eq(*scored as *const ScoredEntry, *best as *const ScoredEntry);
 
             if let Some((run_apex, run_start, run_end)) = compute_peak_boundaries(scored) {
                 writer.add_retention_time(
@@ -3551,7 +3707,7 @@ fn build_mz_index(library: &[LibraryEntry]) -> MzRTIndex {
 /// 2. RT tolerance — binary search on pre-sorted expected_rt within each m/z bin
 /// 3. Optional library filter (for calibration discovery phase)
 /// 4. Optional RT calibration (local tolerance refinement after binary search)
-/// 5. Optional top-3 fragment pre-filter (requires at least 1 of top 3 peaks in spectrum)
+/// 5. Optional top-N fragment pre-filter (requires at least 2 of top 6 peaks in spectrum)
 ///
 /// The MzRTIndex stores entries sorted by expected_rt (calibrated if available),
 /// enabling O(log n + k) candidate selection instead of O(n) per m/z bin.
@@ -3620,9 +3776,9 @@ fn select_candidates_with_calibration(
                     }
                 }
 
-                // Apply top-3 fragment pre-filter if enabled
+                // Apply top-N fragment pre-filter if enabled
                 if let Some(ref frag_tol) = fragment_tolerance {
-                    if !has_top3_fragment_match(
+                    if !has_topn_fragment_match(
                         &entry.fragments,
                         &spectrum.mzs,
                         frag_tol.tolerance,

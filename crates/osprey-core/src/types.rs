@@ -614,8 +614,10 @@ pub struct FeatureSet {
     pub peak_sharpness: f64,
     /// Peak prominence (apex / baseline)
     pub peak_prominence: f64,
-    /// Signal-to-noise ratio (peak apex vs background)
+    /// Signal-to-noise ratio on coefficient series (peak apex vs background)
     pub signal_to_noise: f64,
+    /// Signal-to-noise ratio on best fragment XIC (highest correlation to coefficient series)
+    pub xic_signal_to_noise: f64,
 
     // Spectral features (from mixed/observed spectrum at apex)
     /// X!Tandem-style hyperscore: log(n_b!) + log(n_y!) + Σlog(I_f+1)
@@ -642,8 +644,10 @@ pub struct FeatureSet {
     pub base_peak_rank: u32,
     /// Number of top-6 predicted fragments matched
     pub top6_matches: u32,
-    /// Fraction of observed intensity explained
+    /// Fraction of observed intensity explained (at apex spectrum)
     pub explained_intensity: f64,
+    /// Mean explained intensity across spectra within ±1.96σ peak boundaries
+    pub explained_intensity_mean: f64,
 
     // Deconvoluted spectral features (from summed deconvoluted signal, apex ± 2 scans)
     // These compare the deconvoluted (coefficient-scaled) contribution to the library,
@@ -665,11 +669,13 @@ pub struct FeatureSet {
     /// Top-6 matches from deconvoluted spectrum
     pub top6_matches_deconv: u32,
 
-    // Contextual features
-    /// Number of competing candidates
+    // Contextual features (computed at apex regression result)
+    /// Number of competing candidates at apex spectrum
     pub n_competitors: u32,
-    /// Coefficient relative to sum of all
+    /// Coefficient relative to sum of all at apex spectrum
     pub relative_coefficient: f64,
+    /// Mean relative coefficient over apex ± 2 spectra
+    pub relative_coefficient_mean: f64,
     /// Local peptide density
     pub local_peptide_density: f64,
     /// Spectral complexity estimate
@@ -682,6 +688,7 @@ pub struct FeatureSet {
     pub modification_count: u32,
 
     // Fragment co-elution features (DIA-NN pTimeCorr-inspired)
+    // Computed within peak integration boundaries only (start_rt..end_rt)
     /// Sum of Pearson correlations between each fragment XIC and the coefficient time series
     pub fragment_coelution_sum: f64,
     /// Minimum per-fragment correlation with coefficient time series
@@ -689,9 +696,33 @@ pub struct FeatureSet {
     /// Number of fragments with positive correlation to coefficient series
     pub n_coeluting_fragments: u32,
 
+    // Per-fragment correlation array (top 6 fragments by library intensity)
+    // Correlations computed within peak integration boundaries only.
+    // Fragments not present in library are 0-padded.
+    /// Correlation of fragment 0 (highest library intensity) XIC vs coefficient series
+    pub fragment_corr_0: f64,
+    /// Correlation of fragment 1 XIC vs coefficient series
+    pub fragment_corr_1: f64,
+    /// Correlation of fragment 2 XIC vs coefficient series
+    pub fragment_corr_2: f64,
+    /// Correlation of fragment 3 XIC vs coefficient series
+    pub fragment_corr_3: f64,
+    /// Correlation of fragment 4 XIC vs coefficient series
+    pub fragment_corr_4: f64,
+    /// Correlation of fragment 5 XIC vs coefficient series
+    pub fragment_corr_5: f64,
+
+    // Elution-weighted spectral similarity
+    /// Cosine similarity computed at each scan within peak boundaries,
+    /// weighted by coefficient², then averaged. Captures whether the library
+    /// pattern holds across the entire peak, not just at the apex.
+    pub elution_weighted_cosine: f64,
+
     // Per-fragment mass accuracy at apex (ppm for HRAM, Th for unit resolution)
-    /// Mean absolute mass error across matched fragments at apex
-    pub mass_accuracy_mean: f64,
+    /// Signed mean mass error across matched fragments at apex (systematic bias)
+    pub mass_accuracy_deviation_mean: f64,
+    /// Absolute mean mass error across matched fragments at apex
+    pub abs_mass_accuracy_deviation_mean: f64,
     /// Standard deviation of mass errors across matched fragments at apex
     pub mass_accuracy_std: f64,
 
@@ -704,8 +735,19 @@ pub struct FeatureSet {
     pub missed_cleavages: u32,
     /// ln(number of candidates in regression)
     pub ln_num_candidates: f64,
-    /// Coefficient relative to max in apex spectrum (1.0 = dominant peptide)
-    pub delta_score: f64,
+    /// Z-score of this peptide's coefficient at apex spectrum
+    /// (how many SDs above the mean of all coefficients in the spectrum)
+    pub coef_zscore: f64,
+    /// Mean z-score across apex ± 2 spectra (smoothed version)
+    pub coef_zscore_mean: f64,
+
+    // MS1-based features (HRAM only, 0.0 for unit resolution or missing MS1)
+    /// Pearson correlation between coefficient time series and MS1 monoisotopic
+    /// precursor XIC within peak integration boundaries.
+    pub ms1_precursor_coelution: f64,
+    /// Cosine similarity between observed MS1 isotope envelope at apex RT and
+    /// theoretical isotope distribution from peptide sequence.
+    pub ms1_isotope_cosine: f64,
 }
 
 #[cfg(test)]

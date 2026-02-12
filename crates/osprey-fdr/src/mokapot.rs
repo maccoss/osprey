@@ -1077,59 +1077,63 @@ fn find_mokapot_models(dir: &Path) -> Result<Vec<PathBuf>> {
     )))
 }
 
-/// Get the feature header for PIN format
+/// Get the feature header for PIN format (26 features)
 ///
 /// Features are grouped by source:
 /// - Ridge regression (chromatographic): peak_apex, peak_area, peak_width,
-///   n_contributing_scans, coefficient_stability, relative_coefficient, explained_intensity
-/// - Spectral matching (mixed, at apex): hyperscore, xcorr, dot_product, dot_product_smz,
-///   fragment_coverage, sequence_coverage, consecutive_ions, top6_matches
+///   coefficient_stability, relative_coefficient, explained_intensity, signal_to_noise,
+///   xic_signal_to_noise
+/// - Spectral matching (mixed, at apex): xcorr, consecutive_ions
 /// - Spectral matching (deconvoluted, apex ± 2): *_deconv versions
-/// - Derived: rt_deviation
+/// - Derived: rt_deviation, fragment co-elution, mass accuracy
+/// - Percolator-style: abs_rt_deviation, peptide_length, missed_cleavages,
+///   ln_num_candidates, coef_zscore, coef_zscore_mean
 fn get_feature_header() -> String {
     [
         // Ridge regression features (chromatographic profile)
         "peak_apex",
         "peak_area",
         "peak_width",
-        "n_contributing_scans",
         "coefficient_stability",
         "relative_coefficient",
         "explained_intensity",
         "signal_to_noise",
+        "xic_signal_to_noise",
         // Spectral matching features (mixed/observed at apex spectrum)
-        "hyperscore",
         "xcorr",
-        "dot_product",
-        "dot_product_smz",
-        "fragment_coverage",
-        "sequence_coverage",
         "consecutive_ions",
-        "top6_matches",
         // Spectral matching features (deconvoluted, coefficient-weighted apex ± 2 scans)
-        "hyperscore_deconv",
         "xcorr_deconv",
-        "dot_product_deconv",
-        "dot_product_smz_deconv",
-        "fragment_coverage_deconv",
-        "sequence_coverage_deconv",
         "consecutive_ions_deconv",
-        "top6_matches_deconv",
         // Derived features
         "rt_deviation",
-        // Fragment co-elution features
+        // Fragment co-elution features (bounded to peak integration boundaries)
         "fragment_coelution_sum",
         "fragment_coelution_min",
         "n_coeluting_fragments",
+        // Per-fragment correlations (top 6 by library intensity, 0-padded)
+        "fragment_corr_0",
+        "fragment_corr_1",
+        "fragment_corr_2",
+        "fragment_corr_3",
+        "fragment_corr_4",
+        "fragment_corr_5",
+        // Elution-weighted spectral similarity
+        "elution_weighted_cosine",
         // Per-fragment mass accuracy
-        "mass_accuracy_mean",
+        "mass_accuracy_deviation_mean",
+        "abs_mass_accuracy_deviation_mean",
         "mass_accuracy_std",
         // Percolator-style features
         "abs_rt_deviation",
         "peptide_length",
         "missed_cleavages",
         "ln_num_candidates",
-        "delta_score",
+        "coef_zscore",
+        "coef_zscore_mean",
+        // MS1-based features (HRAM only, 0.0 for unit resolution or missing MS1)
+        "ms1_precursor_coelution",
+        "ms1_isotope_cosine",
     ]
     .join("\t")
 }
@@ -1147,52 +1151,54 @@ fn format_charge_features(charge: u8) -> String {
     )
 }
 
-/// Format features for PIN output
+/// Format features for PIN output (34 features)
 fn format_features(features: &FeatureSet) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         // Ridge regression features (chromatographic profile)
         features.peak_apex,
         features.peak_area,
         features.peak_width,
-        features.n_contributing_scans,
         features.coefficient_stability,
         features.relative_coefficient,
         features.explained_intensity,
         features.signal_to_noise,
+        features.xic_signal_to_noise,
         // Spectral matching features (mixed/observed at apex spectrum)
-        features.hyperscore,
         features.xcorr,
-        features.dot_product,
-        features.dot_product_smz,
-        features.fragment_coverage,
-        features.sequence_coverage,
         features.consecutive_ions,
-        features.top6_matches,
         // Spectral matching features (deconvoluted, coefficient-weighted apex ± 2 scans)
-        features.hyperscore_deconv,
         features.xcorr_deconv,
-        features.dot_product_deconv,
-        features.dot_product_smz_deconv,
-        features.fragment_coverage_deconv,
-        features.sequence_coverage_deconv,
         features.consecutive_ions_deconv,
-        features.top6_matches_deconv,
         // Derived features
         features.rt_deviation,
-        // Fragment co-elution features
+        // Fragment co-elution features (bounded to peak integration boundaries)
         features.fragment_coelution_sum,
         features.fragment_coelution_min,
         features.n_coeluting_fragments,
+        // Per-fragment correlations (top 6 by library intensity, 0-padded)
+        features.fragment_corr_0,
+        features.fragment_corr_1,
+        features.fragment_corr_2,
+        features.fragment_corr_3,
+        features.fragment_corr_4,
+        features.fragment_corr_5,
+        // Elution-weighted spectral similarity
+        features.elution_weighted_cosine,
         // Per-fragment mass accuracy
-        features.mass_accuracy_mean,
+        features.mass_accuracy_deviation_mean,
+        features.abs_mass_accuracy_deviation_mean,
         features.mass_accuracy_std,
         // Percolator-style features
         features.abs_rt_deviation,
         features.peptide_length,
         features.missed_cleavages,
         features.ln_num_candidates,
-        features.delta_score,
+        features.coef_zscore,
+        features.coef_zscore_mean,
+        // MS1-based features (HRAM only, 0.0 for unit resolution or missing MS1)
+        features.ms1_precursor_coelution,
+        features.ms1_isotope_cosine,
     )
 }
 
@@ -1265,8 +1271,18 @@ mod tests {
     fn test_feature_header() {
         let header = get_feature_header();
         assert!(header.contains("peak_apex"));
-        assert!(header.contains("dot_product"));
+        assert!(header.contains("xcorr"));
+        assert!(header.contains("coef_zscore"));
+        assert!(header.contains("xic_signal_to_noise"));
+        assert!(header.contains("ms1_precursor_coelution"));
+        assert!(header.contains("ms1_isotope_cosine"));
         assert!(!header.contains("precursor_intensity")); // Optional field not included
+                                                          // Removed features should not be present
+        assert!(!header.contains("dot_product"));
+        assert!(!header.contains("hyperscore"));
+        assert!(!header.contains("fragment_coverage"));
+        assert!(!header.contains("top6_matches"));
+        assert!(!header.contains("n_contributing_scans"));
     }
 
     /// Verifies that charge states 1-5 produce correct one-hot encodings and out-of-range charges produce all zeros.

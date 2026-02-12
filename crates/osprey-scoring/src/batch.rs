@@ -34,7 +34,7 @@ use osprey_core::{
 use rayon::prelude::*;
 use std::collections::HashMap;
 
-use super::has_top3_fragment_match;
+use super::has_topn_fragment_match;
 
 use crate::SpectralScorer;
 
@@ -1943,9 +1943,9 @@ pub trait MS1SpectrumLookup: Sync {
 /// Run calibration scoring with XCorr + MS1 isotope extraction
 ///
 /// This is the primary calibration scoring function. For each library entry:
-/// 1. Filter by precursor window, RT tolerance, and top-3 fragment match
+/// 1. Filter by precursor window, RT tolerance, and top-N fragment match
 /// 2. Calculate XCorr across all passing spectra to find the best RT
-/// 3. Collect MS2 mass errors from top-3 fragment matches at best spectrum
+/// 3. Collect MS2 mass errors from top-N fragment matches at best spectrum
 /// 4. Calculate Comet-style E-value from the XCorr score distribution
 /// 5. Extract M+0 isotope peak from MS1 for accurate mass calibration
 ///
@@ -2037,14 +2037,14 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                     .map(|spec| xcorr_scorer.preprocess_spectrum_for_xcorr(spec))
                     .collect();
 
-                // NOTE: Library entries are preprocessed lazily (only after passing RT + top3 filters)
+                // NOTE: Library entries are preprocessed lazily (only after passing RT + topN filters)
                 // This avoids wasting ~8KB per entry for entries that never get scored
 
                 // Score each library entry against all spectra in this window
                 let mut window_matches: Vec<CalibrationMatch> = Vec::new();
 
                 for entry in &window_entries {
-                    // === FIRST PASS: find spectra passing RT + top3 filters ===
+                    // === FIRST PASS: find spectra passing RT + topN filters ===
                     let candidate_indices: Vec<usize> = window_spectra
                         .iter()
                         .enumerate()
@@ -2053,7 +2053,7 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                             if rt_diff > rt_tolerance {
                                 return false;
                             }
-                            has_top3_fragment_match(
+                            has_topn_fragment_match(
                                 &entry.fragments,
                                 &spec.mzs,
                                 fragment_tolerance.tolerance,
@@ -2073,7 +2073,7 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                     let entry_xcorr_vec = xcorr_scorer.preprocess_library_for_xcorr(entry);
 
                     // === COLLECT ALL XCORR SCORES FOR E-VALUE CALCULATION ===
-                    // Score against spectra that passed RT + top3 filters
+                    // Score against spectra that passed RT + topN filters
                     let mut all_xcorr_scores: Vec<f64> = Vec::new();
                     let mut best_xcorr = 0.0f64;
                     let mut best_local_idx = 0usize; // Index into window_spectra
@@ -2103,8 +2103,8 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                     if best_xcorr > 0.0 {
                         let best_spec = window_spectra[best_local_idx];
 
-                        // Collect MS2 mass errors from top-3 fragments at best spectrum
-                        let (_has_match, ms2_errors) = super::top3_fragment_match_with_errors(
+                        // Collect MS2 mass errors from top-N fragments at best spectrum
+                        let (_has_match, ms2_errors) = super::topn_fragment_match_with_errors(
                             &entry.fragments,
                             &best_spec.mzs,
                             fragment_tolerance.tolerance,
@@ -2219,13 +2219,13 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                     .map(|spec| xcorr_scorer.preprocess_spectrum_for_xcorr(spec))
                     .collect();
 
-                // NOTE: Library entries are preprocessed lazily (only after passing RT + top3 filters)
+                // NOTE: Library entries are preprocessed lazily (only after passing RT + topN filters)
                 // This avoids wasting ~8KB per entry for entries that never get scored
 
                 let mut window_matches: Vec<CalibrationMatch> = Vec::new();
 
                 for entry in &window_entries {
-                    // === FIRST PASS: find spectra passing RT + top3 filters ===
+                    // === FIRST PASS: find spectra passing RT + topN filters ===
                     let candidate_indices: Vec<usize> = window_spectra
                         .iter()
                         .enumerate()
@@ -2234,7 +2234,7 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                             if rt_diff > rt_tolerance {
                                 return false;
                             }
-                            has_top3_fragment_match(
+                            has_topn_fragment_match(
                                 &entry.fragments,
                                 &spec.mzs,
                                 fragment_tolerance.tolerance,
@@ -2282,8 +2282,8 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                     if best_xcorr > 0.0 {
                         let best_spec = window_spectra[best_local_idx];
 
-                        // Collect MS2 mass errors from top-3 fragments at best spectrum
-                        let (_has_match, ms2_errors) = super::top3_fragment_match_with_errors(
+                        // Collect MS2 mass errors from top-N fragments at best spectrum
+                        let (_has_match, ms2_errors) = super::topn_fragment_match_with_errors(
                             &entry.fragments,
                             &best_spec.mzs,
                             fragment_tolerance.tolerance,
@@ -2687,8 +2687,8 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
         let apex_spec = candidate_spectra[apex_spec_local_idx];
         let apex_global_idx = candidate_global_indices[apex_spec_local_idx];
 
-        // Collect MS2 mass errors from top-3 fragments at apex spectrum
-        let (_has_match, ms2_errors) = super::top3_fragment_match_with_errors(
+        // Collect MS2 mass errors from top-N fragments at apex spectrum
+        let (_has_match, ms2_errors) = super::topn_fragment_match_with_errors(
             &entry.fragments,
             &apex_spec.mzs,
             fragment_tolerance.tolerance,
@@ -2823,7 +2823,7 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
                         if rt_diff > rt_tolerance {
                             return false;
                         }
-                        has_top3_fragment_match(
+                        has_topn_fragment_match(
                             &entry.fragments,
                             &spec.mzs,
                             fragment_tolerance.tolerance,

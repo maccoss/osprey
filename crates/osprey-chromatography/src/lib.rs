@@ -41,6 +41,22 @@ pub use calibration::{
     RTStratifiedSampler,
 };
 
+/// Compute trapezoidal area of a (RT, value) time series slice.
+///
+/// area = Σ (v_i + v_{i+1}) / 2 × (t_{i+1} - t_i)
+fn trapezoidal_area(series: &[(f64, f64)]) -> f64 {
+    if series.len() < 2 {
+        return series.first().map(|(_, c)| *c).unwrap_or(0.0);
+    }
+    let mut area = 0.0;
+    for i in 0..series.len() - 1 {
+        let dt = series[i + 1].0 - series[i].0;
+        let avg_height = (series[i].1 + series[i + 1].1) / 2.0;
+        area += avg_height * dt;
+    }
+    area
+}
+
 /// Simple peak detector for coefficient time series
 #[derive(Debug, Default)]
 pub struct PeakDetector {
@@ -99,11 +115,9 @@ impl PeakDetector {
                 // End of peak
                 let peak_end_idx = i.saturating_sub(1);
                 if peak_end_idx - peak_start_idx + 1 >= self.min_width {
-                    // Calculate peak area
-                    let area: f64 = series[peak_start_idx..=peak_end_idx]
-                        .iter()
-                        .map(|(_, c)| c)
-                        .sum();
+                    // Calculate peak area using trapezoidal integration
+                    let peak_slice = &series[peak_start_idx..=peak_end_idx];
+                    let area = trapezoidal_area(peak_slice);
 
                     peaks.push(PeakBoundaries {
                         start_rt: series[peak_start_idx].0,
@@ -122,10 +136,8 @@ impl PeakDetector {
         if in_peak {
             let peak_end_idx = series.len() - 1;
             if peak_end_idx - peak_start_idx + 1 >= self.min_width {
-                let area: f64 = series[peak_start_idx..=peak_end_idx]
-                    .iter()
-                    .map(|(_, c)| c)
-                    .sum();
+                let peak_slice = &series[peak_start_idx..=peak_end_idx];
+                let area = trapezoidal_area(peak_slice);
 
                 peaks.push(PeakBoundaries {
                     start_rt: series[peak_start_idx].0,

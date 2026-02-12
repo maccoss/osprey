@@ -63,7 +63,7 @@ use std::collections::HashMap;
 ///
 /// # Returns
 /// `true` if at least 2 of the top 6 library peaks have matching observed peaks
-pub fn has_top3_fragment_match(
+pub fn has_topn_fragment_match(
     library_fragments: &[LibraryFragment],
     spectrum_mzs: &[f64],
     tolerance: f64,
@@ -172,16 +172,16 @@ pub fn has_match_within_tolerance(
     start_idx < spectrum_mzs.len() && spectrum_mzs[start_idx] <= upper
 }
 
-/// Check if any top-3 library fragment matches an observed peak, and collect mass errors.
+/// Check if any top N library fragments match an observed peak, and collect mass errors.
 ///
 /// Combines the filtering check with mass error collection for calibration.
-/// Uses binary search for O(3 × log n) performance. For each matched top-3 fragment,
-/// finds the closest observed peak and computes the mass error.
+/// Uses the top 6 fragments by intensity, requiring at least 1 match.
+/// For each matched fragment, finds the closest observed peak and computes the mass error.
 ///
 /// # Returns
-/// `(has_match, mass_errors)` where `has_match` is true if at least 1 top-3 peak matches,
+/// `(has_match, mass_errors)` where `has_match` is true if at least 1 top-N peak matches,
 /// and `mass_errors` contains the error (in the configured unit) for each matched fragment.
-pub fn top3_fragment_match_with_errors(
+pub fn topn_fragment_match_with_errors(
     library_fragments: &[LibraryFragment],
     spectrum_mzs: &[f64],
     tolerance: f64,
@@ -191,23 +191,24 @@ pub fn top3_fragment_match_with_errors(
         return (true, Vec::new());
     }
 
-    // Get indices of top 3 fragments by intensity
-    let mut top3_indices: Vec<usize> = (0..library_fragments.len().min(3)).collect();
+    // Get indices of top 6 fragments by intensity (consistent with has_topn_fragment_match)
+    let n_top = library_fragments.len().min(6);
+    let mut top_indices: Vec<usize> = (0..n_top).collect();
 
-    if library_fragments.len() > 3 {
+    if library_fragments.len() > 6 {
         let mut indexed: Vec<(usize, f32)> = library_fragments
             .iter()
             .enumerate()
             .map(|(i, f)| (i, f.relative_intensity))
             .collect();
         indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-        top3_indices = indexed.iter().take(3).map(|(i, _)| *i).collect();
+        top_indices = indexed.iter().take(6).map(|(i, _)| *i).collect();
     }
 
     let mut has_match = false;
-    let mut mass_errors = Vec::with_capacity(3);
+    let mut mass_errors = Vec::with_capacity(n_top);
 
-    for &idx in &top3_indices {
+    for &idx in &top_indices {
         let lib_mz = library_fragments[idx].mz;
 
         let tol_da = match unit {
@@ -249,26 +250,59 @@ pub fn top3_fragment_match_with_errors(
     (has_match, mass_errors)
 }
 
+/// Result of fragment co-elution analysis.
+pub struct FragmentCoelutionResult {
+    /// Sum of Pearson correlations across scored fragments
+    pub coelution_sum: f64,
+    /// Minimum per-fragment correlation
+    pub coelution_min: f64,
+    /// Number of fragments with positive correlation
+    pub n_positive: u32,
+    /// Per-fragment correlations for top 6 fragments (0-padded if fewer)
+    pub per_fragment_corr: [f64; 6],
+    /// Best-correlated fragment XIC as (RT, intensity) pairs for SNR computation
+    pub best_xic: Option<Vec<(f64, f64)>>,
+}
+
 /// Compute fragment co-elution correlation (DIA-NN pTimeCorr-inspired).
 ///
 /// For each of the top 6 library fragments, extracts a raw XIC from the peak region
 /// spectra and computes Pearson correlation against the regression coefficient time series.
 /// The coefficient series serves as the deconvolved elution profile reference.
 ///
-/// Uses plain Pearson correlation on raw intensities (no sqrt transform), matching DIA-NN.
+/// Only data points within `[peak_start_rt, peak_end_rt]` are used for correlation,
+/// ensuring that scoring reflects the detected peak rather than flanking interference.
 ///
-/// # Returns
-/// `(sum, min, n_positive)` — sum of per-fragment correlations, minimum correlation,
-/// and count of fragments with positive correlation.
+/// Uses plain Pearson correlation on raw intensities (no sqrt transform), matching DIA-NN.
 pub fn compute_fragment_coelution(
     library_fragments: &[LibraryFragment],
     coefficient_series: &[(f64, f64)], // (RT, coefficient) pairs
     spectra: &[&Spectrum],             // peak region spectra (sorted by RT)
     tolerance_da: f64,
     tolerance_ppm: f64,
-) -> (f64, f64, u32) {
+    peak_start_rt: f64,
+    peak_end_rt: f64,
+) -> FragmentCoelutionResult {
+    let empty = FragmentCoelutionResult {
+        coelution_sum: 0.0,
+        coelution_min: 0.0,
+        n_positive: 0,
+        per_fragment_corr: [0.0; 6],
+        best_xic: None,
+    };
+
     if library_fragments.is_empty() || coefficient_series.len() < 3 || spectra.is_empty() {
-        return (0.0, 0.0, 0);
+        return empty;
+    }
+
+    // Filter coefficient series to peak boundaries
+    let bounded_series: Vec<&(f64, f64)> = coefficient_series
+        .iter()
+        .filter(|(rt, _)| *rt >= peak_start_rt && *rt <= peak_end_rt)
+        .collect();
+
+    if bounded_series.len() < 3 {
+        return empty;
     }
 
     // Select top 6 fragments by relative intensity
@@ -284,25 +318,26 @@ pub fn compute_fragment_coelution(
         indexed.iter().take(6).map(|(i, _)| *i).collect()
     };
 
-    // Build a map from spectrum RT to index for alignment with coefficient series
-    // Both coefficient_series and spectra should cover the same RT region
+    // Build spectrum RT index for fast nearest-RT lookup
     let spec_rts: Vec<f64> = spectra.iter().map(|s| s.retention_time).collect();
 
     let mut coelution_sum = 0.0;
     let mut coelution_min = f64::MAX;
     let mut n_positive: u32 = 0;
     let mut n_scored: u32 = 0;
+    let mut per_fragment_corr = [0.0f64; 6];
+    let mut best_corr = f64::NEG_INFINITY;
+    let mut best_xic: Option<Vec<(f64, f64)>> = None;
 
-    for &frag_idx in &top_indices {
+    for (rank, &frag_idx) in top_indices.iter().enumerate() {
         let frag_mz = library_fragments[frag_idx].mz;
         let tol = tolerance_da.max(frag_mz * tolerance_ppm / 1e6);
 
-        // Extract raw XIC: for each coefficient series point, find the nearest spectrum
-        // and extract the fragment intensity via binary search
-        let mut xic: Vec<f64> = Vec::with_capacity(coefficient_series.len());
-        let mut coefs: Vec<f64> = Vec::with_capacity(coefficient_series.len());
+        // Extract raw XIC only within peak boundaries
+        let mut xic: Vec<f64> = Vec::with_capacity(bounded_series.len());
+        let mut coefs: Vec<f64> = Vec::with_capacity(bounded_series.len());
 
-        for &(rt, coef) in coefficient_series {
+        for &&(rt, coef) in &bounded_series {
             // Find the spectrum closest to this RT
             let spec_idx = match spec_rts
                 .binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal))
@@ -360,17 +395,230 @@ pub fn compute_fragment_coelution(
                 n_positive += 1;
             }
             n_scored += 1;
+
+            // Store per-fragment correlation (rank-ordered by library intensity)
+            if rank < 6 {
+                per_fragment_corr[rank] = corr;
+            }
+
+            // Track the best-correlated fragment XIC for SNR computation
+            // (use full coefficient series for XIC to get proper SNR baseline)
+            if corr > best_corr {
+                best_corr = corr;
+                best_xic = Some(extract_fragment_xic(
+                    frag_mz,
+                    tol,
+                    coefficient_series,
+                    spectra,
+                    &spec_rts,
+                ));
+            }
         }
     }
 
     if n_scored == 0 {
-        return (0.0, 0.0, 0);
+        return empty;
     }
     if coelution_min == f64::MAX {
         coelution_min = 0.0;
     }
 
-    (coelution_sum, coelution_min, n_positive)
+    FragmentCoelutionResult {
+        coelution_sum,
+        coelution_min,
+        n_positive,
+        per_fragment_corr,
+        best_xic,
+    }
+}
+
+/// Extract a fragment XIC across the full coefficient series (for SNR computation).
+fn extract_fragment_xic(
+    frag_mz: f64,
+    tol: f64,
+    coefficient_series: &[(f64, f64)],
+    spectra: &[&Spectrum],
+    spec_rts: &[f64],
+) -> Vec<(f64, f64)> {
+    let lower = frag_mz - tol;
+    let upper = frag_mz + tol;
+
+    coefficient_series
+        .iter()
+        .map(|&(rt, _)| {
+            let spec_idx = match spec_rts
+                .binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                Ok(i) => i,
+                Err(i) => {
+                    if i == 0 {
+                        0
+                    } else if i >= spec_rts.len() {
+                        spec_rts.len() - 1
+                    } else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() {
+                        i
+                    } else {
+                        i - 1
+                    }
+                }
+            };
+            let spectrum = &spectra[spec_idx];
+            let start = spectrum.mzs.partition_point(|&mz| mz < lower);
+            let intensity = if start < spectrum.mzs.len() && spectrum.mzs[start] <= upper {
+                let mut best_intensity = spectrum.intensities[start] as f64;
+                let mut best_diff = (spectrum.mzs[start] - frag_mz).abs();
+                let mut j = start + 1;
+                while j < spectrum.mzs.len() && spectrum.mzs[j] <= upper {
+                    let diff = (spectrum.mzs[j] - frag_mz).abs();
+                    if diff < best_diff {
+                        best_diff = diff;
+                        best_intensity = spectrum.intensities[j] as f64;
+                    }
+                    j += 1;
+                }
+                best_intensity
+            } else {
+                0.0
+            };
+            (rt, intensity)
+        })
+        .collect()
+}
+
+/// Compute elution-weighted cosine similarity across peak boundaries.
+///
+/// At each scan within `[peak_start_rt, peak_end_rt]`, computes the cosine similarity
+/// (sqrt preprocessing, L2 normalization) between the observed spectrum and the library.
+/// Each scan's cosine is weighted by coefficient², then the weighted average is returned.
+///
+/// This captures whether the library spectral pattern holds consistently across the
+/// entire peak, not just at the apex. Interference that only affects part of the peak
+/// will reduce this score even if the apex cosine is high.
+///
+/// Inspired by DIA-NN's `pCos` (elution-weighted cosine) feature.
+pub fn compute_elution_weighted_cosine(
+    library_fragments: &[LibraryFragment],
+    coefficient_series: &[(f64, f64)], // (RT, coefficient) pairs
+    spectra: &[&Spectrum],             // peak region spectra (sorted by RT)
+    tolerance_da: f64,
+    tolerance_ppm: f64,
+    peak_start_rt: f64,
+    peak_end_rt: f64,
+) -> f64 {
+    if library_fragments.is_empty() || spectra.is_empty() || coefficient_series.is_empty() {
+        return 0.0;
+    }
+
+    let spec_rts: Vec<f64> = spectra.iter().map(|s| s.retention_time).collect();
+
+    let mut weighted_cosine_sum = 0.0;
+    let mut weight_sum = 0.0;
+
+    // For each data point within peak boundaries, compute cosine at the nearest spectrum
+    for &(rt, coef) in coefficient_series {
+        if rt < peak_start_rt || rt > peak_end_rt {
+            continue;
+        }
+        if coef <= 0.0 {
+            continue;
+        }
+
+        // Weight = coefficient² (like DIA-NN's elution² weighting)
+        let weight = coef * coef;
+
+        // Find nearest spectrum
+        let spec_idx = match spec_rts
+            .binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            Ok(i) => i,
+            Err(i) => {
+                if i == 0 {
+                    0
+                } else if i >= spec_rts.len() {
+                    spec_rts.len() - 1
+                } else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() {
+                    i
+                } else {
+                    i - 1
+                }
+            }
+        };
+
+        let spectrum = spectra[spec_idx];
+
+        // Compute LibCosine (sqrt preprocessing) between this spectrum and library
+        let cosine =
+            compute_cosine_at_scan(library_fragments, spectrum, tolerance_da, tolerance_ppm);
+
+        weighted_cosine_sum += cosine * weight;
+        weight_sum += weight;
+    }
+
+    if weight_sum > 0.0 {
+        weighted_cosine_sum / weight_sum
+    } else {
+        0.0
+    }
+}
+
+/// Compute cosine similarity (sqrt preprocessing, L2 normalization) between
+/// a single observed spectrum and library fragment list.
+fn compute_cosine_at_scan(
+    library_fragments: &[LibraryFragment],
+    spectrum: &Spectrum,
+    tolerance_da: f64,
+    tolerance_ppm: f64,
+) -> f64 {
+    if library_fragments.is_empty() || spectrum.mzs.is_empty() {
+        return 0.0;
+    }
+
+    let mut lib_preprocessed: Vec<f64> = Vec::new();
+    let mut obs_preprocessed: Vec<f64> = Vec::new();
+
+    for frag in library_fragments {
+        let tol = tolerance_da.max(frag.mz * tolerance_ppm / 1e6);
+        let lower = frag.mz - tol;
+        let upper = frag.mz + tol;
+        let start = spectrum.mzs.partition_point(|&mz| mz < lower);
+
+        // Find closest peak within tolerance
+        let mut best_match: Option<f64> = None;
+        let mut best_diff = f64::MAX;
+        let mut j = start;
+        while j < spectrum.mzs.len() && spectrum.mzs[j] <= upper {
+            let diff = (spectrum.mzs[j] - frag.mz).abs();
+            if diff < best_diff {
+                best_diff = diff;
+                best_match = Some(spectrum.intensities[j] as f64);
+            }
+            j += 1;
+        }
+
+        if let Some(obs_intensity) = best_match {
+            lib_preprocessed.push((frag.relative_intensity as f64).sqrt());
+            obs_preprocessed.push(obs_intensity.sqrt());
+        }
+    }
+
+    if lib_preprocessed.is_empty() {
+        return 0.0;
+    }
+
+    // L2 normalize
+    let lib_norm = lib_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let obs_norm = obs_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
+
+    if lib_norm < 1e-10 || obs_norm < 1e-10 {
+        return 0.0;
+    }
+
+    // Cosine = dot(lib_norm, obs_norm)
+    lib_preprocessed
+        .iter()
+        .zip(obs_preprocessed.iter())
+        .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
+        .sum()
 }
 
 /// Compute per-fragment mass accuracy statistics at the apex scan.
@@ -380,10 +628,10 @@ pub fn compute_fragment_coelution(
 /// * `unit` - Tolerance unit determining error computation (ppm for HRAM, Th for unit resolution)
 ///
 /// # Returns
-/// `(mean_abs_error, std_error)` in the configured unit
-pub fn compute_mass_accuracy(matches: &[FragmentMatch], unit: ToleranceUnit) -> (f64, f64) {
+/// `(signed_mean, abs_mean, std)` in the configured unit
+pub fn compute_mass_accuracy(matches: &[FragmentMatch], unit: ToleranceUnit) -> (f64, f64, f64) {
     if matches.is_empty() {
-        return (0.0, 0.0);
+        return (0.0, 0.0, 0.0);
     }
 
     let errors: Vec<f64> = matches
@@ -396,11 +644,13 @@ pub fn compute_mass_accuracy(matches: &[FragmentMatch], unit: ToleranceUnit) -> 
 
     let n = errors.len() as f64;
 
-    // Mean of absolute errors
+    // Mean of signed errors (systematic bias direction)
+    let mean_signed: f64 = errors.iter().sum::<f64>() / n;
+
+    // Mean of absolute errors (overall accuracy)
     let mean_abs: f64 = errors.iter().map(|e| e.abs()).sum::<f64>() / n;
 
     // Standard deviation of signed errors
-    let mean_signed: f64 = errors.iter().sum::<f64>() / n;
     let variance: f64 = errors
         .iter()
         .map(|e| (e - mean_signed).powi(2))
@@ -408,7 +658,7 @@ pub fn compute_mass_accuracy(matches: &[FragmentMatch], unit: ToleranceUnit) -> 
         / n;
     let std_dev = variance.sqrt();
 
-    (mean_abs, std_dev)
+    (mean_signed, mean_abs, std_dev)
 }
 
 /// Extract XICs for the top N library fragments from a set of spectra.
@@ -702,6 +952,147 @@ pub fn compute_fwhm_interpolated(series: &[(f64, f64)]) -> Option<(f64, f64, f64
     }
 }
 
+/// Calculate signal-to-noise ratio from a time series.
+///
+/// Uses FWHM-based peak boundaries (±1.96σ) to define the peak region.
+/// Background is measured from 3-5 points on each side outside these boundaries.
+/// SNR = (apex - background_mean) / background_sd.
+///
+/// Works on any (RT, value) series — coefficient series or fragment XICs.
+pub fn compute_signal_to_noise(
+    series: &[(f64, f64)],
+    apex_idx: usize,
+    apex_value: f64,
+) -> Option<f64> {
+    if series.len() < 10 || apex_value <= 0.0 {
+        return None;
+    }
+
+    let bg = compute_background_stats(series, apex_idx)?;
+
+    if bg.sd <= 1e-10 {
+        return None;
+    }
+
+    // S/N = (signal - background) / noise
+    let signal = apex_value - bg.mean;
+    let snr = signal / bg.sd;
+
+    Some(snr.max(0.0))
+}
+
+/// Background statistics from flanking points outside the peak region.
+pub struct BackgroundStats {
+    /// Mean of background points
+    pub mean: f64,
+    /// Standard deviation of background points
+    pub sd: f64,
+    /// Number of background points used
+    pub n_points: usize,
+}
+
+/// Estimate background level from points flanking the peak.
+///
+/// Uses FWHM-based peak boundaries (±1.96σ) to define the peak region,
+/// then collects up to 5 points on each side outside these boundaries.
+/// Returns None if fewer than 4 background points are available.
+///
+/// Works on any (RT, value) series — coefficient series or fragment XICs.
+pub fn compute_background_stats(series: &[(f64, f64)], apex_idx: usize) -> Option<BackgroundStats> {
+    if series.len() < 10 {
+        return None;
+    }
+
+    let apex_value = series[apex_idx].1;
+    if apex_value <= 0.0 {
+        return None;
+    }
+
+    // Calculate FWHM to determine peak boundaries
+    let (fwhm, _, _) = compute_fwhm_interpolated(series)?;
+
+    // Peak boundaries: ±1.96σ where σ = FWHM / 2.355
+    let sigma = fwhm / 2.355;
+    let boundary_width = 1.96 * sigma;
+    let apex_rt = series[apex_idx].0;
+    let left_boundary = apex_rt - boundary_width;
+    let right_boundary = apex_rt + boundary_width;
+
+    // Collect background points outside peak boundaries
+    let mut background_values = Vec::new();
+
+    // Left side: points before left boundary
+    for (rt, val) in series.iter().take(apex_idx) {
+        if *rt < left_boundary {
+            background_values.push(*val);
+        }
+    }
+    // Take last 5 on left (closest to peak)
+    if background_values.len() > 5 {
+        background_values = background_values.into_iter().rev().take(5).collect();
+    }
+
+    // Right side: points after right boundary
+    let mut right_bg = Vec::new();
+    for (rt, val) in series.iter().skip(apex_idx + 1) {
+        if *rt > right_boundary {
+            right_bg.push(*val);
+            if right_bg.len() >= 5 {
+                break;
+            }
+        }
+    }
+    background_values.extend(right_bg);
+
+    // Need at least 4 background points
+    if background_values.len() < 4 {
+        return None;
+    }
+
+    // Calculate background mean and SD
+    let n = background_values.len() as f64;
+    let bg_mean = background_values.iter().sum::<f64>() / n;
+    let bg_variance = background_values
+        .iter()
+        .map(|x| (x - bg_mean).powi(2))
+        .sum::<f64>()
+        / n;
+    let bg_sd = bg_variance.sqrt();
+
+    Some(BackgroundStats {
+        mean: bg_mean,
+        sd: bg_sd,
+        n_points: background_values.len(),
+    })
+}
+
+/// Compute trapezoidal area of a time series between given RT boundaries.
+///
+/// Integrates only the points within [start_rt, end_rt] using the trapezoidal rule:
+/// area = Σ (c_i + c_{i+1}) / 2 * (t_{i+1} - t_i)
+///
+/// If no points fall within boundaries, returns 0.0.
+pub fn compute_trapezoidal_area(series: &[(f64, f64)], start_rt: f64, end_rt: f64) -> f64 {
+    // Filter to points within boundaries
+    let bounded: Vec<(f64, f64)> = series
+        .iter()
+        .filter(|(rt, _)| *rt >= start_rt && *rt <= end_rt)
+        .copied()
+        .collect();
+
+    if bounded.len() < 2 {
+        return bounded.first().map(|(_, c)| *c).unwrap_or(0.0);
+    }
+
+    let mut area = 0.0;
+    for i in 0..bounded.len() - 1 {
+        let dt = bounded[i + 1].0 - bounded[i].0;
+        let avg_height = (bounded[i].1 + bounded[i + 1].1) / 2.0;
+        area += avg_height * dt;
+    }
+    area
+}
+
 /// Result of hyperscore computation with binary search fragment matching.
 #[derive(Debug, Clone)]
 pub struct HyperscoreResult {
@@ -723,7 +1114,7 @@ pub struct HyperscoreResult {
 /// counts b/y ions, and computes hyperscore = ln(n_b!) + ln(n_y!) + Σ ln(I+1).
 ///
 /// Uses binary search for O(n_frags × log n_peaks) performance — same pattern as
-/// `has_top3_fragment_match` but for ALL fragments.
+/// `has_topn_fragment_match` but for ALL fragments.
 ///
 /// Mass errors for all matched fragments are collected as a side product,
 /// so no separate mass error collection pass is needed.
@@ -866,14 +1257,17 @@ impl SpectralScorer {
     }
 
     /// Set Da tolerance for unit resolution matching
+    /// Set Da tolerance for unit resolution matching (clears ppm tolerance)
     pub fn with_tolerance_da(mut self, tolerance: f64) -> Self {
         self.tolerance_da = tolerance;
+        self.tolerance_ppm = 0.0; // Da mode — don't let ppm default override
         self
     }
 
-    /// Set ppm tolerance for HRAM matching
+    /// Set ppm tolerance for HRAM matching (clears Da tolerance)
     pub fn with_tolerance_ppm(mut self, tolerance: f64) -> Self {
         self.tolerance_ppm = tolerance;
+        self.tolerance_da = 0.0; // ppm mode — don't let Da default override
         self
     }
 
@@ -975,7 +1369,7 @@ impl SpectralScorer {
         let base_peak_rank =
             self.compute_base_peak_rank(&matches, &lib_intensities, &obs_intensities);
 
-        // Compute top-3 matches
+        // Compute top-N matches
         let top6_matches = self.compute_top6_matches(library, &matches);
 
         // Compute LibCosine with SMZ preprocessing (sqrt(intensity) * mz²)
@@ -1199,7 +1593,7 @@ impl SpectralScorer {
         }
     }
 
-    /// Count how many of the top-3 library peaks are matched
+    /// Count how many of the top-6 library peaks are matched
     fn compute_top6_matches(&self, library: &LibraryEntry, matches: &[FragmentMatch]) -> u32 {
         if library.fragments.is_empty() {
             return 0;
@@ -2042,16 +2436,19 @@ impl FeatureExtractor {
         apex_spectrum: Option<&Spectrum>,
         expected_rt: Option<f64>,
     ) -> FeatureSet {
-        let mut features = FeatureSet::default();
-
         // Percolator-style sequence features
-        features.peptide_length = entry.sequence.len() as u32;
         let seq_bytes = entry.sequence.as_bytes();
-        features.missed_cleavages = seq_bytes
+        let missed_cleavages = seq_bytes
             .iter()
             .take(seq_bytes.len().saturating_sub(1)) // exclude C-terminal
             .filter(|&&b| b == b'K' || b == b'R')
             .count() as u32;
+
+        let mut features = FeatureSet {
+            peptide_length: entry.sequence.len() as u32,
+            missed_cleavages,
+            ..Default::default()
+        };
 
         // Chromatographic features from coefficient series (FR-5.1.*)
         if !coefficient_series.is_empty() {
@@ -2062,24 +2459,49 @@ impl FeatureExtractor {
                 .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
                 .map(|(i, (_, c))| (i, *c))
                 .unwrap_or((0, 0.0));
-            features.peak_apex = apex_value;
 
             let apex_rt = coefficient_series
                 .get(apex_idx)
                 .map(|(rt, _)| *rt)
                 .unwrap_or(0.0);
 
-            // FR-5.1.2: Integrated peak area (AUC of coefficients)
-            features.peak_area = coefficient_series.iter().map(|(_, c)| c).sum();
+            // Compute FWHM-based peak boundaries for background subtraction
+            let fwhm_info = compute_fwhm_interpolated(coefficient_series);
+            let bg_stats = compute_background_stats(coefficient_series, apex_idx);
+            let bg_mean = bg_stats.as_ref().map(|bg| bg.mean).unwrap_or(0.0);
+
+            // Peak apex: background-subtracted (signal above baseline)
+            features.peak_apex = (apex_value - bg_mean).max(0.0);
+
+            // FR-5.1.2: Integrated peak area (trapezoidal, background-subtracted)
+            // Use FWHM-based boundaries (±1.96σ) for integration region
+            if let Some((fwhm, _, _)) = fwhm_info {
+                let sigma = fwhm / 2.355;
+                let boundary_width = 1.96 * sigma;
+                let left_boundary = apex_rt - boundary_width;
+                let right_boundary = apex_rt + boundary_width;
+
+                // Trapezoidal area of signal within peak boundaries
+                let signal_area =
+                    compute_trapezoidal_area(coefficient_series, left_boundary, right_boundary);
+                // Baseline area = bg_mean × peak width
+                let baseline_area = bg_mean * (right_boundary - left_boundary);
+                features.peak_area = (signal_area - baseline_area).max(0.0);
+
+                // FR-5.1.4: Peak width (FWHM with linear interpolation)
+                features.peak_width = fwhm;
+            } else {
+                // Fallback: trapezoidal area over full series, no background subtraction
+                features.peak_area = compute_trapezoidal_area(
+                    coefficient_series,
+                    coefficient_series.first().map(|(rt, _)| *rt).unwrap_or(0.0),
+                    coefficient_series.last().map(|(rt, _)| *rt).unwrap_or(0.0),
+                );
+            }
 
             // FR-5.1.8: Number of contributing scans
             features.n_contributing_scans =
                 coefficient_series.iter().filter(|(_, c)| *c > 0.0).count() as u32;
-
-            // FR-5.1.4: Peak width (FWHM with linear interpolation)
-            if let Some((fwhm, _, _)) = compute_fwhm_interpolated(coefficient_series) {
-                features.peak_width = fwhm;
-            }
 
             // FR-5.1.5: Peak symmetry (leading/trailing ratio)
             features.peak_symmetry = self.compute_peak_symmetry(coefficient_series, apex_idx);
@@ -2159,7 +2581,7 @@ impl FeatureExtractor {
             // FR-5.2.10: Base peak match rank
             features.base_peak_rank = spectral_score.base_peak_rank;
 
-            // FR-5.2.11: Top-3 match count
+            // FR-5.2.11: Top-N match count
             features.top6_matches = spectral_score.top6_matches;
         }
 
@@ -2390,79 +2812,13 @@ impl FeatureExtractor {
     }
 
     /// Calculate signal-to-noise ratio from coefficient series
-    ///
-    /// Uses FWHM-based peak boundaries (±1.96σ) to define the peak region.
-    /// Background is measured from 3-5 points on each side outside these boundaries.
     fn compute_signal_to_noise(
         &self,
         series: &[(f64, f64)],
         apex_idx: usize,
         apex_value: f64,
     ) -> Option<f64> {
-        if series.len() < 10 || apex_value <= 0.0 {
-            return None;
-        }
-
-        // Calculate FWHM to determine peak boundaries
-        let (fwhm, _, _) = compute_fwhm_interpolated(series)?;
-
-        // Peak boundaries: ±1.96σ where σ = FWHM / 2.355
-        let sigma = fwhm / 2.355;
-        let boundary_width = 1.96 * sigma;
-        let apex_rt = series[apex_idx].0;
-        let left_boundary = apex_rt - boundary_width;
-        let right_boundary = apex_rt + boundary_width;
-
-        // Collect background points outside peak boundaries
-        let mut background_values = Vec::new();
-
-        // Left side: points before left boundary
-        for (rt, coef) in series.iter().take(apex_idx) {
-            if *rt < left_boundary {
-                background_values.push(*coef);
-            }
-        }
-        // Take last 5 on left
-        if background_values.len() > 5 {
-            background_values = background_values.into_iter().rev().take(5).collect();
-        }
-
-        // Right side: points after right boundary
-        let mut right_bg = Vec::new();
-        for (rt, coef) in series.iter().skip(apex_idx + 1) {
-            if *rt > right_boundary {
-                right_bg.push(*coef);
-                if right_bg.len() >= 5 {
-                    break;
-                }
-            }
-        }
-        background_values.extend(right_bg);
-
-        // Need at least 4 background points
-        if background_values.len() < 4 {
-            return None;
-        }
-
-        // Calculate background mean and SD
-        let n = background_values.len() as f64;
-        let bg_mean = background_values.iter().sum::<f64>() / n;
-        let bg_variance = background_values
-            .iter()
-            .map(|x| (x - bg_mean).powi(2))
-            .sum::<f64>()
-            / n;
-        let bg_sd = bg_variance.sqrt();
-
-        if bg_sd <= 1e-10 {
-            return None;
-        }
-
-        // S/N = (signal - background) / noise
-        let signal = apex_value - bg_mean;
-        let snr = signal / bg_sd;
-
-        Some(snr.max(0.0))
+        compute_signal_to_noise(series, apex_idx, apex_value)
     }
 
     /// Estimate EMG fit quality (heuristic based on peak shape)
@@ -3236,8 +3592,11 @@ mod tests {
         let series = vec![(9.0, 0.1), (10.0, 1.0), (11.0, 0.5)];
         let features = extractor.extract(&entry, &series, None);
 
+        // peak_apex: bg-subtracted, but only 3 points so bg_mean = 0.0 (fallback)
         assert!((features.peak_apex - 1.0).abs() < 1e-6);
-        assert!((features.peak_area - 1.6).abs() < 1e-6);
+        // peak_area: trapezoidal integration within FWHM-based boundaries
+        // With 3 points: trap area = (0.1+1.0)/2*1 + (1.0+0.5)/2*1 = 0.55 + 0.75 = 1.3
+        assert!((features.peak_area - 1.3).abs() < 1e-6);
         assert_eq!(features.n_contributing_scans, 3);
     }
 
