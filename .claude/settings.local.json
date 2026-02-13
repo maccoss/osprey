@@ -94,7 +94,13 @@
       "WebFetch(domain:www.matrixscience.com)",
       "WebFetch(domain:sage-docs.vercel.app)",
       "WebFetch(domain:www.biorxiv.org)",
-      "WebFetch(domain:noble.gs.washington.edu)"
+      "WebFetch(domain:noble.gs.washington.edu)",
+      "Bash(git branch:*)",
+      "Bash(/mnt/c/Users/macco/Documents/github/maccoss/osprey/target/release/osprey:*)",
+      "Bash(../../target/release/osprey:*)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "Bash(wc:*)",
+      "Bash(find:*)"
     ],
     "additionalDirectories": [
       "/mnt/c/Users/macco/Documents/github/maccoss/osprey/example_test_data/astral"

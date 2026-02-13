@@ -78,7 +78,7 @@ CI runs `cargo fmt --check` and `cargo clippy -D warnings` (including test targe
 - `crates/osprey/src/main.rs` - CLI entry point
 - `crates/osprey-fdr/src/mokapot.rs` - Mokapot integration
 - `crates/osprey-io/src/output/blib.rs` - BiblioSpec blib writer
-- `crates/osprey-core/src/types.rs` - FeatureSet (30 features)
+- `crates/osprey-core/src/types.rs` - FeatureSet (37 features for Mokapot PIN)
 - `crates/osprey-chromatography/src/calibration/` - RT and mass calibration
 
 ## Configuration
@@ -122,7 +122,8 @@ External:
 - Ridge regression with NNLS solver (f32)
 - HRAM sparse matrix support (ppm-based matching)
 - Peak detection in coefficient time series
-- 30-feature extraction per precursor
+- Tukey median polish for robust peak boundaries and fragment scoring
+- 37-feature extraction per precursor
 - Two-level FDR control (run + experiment level)
 - Mokapot integration with parallel workers
 - Progress streaming from Mokapot
@@ -133,22 +134,31 @@ External:
 - Calibration JSON save/load
 - Calibration HTML report generation
 
-### Feature Set (30 Features for Mokapot)
+### Feature Set (37 Features for Mokapot PIN)
 
-Chromatographic (12):
-- peak_apex, peak_area, emg_fit_quality, peak_width, peak_symmetry
-- rt_deviation, rt_deviation_normalized, n_contributing_scans
-- coefficient_stability, peak_sharpness, peak_prominence, modification_count
+Ridge regression (8):
+- peak_apex, peak_area, peak_width, coefficient_stability
+- relative_coefficient, explained_intensity, signal_to_noise, xic_signal_to_noise
 
-Spectral (13):
-- hyperscore, xcorr, spectral_contrast_angle
-- dot_product, dot_product_smz, pearson_correlation, spearman_correlation
-- fragment_coverage, sequence_coverage, consecutive_ions
-- base_peak_rank, top3_matches, explained_intensity
+Spectral matching - mixed at apex (2): xcorr, consecutive_ions
+Spectral matching - deconvoluted (2): xcorr_deconv, consecutive_ions_deconv
+RT deviation (1): rt_deviation
 
-Contextual (5):
-- n_competitors, relative_coefficient, local_peptide_density
-- spectral_complexity, regression_residual
+Fragment co-elution (9):
+- fragment_coelution_sum, fragment_coelution_min, n_coeluting_fragments
+- fragment_corr_0..5 (per-fragment correlations, top 6 by library intensity)
+
+Elution-weighted similarity (1): elution_weighted_cosine
+Mass accuracy (3): mass_accuracy_deviation_mean, abs_mass_accuracy_deviation_mean, mass_accuracy_std
+
+Percolator-style (6):
+- abs_rt_deviation, peptide_length, missed_cleavages
+- ln_num_candidates, coef_zscore, coef_zscore_mean
+
+MS1 features (2): ms1_precursor_coelution, ms1_isotope_cosine
+
+Tukey median polish (3):
+- median_polish_cosine, median_polish_rsquared, median_polish_residual_ratio
 
 ### TODO (Future)
 
@@ -198,10 +208,17 @@ python scripts/inspect_mokapot_weights.py mokapot.model.pkl
 
 ## Recent Changes
 
+- Replaced library-assisted median polish with Tukey median polish for peak boundaries
+- Added 3 median polish features: cosine, R², residual_ratio
+- Fixed all cosine/correlation scoring to include ALL library fragments (0 for unmatched)
+- Reduced PIN features from 30 mixed to focused 37 features with better discrimination
+- Added fragment co-elution features (9 features: sum, min, n_positive, per-fragment corr)
+- Added elution-weighted cosine, mass accuracy features, Percolator-style features
+- Added MS1 precursor co-elution and isotope cosine features
+- Fixed RT calibration NaN bug from duplicate library_rts
+- Fixed LDA calibration scoring: non-negative weights, early stopping
 - Added `--save_models` to Mokapot for feature weight inspection
 - Fixed two-level FDR to aggregate by precursor (peptide+charge), not peptide
 - Single replicate now skips experiment-level FDR (uses run-level directly)
 - Added parallel workers to Mokapot (auto-detected, capped at 8)
 - Added progress streaming from Mokapot to console
-- Optimized evaluate_calibration.py density calculation (O(n log n) binary search)
-- Changed density heatmap colorscale to Turbo with sqrt scaling

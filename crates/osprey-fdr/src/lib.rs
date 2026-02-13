@@ -8,7 +8,10 @@
 
 pub mod mokapot;
 
-pub use mokapot::{MokapotResult, MokapotRunner, PsmFeatures};
+pub use mokapot::{
+    get_pin_feature_names, pin_feature_value, MokapotResult, MokapotRunner, PsmFeatures,
+    NUM_PIN_FEATURES,
+};
 
 use osprey_core::Result;
 use std::collections::HashMap;

@@ -563,6 +563,11 @@ pub fn compute_elution_weighted_cosine(
 
 /// Compute cosine similarity (sqrt preprocessing, L2 normalization) between
 /// a single observed spectrum and library fragment list.
+///
+/// ALL library fragments within the spectrum's mass range are included.
+/// Unmatched fragments use observed intensity of 0, which penalizes the
+/// cosine — a missing fragment that should be present is strong evidence
+/// against a match.
 fn compute_cosine_at_scan(
     library_fragments: &[LibraryFragment],
     spectrum: &Spectrum,
@@ -573,32 +578,39 @@ fn compute_cosine_at_scan(
         return 0.0;
     }
 
+    let spec_mz_min = spectrum.mzs[0];
+    let spec_mz_max = spectrum.mzs[spectrum.mzs.len() - 1];
+
     let mut lib_preprocessed: Vec<f64> = Vec::new();
     let mut obs_preprocessed: Vec<f64> = Vec::new();
 
     for frag in library_fragments {
+        // Skip fragments outside the spectrum's mass range
+        if frag.mz < spec_mz_min || frag.mz > spec_mz_max {
+            continue;
+        }
+
         let tol = tolerance_da.max(frag.mz * tolerance_ppm / 1e6);
         let lower = frag.mz - tol;
         let upper = frag.mz + tol;
         let start = spectrum.mzs.partition_point(|&mz| mz < lower);
 
         // Find closest peak within tolerance
-        let mut best_match: Option<f64> = None;
+        let mut best_intensity = 0.0f64;
         let mut best_diff = f64::MAX;
         let mut j = start;
         while j < spectrum.mzs.len() && spectrum.mzs[j] <= upper {
             let diff = (spectrum.mzs[j] - frag.mz).abs();
             if diff < best_diff {
                 best_diff = diff;
-                best_match = Some(spectrum.intensities[j] as f64);
+                best_intensity = spectrum.intensities[j] as f64;
             }
             j += 1;
         }
 
-        if let Some(obs_intensity) = best_match {
-            lib_preprocessed.push((frag.relative_intensity as f64).sqrt());
-            obs_preprocessed.push(obs_intensity.sqrt());
-        }
+        // Always include: library sqrt(intensity) and observed sqrt(intensity) or 0
+        lib_preprocessed.push((frag.relative_intensity as f64).sqrt());
+        obs_preprocessed.push(best_intensity.sqrt());
     }
 
     if lib_preprocessed.is_empty() {
@@ -710,7 +722,6 @@ pub fn extract_fragment_xics(
         let upper = frag_mz + tol;
 
         let mut xic = Vec::with_capacity(spectra.len());
-        let mut has_signal = false;
 
         for spectrum in spectra {
             let start = spectrum.mzs.partition_point(|&mz| mz < lower);
@@ -728,7 +739,6 @@ pub fn extract_fragment_xics(
                     }
                     j += 1;
                 }
-                has_signal = true;
                 best_intensity
             } else {
                 0.0
@@ -737,55 +747,475 @@ pub fn extract_fragment_xics(
             xic.push((spectrum.retention_time, intensity));
         }
 
-        if has_signal {
-            results.push((frag_idx, xic));
-        }
+        // Always include the fragment XIC, even if all-zero.
+        // Zero intensities are valid data (no centroided peak found) and are
+        // handled properly in log-space models by skipping them per-scan.
+        // Dropping all-zero fragments biases the median polish by giving decoys
+        // (with fewer matching fragments) artificially high R².
+        results.push((frag_idx, xic));
     }
 
     results
 }
 
-/// Build a consensus XIC from co-eluting fragment ions and compute FWHM.
+/// Result of Tukey median polish decomposition of fragment XICs.
 ///
-/// Uses co-eluting fragment XICs (inspired by DIA-NN's approach, Demichev et al.,
-/// Nature Methods, 2020) to determine chromatographic peak boundaries.
+/// Decomposes the fragment XIC matrix (fragments × scans) into additive components
+/// in log space using the standard Tukey median polish algorithm.
 ///
-/// 1. Extracts XICs for top 6 fragments
-/// 2. Correlates each against the coefficient series (reference)
-/// 3. For fragments with positive correlation (co-eluting):
-///    - Normalize each XIC to max=1
-///    - Sum into consensus XIC
-/// 4. Compute FWHM with linear interpolation on the consensus
-/// 5. Derive 95% Gaussian boundaries: apex ± 1.96σ where σ = FWHM/2.355
+/// Model: `ln(Observed[f,s]) = μ + α_f + β_s + ε_fs`
+///
+/// - Column effects (β_s) give a robust elution profile for FWHM/boundary estimation.
+/// - Row effects (α_f) give interference-free fragment intensities for library scoring.
+///
+/// Reference: PRISM `rollup.py:640-731`
+pub struct TukeyMedianPolishResult {
+    /// Overall effect (grand median, ln space).
+    pub overall: f64,
+    /// Row effects per fragment (ln space) — data-derived relative fragment intensities.
+    pub row_effects: Vec<f64>,
+    /// Column effects per scan (ln space) — elution profile shape.
+    pub col_effects: Vec<f64>,
+    /// Elution profile in linear space: (RT, exp(μ + β_s)) per scan.
+    pub elution_profile: Vec<(f64, f64)>,
+    /// Residuals\[fragment\]\[scan\] in ln space. NaN for zero-intensity cells.
+    pub residuals: Vec<Vec<f64>>,
+    /// Number of iterations used.
+    pub n_iterations: usize,
+    /// Whether the algorithm converged within tolerance.
+    pub converged: bool,
+    /// Number of fragments with at least one non-zero intensity.
+    pub n_fragments_used: usize,
+    /// Fragment indices from the input (maps row index → original fragment index).
+    pub fragment_indices: Vec<usize>,
+}
+
+/// Compute median of a slice, skipping NaN values. Returns NaN if no finite values.
+fn nanmedian(values: &[f64]) -> f64 {
+    let mut finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return f64::NAN;
+    }
+    finite.sort_by(|a, b| a.total_cmp(b));
+    let mid = finite.len() / 2;
+    if finite.len() % 2 == 0 {
+        (finite[mid - 1] + finite[mid]) / 2.0
+    } else {
+        finite[mid]
+    }
+}
+
+/// Cosine similarity between two vectors. Returns 0 if either has zero norm.
+pub fn cosine_angle(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let mut norm_a = 0.0;
+    let mut norm_b = 0.0;
+    for i in 0..n {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    if norm_a < 1e-30 || norm_b < 1e-30 {
+        return 0.0;
+    }
+    (dot / (norm_a.sqrt() * norm_b.sqrt())).clamp(0.0, 1.0)
+}
+
+/// Tukey median polish decomposition of fragment XICs.
+///
+/// Decomposes the 6×N fragment XIC matrix into overall + row effects + column effects
+/// + residuals using iterative median subtraction. Works in ln space with NaN for zeros.
+///
+/// The column effects give a robust elution profile (shared peak shape across transitions,
+/// resistant to interference on individual fragments). The row effects give data-derived
+/// fragment intensities that can be scored against the library.
+///
+/// Following PRISM `rollup.py:640-731`:
+/// 1. Row sweep: subtract row medians (captures fragment-level intensity differences)
+/// 2. Column sweep: subtract column medians (captures scan-to-scan elution shape)
+/// 3. Repeat until convergence (max change < tol) or max iterations reached
+pub fn tukey_median_polish(
+    xics: &[(usize, Vec<(f64, f64)>)],
+    max_iter: usize,
+    tol: f64,
+) -> Option<TukeyMedianPolishResult> {
+    if xics.len() < 2 {
+        return None;
+    }
+
+    let n_scans = xics[0].1.len();
+    if n_scans < 3 {
+        return None;
+    }
+
+    let n_frags = xics.len();
+    let rts: Vec<f64> = xics[0].1.iter().map(|(rt, _)| *rt).collect();
+    let fragment_indices: Vec<usize> = xics.iter().map(|(idx, _)| *idx).collect();
+
+    // Build ln-space matrix. Zeros → NaN (missing data).
+    let mut residuals: Vec<Vec<f64>> = Vec::with_capacity(n_frags);
+    for (_frag_idx, xic) in xics {
+        let row: Vec<f64> = xic
+            .iter()
+            .map(|(_, intensity)| {
+                if *intensity > 0.0 {
+                    intensity.ln()
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect();
+        residuals.push(row);
+    }
+
+    let mut overall: f64 = 0.0;
+    let mut row_effects: Vec<f64> = vec![0.0; n_frags];
+    let mut col_effects: Vec<f64> = vec![0.0; n_scans];
+    let mut converged = false;
+    let mut n_iter = 0;
+
+    for iteration in 0..max_iter {
+        n_iter = iteration + 1;
+
+        // Save old residuals for convergence check
+        let old_residuals: Vec<Vec<f64>> = residuals.clone();
+
+        // === Row sweep: subtract nanmedian of each row ===
+        let row_medians: Vec<f64> = residuals.iter().map(|row| nanmedian(row)).collect();
+
+        for (f, row) in residuals.iter_mut().enumerate() {
+            let rm = row_medians[f];
+            if rm.is_finite() {
+                for val in row.iter_mut() {
+                    if val.is_finite() {
+                        *val -= rm;
+                    }
+                }
+            }
+        }
+
+        // Update: row_effects += (row_medians - median(row_medians)), overall += median(row_medians)
+        let median_of_row_medians = nanmedian(&row_medians);
+        if median_of_row_medians.is_finite() {
+            for (f, &rm) in row_medians.iter().enumerate() {
+                if rm.is_finite() {
+                    row_effects[f] += rm - median_of_row_medians;
+                }
+            }
+            overall += median_of_row_medians;
+        }
+
+        // === Column sweep: subtract nanmedian of each column ===
+        let mut col_buf: Vec<f64> = Vec::with_capacity(n_frags);
+        let col_medians: Vec<f64> = (0..n_scans)
+            .map(|s| {
+                col_buf.clear();
+                col_buf.extend(residuals.iter().map(|row| row[s]));
+                nanmedian(&col_buf)
+            })
+            .collect();
+
+        for row in residuals.iter_mut() {
+            for (s, val) in row.iter_mut().enumerate() {
+                let cm = col_medians[s];
+                if val.is_finite() && cm.is_finite() {
+                    *val -= cm;
+                }
+            }
+        }
+
+        // Update: col_effects += (col_medians - median(col_medians)), overall += median(col_medians)
+        let median_of_col_medians = nanmedian(&col_medians);
+        if median_of_col_medians.is_finite() {
+            for (s, &cm) in col_medians.iter().enumerate() {
+                if cm.is_finite() {
+                    col_effects[s] += cm - median_of_col_medians;
+                }
+            }
+            overall += median_of_col_medians;
+        }
+
+        // Convergence check: max(|new - old|) < tol
+        let max_change = residuals
+            .iter()
+            .zip(old_residuals.iter())
+            .flat_map(|(new_row, old_row)| {
+                new_row.iter().zip(old_row.iter()).map(|(n, o)| {
+                    if n.is_finite() && o.is_finite() {
+                        (n - o).abs()
+                    } else {
+                        0.0
+                    }
+                })
+            })
+            .fold(0.0f64, f64::max);
+
+        if max_change < tol {
+            converged = true;
+            break;
+        }
+    }
+
+    // Count fragments with at least one finite value
+    let n_fragments_used = residuals
+        .iter()
+        .filter(|row| row.iter().any(|v| v.is_finite()))
+        .count();
+
+    if n_fragments_used < 2 {
+        return None;
+    }
+
+    // Build linear-space elution profile: exp(overall + col_effects[s])
+    let elution_profile: Vec<(f64, f64)> = rts
+        .iter()
+        .zip(col_effects.iter())
+        .map(|(&rt, &ce)| (rt, (overall + ce).exp()))
+        .collect();
+
+    Some(TukeyMedianPolishResult {
+        overall,
+        row_effects,
+        col_effects,
+        elution_profile,
+        residuals,
+        n_iterations: n_iter,
+        converged,
+        n_fragments_used,
+        fragment_indices,
+    })
+}
+
+/// Compute cosine similarity between Tukey median polish row effects and library
+/// fragment intensities, using sqrt preprocessing (matching LibCosine convention).
+///
+/// Row effects are in ln space. Convert to linear via exp(overall + α_f), then sqrt.
+/// Library intensities are linear; apply sqrt.
+///
+/// For targets: row effects match library → high cosine.
+/// For decoys: row effects are random → low cosine.
+pub fn median_polish_libcosine(
+    polish: &TukeyMedianPolishResult,
+    library_fragments: &[LibraryFragment],
+) -> f64 {
+    let n = polish.fragment_indices.len();
+    if n < 2 {
+        return 0.0;
+    }
+
+    let mut row_vec: Vec<f64> = Vec::with_capacity(n);
+    let mut lib_vec: Vec<f64> = Vec::with_capacity(n);
+
+    for (i, &frag_idx) in polish.fragment_indices.iter().enumerate() {
+        if frag_idx >= library_fragments.len() {
+            continue;
+        }
+
+        // Library intensity ALWAYS contributes — even for undetected fragments.
+        // This keeps the cosine in full 6D space. Undetected fragments push 0
+        // into the dot product but their library intensity increases the denominator,
+        // naturally penalizing decoys that fail to detect high-intensity fragments.
+        let lib_int = library_fragments[frag_idx].relative_intensity as f64;
+        lib_vec.push(lib_int.max(0.0).sqrt());
+
+        // Check if fragment had any detected signal (at least one finite residual)
+        let has_signal = polish.residuals[i].iter().any(|v| v.is_finite());
+        if !has_signal || !polish.row_effects[i].is_finite() {
+            row_vec.push(0.0);
+            continue;
+        }
+
+        // Row effect is ln-space; convert to linear, then sqrt (Poisson noise model)
+        let linear = (polish.overall + polish.row_effects[i]).exp();
+        row_vec.push(linear.max(0.0).sqrt());
+    }
+
+    if row_vec.len() < 2 {
+        return 0.0;
+    }
+
+    cosine_angle(&row_vec, &lib_vec)
+}
+
+/// Compute R² (coefficient of determination) from the Tukey median polish model.
+///
+/// Measures how well the additive model (μ + α_f + β_s) explains the observed
+/// fragment×scan intensity matrix. Uses sqrt preprocessing (Poisson noise model)
+/// to compress dynamic range — without this, R² is dominated by the highest-intensity
+/// cells. Cells where the model predicts signal but none was detected (observed=0)
+/// contribute sqrt(predicted)² to SS_residual, properly penalizing poor matches.
+///
+/// R² = 1 - SS_residual / SS_total
+///   SS_residual = Σ(sqrt(observed) - sqrt(predicted))²  over all cells
+///   SS_total    = Σ(sqrt(observed) - mean(sqrt(observed)))²  over all cells
+pub fn median_polish_rsquared(polish: &TukeyMedianPolishResult) -> f64 {
+    let n_frags = polish.row_effects.len();
+    let n_scans = if n_frags > 0 {
+        polish.col_effects.len()
+    } else {
+        return 0.0;
+    };
+    if n_frags < 2 || n_scans < 3 {
+        return 0.0;
+    }
+
+    let mut obs_values: Vec<f64> = Vec::with_capacity(n_frags * n_scans);
+    let mut pred_values: Vec<f64> = Vec::with_capacity(n_frags * n_scans);
+
+    for f in 0..n_frags {
+        for s in 0..n_scans {
+            // Predicted intensity: convert to linear then sqrt
+            let predicted = (polish.overall + polish.row_effects[f] + polish.col_effects[s]).exp();
+
+            // Observed: if residual is finite, reconstruct from model + residual;
+            // if NaN (original was zero), observed = 0
+            let observed = if polish.residuals[f][s].is_finite() {
+                (polish.overall
+                    + polish.row_effects[f]
+                    + polish.col_effects[s]
+                    + polish.residuals[f][s])
+                    .exp()
+            } else {
+                0.0
+            };
+
+            // Sqrt preprocessing (Poisson noise model, matches cosine convention)
+            pred_values.push(predicted.max(0.0).sqrt());
+            obs_values.push(observed.max(0.0).sqrt());
+        }
+    }
+
+    let n = obs_values.len() as f64;
+    if n < 2.0 {
+        return 0.0;
+    }
+
+    let mean_obs = obs_values.iter().sum::<f64>() / n;
+    let ss_total: f64 = obs_values.iter().map(|o| (o - mean_obs).powi(2)).sum();
+    let ss_residual: f64 = obs_values
+        .iter()
+        .zip(pred_values.iter())
+        .map(|(o, p)| (o - p).powi(2))
+        .sum();
+
+    if ss_total < 1e-30 {
+        return 0.0;
+    }
+
+    (1.0 - ss_residual / ss_total).clamp(0.0, 1.0)
+}
+
+/// Compute residual ratio from the Tukey median polish model.
+///
+/// Measures the fraction of total signal that is unexplained by the additive model.
+/// Computed in linear space: Σ|observed - predicted| / Σ observed.
+///
+/// Low values (~0) indicate clean co-elution where all fragments follow the same
+/// chromatographic shape. High values indicate interference or noise on individual
+/// fragments. Cells where observed=0 but the model predicts signal contribute to
+/// the numerator, penalizing missing fragments.
+///
+/// Note: this is inverted relative to R² — lower is better. Mokapot handles
+/// this automatically via semi-supervised learning.
+pub fn median_polish_residual_ratio(polish: &TukeyMedianPolishResult) -> f64 {
+    let n_frags = polish.row_effects.len();
+    let n_scans = if n_frags > 0 {
+        polish.col_effects.len()
+    } else {
+        return 1.0;
+    };
+    if n_frags < 2 || n_scans < 3 {
+        return 1.0;
+    }
+
+    let mut sum_abs_residual = 0.0;
+    let mut sum_observed = 0.0;
+
+    for f in 0..n_frags {
+        for s in 0..n_scans {
+            let predicted = (polish.overall + polish.row_effects[f] + polish.col_effects[s]).exp();
+
+            let observed = if polish.residuals[f][s].is_finite() {
+                (polish.overall
+                    + polish.row_effects[f]
+                    + polish.col_effects[s]
+                    + polish.residuals[f][s])
+                    .exp()
+            } else {
+                0.0
+            };
+
+            sum_abs_residual += (observed - predicted).abs();
+            sum_observed += observed;
+        }
+    }
+
+    if sum_observed < 1e-30 {
+        return 1.0;
+    }
+
+    sum_abs_residual / sum_observed
+}
+
+/// Compute fragment-based FWHM and peak boundaries using Tukey median polish.
+///
+/// Primary approach: Tukey median polish decomposes the fragment XIC matrix into
+/// row effects (fragment intensities) and column effects (elution profile). The
+/// column effects give a robust peak shape by borrowing strength across all 6
+/// transitions, with interference suppressed by the median. FWHM is computed on
+/// this elution profile.
+///
+/// Fallback: consensus XIC (normalize co-eluting fragment XICs to max=1, sum, then
+/// compute FWHM on the consensus).
 ///
 /// # Returns
-/// `Some((start_rt, end_rt, fwhm))` using 95% Gaussian boundaries,
-/// or `None` if FWHM cannot be computed.
+/// Tuple of:
+/// - `Option<(start_rt, end_rt, fwhm)>` — 95% Gaussian boundaries (±1.96σ)
+/// - `Option<TukeyMedianPolishResult>` — decomposition for feature extraction
 pub fn compute_fragment_fwhm(
     library_fragments: &[LibraryFragment],
     coefficient_series: &[(f64, f64)],
     spectra: &[&Spectrum],
     tolerance_da: f64,
     tolerance_ppm: f64,
-) -> Option<(f64, f64, f64)> {
+) -> (Option<(f64, f64, f64)>, Option<TukeyMedianPolishResult>) {
     if coefficient_series.len() < 3 || spectra.is_empty() {
-        return None;
+        return (None, None);
     }
 
     // Extract XICs for top 6 fragments
     let xics = extract_fragment_xics(library_fragments, spectra, tolerance_da, tolerance_ppm, 6);
     if xics.is_empty() {
-        return None;
+        return (None, None);
     }
 
-    // For each fragment XIC, correlate against the coefficient series
-    // Align by finding the nearest spectrum RT for each coefficient point
-    let spec_rts: Vec<f64> = spectra.iter().map(|s| s.retention_time).collect();
+    // Try Tukey median polish first
+    let polish_result = tukey_median_polish(&xics, 20, 1e-4);
+    if let Some(ref polish) = polish_result {
+        if let Some((fwhm, _left, _right)) = compute_fwhm_interpolated(&polish.elution_profile) {
+            let apex_rt = polish
+                .elution_profile
+                .iter()
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(rt, _)| *rt);
+            if let Some(apex_rt) = apex_rt {
+                let sigma = fwhm / 2.355;
+                let start_rt = apex_rt - 1.96 * sigma;
+                let end_rt = apex_rt + 1.96 * sigma;
+                return (Some((start_rt, end_rt, fwhm)), polish_result);
+            }
+        }
+    }
 
+    // Fallback: consensus XIC approach
+    let spec_rts: Vec<f64> = spectra.iter().map(|s| s.retention_time).collect();
     let mut coeluting_xics: Vec<&Vec<(f64, f64)>> = Vec::new();
 
     for (_frag_idx, xic) in &xics {
-        // Build aligned vectors: for each coefficient point, find nearest XIC value
         let mut xic_aligned: Vec<f64> = Vec::with_capacity(coefficient_series.len());
         let mut coefs: Vec<f64> = Vec::with_capacity(coefficient_series.len());
 
@@ -817,10 +1247,9 @@ pub fn compute_fragment_fwhm(
     }
 
     if coeluting_xics.is_empty() {
-        return None;
+        return (None, polish_result);
     }
 
-    // Build consensus XIC: normalize each co-eluting XIC to max=1, then sum
     let n_points = coeluting_xics[0].len();
     let mut consensus: Vec<(f64, f64)> =
         coeluting_xics[0].iter().map(|&(rt, _)| (rt, 0.0)).collect();
@@ -834,19 +1263,16 @@ pub fn compute_fragment_fwhm(
         }
     }
 
-    // Compute FWHM on the consensus XIC
-    let (fwhm, _left, _right) = compute_fwhm_interpolated(&consensus)?;
+    let fwhm_result = compute_fwhm_interpolated(&consensus).and_then(|(fwhm, _left, _right)| {
+        let apex_rt = consensus
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(rt, _)| *rt)?;
+        let sigma = fwhm / 2.355;
+        Some((apex_rt - 1.96 * sigma, apex_rt + 1.96 * sigma, fwhm))
+    });
 
-    // 95% Gaussian boundaries: apex ± 1.96σ where σ = FWHM / 2.355
-    let apex_rt = consensus
-        .iter()
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(rt, _)| *rt)?;
-    let sigma = fwhm / 2.355;
-    let start_rt = apex_rt - 1.96 * sigma;
-    let end_rt = apex_rt + 1.96 * sigma;
-
-    Some((start_rt, end_rt, fwhm))
+    (fwhm_result, polish_result)
 }
 
 /// Plain Pearson correlation on raw values (no intensity transform).
@@ -1283,41 +1709,67 @@ impl SpectralScorer {
 
     /// Compute LibCosine score between observed spectrum and library entry
     ///
-    /// LibCosine uses sqrt(intensity) preprocessing with L2 normalization,
-    /// then computes cosine similarity. Also computes SMZ variant and hyperscore.
+    /// ALL library fragments within the spectrum's mass range are included.
+    /// Unmatched fragments use observed intensity of 0 — a missing fragment
+    /// that should be present is strong evidence against a match and penalizes
+    /// cosine, Pearson, and Spearman scores.
+    ///
+    /// Counting metrics (fragment_coverage, consecutive_ions, top6_matches,
+    /// sequence_coverage) use matched fragments only since they measure presence.
     pub fn lib_cosine(&self, observed: &Spectrum, library: &LibraryEntry) -> SpectralScore {
         if library.fragments.is_empty() || observed.mzs.is_empty() {
             return SpectralScore::default();
         }
 
-        // Match library fragments to observed peaks
+        let spec_mz_min = observed.mzs[0];
+        let spec_mz_max = observed.mzs[observed.mzs.len() - 1];
+
+        // Match library fragments to observed peaks (for counting metrics)
         let matches = self.match_fragments(observed, library);
 
-        if matches.is_empty() {
+        // Build intensity vectors for ALL library fragments within mass range.
+        // Unmatched fragments get observed intensity = 0.
+        let mut lib_preprocessed: Vec<f64> = Vec::new();
+        let mut obs_preprocessed: Vec<f64> = Vec::new();
+        let mut lib_intensities: Vec<f64> = Vec::new();
+        let mut obs_intensities: Vec<f64> = Vec::new();
+
+        for frag in &library.fragments {
+            if frag.mz < spec_mz_min || frag.mz > spec_mz_max {
+                continue;
+            }
+
+            let tol_da = self.tolerance_da.max(frag.mz * self.tolerance_ppm / 1e6);
+            let lower = frag.mz - tol_da;
+            let upper = frag.mz + tol_da;
+            let start = observed.mzs.partition_point(|&mz| mz < lower);
+
+            let mut best_intensity = 0.0f64;
+            let mut best_diff = f64::MAX;
+            let mut j = start;
+            while j < observed.mzs.len() && observed.mzs[j] <= upper {
+                let diff = (observed.mzs[j] - frag.mz).abs();
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_intensity = observed.intensities[j] as f64;
+                }
+                j += 1;
+            }
+
+            // Raw intensities for Pearson/Spearman (0 for unmatched)
+            lib_intensities.push(frag.relative_intensity as f64);
+            obs_intensities.push(best_intensity);
+
+            // Sqrt-preprocessed for cosine (0 for unmatched)
+            lib_preprocessed.push((frag.relative_intensity as f64).sqrt());
+            obs_preprocessed.push(best_intensity.sqrt());
+        }
+
+        if lib_preprocessed.len() < 2 {
             return SpectralScore::default();
         }
 
-        // Preprocess library fragments: sqrt(intensity) × m/z²
-        let mut lib_preprocessed: Vec<f64> = Vec::with_capacity(matches.len());
-        let mut obs_preprocessed: Vec<f64> = Vec::with_capacity(matches.len());
-
-        // Keep raw intensities for correlation computation
-        let mut lib_intensities: Vec<f64> = Vec::with_capacity(matches.len());
-        let mut obs_intensities: Vec<f64> = Vec::with_capacity(matches.len());
-
-        for m in &matches {
-            // Library: sqrt(relative_intensity)
-            let lib_val = (m.lib_intensity as f64).sqrt();
-            lib_preprocessed.push(lib_val);
-            lib_intensities.push(m.lib_intensity as f64);
-
-            // Observed: sqrt(intensity)
-            let obs_val = (m.obs_intensity as f64).sqrt();
-            obs_preprocessed.push(obs_val);
-            obs_intensities.push(m.obs_intensity as f64);
-        }
-
-        // L2 normalize both vectors
+        // L2 normalize for cosine
         let lib_norm = lib_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
         let obs_norm = obs_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
 
@@ -1325,26 +1777,21 @@ impl SpectralScorer {
             return SpectralScore::default();
         }
 
-        for v in lib_preprocessed.iter_mut() {
-            *v /= lib_norm;
-        }
-        for v in obs_preprocessed.iter_mut() {
-            *v /= obs_norm;
-        }
-
-        // Cosine similarity (dot product of normalized vectors)
         let dot_product: f64 = lib_preprocessed
             .iter()
             .zip(obs_preprocessed.iter())
-            .map(|(a, b)| a * b)
+            .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
             .sum();
 
-        // Compute additional metrics
+        // Pearson and Spearman use all fragments (0 for unmatched is informative)
+        let pearson_correlation = Self::pearson_correlation(&lib_intensities, &obs_intensities);
+        let spearman_correlation = Self::spearman_correlation(&lib_intensities, &obs_intensities);
+
+        // Counting metrics use matched fragments only (presence-based)
         let n_matched = matches.len() as u32;
         let n_library = library.fragments.len() as u32;
         let fragment_coverage = n_matched as f64 / n_library as f64;
 
-        // Compute explained intensity (sum of matched intensities / total observed intensity)
         let matched_intensity: f64 = matches.iter().map(|m| m.obs_intensity as f64).sum();
         let total_intensity: f64 = observed.intensities.iter().map(|&i| i as f64).sum();
         let explained_intensity = if total_intensity > 0.0 {
@@ -1353,23 +1800,10 @@ impl SpectralScorer {
             0.0
         };
 
-        // Compute Pearson correlation
-        let pearson_correlation = Self::pearson_correlation(&lib_intensities, &obs_intensities);
-
-        // Compute Spearman correlation
-        let spearman_correlation = Self::spearman_correlation(&lib_intensities, &obs_intensities);
-
-        // Compute consecutive ion series
         let consecutive_ions = self.longest_consecutive_ions(library, &matches);
-
-        // Compute sequence coverage (backbone cleavage sites)
         let sequence_coverage = self.compute_sequence_coverage(library, &matches);
-
-        // Compute base peak rank
         let base_peak_rank =
             self.compute_base_peak_rank(&matches, &lib_intensities, &obs_intensities);
-
-        // Compute top-N matches
         let top6_matches = self.compute_top6_matches(library, &matches);
 
         // Compute LibCosine with SMZ preprocessing (sqrt(intensity) * mz²)
@@ -1690,30 +2124,48 @@ impl SpectralScorer {
     ///
     /// This variant weights fragment matches by their m/z value squared,
     /// giving more importance to higher m/z fragments which are more sequence-specific.
-    /// This is the original SMZ (Sqrt-Mz-squared) preprocessing from spectral library searching.
+    /// ALL library fragments within the spectrum's mass range are included —
+    /// unmatched fragments use observed intensity of 0.
     pub fn lib_cosine_smz(&self, observed: &Spectrum, library: &LibraryEntry) -> f64 {
         if library.fragments.is_empty() || observed.mzs.is_empty() {
             return 0.0;
         }
 
-        let matches = self.match_fragments(observed, library);
-        if matches.is_empty() {
-            return 0.0;
+        let spec_mz_min = observed.mzs[0];
+        let spec_mz_max = observed.mzs[observed.mzs.len() - 1];
+
+        let mut lib_preprocessed: Vec<f64> = Vec::new();
+        let mut obs_preprocessed: Vec<f64> = Vec::new();
+
+        for frag in &library.fragments {
+            if frag.mz < spec_mz_min || frag.mz > spec_mz_max {
+                continue;
+            }
+
+            let tol_da = self.tolerance_da.max(frag.mz * self.tolerance_ppm / 1e6);
+            let lower = frag.mz - tol_da;
+            let upper = frag.mz + tol_da;
+            let start = observed.mzs.partition_point(|&mz| mz < lower);
+
+            let mut best_intensity = 0.0f64;
+            let mut best_diff = f64::MAX;
+            let mut j = start;
+            while j < observed.mzs.len() && observed.mzs[j] <= upper {
+                let diff = (observed.mzs[j] - frag.mz).abs();
+                if diff < best_diff {
+                    best_diff = diff;
+                    best_intensity = observed.intensities[j] as f64;
+                }
+                j += 1;
+            }
+
+            let mz_sq = frag.mz * frag.mz;
+            lib_preprocessed.push((frag.relative_intensity as f64).sqrt() * mz_sq);
+            obs_preprocessed.push(best_intensity.sqrt() * mz_sq);
         }
 
-        let mut lib_preprocessed: Vec<f64> = Vec::with_capacity(matches.len());
-        let mut obs_preprocessed: Vec<f64> = Vec::with_capacity(matches.len());
-
-        for m in &matches {
-            let mz_sq = m.lib_mz * m.lib_mz;
-
-            // Library: sqrt(relative_intensity) * mz²
-            let lib_val = (m.lib_intensity as f64).sqrt() * mz_sq;
-            lib_preprocessed.push(lib_val);
-
-            // Observed: sqrt(intensity) * mz²
-            let obs_val = (m.obs_intensity as f64).sqrt() * mz_sq;
-            obs_preprocessed.push(obs_val);
+        if lib_preprocessed.is_empty() {
+            return 0.0;
         }
 
         // L2 normalize both vectors
@@ -1724,18 +2176,10 @@ impl SpectralScorer {
             return 0.0;
         }
 
-        for v in lib_preprocessed.iter_mut() {
-            *v /= lib_norm;
-        }
-        for v in obs_preprocessed.iter_mut() {
-            *v /= obs_norm;
-        }
-
-        // Cosine similarity (dot product of normalized vectors)
         lib_preprocessed
             .iter()
             .zip(obs_preprocessed.iter())
-            .map(|(a, b)| a * b)
+            .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
             .sum()
     }
 
@@ -3692,10 +4136,12 @@ mod tests {
         // Should have 2 matches out of 4
         assert_eq!(score.n_matched, 2);
         assert!((score.fragment_coverage - 0.5).abs() < 1e-6);
-        // LibCosine should still be reasonable for the matched fragments
+        // LibCosine includes all 4 library fragments (0 for unmatched).
+        // With only 2 of 4 matched, cosine should be penalized (~0.77).
         assert!(
-            score.lib_cosine > 0.9,
-            "LibCosine should be high for matched fragments"
+            score.lib_cosine > 0.7 && score.lib_cosine < 0.85,
+            "LibCosine should reflect partial match penalty, got {}",
+            score.lib_cosine
         );
     }
 

@@ -138,17 +138,16 @@ The integrated area is the sum of all regression coefficients within the peak bo
 
 After peak detection, chromatographic features are extracted from the coefficient time series for Mokapot scoring. These are computed by `FeatureExtractor` in `osprey-scoring`:
 
+**Features sent to Mokapot PIN:**
+
 | Feature | Field | Description |
 |---------|-------|-------------|
 | Peak apex | `peak_apex` | Maximum coefficient value |
 | Peak area | `peak_area` | Integrated coefficient sum |
-| Peak width | `peak_width` | FWHM (full width at half maximum) in minutes |
-| Peak symmetry | `peak_symmetry` | Leading area / trailing area ratio (1.0 = symmetric) |
-| Contributing scans | `n_contributing_scans` | Count of non-zero coefficients |
-| Coefficient stability | `coefficient_stability` | Inverse CV near apex (higher = more stable) |
-| Peak sharpness | `peak_sharpness` | Average slope from apex to boundaries |
-| Peak prominence | `peak_prominence` | Apex / baseline estimate |
-| EMG fit quality | `emg_fit_quality` | Symmetry-based heuristic (placeholder for true EMG fit) |
+| Peak width | `peak_width` | FWHM from Tukey median polish elution profile (minutes) |
+| Coefficient stability | `coefficient_stability` | CV of coefficients near apex |
+| Signal to noise | `signal_to_noise` | Peak apex / noise estimate |
+| XIC signal to noise | `xic_signal_to_noise` | S/N from best-correlated fragment XIC |
 
 ## Example
 
@@ -192,26 +191,19 @@ A peptide may have multiple peaks due to:
 
 Osprey selects the peak with the highest apex coefficient that is within RT tolerance of the expected RT. If no peak is within tolerance, the peptide is not reported.
 
-## EMG Peak Fitting (TODO)
+## Peak Boundaries via Tukey Median Polish
 
-Exponentially Modified Gaussian (EMG) models chromatographic peak shape more accurately than threshold crossing:
+After initial peak detection identifies the apex, Osprey refines peak boundaries using Tukey median polish on fragment XICs:
 
-```
-EMG(t) = (A * sigma * sqrt(2*pi)) / (2*tau) *
-         exp(sigma^2 / (2*tau^2) - (t-mu)/tau) *
-         erfc((sigma/tau - (t-mu)/sigma) / sqrt(2))
+1. Extract XICs for top 6 library fragments
+2. Run Tukey median polish on the 6×N XIC matrix (log space)
+3. Column effects give a robust shared elution profile
+4. Compute FWHM on the elution profile
+5. Convert to boundaries: `σ = FWHM / 2.355`, `[apex - 1.96σ, apex + 1.96σ]`
 
-Where:
-  A     = amplitude
-  mu    = Gaussian mean (RT)
-  sigma = Gaussian standard deviation
-  tau   = exponential decay constant (tailing)
-```
+The Tukey median polish approach is more robust than using any single fragment XIC because the median across 6 fragments suppresses interference on individual transitions.
 
-EMG fitting would provide:
-- More accurate apex RT estimation (important for tailing peaks)
-- Better peak boundary determination
-- Peak asymmetry quantification as a scoring feature
+See [docs/README.md](README.md) for full details on the Tukey median polish algorithm.
 
 ## Implementation
 

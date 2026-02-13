@@ -73,106 +73,13 @@ If we wanted to refine apex selection, one approach would be to score the top-N 
 
 ---
 
-## Spectral Scores
+## Spectral Scores (Sent to Mokapot)
 
-All spectral scores are computed at the apex spectrum (the observed MS2 spectrum closest in RT to the coefficient apex). Each score captures a different aspect of the match between the observed spectrum and the library prediction.
+All spectral scores are computed at the apex spectrum (the observed MS2 spectrum closest in RT to the coefficient apex). Only XCorr and consecutive ions are sent to the Mokapot PIN file for FDR control. Additional scores (LibCosine, hyperscore, etc.) are computed and stored in the FeatureSet for diagnostics and blib output but are not used for FDR.
 
-### 1. LibCosine (sqrt scaling)
+**Important**: All intensity-based spectral similarity scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks. A missing peak that should be present is a strong discriminator between good and bad matches.
 
-**Requires library**: Yes (library fragment intensities)
-**Implementation status**: Done
-**FeatureSet field**: `dot_product`
-
-LibCosine measures the cosine similarity between the observed and library spectra after sqrt intensity preprocessing.
-
-#### Formula
-
-```
-For each matched fragment pair (obs_i, lib_i):
-  obs_preprocessed_i = sqrt(obs_intensity_i)
-  lib_preprocessed_i = sqrt(lib_intensity_i)
-
-L2 normalize both vectors:
-  obs_norm = obs_preprocessed / ||obs_preprocessed||₂
-  lib_norm = lib_preprocessed / ||lib_preprocessed||₂
-
-LibCosine = obs_norm · lib_norm  (dot product)
-```
-
-#### Score range: 0 to 1 (1 = perfect match)
-
-#### Fragment matching
-- PPM matching (10-20 ppm for HRAM, 0.5 Da for unit resolution)
-- Closest m/z within tolerance (NOT highest intensity)
-- Each library fragment matched to at most one observed peak
-
-#### Why sqrt preprocessing?
-- Down-weights dominant peaks
-- Gives more influence to smaller diagnostic fragments
-- Reduces impact of intensity measurement noise
-- L2 normalization makes scores comparable regardless of total signal
-
-#### Example
-```
-Library fragments:   y3=100  y4=80   y5=60   b3=40
-Observed intensities: y3=9000 y4=7200 y5=4800  b3=?
-
-sqrt preprocessing:
-  Library:  [10.0,  8.94,  7.75,  6.32]
-  Observed: [94.87, 84.85, 69.28, -   ]  (b3 not matched)
-
-L2 normalize:
-  Library:  [0.619, 0.554, 0.480, 0.392]  (only matched)
-  → [0.619, 0.554, 0.480] / ||(0.619, 0.554, 0.480)||
-  Observed: [0.672, 0.601, 0.491] / ||(...)||
-
-LibCosine ≈ 0.997
-```
-
-### 2. LibCosine with sqrt(intensity) * mz² Scaling
-
-**Requires library**: Yes (library fragment intensities)
-**Implementation status**: Done
-**FeatureSet field**: `dot_product_smz`
-
-This variant weights fragment matches by their m/z value squared, giving more importance to higher m/z fragments which are more likely to be unique.
-
-#### Formula
-
-```
-For each matched fragment pair (obs_i, lib_i) at m/z_i:
-  obs_preprocessed_i = sqrt(obs_intensity_i) * mz_i²
-  lib_preprocessed_i = sqrt(lib_intensity_i) * mz_i²
-
-L2 normalize both vectors:
-  obs_norm = obs_preprocessed / ||obs_preprocessed||₂
-  lib_norm = lib_preprocessed / ||lib_preprocessed||₂
-
-LibCosine_SMZ = obs_norm · lib_norm
-```
-
-#### Why m/z² weighting?
-- Higher m/z fragments are more sequence-specific (longer ion series)
-- Low m/z fragments (immonium ions, small b/y ions) are less diagnostic
-- The m/z² weighting gives ~100× more weight to a fragment at m/z 1000 vs m/z 100
-- Helps discriminate between peptides that share low-mass fragments
-- This is the original SMZ (Sqrt-Mz-squared) preprocessing from spectral library searching
-
-#### Example
-```
-Library fragments at m/z:  y3@348.2=100  y4@461.3=80  y5@576.3=60
-
-sqrt * mz² preprocessing:
-  Library:
-    y3: sqrt(100) * 348.2² = 10.0 * 121,243 = 1,212,430
-    y4: sqrt(80)  * 461.3² = 8.94 * 212,798 = 1,902,417
-    y5: sqrt(60)  * 576.3² = 7.75 * 332,122 = 2,573,945
-
-Note: y5 dominates despite lowest raw intensity, because
-      it has the highest m/z → most diagnostic.
-```
-
-### 3. XCorr (Cross-Correlation)
+### 1. XCorr (Cross-Correlation)
 
 **Requires library**: Partially (fragment m/z only, NOT intensities)
 **Implementation status**: Done
@@ -221,50 +128,47 @@ Step 5: Score
 - Scale factor 0.005 matches Comet's spectrum-centric scoring
 - Preprocessing the theoretical spectrum would inflate scores ~50× (a common bug)
 
-### 4. X!Tandem Hyperscore
+### 2. Consecutive Ions
 
-**Requires library**: Partially (fragment m/z and ion types, NOT intensities)
-**Implementation status**: Done
-**FeatureSet field**: `hyperscore`
+**PIN feature**: `consecutive_ions` (mixed), `consecutive_ions_deconv` (deconvoluted)
 
-The X!Tandem hyperscore combines the number of matched fragment ions with their observed intensities, rewarding spectra with many matching fragments.
+The length of the longest run of consecutive b or y ions matched in the spectrum.
 
 #### Formula
 
 ```
-Step 1: Match predicted fragments to observed peaks
-  For each predicted fragment f in library:
-    Find closest observed peak within tolerance
-    Record matched intensity I_f and ion type (b or y)
+For each ion series (b-ions, y-ions):
+  Find the longest contiguous run of matched ions
+  e.g., b3, b4, b5 matched → run length = 3
 
-Step 2: Count matched ions by type
-  n_b = count of matched b-ions
-  n_y = count of matched y-ions
-
-Step 3: Calculate score
-  hyperscore = log(n_b!) + log(n_y!) + Σ log(I_f + 1)
-  where:
-    n_b! = factorial of number of matched b-ions
-    n_y! = factorial of number of matched y-ions
-    Σ log(I_f + 1) = sum over ALL matched fragments
+consecutive_ions = max(longest_b_run, longest_y_run)
 ```
 
-#### Why hyperscore is useful
-- Rewards having many matched ions of each type (through the factorial terms)
-- log(n_b!) grows superlinearly: log(5!) = 4.79, log(10!) = 15.10
-- A spectrum matching 10 b-ions and 8 y-ions scores much higher than one matching 18 b-ions and 0 y-ions
-- The intensity term ensures matched peaks are real signal, not noise
-- Does not depend on predicted intensities, only on fragment m/z positions
+#### Score range: 0 to n (peptide length - 1)
 
-#### Score range: 0 to ~50 for typical tryptic peptides
+#### Why it matters
+- True peptide matches tend to have long runs of sequential fragment ions
+- Random noise matches tend to have scattered, non-consecutive ion matches
+- Simple integer feature that captures ion series completeness
 
-#### Comparison to XCorr
-- Hyperscore explicitly rewards having both b and y ions (factorial terms)
-- XCorr treats all fragment positions equally
-- Hyperscore uses raw observed intensities; XCorr uses preprocessed bins
-- Both are library-intensity-independent
+### 3. Explained Intensity
 
-### 5. Delta RT (RT Deviation)
+**PIN feature**: `explained_intensity`
+
+The fraction of total observed intensity in the spectrum that is accounted for by matched library fragments.
+
+#### Formula
+
+```
+matched_intensity = Σ intensity of observed peaks that match a library fragment
+total_intensity = Σ intensity of all observed peaks (above threshold)
+
+explained_intensity = matched_intensity / total_intensity
+```
+
+#### Score range: 0 to 1 (1 = all signal comes from predicted fragments)
+
+### 4. Delta RT (RT Deviation)
 
 **Requires library**: Yes (expected RT from calibration)
 **Implementation status**: Done
@@ -286,111 +190,11 @@ Step 2: Compute deviation
 - Peptides eluting far from their predicted RT are less likely to be correct
 - Strong feature for Mokapot to discriminate targets from decoys
 
-### 6. Fragment Coverage
-
-**Requires library**: Yes (predicted fragment m/z positions)
-**Implementation status**: Done
-**FeatureSet field**: `fragment_coverage`
-
-The fraction of predicted library fragments that were matched in the observed spectrum.
-
-#### Formula
-
-```
-fragment_coverage = n_matched_fragments / n_predicted_fragments
-```
-
-Where:
-- `n_matched_fragments` = count of library fragments with a matching observed peak (within tolerance)
-- `n_predicted_fragments` = total fragments in the library spectrum
-
-#### Score range: 0 to 1 (1 = all predicted fragments found)
-
-### 7. Sequence Coverage
-
-**Requires library**: Yes (ion series positions)
-**Implementation status**: Done
-**FeatureSet field**: `sequence_coverage`
-
-The fraction of backbone cleavage sites covered by at least one matched ion (b or y).
-
-#### Formula
-
-```
-For a peptide of length L:
-  n_cleavage_sites = L - 1  (positions between each amino acid)
-
-For each site i (1 to L-1):
-  covered[i] = True if b_i OR y_{L-i} is matched
-
-sequence_coverage = sum(covered) / n_cleavage_sites
-```
-
-#### Example
-```
-Peptide: PEPTIDE (7 AA, 6 cleavage sites)
-
-Matched ions: b2, b3, y4, y5
-  Site 1: b1? NO, y6? NO  → not covered
-  Site 2: b2? YES         → covered
-  Site 3: b3? YES         → covered
-  Site 4: b4? NO, y3? NO  → not covered
-  Site 5: b5? NO, y2? NO  → not covered
-  Site 6: b6? NO, y1? NO  → not covered
-
-Wait, let's recalculate with y4, y5:
-  y4 covers site 7-4=3, y5 covers site 7-5=2
-
-sequence_coverage = 2/6 = 0.33
-```
-
-### 8. Top-3 Matches
-
-**Requires library**: Yes (fragment intensities to identify top-3)
-**Implementation status**: Done
-**FeatureSet field**: `top3_matches`
-
-The number of the 3 most intense predicted fragments that were matched.
-
-#### Formula
-
-```
-Step 1: Rank library fragments by predicted intensity (descending)
-Step 2: Take top 3 most intense fragments
-Step 3: Count how many of these are matched in observed spectrum
-
-top3_matches ∈ {0, 1, 2, 3}
-```
-
-#### Why it matters
-- The most intense predicted fragments are most likely to be visible
-- Missing all top-3 fragments suggests a poor match or wrong peptide
-- Simple, interpretable feature
-
-### 9. Explained Intensity
-
-**Requires library**: Yes (fragment m/z positions)
-**Implementation status**: Done
-**FeatureSet field**: `explained_intensity`
-
-The fraction of observed intensity that is explained by matched library fragments.
-
-#### Formula
-
-```
-matched_intensity = Σ intensity of observed peaks that match a library fragment
-total_intensity = Σ intensity of all observed peaks (above threshold)
-
-explained_intensity = matched_intensity / total_intensity
-```
-
-#### Score range: 0 to 1 (1 = all signal comes from predicted fragments)
-
 ---
 
 ## Deconvoluted Spectral Features
 
-In addition to scoring the raw observed spectrum at the apex, Osprey computes a second set of spectral scores from a **deconvoluted spectrum**. This helps discriminate true peptides from false matches caused by co-eluting interference.
+In addition to scoring the raw observed spectrum at the apex, Osprey computes spectral scores from a **deconvoluted spectrum**. This helps discriminate true peptides from false matches caused by co-eluting interference.
 
 ### What is Deconvolution?
 
@@ -404,20 +208,12 @@ Aggregate across scans:
   deconvoluted_spectrum = Σ deconv_contribution[scan] (weighted by coefficient)
 ```
 
-### Deconvoluted Features
-
-These features use the same scoring algorithms as the "mixed" spectral features, but applied to the deconvoluted (cleaned) spectrum:
+### Features Sent to Mokapot (Deconvoluted)
 
 | Feature | Field | Description |
 |---------|-------|-------------|
-| Hyperscore (deconv) | `hyperscore_deconv` | X!Tandem hyperscore on deconvoluted spectrum |
 | XCorr (deconv) | `xcorr_deconv` | Cross-correlation on deconvoluted spectrum |
-| Dot product (deconv) | `dot_product_deconv` | LibCosine on deconvoluted spectrum |
-| Dot product SMZ (deconv) | `dot_product_smz_deconv` | LibCosine with m/z² weighting on deconvoluted spectrum |
-| Fragment coverage (deconv) | `fragment_coverage_deconv` | Fraction of fragments matched in deconvoluted spectrum |
-| Sequence coverage (deconv) | `sequence_coverage_deconv` | Backbone coverage in deconvoluted spectrum |
 | Consecutive ions (deconv) | `consecutive_ions_deconv` | Longest b/y run in deconvoluted spectrum |
-| Top-3 matches (deconv) | `top3_matches_deconv` | Top-3 predicted fragments matched in deconvoluted spectrum |
 
 ### Why Both Mixed and Deconvoluted Scores?
 
@@ -436,25 +232,18 @@ The combination of both score types helps Mokapot identify cases where a peptide
 
 These features describe the shape and quality of the deconvoluted chromatographic peak.
 
-**Features sent to Mokapot (6 features):**
+**Features sent to Mokapot (8 features):**
 
 | Feature | Field | Description |
 |---------|-------|-------------|
 | Peak apex | `peak_apex` | Maximum coefficient value across the elution profile |
 | Peak area | `peak_area` | Integrated area under the coefficient curve |
-| Peak width | `peak_width` | Full width at half maximum (FWHM) in minutes |
-| Contributing scans | `n_contributing_scans` | Number of scans with non-zero coefficient |
-| Coefficient stability | `coefficient_stability` | Variance of coefficients near apex (lower = more stable) |
+| Peak width | `peak_width` | FWHM from Tukey median polish elution profile (minutes) |
+| Coefficient stability | `coefficient_stability` | CV of coefficients near apex |
 | Relative coefficient | `relative_coefficient` | This peptide's coefficient / sum of all coefficients in spectrum |
-
-**Additional features in FeatureSet (not currently sent to Mokapot):**
-
-| Feature | Field | Description |
-|---------|-------|-------------|
-| Peak symmetry | `peak_symmetry` | Leading width / trailing width at half-max |
-| Peak sharpness | `peak_sharpness` | Rate of coefficient change at boundaries |
-| Peak prominence | `peak_prominence` | Apex / baseline estimate |
-| EMG fit quality | `emg_fit_quality` | Proxy for exponentially modified Gaussian fit |
+| Explained intensity | `explained_intensity` | Fraction of observed intensity explained by matched fragments |
+| Signal to noise | `signal_to_noise` | Peak apex / noise estimate from coefficient time series |
+| XIC signal to noise | `xic_signal_to_noise` | S/N from best-correlated fragment XIC |
 
 ---
 
@@ -473,118 +262,73 @@ score_run() in crates/osprey/src/pipeline.rs
 │     │
 │     ├─ Find apex_rt = RT at max coefficient
 │     │
-│     ├─ Collect peak region spectra:
-│     │     Filter: isolation_window contains precursor_mz
-│     │             AND RT within coefficient series range
+│     ├─ Extract fragment XICs (top 6 by library intensity)
 │     │
-│     ├─ Build RegressionContext:
-│     │     avg_n_competitors, avg_relative_coefficient,
-│     │     avg_residual, avg_explained_variance
+│     ├─ Run Tukey median polish on 6×N XIC matrix
+│     │     → Column effects = elution profile (robust peak shape)
+│     │     → Row effects = interference-free fragment intensities
+│     │     → FWHM from elution profile → peak boundaries
 │     │
-│     ├─ Extract chromatographic features from coefficient series
-│     │     peak_apex, peak_area, peak_width, peak_symmetry, ...
+│     ├─ Compute fragment co-elution features within peak boundaries
 │     │
-│     ├─ Aggregate spectra around apex (weighted by coefficients)
-│     │     → Creates a single "deconvoluted" spectrum
+│     ├─ Compute elution-weighted cosine (libcosine at each scan, weighted by coef²)
+│     │
+│     ├─ Compute MS1 features (precursor co-elution, isotope envelope)
 │     │
 │     ├─ Find apex spectrum (closest to apex_rt)
 │     │
 │     ├─ Compute spectral scores at apex spectrum:
-│     │     ├─ LibCosine (sqrt preprocessing) ← primary score
-│     │     ├─ XCorr (Comet-style)
-│     │     ├─ Fragment coverage, explained intensity
-│     │     ├─ Pearson/Spearman correlations
-│     │     └─ Consecutive ions, sequence coverage, etc.
+│     │     ├─ XCorr (Comet-style, mixed and deconvoluted)
+│     │     ├─ Consecutive ions (mixed and deconvoluted)
+│     │     └─ Explained intensity
 │     │
-│     ├─ Apply contextual features from regression
+│     ├─ Compute Tukey median polish scores:
+│     │     ├─ median_polish_cosine (row effects vs library, sqrt space)
+│     │     ├─ median_polish_rsquared (R² in sqrt space)
+│     │     └─ median_polish_residual_ratio (residual ratio in linear space)
+│     │
+│     ├─ Compute mass accuracy features (ppm errors)
+│     │
+│     ├─ Compute Percolator-style features (peptide_length, missed_cleavages, etc.)
 │     │
 │     └─ Return ScoredEntry with all features
 │
 └─ 3. Output: Vec<ScoredEntry> (targets + decoys)
-       → Written to PIN file for Mokapot
+       → 37 features written to PIN file for Mokapot
 ```
 
-## Mokapot PIN Feature Summary (24 Features)
+## Mokapot PIN Feature Summary (37 Features)
 
-The following 24 features are written to the PIN file for Mokapot:
+See [docs/README.md](README.md) for the complete 37-feature table organized by category.
 
-### Chromatographic Features (7)
+The features fall into these groups:
+- **Ridge regression (8)**: peak_apex, peak_area, peak_width, coefficient_stability, relative_coefficient, explained_intensity, signal_to_noise, xic_signal_to_noise
+- **Spectral matching - mixed (2)**: xcorr, consecutive_ions
+- **Spectral matching - deconvoluted (2)**: xcorr_deconv, consecutive_ions_deconv
+- **RT deviation (1)**: rt_deviation
+- **Fragment co-elution (9)**: coelution sum/min/n_positive, 6 per-fragment correlations
+- **Elution-weighted cosine (1)**: cosine at each scan, weighted by coefficient^2
+- **Mass accuracy (3)**: mean/abs_mean/std of fragment mass errors (ppm)
+- **Percolator-style (6)**: abs_rt_deviation, peptide_length, missed_cleavages, ln_num_candidates, coef_zscore, coef_zscore_mean
+- **MS1 features (2)**: ms1_precursor_coelution, ms1_isotope_cosine
+- **Tukey median polish (3)**: median_polish_cosine, median_polish_rsquared, median_polish_residual_ratio
 
-| # | Field | Description | Range |
-|---|-------|-------------|-------|
-| 1 | `peak_apex` | Maximum coefficient value | 0+ |
-| 2 | `peak_area` | Integrated coefficient area | 0+ |
-| 3 | `peak_width` | FWHM in minutes | 0+ |
-| 4 | `n_contributing_scans` | Scans with non-zero coefficient | 0-N |
-| 5 | `coefficient_stability` | Variance near apex | 0+ |
-| 6 | `relative_coefficient` | Fraction of total signal | 0-1 |
-| 7 | `explained_intensity` | Fraction of observed intensity matched | 0-1 |
+### Design Principles
 
-### Spectral Features - Mixed/Observed Spectrum (8)
-
-| # | Field | Requires Library Intensities | Range |
-|---|-------|------------------------------|-------|
-| 8 | `hyperscore` | No (fragment types only) | 0-50 |
-| 9 | `xcorr` | No (unit intensity) | -0.5 to 2.0 |
-| 10 | `dot_product` | Yes | 0-1 |
-| 11 | `dot_product_smz` | Yes | 0-1 |
-| 12 | `fragment_coverage` | Yes (fragment m/z) | 0-1 |
-| 13 | `sequence_coverage` | Yes (ion types) | 0-1 |
-| 14 | `consecutive_ions` | Yes (ion types) | 0-N |
-| 15 | `top3_matches` | Yes | 0-3 |
-
-### Spectral Features - Deconvoluted Spectrum (8)
-
-| # | Field | Requires Library Intensities | Range |
-|---|-------|------------------------------|-------|
-| 16 | `hyperscore_deconv` | No | 0-50 |
-| 17 | `xcorr_deconv` | No | -0.5 to 2.0 |
-| 18 | `dot_product_deconv` | Yes | 0-1 |
-| 19 | `dot_product_smz_deconv` | Yes | 0-1 |
-| 20 | `fragment_coverage_deconv` | Yes | 0-1 |
-| 21 | `sequence_coverage_deconv` | Yes | 0-1 |
-| 22 | `consecutive_ions_deconv` | Yes | 0-N |
-| 23 | `top3_matches_deconv` | Yes | 0-3 |
-
-### Derived Features (1)
-
-| # | Field | Description | Range |
-|---|-------|-------------|-------|
-| 24 | `rt_deviation` | Observed apex RT - predicted RT | minutes |
-
----
-
-## Features in FeatureSet Not Sent to Mokapot
-
-These features are computed and stored in `FeatureSet` but are NOT currently included in the PIN file:
-
-| Field | Description | Reason Not Included |
-|-------|-------------|---------------------|
-| `emg_fit_quality` | EMG fit R² | Not yet implemented |
-| `peak_symmetry` | Leading/trailing width ratio | Low discrimination power |
-| `peak_sharpness` | Boundary slope | Redundant with peak_width |
-| `peak_prominence` | Apex / baseline | Redundant with peak_apex |
-| `rt_deviation_normalized` | RT deviation / FWHM | Redundant with rt_deviation |
-| `spectral_contrast_angle` | Angle-based similarity | Redundant with dot_product |
-| `pearson_correlation` | Intensity correlation | Redundant with dot_product |
-| `spearman_correlation` | Rank correlation | Low discrimination power |
-| `base_peak_rank` | Rank of base peak | Low discrimination power |
-| `n_competitors` | Candidates per spectrum | Context feature, may add later |
-| `local_peptide_density` | Average competitors | Context feature, may add later |
-| `spectral_complexity` | Regression complexity | Context feature, may add later |
-| `regression_residual` | Unexplained signal | Context feature, may add later |
-| `precursor_intensity` | MS1 intensity | Optional, not always available |
-| `modification_count` | Number of modifications | May add for PTM analysis |
+- All intensity-based scores (cosine, Pearson, Spearman) include ALL library fragments within the spectrum's mass range, using 0 for unmatched peaks
+- sqrt preprocessing (Poisson noise model) used for cosine scoring
+- Fragment co-elution features capture whether individual fragment XICs track the coefficient time series
+- Tukey median polish provides robust peak boundaries and interference-free fragment scoring
 
 ## Implementation Files
 
 | File | Purpose |
 |------|---------|
-| `crates/osprey-scoring/src/lib.rs` | SpectralScorer (LibCosine, XCorr, Hyperscore), FeatureExtractor |
+| `crates/osprey-scoring/src/lib.rs` | SpectralScorer (LibCosine, XCorr), FeatureExtractor, Tukey median polish, fragment co-elution |
 | `crates/osprey-scoring/src/batch.rs` | BLAS-accelerated batch scoring (calibration phase) |
 | `crates/osprey/src/pipeline.rs` | score_run() - orchestrates scoring after regression |
-| `crates/osprey-core/src/types.rs` | FeatureSet struct (all available features) |
-| `crates/osprey-fdr/src/mokapot.rs` | PIN file output (24 features), Mokapot runner |
+| `crates/osprey-core/src/types.rs` | FeatureSet struct (37 PIN features + additional computed fields) |
+| `crates/osprey-fdr/src/mokapot.rs` | PIN file output (37 features), Mokapot runner |
 
 ## Feature Weight Analysis
 
@@ -599,10 +343,3 @@ This helps identify:
 - Which features contribute most to target/decoy discrimination
 - Features with near-zero weights (candidates for removal to speed up processing)
 - Unexpected feature importance patterns
-
-## TODO
-
-1. **Consider apex refinement**: Score top-N coefficient spectra and pick best spectral match
-2. **EMG peak fitting**: Replace symmetry-based heuristic with true Levenberg-Marquardt EMG fit
-3. **Feature reduction**: Use Mokapot weights to identify and remove low-value features
-4. **Context features**: Evaluate adding n_competitors, regression_residual to PIN file

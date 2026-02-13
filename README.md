@@ -366,29 +366,34 @@ cargo doc --open
 
 ## Current Status
 
-### Implemented (Phase 1)
+### Implemented
 
 - mzML parsing via mzdata crate
 - DIA-NN TSV library loading
 - EncyclopeDIA elib library loading
 - BiblioSpec blib library loading
-- Ridge regression with Cholesky solver
-- Unit resolution binning
-- HRAM sparse matrix support (ppm-based peak matching)
-- Basic peak detection
-- RT calibration with LOESS and stratified sampling
+- Ridge regression with Cholesky solver (NNLS, f32)
+- Unit resolution binning with HRAM sparse matrix support (ppm-based matching)
+- Peak detection with Tukey median polish peak boundaries
+- RT calibration with LOESS regression and stratified sampling
+- MS1/MS2 mass calibration
 - Enzyme-aware decoy generation with fragment recalculation
+- 37-feature extraction per precursor for Mokapot
+- Two-level FDR control (run + experiment level) via Mokapot
+- Tukey median polish for robust elution profiles and fragment scoring
+- Fragment co-elution scoring, elution-weighted cosine
+- Mass accuracy features (ppm-level)
+- MS1 isotope envelope and precursor co-elution features
 - blib output with Osprey extension tables
 - YAML configuration
 - CLI with all core options
-- Mokapot integration (PIN file generation, result parsing)
+- Calibration JSON save/load and HTML report generation
 
-### TODO (Phase 2)
+### TODO
 
-- EMG peak fitting
-- Full 30+ feature extraction
 - Two-step search strategy
 - Background correction
+- Iterative candidate expansion
 
 ## Citation
 

@@ -57,7 +57,10 @@ use osprey_core::{
     LibraryFragment, MS1Spectrum, OspreyConfig, OspreyError, RegressionResult, Result, Spectrum,
     ToleranceUnit,
 };
-use osprey_fdr::{FdrController, MokapotRunner, PsmFeatures};
+use osprey_fdr::{
+    get_pin_feature_names, pin_feature_value, FdrController, MokapotRunner, PsmFeatures,
+    NUM_PIN_FEATURES,
+};
 use osprey_io::{load_all_spectra, load_library, BlibWriter, MS1Index};
 use osprey_regression::{Binner, DesignMatrixBuilder, OptimizedSolver, RidgeSolver};
 use osprey_scoring::{
@@ -323,6 +326,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
             file_name
         );
 
+        // Filter out entries with no spectral evidence before deduplication and competition
+        let pre_filter_count = scored_entries.len();
+        let scored_entries: Vec<ScoredEntry> = scored_entries
+            .into_iter()
+            .filter(|e| e.features.median_polish_cosine > 0.0)
+            .collect();
+        let filtered_count = pre_filter_count - scored_entries.len();
+        if filtered_count > 0 {
+            log::info!(
+                "{}: filtered {}/{} entries with failed median polish (kept {})",
+                file_name,
+                filtered_count,
+                pre_filter_count,
+                scored_entries.len()
+            );
+        }
+
         // Deduplicate double-counted peptides sharing fragment ions within the same isolation window
         let scored_entries = deduplicate_double_counting(
             scored_entries,
@@ -331,6 +351,9 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
             calibration_params,
             &config,
         );
+
+        // Target-decoy competition: only winners go to PIN file
+        let scored_entries = compete_target_decoy_pairs(scored_entries, &library);
 
         // Export coefficient matrix to parquet if requested
         if config.export_coefficients {
@@ -2210,13 +2233,22 @@ fn score_run(
                 }
 
                 // Compute fragment-based FWHM from co-eluting XICs for blib boundaries
-                let fragment_peak_bounds = osprey_scoring::compute_fragment_fwhm(
+                let (fragment_peak_bounds, median_polish) = osprey_scoring::compute_fragment_fwhm(
                     &entry.fragments,
                     &rt_coef_pairs,
                     &peak_region_spectra,
                     spectral_scorer.tolerance_da(),
                     spectral_scorer.tolerance_ppm(),
                 );
+
+                // Extract median polish features
+                if let Some(ref mp) = median_polish {
+                    features.median_polish_cosine =
+                        osprey_scoring::median_polish_libcosine(mp, &entry.fragments);
+                    features.median_polish_rsquared = osprey_scoring::median_polish_rsquared(mp);
+                    features.median_polish_residual_ratio =
+                        osprey_scoring::median_polish_residual_ratio(mp);
+                }
 
                 // Find apex spectrum from peak region (closest to apex RT) for spectral scoring
                 let apex_spectrum = peak_region_spectra.iter().min_by(|a, b| {
@@ -2991,11 +3023,17 @@ fn write_coefficient_parquet(
 ///
 /// This is used for memory-efficient processing where each file's PSM features
 /// are created immediately after scoring and written to a PIN file.
+///
+/// Entries where the median polish failed (cosine == 0.0) are filtered out,
+/// since the default feature values (0.0) would mislead Mokapot into treating
+/// failed decompositions as perfect signals.
 fn create_psm_features_for_file(
     file_name: &str,
     entries: &[ScoredEntry],
     library: &[LibraryEntry],
 ) -> Vec<PsmFeatures> {
+    // Note: median_polish_cosine > 0.0 filter is applied earlier in the pipeline
+    // (before deduplication and target-decoy competition)
     entries
         .iter()
         .map(|entry| {
@@ -3029,6 +3067,185 @@ fn collect_psm_features_by_file(
     }
 
     psms_by_file
+}
+
+/// Find the PIN feature that best separates targets from decoys using Cohen's d.
+///
+/// Returns `(feature_index, higher_is_better)` or `None` if separation cannot be computed.
+fn select_best_separating_feature(
+    entries: &[ScoredEntry],
+    _library: &[LibraryEntry],
+) -> Option<(usize, bool)> {
+    let mut best_index = 0usize;
+    let mut best_abs_d = 0.0f64;
+    let mut best_d = 0.0f64;
+
+    let feature_names = get_pin_feature_names();
+
+    for feat_idx in 0..NUM_PIN_FEATURES {
+        // Collect finite target and decoy values for this feature
+        let mut target_vals = Vec::new();
+        let mut decoy_vals = Vec::new();
+
+        for entry in entries {
+            let val = pin_feature_value(&entry.features, feat_idx);
+            if !val.is_finite() {
+                continue;
+            }
+            if entry.is_decoy {
+                decoy_vals.push(val);
+            } else {
+                target_vals.push(val);
+            }
+        }
+
+        // Need at least 2 of each for meaningful variance
+        if target_vals.len() < 2 || decoy_vals.len() < 2 {
+            continue;
+        }
+
+        let n_t = target_vals.len() as f64;
+        let n_d = decoy_vals.len() as f64;
+        let mean_t = target_vals.iter().sum::<f64>() / n_t;
+        let mean_d = decoy_vals.iter().sum::<f64>() / n_d;
+        let var_t = target_vals
+            .iter()
+            .map(|v| (v - mean_t).powi(2))
+            .sum::<f64>()
+            / (n_t - 1.0);
+        let var_d = decoy_vals.iter().map(|v| (v - mean_d).powi(2)).sum::<f64>() / (n_d - 1.0);
+
+        let pooled_sd = ((var_t + var_d) / 2.0).sqrt();
+        if pooled_sd < 1e-15 {
+            continue; // Zero variance — skip
+        }
+
+        let d = (mean_t - mean_d) / pooled_sd;
+        if d.abs() > best_abs_d {
+            best_abs_d = d.abs();
+            best_d = d;
+            best_index = feat_idx;
+        }
+    }
+
+    if best_abs_d < 1e-15 {
+        log::warn!("Target-decoy competition: no feature separates targets from decoys");
+        return None;
+    }
+
+    let higher_is_better = best_d > 0.0;
+    log::info!(
+        "Target-decoy competition: best separating feature = {} (Cohen's d = {:.3}, {})",
+        feature_names[best_index],
+        best_d,
+        if higher_is_better {
+            "higher is better"
+        } else {
+            "lower is better"
+        }
+    );
+
+    Some((best_index, higher_is_better))
+}
+
+/// Run target-decoy competition: for each paired target/decoy, only the winner survives.
+///
+/// Pairs are identified by `library[entry.lib_idx].id & 0x7FFFFFFF`.
+/// The best-separating PIN feature (Cohen's d) is used for head-to-head comparison.
+/// Singletons (unpaired entries) win automatically.
+/// Ties go to the decoy (conservative for FDR estimation).
+fn compete_target_decoy_pairs(
+    entries: Vec<ScoredEntry>,
+    library: &[LibraryEntry],
+) -> Vec<ScoredEntry> {
+    let (feat_idx, higher_is_better) = match select_best_separating_feature(&entries, library) {
+        Some(result) => result,
+        None => {
+            // Fallback: use peak_apex (index 0, higher is better) when we can't compute
+            // Cohen's d (e.g., too few entries for variance estimation)
+            log::warn!("Target-decoy competition: using peak_apex as fallback competition feature");
+            (0, true)
+        }
+    };
+
+    // Group entries by target_id (clear decoy bit)
+    let mut groups: std::collections::HashMap<u32, (Option<ScoredEntry>, Option<ScoredEntry>)> =
+        std::collections::HashMap::new();
+
+    for entry in entries {
+        let target_id = library[entry.lib_idx].id & 0x7FFFFFFF;
+        let slot = groups.entry(target_id).or_insert((None, None));
+        if entry.is_decoy {
+            slot.1 = Some(entry);
+        } else {
+            slot.0 = Some(entry);
+        }
+    }
+
+    let mut winners = Vec::with_capacity(groups.len());
+    let mut n_target_auto = 0usize;
+    let mut n_decoy_auto = 0usize;
+    let mut n_target_wins = 0usize;
+    let mut n_decoy_wins = 0usize;
+    let mut n_pairs = 0usize;
+
+    for (_target_id, (target_opt, decoy_opt)) in groups {
+        match (target_opt, decoy_opt) {
+            (Some(target), None) => {
+                n_target_auto += 1;
+                winners.push(target);
+            }
+            (None, Some(decoy)) => {
+                n_decoy_auto += 1;
+                winners.push(decoy);
+            }
+            (Some(target), Some(decoy)) => {
+                n_pairs += 1;
+                let t_val = pin_feature_value(&target.features, feat_idx);
+                let d_val = pin_feature_value(&decoy.features, feat_idx);
+
+                // NaN treated as -infinity (automatic loss)
+                let t_val = if t_val.is_finite() {
+                    t_val
+                } else {
+                    f64::NEG_INFINITY
+                };
+                let d_val = if d_val.is_finite() {
+                    d_val
+                } else {
+                    f64::NEG_INFINITY
+                };
+
+                let target_wins = if higher_is_better {
+                    t_val > d_val // strict: ties go to decoy
+                } else {
+                    t_val < d_val // strict: ties go to decoy
+                };
+
+                if target_wins {
+                    n_target_wins += 1;
+                    winners.push(target);
+                } else {
+                    n_decoy_wins += 1;
+                    winners.push(decoy);
+                }
+            }
+            (None, None) => {} // shouldn't happen
+        }
+    }
+
+    log::info!(
+        "Target-decoy competition: {} pairs competed, {} target auto-wins, {} decoy auto-wins, \
+         {} target wins, {} decoy wins ({} total winners)",
+        n_pairs,
+        n_target_auto,
+        n_decoy_auto,
+        n_target_wins,
+        n_decoy_wins,
+        winners.len()
+    );
+
+    winners
 }
 
 /// Fallback: Apply simple target-decoy FDR to run-level q-values
@@ -4434,5 +4651,142 @@ mod tests {
         let config = OspreyConfig::default();
         let result = deduplicate_double_counting(Vec::new(), &[], &spectra, None, &config);
         assert!(result.is_empty());
+    }
+
+    // ============================================
+    // Tests for target-decoy competition
+    // ============================================
+
+    fn make_scored_entry(lib_idx: usize, is_decoy: bool, peak_apex: f64) -> ScoredEntry {
+        ScoredEntry {
+            lib_idx,
+            psm_id: format!("psm_{}", lib_idx),
+            file_name: "test".into(),
+            apex_scan_number: 1,
+            rt_coef_pairs: vec![(10.0, peak_apex)],
+            features: FeatureSet {
+                peak_apex,
+                ..FeatureSet::default()
+            },
+            score: peak_apex,
+            run_qvalue: 1.0,
+            experiment_qvalue: 1.0,
+            pep: 1.0,
+            is_decoy,
+            fragment_peak_bounds: None,
+        }
+    }
+
+    fn make_library_pair(target_id: u32) -> (LibraryEntry, LibraryEntry) {
+        let mut target = LibraryEntry::new(
+            target_id,
+            "PEPTIDE".into(),
+            "PEPTIDE".into(),
+            2,
+            500.0,
+            10.0,
+        );
+        target.is_decoy = false;
+        let mut decoy = LibraryEntry::new(
+            target_id | 0x80000000,
+            "EDITPEP".into(),
+            "EDITPEP".into(),
+            2,
+            500.0,
+            10.0,
+        );
+        decoy.is_decoy = true;
+        (target, decoy)
+    }
+
+    /// Target wins when it has a better feature value.
+    #[test]
+    fn test_compete_target_wins() {
+        let (target_lib, decoy_lib) = make_library_pair(1);
+        let library = vec![target_lib, decoy_lib];
+
+        // Target (lib_idx=0) has peak_apex=0.9, decoy (lib_idx=1) has peak_apex=0.3
+        let entries = vec![
+            make_scored_entry(0, false, 0.9),
+            make_scored_entry(1, true, 0.3),
+        ];
+
+        let result = compete_target_decoy_pairs(entries, &library);
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].is_decoy, "Target should win");
+    }
+
+    /// Decoy wins when it has a better feature value.
+    #[test]
+    fn test_compete_decoy_wins() {
+        let (target_lib, decoy_lib) = make_library_pair(1);
+        let library = vec![target_lib, decoy_lib];
+
+        // Target has peak_apex=0.3, decoy has peak_apex=0.9
+        let entries = vec![
+            make_scored_entry(0, false, 0.3),
+            make_scored_entry(1, true, 0.9),
+        ];
+
+        let result = compete_target_decoy_pairs(entries, &library);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_decoy, "Decoy should win");
+    }
+
+    /// Unpaired entries (singletons) win automatically.
+    #[test]
+    fn test_compete_singleton_auto_wins() {
+        let (target_lib, _decoy_lib) = make_library_pair(1);
+        // Only put target in library, no decoy scored
+        let library = vec![target_lib];
+
+        let entries = vec![make_scored_entry(0, false, 0.5)];
+
+        let result = compete_target_decoy_pairs(entries, &library);
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].is_decoy, "Singleton target should auto-win");
+    }
+
+    /// Ties go to the decoy (conservative for FDR estimation).
+    #[test]
+    fn test_compete_tie_goes_to_decoy() {
+        let (target_lib, decoy_lib) = make_library_pair(1);
+        let library = vec![target_lib, decoy_lib];
+
+        // Both have identical peak_apex=0.5
+        let entries = vec![
+            make_scored_entry(0, false, 0.5),
+            make_scored_entry(1, true, 0.5),
+        ];
+
+        let result = compete_target_decoy_pairs(entries, &library);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].is_decoy, "Tie should go to decoy");
+    }
+
+    /// Competition with multiple pairs returns correct number of winners.
+    #[test]
+    fn test_compete_multiple_pairs() {
+        let (t1, d1) = make_library_pair(1);
+        let (t2, d2) = make_library_pair(2);
+        let (t3, d3) = make_library_pair(3);
+        let library = vec![t1, d1, t2, d2, t3, d3];
+
+        let entries = vec![
+            make_scored_entry(0, false, 0.9), // target 1 wins
+            make_scored_entry(1, true, 0.3),  // decoy 1 loses
+            make_scored_entry(2, false, 0.2), // target 2 loses
+            make_scored_entry(3, true, 0.8),  // decoy 2 wins
+            make_scored_entry(4, false, 0.6), // target 3 wins
+            make_scored_entry(5, true, 0.4),  // decoy 3 loses
+        ];
+
+        let result = compete_target_decoy_pairs(entries, &library);
+        assert_eq!(result.len(), 3, "Should have one winner per pair");
+
+        let n_targets = result.iter().filter(|e| !e.is_decoy).count();
+        let n_decoys = result.iter().filter(|e| e.is_decoy).count();
+        assert_eq!(n_targets, 2);
+        assert_eq!(n_decoys, 1);
     }
 }

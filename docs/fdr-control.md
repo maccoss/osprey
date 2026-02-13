@@ -6,7 +6,7 @@ Osprey uses two-level FDR (False Discovery Rate) control to ensure high-quality 
 
 ```
 FDR Control Workflow:
-  1. Extract 24 features per precursor (targets + decoys)
+  1. Extract 37 features per precursor (targets + decoys)
   2. Write PIN files (one per mzML file)
   3. Run Mokapot CLI with two-step analysis:
      - Step 1: Train joint model, report per-file q-values
@@ -94,7 +94,7 @@ Mokapot is a Python tool for semi-supervised learning in proteomics FDR control.
 
 ### PIN File Format
 
-Osprey writes one PIN file per mzML file with 24 features:
+Osprey writes one PIN file per mzML file with 37 features:
 
 ```
 SpecId  Label  ScanNr  ChargeState  peak_apex  peak_area  ...  Peptide  Proteins
@@ -104,7 +104,7 @@ psm_002   -1    1234           2       0.12       1.1  ...  -.KEDITPEP.-  DECOY_
 
 - `Label`: 1 for target, -1 for decoy
 - `SpecId`: Unique identifier for the PSM
-- 24 feature columns (see Feature Set below)
+- 37 feature columns (see Feature Set below)
 - `Peptide`: Flanking.SEQUENCE.Flanking format
 - `Proteins`: Protein accessions
 
@@ -151,65 +151,100 @@ FEATURE WEIGHTS (ranked by absolute importance)
 ======================================================================
 Rank   Feature                                  Weight     |Weight|
 ----------------------------------------------------------------------
-1      dot_product                              0.8532      0.8532  ++++++++
+1      elution_weighted_cosine                  0.8532      0.8532  ++++++++
 2      xcorr                                    0.7891      0.7891  +++++++
 3      peak_apex                                0.6234      0.6234  ++++++
 4      rt_deviation                            -0.4521      0.4521  ----
-5      hyperscore                               0.3987      0.3987  +++
+5      median_polish_cosine                     0.3987      0.3987  +++
 ...
 ```
 
-## Feature Set (24 Features)
+## Feature Set (37 Features)
 
-### Ridge Regression Features (7)
+All intensity-based spectral similarity scores include ALL library fragments
+within the spectrum's mass range, using 0 intensity for unmatched peaks.
 
-Derived from coefficient time series analysis:
+### Ridge Regression Features (8)
 
 | Feature | Description | Range |
 |---------|-------------|-------|
-| `peak_apex` | Maximum coefficient value | 0-∞ |
-| `peak_area` | Integrated area under curve | 0-∞ |
-| `peak_width` | FWHM in minutes | 0-∞ |
-| `n_contributing_scans` | Scans with non-zero coefficient | 1-∞ |
-| `coefficient_stability` | CV of coefficients near apex | 0-∞ |
+| `peak_apex` | Maximum coefficient value | 0+ |
+| `peak_area` | Integrated area under curve | 0+ |
+| `peak_width` | FWHM from Tukey median polish elution profile | 0+ |
+| `coefficient_stability` | CV of coefficients near apex | 0+ |
 | `relative_coefficient` | Coefficient / sum(all) | 0-1 |
 | `explained_intensity` | Explained/total intensity | 0-1 |
+| `signal_to_noise` | Peak apex / noise estimate | 0+ |
+| `xic_signal_to_noise` | S/N from best-correlated fragment XIC | 0+ |
 
-### Spectral Matching Features - Mixed (8)
-
-Computed on the observed (mixed) spectrum at apex:
+### Spectral Matching - Mixed (2)
 
 | Feature | Description | Range |
 |---------|-------------|-------|
-| `hyperscore` | X!Tandem-style score | 0-∞ |
-| `xcorr` | Comet-style cross-correlation | 0-∞ |
-| `dot_product` | LibCosine (sqrt preprocessing) | 0-1 |
-| `dot_product_smz` | LibCosine (sqrt×mz² preprocessing) | 0-1 |
-| `fragment_coverage` | Matched/predicted fragments | 0-1 |
-| `sequence_coverage` | Backbone coverage | 0-1 |
+| `xcorr` | Comet-style cross-correlation | 0+ |
 | `consecutive_ions` | Longest b/y ion run | 0-n |
-| `top3_matches` | Top-3 fragments matched | 0-3 |
 
-### Spectral Matching Features - Deconvoluted (8)
-
-Computed on coefficient-weighted spectra (apex ± 2 scans):
+### Spectral Matching - Deconvoluted (2)
 
 | Feature | Description | Range |
 |---------|-------------|-------|
-| `hyperscore_deconv` | X!Tandem-style score | 0-∞ |
-| `xcorr_deconv` | Comet-style cross-correlation | 0-∞ |
-| `dot_product_deconv` | LibCosine (sqrt preprocessing) | 0-1 |
-| `dot_product_smz_deconv` | LibCosine (sqrt×mz² preprocessing) | 0-1 |
-| `fragment_coverage_deconv` | Matched/predicted fragments | 0-1 |
-| `sequence_coverage_deconv` | Backbone coverage | 0-1 |
-| `consecutive_ions_deconv` | Longest b/y ion run | 0-n |
-| `top3_matches_deconv` | Top-3 fragments matched | 0-3 |
+| `xcorr_deconv` | XCorr on deconvoluted spectrum | 0+ |
+| `consecutive_ions_deconv` | Consecutive ions on deconvoluted spectrum | 0-n |
 
-### Derived Features (1)
+### RT Deviation (1)
 
 | Feature | Description | Range |
 |---------|-------------|-------|
-| `rt_deviation` | Observed - predicted RT (min) | -∞ to ∞ |
+| `rt_deviation` | Observed - predicted RT (min) | -inf to inf |
+
+### Fragment Co-elution (9)
+
+| Feature | Description | Range |
+|---------|-------------|-------|
+| `fragment_coelution_sum` | Sum of per-fragment correlations | 0+ |
+| `fragment_coelution_min` | Minimum fragment correlation | -1 to 1 |
+| `n_coeluting_fragments` | Fragments with positive correlation | 0-6 |
+| `fragment_corr_0..5` | Per-fragment correlation (ranked by library intensity) | -1 to 1 |
+
+### Elution-Weighted Similarity (1)
+
+| Feature | Description | Range |
+|---------|-------------|-------|
+| `elution_weighted_cosine` | LibCosine at each scan, weighted by coef^2, averaged | 0-1 |
+
+### Mass Accuracy (3)
+
+| Feature | Description | Range |
+|---------|-------------|-------|
+| `mass_accuracy_deviation_mean` | Mean signed mass error (ppm) | -inf to inf |
+| `abs_mass_accuracy_deviation_mean` | Mean |mass error| (ppm) | 0+ |
+| `mass_accuracy_std` | Std dev of mass errors (ppm) | 0+ |
+
+### Percolator-style (6)
+
+| Feature | Description | Range |
+|---------|-------------|-------|
+| `abs_rt_deviation` | |RT deviation| | 0+ |
+| `peptide_length` | Number of amino acids | 5-50 |
+| `missed_cleavages` | Missed enzymatic cleavages | 0+ |
+| `ln_num_candidates` | ln(candidates in regression) | 0+ |
+| `coef_zscore` | Z-score of coefficient at apex | -inf to inf |
+| `coef_zscore_mean` | Mean z-score across peak | -inf to inf |
+
+### MS1 Features (2)
+
+| Feature | Description | Range |
+|---------|-------------|-------|
+| `ms1_precursor_coelution` | Coefficient vs MS1 XIC correlation | -1 to 1 |
+| `ms1_isotope_cosine` | Observed vs theoretical isotope envelope | 0-1 |
+
+### Tukey Median Polish (3)
+
+| Feature | Description | Range |
+|---------|-------------|-------|
+| `median_polish_cosine` | Row effects vs library, sqrt preprocessing | 0-1 |
+| `median_polish_rsquared` | Additive model R^2 in sqrt space | 0-1 |
+| `median_polish_residual_ratio` | sum|obs-pred| / sum(obs), linear | 0+ |
 
 ## Target-Decoy Competition
 

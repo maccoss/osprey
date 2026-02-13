@@ -1077,7 +1077,7 @@ fn find_mokapot_models(dir: &Path) -> Result<Vec<PathBuf>> {
     )))
 }
 
-/// Get the feature header for PIN format (26 features)
+/// Get the feature header for PIN format (37 features)
 ///
 /// Features are grouped by source:
 /// - Ridge regression (chromatographic): peak_apex, peak_area, peak_width,
@@ -1134,6 +1134,10 @@ fn get_feature_header() -> String {
         // MS1-based features (HRAM only, 0.0 for unit resolution or missing MS1)
         "ms1_precursor_coelution",
         "ms1_isotope_cosine",
+        // Tukey median polish features (fragment XIC decomposition)
+        "median_polish_cosine",
+        "median_polish_rsquared",
+        "median_polish_residual_ratio",
     ]
     .join("\t")
 }
@@ -1151,10 +1155,10 @@ fn format_charge_features(charge: u8) -> String {
     )
 }
 
-/// Format features for PIN output (34 features)
+/// Format features for PIN output (37 features)
 fn format_features(features: &FeatureSet) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         // Ridge regression features (chromatographic profile)
         features.peak_apex,
         features.peak_area,
@@ -1199,8 +1203,104 @@ fn format_features(features: &FeatureSet) -> String {
         // MS1-based features (HRAM only, 0.0 for unit resolution or missing MS1)
         features.ms1_precursor_coelution,
         features.ms1_isotope_cosine,
+        // Tukey median polish features (fragment XIC decomposition)
+        features.median_polish_cosine,
+        features.median_polish_rsquared,
+        features.median_polish_residual_ratio,
     )
 }
+
+/// Returns the 37 PIN feature names in the same order as get_feature_header() and format_features().
+pub fn get_pin_feature_names() -> Vec<&'static str> {
+    vec![
+        "peak_apex",
+        "peak_area",
+        "peak_width",
+        "coefficient_stability",
+        "relative_coefficient",
+        "explained_intensity",
+        "signal_to_noise",
+        "xic_signal_to_noise",
+        "xcorr",
+        "consecutive_ions",
+        "xcorr_deconv",
+        "consecutive_ions_deconv",
+        "rt_deviation",
+        "fragment_coelution_sum",
+        "fragment_coelution_min",
+        "n_coeluting_fragments",
+        "fragment_corr_0",
+        "fragment_corr_1",
+        "fragment_corr_2",
+        "fragment_corr_3",
+        "fragment_corr_4",
+        "fragment_corr_5",
+        "elution_weighted_cosine",
+        "mass_accuracy_deviation_mean",
+        "abs_mass_accuracy_deviation_mean",
+        "mass_accuracy_std",
+        "abs_rt_deviation",
+        "peptide_length",
+        "missed_cleavages",
+        "ln_num_candidates",
+        "coef_zscore",
+        "coef_zscore_mean",
+        "ms1_precursor_coelution",
+        "ms1_isotope_cosine",
+        "median_polish_cosine",
+        "median_polish_rsquared",
+        "median_polish_residual_ratio",
+    ]
+}
+
+/// Returns a single PIN feature value by index (0-36).
+///
+/// Index order matches get_feature_header(), format_features(), and get_pin_feature_names().
+pub fn pin_feature_value(features: &FeatureSet, index: usize) -> f64 {
+    match index {
+        0 => features.peak_apex,
+        1 => features.peak_area,
+        2 => features.peak_width,
+        3 => features.coefficient_stability,
+        4 => features.relative_coefficient,
+        5 => features.explained_intensity,
+        6 => features.signal_to_noise,
+        7 => features.xic_signal_to_noise,
+        8 => features.xcorr,
+        9 => features.consecutive_ions as f64,
+        10 => features.xcorr_deconv,
+        11 => features.consecutive_ions_deconv as f64,
+        12 => features.rt_deviation,
+        13 => features.fragment_coelution_sum,
+        14 => features.fragment_coelution_min,
+        15 => features.n_coeluting_fragments as f64,
+        16 => features.fragment_corr_0,
+        17 => features.fragment_corr_1,
+        18 => features.fragment_corr_2,
+        19 => features.fragment_corr_3,
+        20 => features.fragment_corr_4,
+        21 => features.fragment_corr_5,
+        22 => features.elution_weighted_cosine,
+        23 => features.mass_accuracy_deviation_mean,
+        24 => features.abs_mass_accuracy_deviation_mean,
+        25 => features.mass_accuracy_std,
+        26 => features.abs_rt_deviation,
+        27 => features.peptide_length as f64,
+        28 => features.missed_cleavages as f64,
+        29 => features.ln_num_candidates,
+        30 => features.coef_zscore,
+        31 => features.coef_zscore_mean,
+        32 => features.ms1_precursor_coelution,
+        33 => features.ms1_isotope_cosine,
+        34 => features.median_polish_cosine,
+        35 => features.median_polish_rsquared,
+        36 => features.median_polish_residual_ratio,
+        _ => 0.0,
+    }
+}
+
+/// Number of PIN features (37).
+pub const NUM_PIN_FEATURES: usize = 37;
 
 /// Format peptide for PIN output
 /// Percolator/mokapot expects format: FLANKING.SEQUENCE.FLANKING
@@ -1276,8 +1376,10 @@ mod tests {
         assert!(header.contains("xic_signal_to_noise"));
         assert!(header.contains("ms1_precursor_coelution"));
         assert!(header.contains("ms1_isotope_cosine"));
-        assert!(!header.contains("precursor_intensity")); // Optional field not included
-                                                          // Removed features should not be present
+        assert!(header.contains("median_polish_cosine"));
+        assert!(header.contains("median_polish_rsquared"));
+        assert!(header.contains("median_polish_residual_ratio"));
+        // Removed features should not be present
         assert!(!header.contains("dot_product"));
         assert!(!header.contains("hyperscore"));
         assert!(!header.contains("fragment_coverage"));
@@ -1303,5 +1405,33 @@ mod tests {
         let runner = MokapotRunner::new();
         // This will be false on systems without mokapot, which is expected
         let _available = runner.is_available();
+    }
+
+    /// Verifies that get_pin_feature_names() returns exactly 37 names matching the header.
+    #[test]
+    fn test_get_pin_feature_names_count() {
+        let names = get_pin_feature_names();
+        assert_eq!(names.len(), NUM_PIN_FEATURES);
+
+        // Verify names match the header
+        let header = get_feature_header();
+        let header_names: Vec<&str> = header.split('\t').collect();
+        assert_eq!(header_names.len(), names.len());
+        for (h, n) in header_names.iter().zip(names.iter()) {
+            assert_eq!(h, n);
+        }
+    }
+
+    /// Verifies that pin_feature_value returns consistent values matching format_features order.
+    #[test]
+    fn test_pin_feature_value_matches_format() {
+        let features = FeatureSet::default();
+        // All default values should be 0.0, so pin_feature_value should return 0.0 for all indices
+        for i in 0..NUM_PIN_FEATURES {
+            let val = pin_feature_value(&features, i);
+            assert!(val.is_finite(), "Feature {} returned non-finite value", i);
+        }
+        // Out of range should return 0.0
+        assert_eq!(pin_feature_value(&features, 99), 0.0);
     }
 }

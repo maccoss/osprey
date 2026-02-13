@@ -742,7 +742,7 @@ impl BlibWriter {
         Ok(())
     }
 
-    /// Update the spectrum count in LibInfo
+    /// Update the spectrum count in LibInfo and checkpoint the WAL
     pub fn finalize(&self) -> Result<()> {
         self.conn
             .execute(
@@ -750,6 +750,13 @@ impl BlibWriter {
                 [],
             )
             .map_err(|e| OspreyError::SqliteError(format!("Failed to update LibInfo: {}", e)))?;
+
+        // Checkpoint WAL into the main database file and switch to DELETE journal mode
+        // so the -wal and -shm files are removed, leaving a single clean .blib file
+        self.conn
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .ok();
+        self.conn.pragma_update(None, "journal_mode", "DELETE").ok();
 
         Ok(())
     }

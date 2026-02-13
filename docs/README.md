@@ -10,11 +10,9 @@ Osprey has a **working prototype** that can:
 - Generate enzyme-aware decoys
 - Run auto-calibration with target-decoy FDR control
 - Perform ridge regression spectrum deconvolution
-- Extract 30 features per precursor
+- Extract 37 features per precursor
 - Run Mokapot semi-supervised FDR control
 - Output BiblioSpec .blib files for Skyline
-
-**Recent test run**: 76,169 precursors at 1% FDR from a single Astral file.
 
 ## Algorithm Documentation
 
@@ -40,98 +38,198 @@ Osprey's pipeline has four major phases. The calibration phase uses fast spectra
 ```
 INPUT
   mzML files (DIA data) + Spectral Library (predicted spectra)
-  │
-  ▼
+  |
+  v
 PHASE 1: INITIALIZATION
-  ├─ Load spectral library (DIA-NN TSV, elib, or blib)
-  ├─ Generate decoys (enzyme-aware reversal)
-  └─ Build m/z index for candidate lookup
-  │
-  ▼
+  +- Load spectral library (DIA-NN TSV, elib, or blib)
+  +- Generate decoys (enzyme-aware reversal)
+  +- Build m/z index for candidate lookup
+  |
+  v
 PHASE 2: CALIBRATION DISCOVERY (first file only)
-  ├─ Calculate library-to-measured RT mapping
-  ├─ Set wide RT tolerance (20-50% of gradient)
-  ├─ Score all peptides against all spectra:
-  │     ├─ XCorr (unit resolution bins, BLAS sdot) → find best RT per peptide
-  │     ├─ Top-3 fragment matching (binary search) → MS2 mass errors
-  │     └─ E-value from XCorr survival function
-  ├─ Target-decoy competition → 1% FDR filtering
-  ├─ Fit LOESS RT calibration from confident targets
-  ├─ Calculate MS1/MS2 mass error statistics
-  └─ Set tight RT tolerance for main search (3× residual SD)
-  │
-  ▼
+  +- Calculate library-to-measured RT mapping
+  +- Set wide RT tolerance (20-50% of gradient)
+  +- Score all peptides against all spectra:
+  |     +- XCorr (unit resolution bins, BLAS sdot) -> find best RT per peptide
+  |     +- Top-3 fragment matching (binary search) -> MS2 mass errors
+  |     +- E-value from XCorr survival function
+  +- Target-decoy competition -> 1% FDR filtering
+  +- Fit LOESS RT calibration from confident targets
+  +- Calculate MS1/MS2 mass error statistics
+  +- Set tight RT tolerance for main search (3x residual SD)
+  |
+  v
 PHASE 3: RIDGE REGRESSION (all files, per spectrum)
-  ├─ Select candidates (isolation window + calibrated RT)
-  ├─ Build design matrix from pre-binned library
-  ├─ Solve NNLS ridge regression (f32, projected gradient)
-  └─ Output: coefficients per candidate per spectrum
-  │
-  ▼
+  +- Select candidates (isolation window + calibrated RT)
+  +- Build design matrix from pre-binned library
+  +- Solve NNLS ridge regression (f32, projected gradient)
+  +- Output: coefficients per candidate per spectrum
+  |
+  v
 PHASE 4: POST-REGRESSION SCORING (per precursor)
-  ├─ Aggregate coefficients into time series per precursor
-  ├─ Peak detection → apex RT, boundaries
-  ├─ Score at apex (all 30 features computed here):
-  │     ├─ Spectral scores (dot_product, xcorr, hyperscore, etc.)
-  │     ├─ Chromatographic features (peak shape, width, symmetry)
-  │     └─ Contextual features (competitors, regression quality)
-  ├─ Write PIN file (targets + decoys, 30 features)
-  └─ Mokapot semi-supervised FDR → q-values
-  │
-  ▼
+  +- Aggregate coefficients into time series per precursor
+  +- Peak detection -> apex RT, boundaries
+  +- Tukey median polish on fragment XICs -> elution profile, FWHM
+  +- Peak boundary determination from FWHM
+  +- Score at apex (37 features computed here):
+  |     +- Spectral scores (xcorr, elution-weighted cosine)
+  |     +- Fragment co-elution (per-fragment correlations)
+  |     +- Mass accuracy features
+  |     +- Tukey median polish features (cosine, R^2, residual ratio)
+  |     +- MS1 features (precursor coelution, isotope cosine)
+  |     +- Percolator-style features (peptide length, charge, etc.)
+  +- Write PIN file (targets + decoys, 37 features)
+  +- Mokapot semi-supervised FDR -> q-values
+  |
+  v
 OUTPUT
-  ├─ BiblioSpec (.blib) for Skyline
-  ├─ Mokapot model weights (.pkl) for feature analysis
-  └─ TSV report (optional)
+  +- BiblioSpec (.blib) for Skyline
+  +- Mokapot model weights (.pkl) for feature analysis
+  +- TSV report (optional)
 ```
 
 ---
 
-## Feature Set (30 Features for Mokapot)
+## Feature Set (37 Features for Mokapot)
 
-Osprey extracts 30 features per precursor for semi-supervised FDR control:
+Osprey extracts 37 features per precursor for semi-supervised FDR control. All
+intensity-based spectral similarity scores (cosine, Pearson, Spearman) include
+ALL library fragments within the spectrum's mass range, using 0 intensity for
+unmatched peaks. A missing fragment that should be present is a strong
+discriminator between good and bad matches.
 
-### Chromatographic Features (12)
+### Ridge Regression Features (8)
+
+Derived from coefficient time series and chromatographic analysis:
+
 | Feature | Description |
 |---------|-------------|
 | `peak_apex` | Peak apex coefficient (maximum deconvolution value) |
 | `peak_area` | Integrated peak area (AUC of coefficients) |
-| `emg_fit_quality` | EMG fit quality (R²) |
-| `peak_width` | Peak width (FWHM in minutes) |
-| `peak_symmetry` | Peak symmetry (leading/trailing ratio) |
-| `rt_deviation` | RT deviation from prediction (minutes) |
-| `rt_deviation_normalized` | Normalized RT deviation |
-| `n_contributing_scans` | Number of scans contributing to peak |
+| `peak_width` | Peak width (FWHM in minutes), from Tukey median polish elution profile |
 | `coefficient_stability` | Coefficient variance near apex |
-| `peak_sharpness` | Peak boundary sharpness |
-| `peak_prominence` | Peak prominence (apex / baseline) |
-| `modification_count` | Number of modifications |
+| `relative_coefficient` | Coefficient relative to sum of all candidates |
+| `explained_intensity` | Fraction of observed intensity explained by matched fragments |
+| `signal_to_noise` | Peak apex / noise estimate from coefficient series |
+| `xic_signal_to_noise` | Signal-to-noise from the best-correlated fragment XIC |
 
-### Spectral Features (13)
+### Spectral Matching Features - Mixed (2)
+
+Computed on the observed (mixed) spectrum at apex:
+
 | Feature | Description |
 |---------|-------------|
-| `hyperscore` | X!Tandem-style: log(n_b!) + log(n_y!) + Σlog(I+1) |
-| `xcorr` | Comet-style cross-correlation |
-| `spectral_contrast_angle` | Normalized spectral contrast angle |
-| `dot_product` | LibCosine with sqrt preprocessing |
-| `dot_product_smz` | LibCosine with sqrt×mz² (SMZ) preprocessing |
-| `pearson_correlation` | Pearson intensity correlation |
-| `spearman_correlation` | Spearman rank correlation |
-| `fragment_coverage` | Fraction of predicted fragments detected |
-| `sequence_coverage` | Backbone coverage |
+| `xcorr` | Comet-style cross-correlation (unit intensity library selector) |
 | `consecutive_ions` | Longest consecutive b/y ion run |
-| `base_peak_rank` | Rank of base peak in predicted |
-| `top3_matches` | Number of top-3 predicted fragments matched |
-| `explained_intensity` | Fraction of observed intensity explained |
 
-### Contextual Features (5)
+### Spectral Matching Features - Deconvoluted (2)
+
+Computed on coefficient-weighted spectra (apex +/- 2 scans):
+
 | Feature | Description |
 |---------|-------------|
-| `n_competitors` | Number of competing candidates in regression |
-| `relative_coefficient` | Coefficient relative to sum of all |
-| `local_peptide_density` | Local peptide density (candidates per window) |
-| `spectral_complexity` | Spectral complexity estimate |
-| `regression_residual` | Regression residual (unexplained signal) |
+| `xcorr_deconv` | XCorr on deconvoluted spectrum |
+| `consecutive_ions_deconv` | Consecutive ions on deconvoluted spectrum |
+
+### RT Deviation (1)
+
+| Feature | Description |
+|---------|-------------|
+| `rt_deviation` | Observed apex RT - predicted RT from LOESS calibration (minutes) |
+
+### Fragment Co-elution Features (9)
+
+Computed within peak integration boundaries. Each fragment's XIC is correlated
+against the coefficient time series:
+
+| Feature | Description |
+|---------|-------------|
+| `fragment_coelution_sum` | Sum of Pearson correlations across top 6 fragments |
+| `fragment_coelution_min` | Minimum correlation among scored fragments |
+| `n_coeluting_fragments` | Count of fragments with positive correlation |
+| `fragment_corr_0` | Correlation of highest-intensity library fragment vs coefficient series |
+| `fragment_corr_1` | Correlation of 2nd highest fragment |
+| `fragment_corr_2` | Correlation of 3rd highest fragment |
+| `fragment_corr_3` | Correlation of 4th highest fragment |
+| `fragment_corr_4` | Correlation of 5th highest fragment |
+| `fragment_corr_5` | Correlation of 6th highest fragment |
+
+### Elution-Weighted Spectral Similarity (1)
+
+| Feature | Description |
+|---------|-------------|
+| `elution_weighted_cosine` | LibCosine computed at each scan within peak boundaries, weighted by coefficient^2, averaged. Uses sqrt preprocessing and includes all library fragments (0 for unmatched). |
+
+### Mass Accuracy Features (3)
+
+| Feature | Description |
+|---------|-------------|
+| `mass_accuracy_deviation_mean` | Mean signed mass error (ppm) across matched fragments |
+| `abs_mass_accuracy_deviation_mean` | Mean absolute mass error (ppm) |
+| `mass_accuracy_std` | Standard deviation of mass errors (ppm) |
+
+### Percolator-style Features (6)
+
+| Feature | Description |
+|---------|-------------|
+| `abs_rt_deviation` | Absolute value of RT deviation |
+| `peptide_length` | Number of amino acids in peptide sequence |
+| `missed_cleavages` | Number of missed enzymatic cleavages |
+| `ln_num_candidates` | ln(number of candidates in the regression window) |
+| `coef_zscore` | Z-score of this precursor's coefficient at apex |
+| `coef_zscore_mean` | Mean z-score of coefficients across the peak |
+
+### MS1 Features (2)
+
+HRAM only; 0.0 for unit resolution or when MS1 data is unavailable:
+
+| Feature | Description |
+|---------|-------------|
+| `ms1_precursor_coelution` | Pearson correlation between coefficient series and MS1 monoisotopic precursor XIC |
+| `ms1_isotope_cosine` | Cosine similarity between observed MS1 isotope envelope and theoretical distribution |
+
+### Tukey Median Polish Features (3)
+
+Fragment XIC matrix decomposition via Tukey median polish:
+
+| Feature | Description |
+|---------|-------------|
+| `median_polish_cosine` | Cosine similarity between data-derived fragment intensities (row effects) and library intensities, sqrt preprocessing |
+| `median_polish_rsquared` | R^2 of the additive model in sqrt space. Measures how well the shared elution profile + fragment intensities explain the XIC matrix. |
+| `median_polish_residual_ratio` | Fraction of total signal unexplained by the model: sum|obs-pred| / sum(obs) in linear space. Lower = cleaner co-elution. |
+
+---
+
+## Tukey Median Polish
+
+The Tukey median polish decomposes the fragment XIC matrix into an additive model:
+
+```
+ln(Observed[f,s]) = mu + alpha_f + beta_s + epsilon_fs
+
+  f = fragment index (1..6, top 6 by library intensity)
+  s = scan index (1..N)
+  mu = overall effect (grand median)
+  alpha_f = row effect = data-derived fragment relative intensity
+  beta_s = column effect = shared elution profile shape
+  epsilon_fs = residual = interference + noise
+```
+
+The algorithm iterates (max 20 iterations, convergence tolerance 1e-4):
+1. **Row sweep**: subtract nanmedian of each row from residuals
+2. **Column sweep**: subtract nanmedian of each column from residuals
+3. Check convergence: max(|change|) < tolerance
+
+### Uses
+
+- **Peak boundaries**: Column effects give a robust elution profile by borrowing
+  strength across all 6 transitions. The median suppresses interference from any
+  single fragment. FWHM computed on this profile determines peak boundaries:
+  sigma = FWHM / 2.355, boundaries at +/-1.96*sigma from apex.
+
+- **Scoring features**: Row effects give interference-free fragment intensities
+  that are scored against the library (median_polish_cosine). R^2 and residual
+  ratio measure how well the additive model explains the data.
 
 ---
 
@@ -141,7 +239,7 @@ Osprey uses **two-level FDR control** via Mokapot:
 
 ### Run-Level FDR (Step 1)
 - Per-file target-decoy competition
-- All 30 features passed to Mokapot
+- All 37 features passed to Mokapot
 - Mokapot trains linear SVM to combine features
 - Q-values assigned per precursor
 
@@ -152,7 +250,7 @@ Osprey uses **two-level FDR control** via Mokapot:
 - Precursor = peptide + charge (not just peptide)
 
 ### Mokapot Integration
-- PIN file format with 30 features
+- PIN file format with 37 features
 - `--save_models` flag saves feature weights
 - Use `scripts/inspect_mokapot_weights.py` to view feature importance
 - Parallel workers (auto-detected, capped at 8)
@@ -166,13 +264,13 @@ The calibration phase is a **fast scoring pass** designed to establish RT and ma
 
 ### How Calibration Scoring Works
 
-1. **Pre-filter** (top-3 fragment match): Binary search check — at least 1 of the top-3 most intense library fragments must be present in the observed spectrum. Eliminates candidates with no spectral evidence before expensive XCorr preprocessing. O(3 × log n) per candidate.
+1. **Pre-filter** (top-3 fragment match): Binary search check -- at least 1 of the top-3 most intense library fragments must be present in the observed spectrum. Eliminates candidates with no spectral evidence before expensive XCorr preprocessing. O(3 x log n) per candidate.
 
 2. **XCorr** (all passing spectra): Preprocess experimental spectrum with sqrt, windowing normalization, and flanking bin subtraction. Score against all spectra in RT window via BLAS sdot. Used to find the best-matching RT for each peptide.
 
 3. **Top-3 fragment matching** (at best XCorr spectrum): Binary search the top-3 most intense library fragments in the best XCorr spectrum. Returns signed mass errors (ppm) for MS2 mass calibration.
 
-4. **E-value** (significance): Calculated from the XCorr survival function (Comet-style) — fit log-linear regression to survival counts. Used for target-decoy competition.
+4. **E-value** (significance): Calculated from the XCorr survival function (Comet-style) -- fit log-linear regression to survival counts. Used for target-decoy competition.
 
 5. **MS1 isotope envelope** (at best XCorr spectrum): Extract monoisotopic peak from nearest MS1 spectrum. Returns MS1 mass error (ppm) for precursor mass calibration.
 
@@ -180,8 +278,8 @@ See: [Spectral Scoring](spectral-scoring.md), [XCorr Scoring](xcorr-scoring.md)
 
 ### What Calibration Produces
 
-- **RT calibration curve** (LOESS): Maps library RT → expected measured RT
-- **RT tolerance**: Residual SD × 3 (typically 0.5-2 min)
+- **RT calibration curve** (LOESS): Maps library RT -> expected measured RT
+- **RT tolerance**: Residual SD x 3 (typically 0.5-2 min)
 - **Mass calibration**: Mean/median PPM error for MS1 and MS2
 - **Isolation scheme**: DIA window widths extracted from mzML
 
@@ -205,7 +303,7 @@ For each MS2 spectrum:
 
 1. **Candidate selection**: Find library entries whose precursor m/z falls within the isolation window AND whose calibrated RT is within tolerance
 2. **Design matrix**: Columns are pre-binned library spectra (no preprocessing, raw intensity)
-3. **NNLS ridge regression**: Minimize ‖Ax - b‖² + λ‖x‖² subject to x ≥ 0
+3. **NNLS ridge regression**: Minimize ||Ax - b||^2 + lambda*||x||^2 subject to x >= 0
 4. **Output**: Non-negative coefficient per candidate (how much of the observed signal this peptide explains)
 
 See: [Ridge Regression](ridge-regression.md)
@@ -214,7 +312,7 @@ See: [Ridge Regression](ridge-regression.md)
 
 ## Phase 4: Post-Regression Scoring
 
-After ridge regression assigns coefficients to all precursors across all spectra, Osprey aggregates these into coefficient time series per precursor and computes scoring features. **All scores are computed at the apex** -- the RT where the deconvoluted signal is strongest.
+After ridge regression assigns coefficients to all precursors across all spectra, Osprey aggregates these into coefficient time series per precursor and computes scoring features.
 
 ### Step 1: Coefficient Time Series
 
@@ -233,25 +331,27 @@ The peak detector identifies elution peaks in the coefficient time series using 
 
 See: [Peak Detection](peak-detection.md)
 
-### Step 3: Score Computation at Apex
+### Step 3: Tukey Median Polish and Peak Boundaries
 
-All spectral scores are computed at the apex spectrum (the observed MS2 spectrum closest to the coefficient apex RT). Each score captures a different aspect of the match:
+The top 6 library fragments' XICs are decomposed via Tukey median polish. The column
+effects give a robust shared elution profile (resistant to single-fragment interference).
+FWHM on this profile determines peak integration boundaries at +/-1.96*sigma from apex.
 
-| Score | Field | Description | Requires Library Intensities |
-|-------|-------|-------------|------------------------------|
-| LibCosine (sqrt) | `dot_product` | Cosine similarity, sqrt(intensity) preprocessing | Yes |
-| LibCosine SMZ | `dot_product_smz` | Cosine similarity, sqrt(intensity)×mz² preprocessing | Yes |
-| XCorr | `xcorr` | Comet-style cross-correlation | No |
-| Hyperscore | `hyperscore` | X!Tandem: log(n_b!) + log(n_y!) + Σlog(I+1) | No |
-| Delta RT | `rt_deviation` | Observed apex - predicted RT (minutes) | N/A |
+### Step 4: Score Computation
 
-Chromatographic features (peak shape, width, symmetry) and contextual features (regression quality, competitors) are also extracted.
+All features are computed within or at the peak boundaries:
 
-See: [Deconvolution Scoring](deconvolution-scoring.md)
+- **Fragment co-elution**: Per-fragment XIC correlations against the coefficient series
+- **Elution-weighted cosine**: LibCosine at each scan, weighted by coefficient^2
+- **Mass accuracy**: Mean/std of mass errors across matched fragments
+- **XCorr**: Comet-style cross-correlation at the apex spectrum
+- **Tukey median polish features**: Cosine, R^2, residual ratio from the XIC decomposition
+- **MS1 features**: Precursor co-elution and isotope cosine (HRAM only)
+- **Percolator-style**: Peptide length, missed cleavages, charge, RT deviation
 
-### Step 4: FDR Control via Mokapot
+### Step 5: FDR Control via Mokapot
 
-All 30 features for both targets and decoys are written to a PIN file. Mokapot performs semi-supervised learning (linear SVM) to combine features into an optimal discriminant score, then estimates q-values via target-decoy competition.
+All 37 features for both targets and decoys are written to a PIN file. Mokapot performs semi-supervised learning (linear SVM) to combine features into an optimal discriminant score, then estimates q-values via target-decoy competition.
 
 **Two-level FDR**:
 1. **Run-level**: Per-file FDR control
@@ -267,7 +367,7 @@ See: [FDR Control](fdr-control.md)
 |--------|----------------------|---------------------------|
 | **Purpose** | Establish RT/mass calibration | Determine peptide detections |
 | **Uses regression?** | No | Yes (scores the deconvoluted result) |
-| **Primary score** | XCorr + E-value | All 30 features |
+| **Primary score** | XCorr + E-value | All 37 features |
 | **Fragment matching** | Top-3 binary search (mass errors for calibration) | ppm-based at apex spectrum |
 | **FDR method** | Target-decoy competition on E-value (1% FDR) | Mokapot semi-supervised ML |
 | **Output** | RT curve + mass calibration | Peptide detections with q-values |
@@ -302,49 +402,50 @@ Library retention times may be predicted by deep learning models (Prosit, DeepLC
 
 ```
 osprey/
-├── osprey-core/              # Core types, config, errors, traits
-│   ├── config.rs             # YAML configuration structures
-│   ├── isotope.rs            # Isotope distribution calculations
-│   ├── types.rs              # LibraryEntry, Spectrum, FeatureSet, RegressionResult
-│   └── traits.rs             # MS1SpectrumLookup, etc.
-│
-├── osprey-io/                # File I/O
-│   ├── library/              # DIA-NN TSV, EncyclopeDIA elib, BiblioSpec blib
-│   ├── mzml/                 # mzML parsing (via mzdata crate)
-│   └── output/               # blib and report output
-│
-├── osprey-scoring/           # Spectral scoring and feature extraction
-│   ├── lib.rs                # SpectralScorer, FeatureExtractor, DecoyGenerator
-│   ├── batch.rs              # BLAS-accelerated batch scoring (calibration)
-│   └── pipeline/             # Streaming pipeline components
-│
-├── osprey-chromatography/    # Chromatographic analysis
-│   ├── lib.rs                # PeakDetector
-│   └── calibration/          # LOESS RT calibration, mass calibration, I/O
-│
-├── osprey-regression/        # Ridge regression engine
-│   ├── solver.rs             # Unified f32 CD-NNLS solver (unit res + HRAM)
-│   ├── cd_nnls.rs            # Coordinate Descent NNLS algorithm
-│   ├── ridge.rs              # Dense NNLS solver (f64, reference)
-│   ├── binning.rs            # m/z binning (Comet BIN macro)
-│   └── matrix.rs             # Design matrix construction
-│
-├── osprey-fdr/               # FDR control
-│   ├── lib.rs                # Target-decoy competition, q-values
-│   └── mokapot.rs            # PIN file output, Mokapot integration
-│
-└── osprey/                   # Main library + CLI binary
-    ├── main.rs               # CLI entry point
-    └── pipeline.rs           # Analysis pipeline orchestration
++-- osprey-core/              # Core types, config, errors, traits
+|   +-- config.rs             # YAML configuration structures
+|   +-- isotope.rs            # Isotope distribution calculations
+|   +-- types.rs              # LibraryEntry, Spectrum, FeatureSet, RegressionResult
+|   +-- traits.rs             # MS1SpectrumLookup, etc.
+|
++-- osprey-io/                # File I/O
+|   +-- library/              # DIA-NN TSV, EncyclopeDIA elib, BiblioSpec blib
+|   +-- mzml/                 # mzML parsing (via mzdata crate)
+|   +-- output/               # blib and report output
+|
++-- osprey-scoring/           # Spectral scoring and feature extraction
+|   +-- lib.rs                # SpectralScorer, FeatureExtractor, DecoyGenerator,
+|   |                         # Tukey median polish, fragment co-elution
+|   +-- batch.rs              # BLAS-accelerated batch scoring (calibration)
+|   +-- calibration_ml.rs     # LDA calibration scoring
+|   +-- pipeline/             # Streaming pipeline components
+|
++-- osprey-chromatography/    # Chromatographic analysis
+|   +-- lib.rs                # PeakDetector
+|   +-- calibration/          # LOESS RT calibration, mass calibration, I/O
+|
++-- osprey-regression/        # Ridge regression engine
+|   +-- solver.rs             # Unified f32 CD-NNLS solver (unit res + HRAM)
+|   +-- cd_nnls.rs            # Coordinate Descent NNLS algorithm
+|   +-- ridge.rs              # Dense NNLS solver (f64, reference)
+|   +-- binning.rs            # m/z binning (Comet BIN macro)
+|   +-- matrix.rs             # Design matrix construction
+|
++-- osprey-fdr/               # FDR control
+|   +-- lib.rs                # Target-decoy competition, q-values
+|   +-- mokapot.rs            # PIN file output, Mokapot integration
+|
++-- osprey/                   # Main library + CLI binary
+    +-- main.rs               # CLI entry point
+    +-- pipeline.rs           # Analysis pipeline orchestration
 ```
 
 ## Utility Scripts
 
 ```
 scripts/
-├── evaluate_calibration.py      # Generate HTML report from calibration JSON
-├── inspect_mokapot_weights.py   # Display Mokapot feature weights/importance
-└── ...
++-- evaluate_calibration.py      # Generate HTML report from calibration JSON
++-- inspect_mokapot_weights.py   # Display Mokapot feature weights/importance
 ```
 
 ### evaluate_calibration.py
@@ -352,7 +453,7 @@ scripts/
 Generates an interactive HTML report visualizing calibration quality:
 - RT calibration curve with residuals
 - MS1/MS2 mass error histograms
-- Candidate density heatmap (RT × m/z)
+- Candidate density heatmap (RT x m/z)
 
 ```bash
 python scripts/evaluate_calibration.py calibration.json --output report.html

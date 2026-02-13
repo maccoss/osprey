@@ -646,8 +646,6 @@ pub struct FeatureSet {
     pub top6_matches: u32,
     /// Fraction of observed intensity explained (at apex spectrum)
     pub explained_intensity: f64,
-    /// Mean explained intensity across spectra within ±1.96σ peak boundaries
-    pub explained_intensity_mean: f64,
 
     // Deconvoluted spectral features (from summed deconvoluted signal, apex ± 2 scans)
     // These compare the deconvoluted (coefficient-scaled) contribution to the library,
@@ -682,8 +680,6 @@ pub struct FeatureSet {
     pub spectral_complexity: f64,
     /// Regression residual
     pub regression_residual: f64,
-    /// Precursor intensity if MS1 available
-    pub precursor_intensity: Option<f64>,
     /// Number of modifications
     pub modification_count: u32,
 
@@ -748,6 +744,19 @@ pub struct FeatureSet {
     /// Cosine similarity between observed MS1 isotope envelope at apex RT and
     /// theoretical isotope distribution from peptide sequence.
     pub ms1_isotope_cosine: f64,
+
+    // Tukey median polish features (fragment XIC decomposition)
+    /// Cosine similarity between median-polish row effects (data-derived fragment intensities)
+    /// and library fragment intensities in linear space with sqrt preprocessing.
+    /// Higher = better agreement between observed and expected fragment pattern.
+    pub median_polish_cosine: f64,
+    /// R² of the additive model (μ + α_f + β_s) in linear space.
+    /// Measures how well the shared elution profile + fragment intensities explain
+    /// the observed XIC matrix. Zero-intensity cells included (penalizes missing signal).
+    pub median_polish_rsquared: f64,
+    /// Fraction of total signal unexplained: Σ|obs-pred| / Σobs in linear space.
+    /// Lower = cleaner co-elution. Zero-intensity cells included.
+    pub median_polish_residual_ratio: f64,
 }
 
 #[cfg(test)]
