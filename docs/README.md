@@ -18,8 +18,7 @@ Osprey has a **working prototype** that can:
 
 | Document | Description |
 |----------|-------------|
-| [RT Calibration](rt-calibration.md) | LOESS-based RT calibration with target-decoy FDR |
-| [Mass Calibration](mass-calibration.md) | MS1 (precursor) and MS2 (fragment) mass calibration |
+| [Calibration](calibration.md) | RT, MS1, and MS2 calibration with LDA scoring and LOESS fitting |
 | [Spectral Scoring](spectral-scoring.md) | XCorr + E-value scoring (calibration phase) |
 | [XCorr Scoring](xcorr-scoring.md) | Comet-style XCorr implementation |
 | [Deconvolution Scoring](deconvolution-scoring.md) | Post-regression scoring: all scores computed after ridge regression |
@@ -283,7 +282,7 @@ See: [Spectral Scoring](spectral-scoring.md), [XCorr Scoring](xcorr-scoring.md)
 - **Mass calibration**: Mean/median PPM error for MS1 and MS2
 - **Isolation scheme**: DIA window widths extracted from mzML
 
-See: [RT Calibration](rt-calibration.md), [Mass Calibration](mass-calibration.md)
+See: [Calibration](calibration.md)
 
 ### Multi-File Strategy
 

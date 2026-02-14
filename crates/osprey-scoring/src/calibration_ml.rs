@@ -6,6 +6,7 @@
 use crate::batch::CalibrationMatch;
 use osprey_core::OspreyError;
 use osprey_ml::{kde, linear_discriminant::LinearDiscriminantAnalysis, matrix::Matrix, qvalue};
+use std::collections::HashMap;
 
 /// Train LDA on calibration matches and score them using 3-fold cross-validation
 ///
@@ -36,12 +37,20 @@ pub fn train_and_score_calibration(
     // 2. Build target/decoy labels (true = decoy)
     let decoy_labels: Vec<bool> = matches.iter().map(|m| m.is_decoy).collect();
 
-    // 3. Extract sequences for fold grouping (keep charge states together)
+    // 3. Extract entry IDs for paired target-decoy competition
+    let entry_ids: Vec<u32> = matches.iter().map(|m| m.entry_id).collect();
+
+    // 4. Extract sequences for fold grouping (keep charge states together)
     let sequences: Vec<String> = matches.iter().map(|m| m.sequence.clone()).collect();
 
-    // 4. Train LDA with cross-validation and non-negative constraints
-    let discriminants =
-        train_lda_with_nonnegative_cv(&features, &decoy_labels, &sequences, use_isotope_feature)?;
+    // 5. Train LDA with cross-validation and non-negative constraints
+    let discriminants = train_lda_with_nonnegative_cv(
+        &features,
+        &decoy_labels,
+        &entry_ids,
+        &sequences,
+        use_isotope_feature,
+    )?;
 
     // 5. KDE for posterior error probabilities
     let kde_model = kde::Builder::default().build(&discriminants, &decoy_labels);
@@ -52,7 +61,29 @@ pub fn train_and_score_calibration(
         m.posterior_error = kde_model.posterior_error(discriminants[i]);
     }
 
-    // 7. Sort by discriminant score descending (best matches first)
+    // 7. Calculate q-values using paired target-decoy competition
+    //    IMPORTANT: Must happen BEFORE sorting matches, since entry_ids and
+    //    decoy_labels are in the original order (aligned with discriminants).
+    let all_indices: Vec<usize> = (0..matches.len()).collect();
+    let winner_indices =
+        compete_calibration_pairs(&discriminants, &entry_ids, &decoy_labels, &all_indices);
+
+    let winner_is_decoy: Vec<bool> = winner_indices.iter().map(|&i| decoy_labels[i]).collect();
+    let mut winner_q = vec![0.0; winner_indices.len()];
+    let n_passing = qvalue::calculate_q_values(&winner_is_decoy, &mut winner_q);
+
+    // Map q-values back: winners get their q-value, losers get 1.0
+    let mut q_values = vec![1.0; matches.len()];
+    for (rank, &idx) in winner_indices.iter().enumerate() {
+        q_values[idx] = winner_q[rank];
+    }
+
+    // 8. Assign q-values back to matches
+    for (i, m) in matches.iter_mut().enumerate() {
+        m.q_value = q_values[i];
+    }
+
+    // 9. Sort by discriminant score descending (best matches first)
     matches.sort_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
 
     // DEBUG: Log discriminant score distributions
@@ -93,16 +124,6 @@ pub fn train_and_score_calibration(
             decoy_min,
             decoy_max
         );
-    }
-
-    // 8. Calculate q-values using target-decoy competition
-    let is_decoy: Vec<bool> = matches.iter().map(|m| m.is_decoy).collect();
-    let mut q_values = vec![0.0; matches.len()];
-    let n_passing = qvalue::calculate_q_values(&is_decoy, &mut q_values);
-
-    // 9. Assign q-values back to matches
-    for (i, m) in matches.iter_mut().enumerate() {
-        m.q_value = q_values[i];
     }
 
     log::info!("LDA scoring complete: {} matches passing 1% FDR", n_passing);
@@ -217,6 +238,7 @@ fn train_lda_single_model(
 fn train_lda_with_nonnegative_cv(
     features: &Matrix,
     decoy_labels: &[bool],
+    entry_ids: &[u32],
     sequences: &[String],
     _use_isotope_feature: bool,
 ) -> Result<Vec<f64>, OspreyError> {
@@ -237,7 +259,7 @@ fn train_lda_with_nonnegative_cv(
     let mut best_feat_passing = 0;
     for feat_idx in 0..n_features {
         let feat_scores: Vec<f64> = (0..n_samples).map(|i| features[(i, feat_idx)]).collect();
-        let n_pass = count_passing_targets(&feat_scores, decoy_labels, 0.01);
+        let n_pass = count_passing_targets(&feat_scores, decoy_labels, entry_ids, 0.01);
         log::info!(
             "  Initial feature '{}': {} pass 1% FDR",
             feature_names[feat_idx],
@@ -286,6 +308,7 @@ fn train_lda_with_nonnegative_cv(
             let selected_target_indices = select_positive_training_set(
                 &current_scores,
                 decoy_labels,
+                entry_ids,
                 &train_indices,
                 TRAIN_FDR,
                 MIN_POSITIVE_EXAMPLES,
@@ -374,7 +397,7 @@ fn train_lda_with_nonnegative_cv(
             .map_err(OspreyError::config)?;
         let new_scores = lda_consensus.predict(features);
 
-        let n_passing = count_passing_targets(&new_scores, decoy_labels, 0.01);
+        let n_passing = count_passing_targets(&new_scores, decoy_labels, entry_ids, 0.01);
 
         log::info!(
             "  Iteration {}: weights=[{}], selected {} train targets, {} pass 1% FDR",
@@ -438,10 +461,12 @@ fn train_lda_with_nonnegative_cv(
 ///
 /// This is the key Percolator/Mokapot innovation: don't train on all targets (noisy),
 /// train only on targets that pass an FDR threshold (clean positive examples).
+/// Uses paired target-decoy competition within the subset.
 ///
 /// # Arguments
 /// * `scores` - Current discriminant scores for ALL samples
 /// * `decoy_labels` - Target/decoy labels for ALL samples
+/// * `entry_ids` - Entry IDs for ALL samples (for pairing via `id & 0x7FFFFFFF`)
 /// * `subset_indices` - Indices of samples to consider (train set)
 /// * `fdr_threshold` - Q-value threshold for selecting targets (e.g., 0.01)
 /// * `min_targets` - Minimum number of targets to select
@@ -451,59 +476,38 @@ fn train_lda_with_nonnegative_cv(
 fn select_positive_training_set(
     scores: &[f64],
     decoy_labels: &[bool],
+    entry_ids: &[u32],
     subset_indices: &[usize],
     fdr_threshold: f64,
     min_targets: usize,
 ) -> Vec<usize> {
-    // Sort subset by score descending
-    let mut sorted_indices: Vec<usize> = subset_indices.to_vec();
-    sorted_indices.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+    // Paired competition within subset: only winners enter FDR walk
+    let winner_indices = compete_calibration_pairs(scores, entry_ids, decoy_labels, subset_indices);
 
-    // Calculate q-values using target-decoy competition within subset
-    let mut targets_so_far = 0usize;
-    let mut decoys_so_far = 0usize;
-    let mut q_values = vec![1.0; sorted_indices.len()];
-
-    for (rank, &idx) in sorted_indices.iter().enumerate() {
-        if decoy_labels[idx] {
-            decoys_so_far += 1;
-        } else {
-            targets_so_far += 1;
-        }
-
-        if targets_so_far > 0 {
-            q_values[rank] = decoys_so_far as f64 / targets_so_far as f64;
-        }
+    // Compute q-values on winners (already sorted by score descending)
+    let winner_is_decoy: Vec<bool> = winner_indices.iter().map(|&i| decoy_labels[i]).collect();
+    let mut q_values = vec![1.0; winner_indices.len()];
+    if !winner_indices.is_empty() {
+        qvalue::calculate_q_values(&winner_is_decoy, &mut q_values);
     }
 
-    // Make q-values monotonically non-decreasing from the bottom
-    let mut min_q = f64::INFINITY;
-    for q in q_values.iter_mut().rev() {
-        if *q < min_q {
-            min_q = *q;
-        } else {
-            *q = min_q;
-        }
-    }
+    // Select targets with q ≤ threshold
+    let select_at_threshold = |threshold: f64| -> Vec<usize> {
+        winner_indices
+            .iter()
+            .enumerate()
+            .filter(|&(rank, &idx)| !decoy_labels[idx] && q_values[rank] <= threshold)
+            .map(|(_, &idx)| idx)
+            .collect()
+    };
 
-    // Select targets with q < threshold
-    let mut selected: Vec<usize> = Vec::new();
-    for (rank, &idx) in sorted_indices.iter().enumerate() {
-        if !decoy_labels[idx] && q_values[rank] <= fdr_threshold {
-            selected.push(idx);
-        }
-    }
+    let mut selected = select_at_threshold(fdr_threshold);
 
     // If too few, relax threshold progressively
     if selected.len() < min_targets {
         let relaxed_thresholds = [0.05, 0.10, 0.25, 0.50];
         for &threshold in &relaxed_thresholds {
-            selected.clear();
-            for (rank, &idx) in sorted_indices.iter().enumerate() {
-                if !decoy_labels[idx] && q_values[rank] <= threshold {
-                    selected.push(idx);
-                }
-            }
+            selected = select_at_threshold(threshold);
             if selected.len() >= min_targets {
                 log::debug!(
                     "      Relaxed training FDR to {:.0}% to get {} targets",
@@ -518,42 +522,75 @@ fn select_positive_training_set(
     selected
 }
 
-/// Count targets passing a given FDR threshold
-fn count_passing_targets(scores: &[f64], decoy_labels: &[bool], fdr_threshold: f64) -> usize {
-    // Sort by score descending
-    let mut indices: Vec<usize> = (0..scores.len()).collect();
-    indices.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
-
-    let mut targets = 0usize;
-    let mut decoys = 0usize;
-    let mut n_passing = 0usize;
-    let mut min_q = f64::INFINITY;
-
-    // Forward pass to compute q-values and count passing
-    let mut q_values = vec![1.0; indices.len()];
-    for (rank, &idx) in indices.iter().enumerate() {
-        if decoy_labels[idx] {
-            decoys += 1;
-        } else {
-            targets += 1;
-        }
-        if targets > 0 {
-            q_values[rank] = decoys as f64 / targets as f64;
-        }
-    }
-
-    // Make monotonic from bottom
-    for q in q_values.iter_mut().rev() {
-        if *q < min_q {
-            min_q = *q;
-        } else {
-            *q = min_q;
+/// Paired target-decoy competition for calibration matches.
+///
+/// Groups matches by `entry_id & 0x7FFFFFFF`, competes each pair on the given
+/// score, and returns only winner indices (sorted by score descending).
+/// Singletons auto-win. Ties go to decoy (conservative for FDR estimation).
+fn compete_calibration_pairs(
+    scores: &[f64],
+    entry_ids: &[u32],
+    is_decoy: &[bool],
+    subset_indices: &[usize],
+) -> Vec<usize> {
+    // Group indices by base_id = entry_id & 0x7FFFFFFF
+    let mut groups: HashMap<u32, (Option<usize>, Option<usize>)> = HashMap::new();
+    for &idx in subset_indices {
+        let base_id = entry_ids[idx] & 0x7FFFFFFF;
+        let slot = groups.entry(base_id).or_insert((None, None));
+        if is_decoy[idx] {
+            // Keep the decoy with the higher score if multiple per base_id
+            if slot.1.map_or(true, |prev| scores[idx] > scores[prev]) {
+                slot.1 = Some(idx);
+            }
+        } else if slot.0.map_or(true, |prev| scores[idx] > scores[prev]) {
+            slot.0 = Some(idx);
         }
     }
 
-    // Count targets passing
-    for (rank, &idx) in indices.iter().enumerate() {
-        if !decoy_labels[idx] && q_values[rank] <= fdr_threshold {
+    // Compete each pair
+    let mut winners: Vec<usize> = Vec::with_capacity(groups.len());
+    for (target_opt, decoy_opt) in groups.values() {
+        match (*target_opt, *decoy_opt) {
+            (Some(t), None) => winners.push(t),
+            (None, Some(d)) => winners.push(d),
+            (Some(t), Some(d)) => {
+                if scores[t] > scores[d] {
+                    winners.push(t); // strict >: ties go to decoy
+                } else {
+                    winners.push(d);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    // Sort winners by score descending
+    winners.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+    winners
+}
+
+/// Count targets passing a given FDR threshold using paired competition
+fn count_passing_targets(
+    scores: &[f64],
+    decoy_labels: &[bool],
+    entry_ids: &[u32],
+    fdr_threshold: f64,
+) -> usize {
+    let all_indices: Vec<usize> = (0..scores.len()).collect();
+
+    // Paired competition: only winners enter FDR walk
+    let winner_indices = compete_calibration_pairs(scores, entry_ids, decoy_labels, &all_indices);
+
+    // Compute q-values on winners (already sorted by score descending)
+    let winner_is_decoy: Vec<bool> = winner_indices.iter().map(|&i| decoy_labels[i]).collect();
+    let mut winner_q = vec![0.0; winner_indices.len()];
+    qvalue::calculate_q_values(&winner_is_decoy, &mut winner_q);
+
+    // Count passing targets
+    let mut n_passing = 0;
+    for (rank, &idx) in winner_indices.iter().enumerate() {
+        if !decoy_labels[idx] && winner_q[rank] <= fdr_threshold {
             n_passing += 1;
         }
     }
@@ -743,6 +780,7 @@ mod tests {
     use super::*;
 
     fn make_test_match(
+        entry_id: u32,
         correlation: f64,
         libcosine: f64,
         top6: u8,
@@ -751,7 +789,7 @@ mod tests {
         is_decoy: bool,
     ) -> CalibrationMatch {
         CalibrationMatch {
-            entry_id: 1,
+            entry_id,
             is_decoy,
             library_rt: 10.0,
             measured_rt: 10.0,
@@ -786,8 +824,8 @@ mod tests {
     #[test]
     fn test_feature_matrix_extraction() {
         let matches = vec![
-            make_test_match(3.0, 0.8, 5, 10.0, Some(0.9), false),
-            make_test_match(1.5, 0.5, 3, 5.0, Some(0.7), true),
+            make_test_match(1, 3.0, 0.8, 5, 10.0, Some(0.9), false),
+            make_test_match(1 | 0x80000000, 1.5, 0.5, 3, 5.0, Some(0.7), true),
         ];
 
         // Test 4 features: correlation, libcosine, top6, snr (isotope not used in LDA)
@@ -809,18 +847,21 @@ mod tests {
     fn test_lda_training() {
         // Create synthetic data: targets have higher scores
         // Use distinct sequences so fold assignment distributes across folds
+        // Each target is paired with a decoy via entry_id (high bit = decoy)
         let mut matches = vec![];
 
-        // 10 good targets with distinct sequences
+        // 10 good targets with distinct sequences and unique entry_ids
         for i in 0..10 {
-            let mut m = make_test_match(4.0, 0.9, 6, 15.0, Some(0.95), false);
+            let entry_id = (i + 1) as u32; // IDs 1-10
+            let mut m = make_test_match(entry_id, 4.0, 0.9, 6, 15.0, Some(0.95), false);
             m.sequence = format!("TARGET{}", i);
             matches.push(m);
         }
 
-        // 10 poor decoys with distinct sequences
+        // 10 poor decoys with distinct sequences, paired with targets via entry_id
         for i in 0..10 {
-            let mut m = make_test_match(1.0, 0.3, 2, 3.0, Some(0.5), true);
+            let entry_id = ((i + 1) as u32) | 0x80000000; // Paired with target i+1
+            let mut m = make_test_match(entry_id, 1.0, 0.3, 2, 3.0, Some(0.5), true);
             m.sequence = format!("DECOY{}", i);
             matches.push(m);
         }
@@ -847,5 +888,96 @@ mod tests {
             avg_target > avg_decoy,
             "Targets should score higher than decoys"
         );
+    }
+
+    #[test]
+    fn test_compete_calibration_pairs_target_wins() {
+        // Target has higher score → target wins
+        let scores = vec![0.8, 0.3];
+        let entry_ids = vec![1_u32, 1 | 0x80000000];
+        let is_decoy = vec![false, true];
+        let indices: Vec<usize> = vec![0, 1];
+
+        let winners = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0], 0); // target wins
+    }
+
+    #[test]
+    fn test_compete_calibration_pairs_decoy_wins() {
+        // Decoy has higher score → decoy wins
+        let scores = vec![0.3, 0.8];
+        let entry_ids = vec![1_u32, 1 | 0x80000000];
+        let is_decoy = vec![false, true];
+        let indices: Vec<usize> = vec![0, 1];
+
+        let winners = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0], 1); // decoy wins
+    }
+
+    #[test]
+    fn test_compete_calibration_pairs_tie_goes_to_decoy() {
+        // Equal scores → decoy wins (conservative)
+        let scores = vec![0.5, 0.5];
+        let entry_ids = vec![1_u32, 1 | 0x80000000];
+        let is_decoy = vec![false, true];
+        let indices: Vec<usize> = vec![0, 1];
+
+        let winners = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0], 1); // decoy wins on tie
+    }
+
+    #[test]
+    fn test_compete_calibration_pairs_singleton_auto_wins() {
+        // Unpaired entries auto-win
+        let scores = vec![0.8, 0.6];
+        let entry_ids = vec![1_u32, 2_u32]; // Different base IDs, no pairing
+        let is_decoy = vec![false, false];
+        let indices: Vec<usize> = vec![0, 1];
+
+        let winners = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+        assert_eq!(winners.len(), 2); // Both auto-win
+    }
+
+    #[test]
+    fn test_compete_calibration_pairs_multiple_pairs() {
+        // Two pairs: pair 1 target wins, pair 2 decoy wins
+        let scores = vec![0.9, 0.2, 0.3, 0.7];
+        let entry_ids = vec![1_u32, 1 | 0x80000000, 2_u32, 2 | 0x80000000];
+        let is_decoy = vec![false, true, false, true];
+        let indices: Vec<usize> = vec![0, 1, 2, 3];
+
+        let winners = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+        assert_eq!(winners.len(), 2);
+        // Winners sorted by score descending: target(0.9), decoy(0.7)
+        assert_eq!(winners[0], 0); // target from pair 1 (score 0.9)
+        assert_eq!(winners[1], 3); // decoy from pair 2 (score 0.7)
+    }
+
+    #[test]
+    fn test_compete_calibration_pairs_empty_input() {
+        let scores: Vec<f64> = vec![];
+        let entry_ids: Vec<u32> = vec![];
+        let is_decoy: Vec<bool> = vec![];
+        let indices: Vec<usize> = vec![];
+
+        let winners = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+        assert!(winners.is_empty());
+    }
+
+    #[test]
+    fn test_compete_calibration_pairs_subset() {
+        // Only a subset of indices are considered
+        let scores = vec![0.9, 0.2, 0.3, 0.7];
+        let entry_ids = vec![1_u32, 1 | 0x80000000, 2_u32, 2 | 0x80000000];
+        let is_decoy = vec![false, true, false, true];
+        // Only consider pair 2 (indices 2 and 3)
+        let indices: Vec<usize> = vec![2, 3];
+
+        let winners = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0], 3); // decoy wins (0.7 > 0.3)
     }
 }

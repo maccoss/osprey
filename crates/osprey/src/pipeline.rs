@@ -1061,18 +1061,33 @@ fn run_calibration_discovery_windowed(
     }
 
     // Calibration sampling with retry loop
-    // Attempt 1: sample calibration_sample_size targets (default 5000)
-    // Attempt 2: expand by retry_factor (default 3×)
+    // Attempt 1: sample calibration_sample_size targets
+    // Attempt 2: expand by retry_factor (default 2×)
     // Attempt 3: use ALL library entries (guaranteed fallback)
     // Matches accumulate across attempts — FDR runs on the combined set.
+    // If the library has fewer targets than requested, we use all and skip retries.
     let sample_size = rt_config.calibration_sample_size;
     let retry_factor = rt_config.calibration_retry_factor;
-    let max_attempts: usize = if sample_size > 0 && retry_factor > 1.0 {
-        3
-    } else {
-        1
-    };
+    let n_total_targets = library.iter().filter(|e| !e.is_decoy).count();
+    let max_attempts: usize =
+        if sample_size > 0 && retry_factor > 1.0 && n_total_targets > sample_size {
+            3
+        } else {
+            1
+        };
     let mut current_sample_size = sample_size;
+
+    log::info!(
+        "Calibration: library has {} targets, requesting {} per attempt ({} attempt{} max)",
+        n_total_targets,
+        if current_sample_size == 0 || n_total_targets <= current_sample_size {
+            "all".to_string()
+        } else {
+            format!("{}", current_sample_size)
+        },
+        max_attempts,
+        if max_attempts == 1 { "" } else { "s" }
+    );
 
     // Accumulate best match per entry across all attempts
     let mut accumulated_matches: HashMap<u32, CalibrationMatch> = HashMap::new();
@@ -1081,15 +1096,23 @@ fn run_calibration_discovery_windowed(
         let calibration_library =
             sample_library_for_calibration(library, current_sample_size, 42 + attempt as u64);
 
+        let n_sampled_targets = calibration_library.iter().filter(|e| !e.is_decoy).count();
+        let n_sampled_decoys = calibration_library.len() - n_sampled_targets;
+        let used_all = calibration_library.len() == library.len();
+
         log::info!(
-            "Calibration attempt {}/{}: {} entries ({})",
+            "Calibration attempt {}/{}: {} targets + {} decoys{}",
             attempt,
             max_attempts,
-            calibration_library.len(),
-            if current_sample_size == 0 {
-                "ALL targets".to_string()
+            n_sampled_targets,
+            n_sampled_decoys,
+            if used_all {
+                " (entire library)".to_string()
             } else {
-                format!("{} targets sampled", current_sample_size)
+                format!(
+                    " ({:.0}% of library)",
+                    n_sampled_targets as f64 / n_total_targets.max(1) as f64 * 100.0
+                )
             }
         );
 
@@ -1265,15 +1288,14 @@ fn run_calibration_discovery_windowed(
         const ABSOLUTE_MIN_CALIBRATION_POINTS: usize = 50;
 
         if num_confident_peptides < rt_config.min_calibration_points {
-            if attempt < max_attempts {
-                // Not the final attempt - retry with more targets
+            if attempt < max_attempts && !used_all {
+                // Not the final attempt and haven't used all entries yet - retry with more
                 // Determine next sample size
                 if attempt + 1 == max_attempts {
                     // Final attempt always uses ALL library entries
                     current_sample_size = 0;
                 } else {
                     let new_size = (current_sample_size as f64 * retry_factor) as usize;
-                    let n_total_targets = library.iter().filter(|e| !e.is_decoy).count();
                     if new_size >= n_total_targets {
                         current_sample_size = 0;
                     } else {

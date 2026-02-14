@@ -1465,10 +1465,11 @@ pub fn sample_library_for_calibration(
     let decoys: Vec<&LibraryEntry> = library.iter().filter(|e| e.is_decoy).collect();
 
     if targets.len() <= sample_size {
-        log::debug!(
-            "Library has {} targets, using all (sample_size={})",
+        log::info!(
+            "Calibration sampling: library has {} targets (<= requested {}), using all {} entries",
             targets.len(),
-            sample_size
+            sample_size,
+            library.len()
         );
         return library.to_vec();
     }

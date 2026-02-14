@@ -1,7 +1,76 @@
-cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hra
+cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hram
 
 
 cargo run --release -- -i *.mzML -l ../hela-filtered-SkylineAI_spectral_library.tsv -o stellar-ospreyoutput.blib --fragment-unit mz --fragment-tolerance 0.25 --resolution unit
 
 
 python3 visualize_pin_features.py ../example_test_data/stellar/calibrated-GPF-data/mokapot/Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars.pin --output report-stellar.html
+
+
+Usage: osprey [OPTIONS]
+
+Options:
+  -c, --config <CONFIG>
+          Configuration file (YAML format)
+
+      --generate-config <GENERATE_CONFIG>
+          Generate a template configuration file
+
+  -i, --input <INPUT>...
+          Input mzML file(s)
+
+  -l, --library <LIBRARY>
+          Spectral library file (.tsv for DIA-NN, .blib, or .elib)
+
+  -o, --output <OUTPUT>
+          Output results file (.blib format for Skyline)
+
+      --resolution <RESOLUTION>
+          Resolution mode: unit, hram, auto
+          
+          [default: auto]
+
+      --fragment-tolerance <FRAGMENT_TOLERANCE>
+          Fragment m/z tolerance (e.g., 10 for 10 ppm, or 0.3 for 0.3 Th)
+
+      --fragment-unit <FRAGMENT_UNIT>
+          Fragment tolerance unit: ppm, mz (Thompson)
+
+      --precursor-tolerance <PRECURSOR_TOLERANCE>
+          Precursor m/z tolerance (e.g., 10 for 10 ppm, or 1.0 for 1.0 Th)
+
+      --precursor-unit <PRECURSOR_UNIT>
+          Precursor tolerance unit: ppm, mz (Thompson)
+
+      --rt-tolerance <RT_TOLERANCE>
+          RT tolerance in minutes (fallback when calibration disabled)
+          
+          [default: 2]
+
+      --no-rt-calibration
+          Disable RT calibration (use fixed rt_tolerance instead)
+
+      --lambda <LAMBDA>
+          Fixed regularization parameter lambda
+
+      --max-candidates <MAX_CANDIDATES>
+          Maximum candidates per spectrum (use 0 for unlimited)
+          
+          [default: 5250]
+
+      --run-fdr <RUN_FDR>
+          Run-level FDR threshold
+          
+          [default: 0.01]
+
+      --threads <THREADS>
+          Number of threads (default: all available)
+
+      --report <REPORT>
+          Write TSV report to this file
+
+      --export-coefficients
+          Export coefficient time series to parquet file(s)
+
+  -v, --verbose
+          Verbose output
