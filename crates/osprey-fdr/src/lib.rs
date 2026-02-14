@@ -9,7 +9,8 @@
 pub mod mokapot;
 
 pub use mokapot::{
-    get_pin_feature_names, pin_feature_value, MokapotResult, MokapotRunner, PsmFeatures,
+    coelution_pin_feature_value, get_coelution_pin_feature_names, get_pin_feature_names,
+    pin_feature_value, MokapotResult, MokapotRunner, PsmFeatures, NUM_COELUTION_PIN_FEATURES,
     NUM_PIN_FEATURES,
 };
 

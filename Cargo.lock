@@ -1535,6 +1535,7 @@ dependencies = [
  "log",
  "ndarray",
  "openblas-src",
+ "osprey-chromatography",
  "osprey-core",
  "osprey-io",
  "osprey-ml",

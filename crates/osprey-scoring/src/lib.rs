@@ -1378,35 +1378,6 @@ pub fn compute_fwhm_interpolated(series: &[(f64, f64)]) -> Option<(f64, f64, f64
     }
 }
 
-/// Calculate signal-to-noise ratio from a time series.
-///
-/// Uses FWHM-based peak boundaries (±1.96σ) to define the peak region.
-/// Background is measured from 3-5 points on each side outside these boundaries.
-/// SNR = (apex - background_mean) / background_sd.
-///
-/// Works on any (RT, value) series — coefficient series or fragment XICs.
-pub fn compute_signal_to_noise(
-    series: &[(f64, f64)],
-    apex_idx: usize,
-    apex_value: f64,
-) -> Option<f64> {
-    if series.len() < 10 || apex_value <= 0.0 {
-        return None;
-    }
-
-    let bg = compute_background_stats(series, apex_idx)?;
-
-    if bg.sd <= 1e-10 {
-        return None;
-    }
-
-    // S/N = (signal - background) / noise
-    let signal = apex_value - bg.mean;
-    let snr = signal / bg.sd;
-
-    Some(snr.max(0.0))
-}
-
 /// Background statistics from flanking points outside the peak region.
 pub struct BackgroundStats {
     /// Mean of background points
@@ -1756,11 +1727,13 @@ impl SpectralScorer {
                 j += 1;
             }
 
-            // Raw intensities for Pearson/Spearman (0 for unmatched)
+            // Raw intensities for base_peak_rank (0 for unmatched)
             lib_intensities.push(frag.relative_intensity as f64);
             obs_intensities.push(best_intensity);
 
-            // Sqrt-preprocessed for cosine (0 for unmatched)
+            // Sqrt-preprocessed for cosine, Pearson, and Spearman (0 for unmatched).
+            // Sqrt compresses the dynamic range so all fragments contribute more
+            // equally, rather than being dominated by a single high-intensity peak.
             lib_preprocessed.push((frag.relative_intensity as f64).sqrt());
             obs_preprocessed.push(best_intensity.sqrt());
         }
@@ -1783,9 +1756,12 @@ impl SpectralScorer {
             .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
             .sum();
 
-        // Pearson and Spearman use all fragments (0 for unmatched is informative)
-        let pearson_correlation = Self::pearson_correlation(&lib_intensities, &obs_intensities);
-        let spearman_correlation = Self::spearman_correlation(&lib_intensities, &obs_intensities);
+        // Pearson and Spearman use sqrt-preprocessed intensities including zeros
+        // for unmatched fragments. The zeros are essential — they penalize missing
+        // matches. Without them, a decoy with 2 random matches would score higher
+        // than a target with 6 matches but some noise.
+        let pearson_correlation = Self::pearson_correlation(&lib_preprocessed, &obs_preprocessed);
+        let spearman_correlation = Self::spearman_correlation(&lib_preprocessed, &obs_preprocessed);
 
         // Counting metrics use matched fragments only (presence-based)
         let n_matched = matches.len() as u32;
@@ -1812,6 +1788,29 @@ impl SpectralScorer {
         // Compute X!Tandem hyperscore
         let (hyperscore_val, n_matched_b, n_matched_y) = self.hyperscore(observed, library);
 
+        // Compute top-N cosine variants (top 6, 5, 4 library fragments by intensity).
+        // Sort fragment pairs by library intensity descending, then compute cosine
+        // on the top N. Peptides with fewer than N fragments use all available.
+        let mut frag_data: Vec<(f64, f64, f64)> = lib_intensities
+            .iter()
+            .zip(obs_intensities.iter())
+            .zip(
+                library
+                    .fragments
+                    .iter()
+                    .filter(|f| f.mz >= spec_mz_min && f.mz <= spec_mz_max),
+            )
+            .map(|((lib, obs), frag)| (*lib, *obs, frag.mz))
+            .collect();
+        frag_data.sort_by(|a, b| b.0.total_cmp(&a.0)); // descending by lib intensity
+
+        let dot_product_top6 = Self::cosine_topn_sqrt(&frag_data, 6);
+        let dot_product_top5 = Self::cosine_topn_sqrt(&frag_data, 5);
+        let dot_product_top4 = Self::cosine_topn_sqrt(&frag_data, 4);
+        let dot_product_smz_top6 = Self::cosine_topn_smz(&frag_data, 6);
+        let dot_product_smz_top5 = Self::cosine_topn_smz(&frag_data, 5);
+        let dot_product_smz_top4 = Self::cosine_topn_smz(&frag_data, 4);
+
         SpectralScore {
             lib_cosine: dot_product,
             lib_cosine_smz,
@@ -1830,7 +1829,62 @@ impl SpectralScorer {
             top6_matches,
             n_matched_b,
             n_matched_y,
+            dot_product_top6,
+            dot_product_top5,
+            dot_product_top4,
+            dot_product_smz_top6,
+            dot_product_smz_top5,
+            dot_product_smz_top4,
         }
+    }
+
+    /// Compute cosine similarity on the top N fragments (by library intensity)
+    /// using sqrt preprocessing. `frag_data` must be sorted by library intensity
+    /// descending. Each entry is (lib_intensity_raw, obs_intensity_raw, mz).
+    fn cosine_topn_sqrt(frag_data: &[(f64, f64, f64)], n: usize) -> f64 {
+        let subset = &frag_data[..frag_data.len().min(n)];
+        if subset.len() < 2 {
+            return 0.0;
+        }
+        let lib_sqrt: Vec<f64> = subset.iter().map(|(lib, _, _)| lib.sqrt()).collect();
+        let obs_sqrt: Vec<f64> = subset.iter().map(|(_, obs, _)| obs.sqrt()).collect();
+        let lib_norm = lib_sqrt.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let obs_norm = obs_sqrt.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if lib_norm < 1e-10 || obs_norm < 1e-10 {
+            return 0.0;
+        }
+        lib_sqrt
+            .iter()
+            .zip(obs_sqrt.iter())
+            .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
+            .sum()
+    }
+
+    /// Compute cosine similarity on the top N fragments (by library intensity)
+    /// using SMZ preprocessing (sqrt(intensity) * mz²).
+    fn cosine_topn_smz(frag_data: &[(f64, f64, f64)], n: usize) -> f64 {
+        let subset = &frag_data[..frag_data.len().min(n)];
+        if subset.len() < 2 {
+            return 0.0;
+        }
+        let lib_smz: Vec<f64> = subset
+            .iter()
+            .map(|(lib, _, mz)| lib.sqrt() * mz * mz)
+            .collect();
+        let obs_smz: Vec<f64> = subset
+            .iter()
+            .map(|(_, obs, mz)| obs.sqrt() * mz * mz)
+            .collect();
+        let lib_norm = lib_smz.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let obs_norm = obs_smz.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if lib_norm < 1e-10 || obs_norm < 1e-10 {
+            return 0.0;
+        }
+        lib_smz
+            .iter()
+            .zip(obs_smz.iter())
+            .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
+            .sum()
     }
 
     /// Compute Pearson correlation coefficient
@@ -2100,23 +2154,8 @@ impl SpectralScorer {
         let xcorr_scaled = xcorr_raw * 0.005f32;
 
         SpectralScore {
-            lib_cosine: lib_cosine_score.lib_cosine,
-            lib_cosine_smz: lib_cosine_score.lib_cosine_smz,
             xcorr: xcorr_scaled as f64,
-            hyperscore: lib_cosine_score.hyperscore,
-            dot_product: lib_cosine_score.dot_product,
-            n_matched: lib_cosine_score.n_matched,
-            n_library: lib_cosine_score.n_library,
-            fragment_coverage: lib_cosine_score.fragment_coverage,
-            explained_intensity: lib_cosine_score.explained_intensity,
-            pearson_correlation: lib_cosine_score.pearson_correlation,
-            spearman_correlation: lib_cosine_score.spearman_correlation,
-            consecutive_ions: lib_cosine_score.consecutive_ions,
-            sequence_coverage: lib_cosine_score.sequence_coverage,
-            base_peak_rank: lib_cosine_score.base_peak_rank,
-            top6_matches: lib_cosine_score.top6_matches,
-            n_matched_b: lib_cosine_score.n_matched_b,
-            n_matched_y: lib_cosine_score.n_matched_y,
+            ..lib_cosine_score
         }
     }
 
@@ -2463,6 +2502,18 @@ pub struct SpectralScore {
     pub n_matched_b: u32,
     /// Number of matched y-ions (for hyperscore)
     pub n_matched_y: u32,
+    /// LibCosine using only top 6 library fragments by intensity
+    pub dot_product_top6: f64,
+    /// LibCosine using only top 5 library fragments by intensity
+    pub dot_product_top5: f64,
+    /// LibCosine using only top 4 library fragments by intensity
+    pub dot_product_top4: f64,
+    /// SMZ cosine using only top 6 library fragments by intensity
+    pub dot_product_smz_top6: f64,
+    /// SMZ cosine using only top 5 library fragments by intensity
+    pub dot_product_smz_top5: f64,
+    /// SMZ cosine using only top 4 library fragments by intensity
+    pub dot_product_smz_top4: f64,
 }
 
 /// Fragment matching result with observed m/z for mass accuracy computation
@@ -2971,10 +3022,13 @@ impl FeatureExtractor {
             features.peak_prominence = self.compute_peak_prominence(coefficient_series, apex_value);
 
             // FR-5.1.12: Signal-to-noise ratio
-            if let Some(snr) =
-                self.compute_signal_to_noise(coefficient_series, apex_idx, apex_value)
+            // Use detect_xic_peak for DIA-NN-style boundary detection on the
+            // coefficient series, then compute_snr with 5 points before/after.
+            // Same approach as coelution and calibration.
+            if let Some(coef_peak) =
+                osprey_chromatography::detect_xic_peak(coefficient_series, 0.01, 5.0, expected_rt)
             {
-                features.signal_to_noise = snr;
+                features.signal_to_noise = coef_peak.signal_to_noise;
             }
 
             // FR-5.1.3: EMG fit quality (simplified - use symmetry as proxy)
@@ -2992,11 +3046,6 @@ impl FeatureExtractor {
 
             // LibCosine with sqrt(intensity)*mz² (SMZ) preprocessing
             features.dot_product_smz = spectral_score.lib_cosine_smz;
-
-            // FR-5.2.3: Normalized spectral contrast angle
-            features.spectral_contrast_angle = (spectral_score.lib_cosine.clamp(-1.0, 1.0))
-                .acos()
-                .to_degrees();
 
             // FR-5.2.7: Fragment coverage (fraction detected)
             features.fragment_coverage = spectral_score.fragment_coverage;
@@ -3253,16 +3302,6 @@ impl FeatureExtractor {
         } else {
             0.0
         }
-    }
-
-    /// Calculate signal-to-noise ratio from coefficient series
-    fn compute_signal_to_noise(
-        &self,
-        series: &[(f64, f64)],
-        apex_idx: usize,
-        apex_value: f64,
-    ) -> Option<f64> {
-        compute_signal_to_noise(series, apex_idx, apex_value)
     }
 
     /// Estimate EMG fit quality (heuristic based on peak shape)

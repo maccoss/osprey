@@ -163,6 +163,10 @@ struct Args {
     #[arg(long)]
     export_coefficients: bool,
 
+    /// Search mode: regression (default) or coelution
+    #[arg(long, default_value = "regression")]
+    search_mode: String,
+
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -296,6 +300,15 @@ fn main() -> Result<()> {
             config.fragment_tolerance.unit
         );
     }
+
+    // Override search mode if specified
+    config.search_mode = match args.search_mode.to_lowercase().as_str() {
+        "coelution" | "coelution-search" => {
+            log::info!("Search mode: coelution (DIA-NN style fragment co-elution)");
+            osprey::SearchMode::Coelution
+        }
+        _ => config.search_mode,
+    };
 
     // Set max candidates
     config.max_candidates_per_spectrum = args.max_candidates;

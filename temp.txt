@@ -1,5 +1,7 @@
 cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hram
 
+cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hram --search-mode coelution
+
 
 cargo run --release -- -i *.mzML -l ../hela-filtered-SkylineAI_spectral_library.tsv -o stellar-ospreyoutput.blib --fragment-unit mz --fragment-tolerance 0.25 --resolution unit
 

@@ -2413,12 +2413,13 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
 
 /// Minimum number of spectra required for co-elution scoring.
 /// Fewer than 3 time points makes Pearson correlation unreliable.
-const MIN_COELUTION_SPECTRA: usize = 3;
+/// Minimum number of spectra required for coelution analysis
+pub const MIN_COELUTION_SPECTRA: usize = 3;
 
 /// Count how many of the top-6 library fragments have matches at apex
 ///
-/// Helper function for calibration feature extraction.
-fn count_top6_matched_at_apex(
+/// Helper function for calibration and coelution feature extraction.
+pub fn count_top6_matched_at_apex(
     library_fragments: &[LibraryFragment],
     spectrum_mzs: &[f64],
     tolerance: FragmentToleranceConfig,
@@ -2440,90 +2441,6 @@ fn count_top6_matched_at_apex(
         }
     }
     count
-}
-
-/// Calculate signal-to-noise ratio for a chromatographic peak.
-///
-/// Uses peak boundaries at ±1.96σ (where σ = FWHM / 2.355) to define the peak region.
-/// Background is measured from 3-5 points on each side outside these boundaries.
-///
-/// # Arguments
-/// * `xic` - Time series of (RT, intensity) pairs
-/// * `apex_idx` - Index of the apex point
-/// * `apex_intensity` - Intensity at apex
-///
-/// # Returns
-/// Signal-to-noise ratio, or None if calculation fails
-fn calculate_signal_to_noise(
-    xic: &[(f64, f64)],
-    apex_idx: usize,
-    apex_intensity: f64,
-) -> Option<f64> {
-    if xic.len() < 10 || apex_intensity <= 0.0 {
-        return None;
-    }
-
-    // Calculate FWHM to determine peak boundaries
-    let (fwhm, _, _) = super::compute_fwhm_interpolated(xic)?;
-
-    // Peak boundaries: ±1.96σ where σ = FWHM / 2.355
-    // This gives 95% of Gaussian peak (same as used for blib peak boundaries)
-    let sigma = fwhm / 2.355;
-    let boundary_width = 1.96 * sigma;
-    let apex_rt = xic[apex_idx].0;
-    let left_boundary = apex_rt - boundary_width;
-    let right_boundary = apex_rt + boundary_width;
-
-    // Collect background points outside peak boundaries (3-5 points on each side)
-    let mut background_intensities = Vec::new();
-
-    // Left side: 3-5 points before left boundary
-    for (rt, intensity) in xic.iter().take(apex_idx) {
-        if *rt < left_boundary {
-            background_intensities.push(*intensity);
-        }
-    }
-    // Take last 5 points on left side
-    if background_intensities.len() > 5 {
-        background_intensities = background_intensities.into_iter().rev().take(5).collect();
-    }
-
-    // Right side: 3-5 points after right boundary
-    let mut right_bg = Vec::new();
-    for (rt, intensity) in xic.iter().skip(apex_idx + 1) {
-        if *rt > right_boundary {
-            right_bg.push(*intensity);
-            if right_bg.len() >= 5 {
-                break;
-            }
-        }
-    }
-    background_intensities.extend(right_bg);
-
-    // Need at least 4 background points for reliable statistics
-    if background_intensities.len() < 4 {
-        return None;
-    }
-
-    // Calculate background mean and SD
-    let n = background_intensities.len() as f64;
-    let bg_mean = background_intensities.iter().sum::<f64>() / n;
-    let bg_variance = background_intensities
-        .iter()
-        .map(|x| (x - bg_mean).powi(2))
-        .sum::<f64>()
-        / n;
-    let bg_sd = bg_variance.sqrt();
-
-    if bg_sd <= 1e-10 {
-        return None; // No noise, can't calculate S/N
-    }
-
-    // S/N = (signal - background) / noise
-    let signal = apex_intensity - bg_mean;
-    let snr = signal / bg_sd;
-
-    Some(snr.max(0.0)) // Clamp to non-negative
 }
 
 /// 4. Correlate each other fragment XIC against the smoothed reference (Pearson)
@@ -2660,18 +2577,13 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             return None; // Need at least 2 co-eluting fragments
         }
 
-        // Apex RT = RT at the maximum of the reference XIC
-        let (apex_local_idx, (apex_rt, apex_intensity)) = ref_xic
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))?;
+        // Detect peak on reference XIC using DIA-NN-style valley detection.
+        // This gives us apex, boundaries, and SNR in one step.
+        let expected_rt = entry.retention_time; // Use library RT as hint
+        let peak = osprey_chromatography::detect_xic_peak(ref_xic, 0.01, 5.0, Some(expected_rt))?;
 
-        let apex_rt = *apex_rt;
-        let apex_intensity = *apex_intensity;
-
-        // Calculate signal-to-noise ratio from reference XIC
-        let signal_to_noise =
-            calculate_signal_to_noise(ref_xic, apex_local_idx, apex_intensity).unwrap_or(0.0);
+        let apex_rt = peak.apex_rt;
+        let signal_to_noise = peak.signal_to_noise;
 
         // Find the spectrum closest to apex for mass errors and scan number
         let apex_spec_local_idx = candidate_spectra

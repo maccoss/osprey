@@ -16,7 +16,7 @@
 //! 2. **Experiment-level FDR**: Run mokapot WITH `--aggregate` + WITH `--load_models`
 //!    Reuses the model from Step 1, reports experiment-wide q-values.
 
-use osprey_core::{FeatureSet, OspreyError, Result};
+use osprey_core::{CoelutionFeatureSet, CoelutionScoredEntry, FeatureSet, OspreyError, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -1352,6 +1352,274 @@ pub fn write_mokapot_report<P: AsRef<Path>>(results: &[MokapotResult], path: P) 
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Coelution-mode PIN file support
+// =============================================================================
+
+/// Number of coelution PIN features (48).
+pub const NUM_COELUTION_PIN_FEATURES: usize = 48;
+
+/// Returns the coelution-mode PIN feature header as a tab-separated string.
+fn get_coelution_feature_header() -> String {
+    get_coelution_pin_feature_names().join("\t")
+}
+
+/// Returns the 49 coelution PIN feature names.
+///
+/// Names match regression mode where the same metric is computed:
+/// fragment_coelution_sum, fragment_coelution_min, mass_accuracy_deviation_mean, etc.
+pub fn get_coelution_pin_feature_names() -> Vec<&'static str> {
+    vec![
+        // Pairwise coelution (12)
+        "fragment_coelution_sum",
+        "fragment_coelution_mean",
+        "fragment_coelution_min",
+        "fragment_coelution_max",
+        "n_coeluting_fragments",
+        "n_fragment_pairs",
+        "fragment_corr_0",
+        "fragment_corr_1",
+        "fragment_corr_2",
+        "fragment_corr_3",
+        "fragment_corr_4",
+        "fragment_corr_5",
+        // Peak shape (7)
+        "peak_apex",
+        "peak_area",
+        "peak_width",
+        "peak_symmetry",
+        "signal_to_noise",
+        "n_scans",
+        "peak_sharpness",
+        // Spectral at apex (19)
+        "hyperscore",
+        "xcorr",
+        "dot_product",
+        "dot_product_smz",
+        "dot_product_top6",
+        "dot_product_top5",
+        "dot_product_top4",
+        "dot_product_smz_top6",
+        "dot_product_smz_top5",
+        "dot_product_smz_top4",
+        "pearson_correlation",
+        "spearman_correlation",
+        "fragment_coverage",
+        "sequence_coverage",
+        "consecutive_ions",
+        "explained_intensity",
+        "elution_weighted_cosine",
+        // Mass accuracy (3)
+        "mass_accuracy_deviation_mean",
+        "abs_mass_accuracy_deviation_mean",
+        "mass_accuracy_std",
+        // RT deviation (2)
+        "rt_deviation",
+        "abs_rt_deviation",
+        // MS1 (2)
+        "ms1_precursor_coelution",
+        "ms1_isotope_cosine",
+        // Peptide properties (2)
+        "peptide_length",
+        "missed_cleavages",
+        // Median polish (3)
+        "median_polish_cosine",
+        "median_polish_rsquared",
+        "median_polish_residual_ratio",
+    ]
+}
+
+/// Format coelution features as a tab-separated string for PIN output.
+fn format_coelution_features(f: &CoelutionFeatureSet) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        // Pairwise coelution
+        f.coelution_sum,
+        f.coelution_mean,
+        f.coelution_min,
+        f.coelution_max,
+        f.n_coeluting_fragments,
+        f.n_fragment_pairs,
+        f.fragment_corr[0],
+        f.fragment_corr[1],
+        f.fragment_corr[2],
+        f.fragment_corr[3],
+        f.fragment_corr[4],
+        f.fragment_corr[5],
+        // Peak shape
+        f.peak_apex,
+        f.peak_area,
+        f.peak_width,
+        f.peak_symmetry,
+        f.signal_to_noise,
+        f.n_scans,
+        f.peak_sharpness,
+        // Spectral at apex
+        f.hyperscore,
+        f.xcorr,
+        f.dot_product,
+        f.dot_product_smz,
+        f.dot_product_top6,
+        f.dot_product_top5,
+        f.dot_product_top4,
+        f.dot_product_smz_top6,
+        f.dot_product_smz_top5,
+        f.dot_product_smz_top4,
+        f.pearson_correlation,
+        f.spearman_correlation,
+        f.fragment_coverage,
+        f.sequence_coverage,
+        f.consecutive_ions,
+        f.explained_intensity,
+        f.elution_weighted_cosine,
+        // Mass accuracy
+        f.mass_accuracy_mean,
+        f.abs_mass_accuracy_mean,
+        f.mass_accuracy_std,
+        // RT deviation
+        f.rt_deviation,
+        f.abs_rt_deviation,
+        // MS1
+        f.ms1_precursor_coelution,
+        f.ms1_isotope_cosine,
+        // Peptide properties
+        f.peptide_length,
+        f.missed_cleavages,
+        // Median polish
+        f.median_polish_cosine,
+        f.median_polish_rsquared,
+        f.median_polish_residual_ratio,
+    )
+}
+
+/// Returns a coelution PIN feature value by index (0-47).
+pub fn coelution_pin_feature_value(f: &CoelutionFeatureSet, index: usize) -> f64 {
+    match index {
+        0 => f.coelution_sum,
+        1 => f.coelution_mean,
+        2 => f.coelution_min,
+        3 => f.coelution_max,
+        4 => f.n_coeluting_fragments as f64,
+        5 => f.n_fragment_pairs as f64,
+        6 => f.fragment_corr[0],
+        7 => f.fragment_corr[1],
+        8 => f.fragment_corr[2],
+        9 => f.fragment_corr[3],
+        10 => f.fragment_corr[4],
+        11 => f.fragment_corr[5],
+        12 => f.peak_apex,
+        13 => f.peak_area,
+        14 => f.peak_width,
+        15 => f.peak_symmetry,
+        16 => f.signal_to_noise,
+        17 => f.n_scans as f64,
+        18 => f.peak_sharpness,
+        19 => f.hyperscore,
+        20 => f.xcorr,
+        21 => f.dot_product,
+        22 => f.dot_product_smz,
+        23 => f.dot_product_top6,
+        24 => f.dot_product_top5,
+        25 => f.dot_product_top4,
+        26 => f.dot_product_smz_top6,
+        27 => f.dot_product_smz_top5,
+        28 => f.dot_product_smz_top4,
+        29 => f.pearson_correlation,
+        30 => f.spearman_correlation,
+        31 => f.fragment_coverage,
+        32 => f.sequence_coverage,
+        33 => f.consecutive_ions as f64,
+        34 => f.explained_intensity,
+        35 => f.elution_weighted_cosine,
+        36 => f.mass_accuracy_mean,
+        37 => f.abs_mass_accuracy_mean,
+        38 => f.mass_accuracy_std,
+        39 => f.rt_deviation,
+        40 => f.abs_rt_deviation,
+        41 => f.ms1_precursor_coelution,
+        42 => f.ms1_isotope_cosine,
+        43 => f.peptide_length as f64,
+        44 => f.missed_cleavages as f64,
+        45 => f.median_polish_cosine,
+        46 => f.median_polish_rsquared,
+        47 => f.median_polish_residual_ratio,
+        _ => 0.0,
+    }
+}
+
+impl MokapotRunner {
+    /// Write a coelution-mode PIN file for a single file's scored entries.
+    pub fn write_coelution_pin_file<P: AsRef<Path>>(
+        &self,
+        file_name: &str,
+        entries: &[CoelutionScoredEntry],
+        output_dir: P,
+    ) -> Result<PathBuf> {
+        use std::io::BufWriter;
+
+        let out_dir = output_dir.as_ref();
+        std::fs::create_dir_all(out_dir).map_err(|e| {
+            OspreyError::OutputError(format!("Failed to create output directory: {}", e))
+        })?;
+
+        let safe_name = file_name.replace(['/', '\\', ' '], "_");
+        let pin_path = out_dir.join(format!("{}.pin", safe_name));
+
+        let file = std::fs::File::create(&pin_path)
+            .map_err(|e| OspreyError::OutputError(format!("Failed to create PIN file: {}", e)))?;
+
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+
+        // Write header
+        writeln!(
+            writer,
+            "SpecId\tLabel\tScanNr\tCharge1\tCharge2\tCharge3\tCharge4\tCharge5\t{}\tPeptide\tProteins",
+            get_coelution_feature_header()
+        )
+        .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
+
+        // Write entries
+        for entry in entries {
+            let label = if entry.is_decoy { -1 } else { 1 };
+            let proteins = if entry.protein_ids.is_empty() {
+                "UNKNOWN".to_string()
+            } else {
+                entry.protein_ids.join(",")
+            };
+
+            let psm_id = format!(
+                "{}_{}_{}_{}",
+                file_name, entry.modified_sequence, entry.charge, entry.scan_number
+            );
+
+            writeln!(
+                writer,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                psm_id,
+                label,
+                entry.scan_number,
+                format_charge_features(entry.charge),
+                format_coelution_features(&entry.features),
+                format_peptide(&entry.modified_sequence),
+                proteins
+            )
+            .map_err(|e| OspreyError::OutputError(format!("Failed to write entry: {}", e)))?;
+        }
+
+        writer
+            .flush()
+            .map_err(|e| OspreyError::OutputError(format!("Failed to flush PIN file: {}", e)))?;
+
+        log::info!(
+            "Wrote {} entries to coelution PIN file: {}",
+            entries.len(),
+            pin_path.display()
+        );
+
+        Ok(pin_path)
+    }
 }
 
 #[cfg(test)]

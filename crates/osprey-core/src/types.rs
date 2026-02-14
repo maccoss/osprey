@@ -624,8 +624,6 @@ pub struct FeatureSet {
     pub hyperscore: f64,
     /// XCorr score (Comet-style cross-correlation)
     pub xcorr: f64,
-    /// Normalized spectral contrast angle
-    pub spectral_contrast_angle: f64,
     /// Dot product (LibCosine with sqrt preprocessing)
     pub dot_product: f64,
     /// LibCosine with sqrt(intensity)*mz² (SMZ) preprocessing
@@ -757,6 +755,193 @@ pub struct FeatureSet {
     /// Fraction of total signal unexplained: Σ|obs-pred| / Σobs in linear space.
     /// Lower = cleaner co-elution. Zero-intensity cells included.
     pub median_polish_residual_ratio: f64,
+}
+
+// =============================================================================
+// Coelution search types (DIA-NN-style fragment coelution without regression)
+// =============================================================================
+
+/// Peak boundaries detected from fragment XICs using DIA-NN-style valley detection.
+///
+/// Unlike coefficient-based `PeakBoundaries`, these are derived from fragment
+/// chromatograms with adaptive boundary detection that handles overlapping peaks.
+#[derive(Debug, Clone)]
+pub struct XICPeakBounds {
+    /// Retention time at peak apex (minutes)
+    pub apex_rt: f64,
+    /// Intensity at apex (from smoothed reference XIC)
+    pub apex_intensity: f64,
+    /// Index into the spectrum/XIC array at peak apex
+    pub apex_index: usize,
+    /// Start retention time of peak (minutes)
+    pub start_rt: f64,
+    /// End retention time of peak (minutes)
+    pub end_rt: f64,
+    /// Index into the spectrum/XIC array at peak start
+    pub start_index: usize,
+    /// Index into the spectrum/XIC array at peak end
+    pub end_index: usize,
+    /// Integrated area (trapezoidal) within boundaries
+    pub area: f64,
+    /// Signal-to-noise: (apex - bg_mean) / bg_sd
+    pub signal_to_noise: f64,
+}
+
+/// Feature set for coelution-based scoring (no ridge regression).
+///
+/// ~45 features computed from fragment XICs, pairwise correlation,
+/// spectral matching at apex, and peptide properties.
+#[derive(Debug, Clone, Default)]
+pub struct CoelutionFeatureSet {
+    // --- Pairwise coelution features (from fragment XIC correlation matrix) ---
+    /// Sum of all pairwise Pearson correlations between fragment XICs
+    pub coelution_sum: f64,
+    /// Mean pairwise correlation
+    pub coelution_mean: f64,
+    /// Minimum pairwise correlation (worst pair)
+    pub coelution_min: f64,
+    /// Maximum pairwise correlation (best pair)
+    pub coelution_max: f64,
+    /// Number of fragments with positive mean correlation
+    pub n_coeluting_fragments: u8,
+    /// Number of fragment pairs in correlation matrix
+    pub n_fragment_pairs: u8,
+    /// Per-fragment average correlation with all other fragments (top 6, 0-padded)
+    pub fragment_corr: [f64; 6],
+
+    // --- Peak shape features (from reference XIC) ---
+    /// Peak apex intensity (background-subtracted)
+    pub peak_apex: f64,
+    /// Integrated peak area within boundaries
+    pub peak_area: f64,
+    /// Peak width (FWHM in minutes)
+    pub peak_width: f64,
+    /// Peak symmetry (leading/trailing area ratio around apex)
+    pub peak_symmetry: f64,
+    /// Signal-to-noise ratio
+    pub signal_to_noise: f64,
+    /// Number of scans within peak boundaries
+    pub n_scans: u16,
+    /// Peak sharpness (steepness of edges)
+    pub peak_sharpness: f64,
+
+    // --- Spectral features at apex (from SpectralScorer) ---
+    /// X!Tandem-style hyperscore
+    pub hyperscore: f64,
+    /// Comet-style cross-correlation score
+    pub xcorr: f64,
+    /// Library cosine (dot product with sqrt intensity)
+    pub dot_product: f64,
+    /// Library cosine with sqrt(intensity) * mz² preprocessing
+    pub dot_product_smz: f64,
+    /// Library cosine using only top 6 library fragments by intensity
+    pub dot_product_top6: f64,
+    /// Library cosine using only top 5 library fragments by intensity
+    pub dot_product_top5: f64,
+    /// Library cosine using only top 4 library fragments by intensity
+    pub dot_product_top4: f64,
+    /// SMZ cosine using only top 6 library fragments by intensity
+    pub dot_product_smz_top6: f64,
+    /// SMZ cosine using only top 5 library fragments by intensity
+    pub dot_product_smz_top5: f64,
+    /// SMZ cosine using only top 4 library fragments by intensity
+    pub dot_product_smz_top4: f64,
+    /// Pearson correlation of matched fragment intensities
+    pub pearson_correlation: f64,
+    /// Spearman rank correlation of matched fragment intensities
+    pub spearman_correlation: f64,
+    /// Fraction of library fragments matched in observed spectrum
+    pub fragment_coverage: f64,
+    /// Fraction of peptide backbone covered by b/y ions
+    pub sequence_coverage: f64,
+    /// Longest consecutive b or y ion series
+    pub consecutive_ions: u8,
+    /// Rank of observed base peak among library fragments
+    pub base_peak_rank: u8,
+    /// Count of top 6 library fragments matched
+    pub top6_matches: u8,
+    /// Fraction of total observed intensity explained by matches
+    pub explained_intensity: f64,
+    /// LibCosine at each scan within peak, weighted by reference XIC intensity²
+    pub elution_weighted_cosine: f64,
+
+    // --- Mass accuracy features ---
+    /// Signed mean mass error across matched fragments (ppm or Th)
+    pub mass_accuracy_mean: f64,
+    /// Absolute mean mass error
+    pub abs_mass_accuracy_mean: f64,
+    /// Standard deviation of mass errors
+    pub mass_accuracy_std: f64,
+
+    // --- RT deviation ---
+    /// RT deviation from expected (calibrated) RT (minutes)
+    pub rt_deviation: f64,
+    /// Absolute RT deviation
+    pub abs_rt_deviation: f64,
+
+    // --- MS1 features (HRAM only) ---
+    /// Pearson correlation between reference XIC and MS1 precursor XIC
+    pub ms1_precursor_coelution: f64,
+    /// Cosine similarity of observed vs theoretical isotope envelope
+    pub ms1_isotope_cosine: f64,
+
+    // --- Peptide properties ---
+    /// Number of modifications on the peptide
+    pub modification_count: u8,
+    /// Unmodified sequence length
+    pub peptide_length: u8,
+    /// Number of missed cleavage sites (internal K/R)
+    pub missed_cleavages: u8,
+
+    // --- Median polish features (from XIC matrix decomposition) ---
+    /// Cosine similarity between median polish row effects and library intensities
+    pub median_polish_cosine: f64,
+    /// R² of the additive model in linear space
+    pub median_polish_rsquared: f64,
+    /// Fraction of signal unexplained by additive model
+    pub median_polish_residual_ratio: f64,
+}
+
+/// Scored entry from coelution-based search.
+///
+/// Holds all information needed for Mokapot FDR (via PIN file) and
+/// blib output (spectral library). Produced by `run_coelution_search()`.
+#[derive(Debug, Clone)]
+pub struct CoelutionScoredEntry {
+    /// Library entry ID
+    pub entry_id: u32,
+    /// Whether this is a decoy
+    pub is_decoy: bool,
+    /// Unmodified sequence
+    pub sequence: String,
+    /// Modified sequence
+    pub modified_sequence: String,
+    /// Precursor charge
+    pub charge: u8,
+    /// Precursor m/z
+    pub precursor_mz: f64,
+    /// Protein accession(s)
+    pub protein_ids: Vec<String>,
+    /// Scan number at apex
+    pub scan_number: u32,
+    /// Apex RT (minutes)
+    pub apex_rt: f64,
+    /// Peak boundaries from DIA-NN-style detection
+    pub peak_bounds: XICPeakBounds,
+    /// Coelution feature set (~45 features for Mokapot)
+    pub features: CoelutionFeatureSet,
+    /// Fragment m/z values at apex (for blib output)
+    pub fragment_mzs: Vec<f64>,
+    /// Fragment intensities at apex (for blib output)
+    pub fragment_intensities: Vec<f32>,
+    /// Reference XIC values within peak bounds (for blib coefficient series)
+    pub reference_xic: Vec<(f64, f64)>,
+    /// Source file name (file stem, e.g. "sample1")
+    pub file_name: String,
+    /// Run-level q-value (from Mokapot on single file, default 1.0)
+    pub run_qvalue: f64,
+    /// Experiment-level q-value (from Mokapot across files, default 1.0)
+    pub experiment_qvalue: f64,
 }
 
 #[cfg(test)]

@@ -341,34 +341,54 @@ fn train_lda_with_nonnegative_cv(
             );
 
             // Train LDA on clean training set
-            let lda = LinearDiscriminantAnalysis::fit(&train_features, &train_labels).ok_or_else(
-                || {
-                    OspreyError::config(format!(
-                        "LDA training failed on fold {}/{}",
+            // If LDA fails (singular scatter matrix), skip this fold
+            match LinearDiscriminantAnalysis::fit(&train_features, &train_labels) {
+                Some(lda) => {
+                    let weights = lda.eigenvector().to_vec();
+
+                    log::debug!(
+                        "    Fold {}/{} weights: {}",
                         fold_idx + 1,
-                        N_FOLDS
-                    ))
-                },
-            )?;
+                        N_FOLDS,
+                        feature_names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, name)| format!("{}={:.3}", name, weights[i]))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
 
-            let weights = lda.eigenvector().to_vec();
-
-            log::debug!(
-                "    Fold {}/{} weights: {}",
-                fold_idx + 1,
-                N_FOLDS,
-                feature_names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| format!("{}={:.3}", name, weights[i]))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-
-            fold_weights.push(weights);
+                    fold_weights.push(weights);
+                }
+                None => {
+                    log::warn!(
+                        "    Fold {}/{}: LDA fit failed (singular matrix, {} targets, {} decoys), skipping",
+                        fold_idx + 1,
+                        N_FOLDS,
+                        selected_target_indices.len(),
+                        decoy_indices.len()
+                    );
+                }
+            }
         }
 
         // Phase 2: Average weights across folds → consensus weights
+        // If all folds failed, skip this iteration entirely
+        if fold_weights.is_empty() {
+            log::warn!(
+                "  Iteration {}: All folds failed, using best single feature as baseline",
+                iteration + 1
+            );
+            break;
+        }
+        if fold_weights.len() < N_FOLDS {
+            log::warn!(
+                "  Iteration {}: {}/{} folds succeeded, averaging available weights",
+                iteration + 1,
+                fold_weights.len(),
+                N_FOLDS
+            );
+        }
         let mut consensus_weights = average_weights(&fold_weights);
 
         // Clip negative weights to zero (non-negative constraint)

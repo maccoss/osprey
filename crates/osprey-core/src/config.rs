@@ -59,6 +59,11 @@ pub struct OspreyConfig {
     /// Whether library already contains decoys
     pub decoys_in_library: bool,
 
+    // Search mode
+    /// Search strategy: ridge regression (default) or coelution-based
+    #[serde(default)]
+    pub search_mode: SearchMode,
+
     // Performance
     /// Number of threads to use
     pub n_threads: usize,
@@ -83,6 +88,7 @@ impl Default for OspreyConfig {
             precursor_tolerance: FragmentToleranceConfig::hram(10.0), // 10 ppm for precursor
             max_candidates_per_spectrum: 5250,
             rt_calibration: RTCalibrationConfig::default(),
+            search_mode: SearchMode::default(),
             regularization_lambda: RegularizationSetting::CrossValidated,
             max_iterations: 1000,
             convergence_threshold: 1e-6,
@@ -431,6 +437,16 @@ pub enum DecoyMethod {
     Shuffle,
     /// Use decoys already in library
     FromLibrary,
+}
+
+/// Search strategy for the main analysis
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SearchMode {
+    /// Ridge regression: deconvolute mixed spectra via NNLS (default)
+    #[default]
+    Regression,
+    /// Coelution: DIA-NN-style fragment XIC correlation without regression
+    Coelution,
 }
 
 /// Fragment tolerance configuration for LibCosine scoring
