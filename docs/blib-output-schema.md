@@ -116,8 +116,12 @@ Fragment peak data stored as binary blobs.
 | Column | Type | Description |
 |--------|------|-------------|
 | RefSpectraID | INTEGER | FK to RefSpectra.id |
-| peakMZ | BLOB | m/z values (little-endian f64 array) |
-| peakIntensity | BLOB | Intensity values (little-endian f32 array) |
+| peakMZ | BLOB | m/z values (little-endian f64 array, zlib-compressed) |
+| peakIntensity | BLOB | Intensity values (little-endian f32 array, zlib-compressed) |
+
+**Fragment data source**: The m/z and intensity values stored here are the **library theoretical fragments** (b/y ions from the spectral library), not observed peaks from the DIA spectrum. This applies to both regression and coelution search modes. Skyline uses these theoretical fragment m/z values to build extracted-ion chromatograms for the correct transitions.
+
+**Compression**: Blobs are zlib-compressed. If compression does not reduce size (e.g., for very small arrays), the raw bytes are stored instead. To read, attempt zlib decompression; if it fails or the decompressed size doesn't match `numPeaks * sizeof(type)`, treat the blob as raw bytes.
 
 ### RefSpectraPeakAnnotations
 
@@ -377,3 +381,20 @@ Key methods:
 - `add_run_scores()` - Add run-level scores
 - `add_experiment_scores()` - Add experiment-level scores
 - `finalize()` - Update spectrum count and close
+
+## Data Flow
+
+How data flows from library through search to blib output:
+
+1. **Library loading**: Spectral library loaded from blib/elib/DIA-NN TSV format
+2. **Deduplication**: Entries grouped by (modified_sequence, charge); best spectrum kept per precursor
+3. **Decoy generation**: Reversed-sequence decoys generated for each target
+4. **Search**: Each library precursor scored against DIA data (coelution or regression mode)
+5. **FDR control**: Mokapot semi-supervised learning assigns q-values
+6. **Blib output**: Passing precursors written with:
+   - **RefSpectra**: Peptide sequence, precursor m/z, charge, apex RT, peak boundaries
+   - **RefSpectraPeaks**: Library theoretical fragment m/z and intensities (not observed DIA peaks)
+   - **Modifications**: From library entry (UniMod converted to mass notation)
+   - **Proteins**: From library entry protein accessions
+   - **RetentionTimes**: Per-run peak boundaries for multi-file experiments
+   - **Osprey tables**: Run/experiment q-values, peak boundaries, coefficient series

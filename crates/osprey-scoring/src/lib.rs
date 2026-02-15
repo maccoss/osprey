@@ -3059,12 +3059,6 @@ impl FeatureExtractor {
             // XCorr (Comet-style cross-correlation)
             features.xcorr = spectral_score.xcorr;
 
-            // FR-5.2.5: Pearson intensity correlation
-            features.pearson_correlation = spectral_score.pearson_correlation;
-
-            // FR-5.2.6: Spearman rank correlation
-            features.spearman_correlation = spectral_score.spearman_correlation;
-
             // FR-5.2.8: Sequence coverage (backbone coverage)
             features.sequence_coverage = spectral_score.sequence_coverage;
 

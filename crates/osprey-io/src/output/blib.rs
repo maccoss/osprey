@@ -7,6 +7,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use osprey_core::{Modification, OspreyError, PeakBoundaries, Result};
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -23,6 +24,8 @@ pub struct BlibWriter {
     conn: Connection,
     in_transaction: bool,
     next_spec_id: i64,
+    /// In-memory cache of protein accession → SQLite row ID
+    protein_cache: HashMap<String, i64>,
 }
 
 impl BlibWriter {
@@ -55,6 +58,7 @@ impl BlibWriter {
             conn,
             in_transaction: false,
             next_spec_id: 0,
+            protein_cache: HashMap::new(),
         };
         writer.create_schema()?;
 
@@ -272,15 +276,6 @@ impl BlibWriter {
                 Value TEXT
             );
 
-            -- Create indices for performance
-            CREATE INDEX idx_refspectra_peptide ON RefSpectra(peptideSeq);
-            CREATE INDEX idx_refspectra_modseq ON RefSpectra(peptideModSeq);
-            CREATE INDEX idx_refspectra_mz ON RefSpectra(precursorMZ);
-            CREATE INDEX idx_peaks_refid ON RefSpectraPeaks(RefSpectraID);
-            CREATE INDEX idx_mods_refid ON Modifications(RefSpectraID);
-            CREATE INDEX idx_boundaries_refid ON OspreyPeakBoundaries(RefSpectraID);
-            CREATE INDEX idx_runscores_refid ON OspreyRunScores(RefSpectraID);
-            CREATE INDEX idx_rettimes_refid ON RetentionTimes(RefSpectraID);
             "#,
             )
             .map_err(|e| OspreyError::SqliteError(format!("Failed to create schema: {}", e)))?;
@@ -552,24 +547,15 @@ impl BlibWriter {
     /// Add protein mapping for a spectrum
     ///
     /// Writes protein accessions to the Proteins table and creates the mapping
-    /// in RefSpectraProteins. This allows Skyline to show protein groupings.
-    pub fn add_protein_mapping(&self, ref_id: i64, protein_ids: &[String]) -> Result<()> {
+    /// in RefSpectraProteins. Uses an in-memory cache to avoid repeated SQL
+    /// lookups for the same protein accession.
+    pub fn add_protein_mapping(&mut self, ref_id: i64, protein_ids: &[String]) -> Result<()> {
         for accession in protein_ids {
             if accession.is_empty() {
                 continue;
             }
 
-            // Check if protein already exists
-            let existing_id: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT id FROM Proteins WHERE accession = ?",
-                    params![accession],
-                    |row| row.get(0),
-                )
-                .ok();
-
-            let protein_id = if let Some(id) = existing_id {
+            let protein_id = if let Some(&id) = self.protein_cache.get(accession) {
                 id
             } else {
                 // Insert new protein
@@ -581,7 +567,9 @@ impl BlibWriter {
                     .map_err(|e| {
                         OspreyError::SqliteError(format!("Failed to add protein: {}", e))
                     })?;
-                self.conn.last_insert_rowid()
+                let id = self.conn.last_insert_rowid();
+                self.protein_cache.insert(accession.clone(), id);
+                id
             };
 
             // Create mapping
@@ -750,6 +738,22 @@ impl BlibWriter {
                 [],
             )
             .map_err(|e| OspreyError::SqliteError(format!("Failed to update LibInfo: {}", e)))?;
+
+        // Create indices after all data is inserted (faster than indexing during inserts)
+        self.conn
+            .execute_batch(
+                r#"
+            CREATE INDEX idx_refspectra_peptide ON RefSpectra(peptideSeq);
+            CREATE INDEX idx_refspectra_modseq ON RefSpectra(peptideModSeq);
+            CREATE INDEX idx_refspectra_mz ON RefSpectra(precursorMZ);
+            CREATE INDEX idx_peaks_refid ON RefSpectraPeaks(RefSpectraID);
+            CREATE INDEX idx_mods_refid ON Modifications(RefSpectraID);
+            CREATE INDEX idx_boundaries_refid ON OspreyPeakBoundaries(RefSpectraID);
+            CREATE INDEX idx_runscores_refid ON OspreyRunScores(RefSpectraID);
+            CREATE INDEX idx_rettimes_refid ON RetentionTimes(RefSpectraID);
+            "#,
+            )
+            .map_err(|e| OspreyError::SqliteError(format!("Failed to create indices: {}", e)))?;
 
         // Checkpoint WAL into the main database file and switch to DELETE journal mode
         // so the -wal and -shm files are removed, leaving a single clean .blib file
@@ -1124,5 +1128,284 @@ mod tests {
         // Case insensitive UNIMOD
         let result = convert_unimod_to_mass("PEPTC[UNIMOD:4]IDE");
         assert!(result.starts_with("PEPTC[+57."));
+    }
+
+    /// Helper: decompress a zlib-or-raw blob back to bytes
+    fn decompress_blob(blob: &[u8], expected_len: usize) -> Vec<u8> {
+        if blob.len() == expected_len {
+            // Raw (uncompressed) — compression didn't help
+            blob.to_vec()
+        } else {
+            use flate2::read::ZlibDecoder;
+            use std::io::Read;
+            let mut decoder = ZlibDecoder::new(blob);
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .expect("zlib decompression failed");
+            decompressed
+        }
+    }
+
+    /// Helper: convert bytes back to Vec<f64>
+    fn bytes_to_f64_vec(bytes: &[u8]) -> Vec<f64> {
+        bytes
+            .chunks_exact(8)
+            .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    /// Helper: convert bytes back to Vec<f32>
+    fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    /// Verifies that fragment m/z and intensity values survive the write-read round trip.
+    #[test]
+    fn test_fragment_roundtrip() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut writer = BlibWriter::create(temp.path()).unwrap();
+        let file_id = writer
+            .add_source_file("test.mzML", "library.tsv", 0.01)
+            .unwrap();
+
+        // Known b/y ion m/z values (y1, y2, y3 for a real peptide)
+        let mzs = [175.1190, 288.2030, 375.2351, 488.3191, 601.4032];
+        let intensities: [f32; 5] = [100.0, 80.5, 60.0, 45.2, 30.0];
+
+        let ref_id = writer
+            .add_spectrum(
+                "PEPTIDE",
+                "PEPTIDE",
+                400.0,
+                2,
+                10.0,
+                9.0,
+                11.0,
+                &mzs,
+                &intensities,
+                0.005,
+                file_id,
+                1,
+                0.0,
+            )
+            .unwrap();
+
+        // Read back from SQLite
+        let (mz_blob, int_blob, num_peaks): (Vec<u8>, Vec<u8>, i32) = writer
+            .conn
+            .query_row(
+                "SELECT peakMZ, peakIntensity, r.numPeaks FROM RefSpectraPeaks p JOIN RefSpectra r ON r.id = p.RefSpectraID WHERE p.RefSpectraID = ?",
+                params![ref_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(num_peaks, 5);
+
+        // Decompress and verify m/z values
+        let mz_bytes = decompress_blob(&mz_blob, mzs.len() * 8);
+        let read_mzs = bytes_to_f64_vec(&mz_bytes);
+        assert_eq!(read_mzs.len(), mzs.len());
+        for (got, expected) in read_mzs.iter().zip(mzs.iter()) {
+            assert!(
+                (got - expected).abs() < 1e-10,
+                "m/z mismatch: got {}, expected {}",
+                got,
+                expected
+            );
+        }
+
+        // Decompress and verify intensities
+        let int_bytes = decompress_blob(&int_blob, intensities.len() * 4);
+        let read_intensities = bytes_to_f32_vec(&int_bytes);
+        assert_eq!(read_intensities.len(), intensities.len());
+        for (got, expected) in read_intensities.iter().zip(intensities.iter()) {
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "intensity mismatch: got {}, expected {}",
+                got,
+                expected
+            );
+        }
+    }
+
+    /// Verifies that UniMod notation in modified sequences is converted to mass notation in the database.
+    #[test]
+    fn test_modseq_roundtrip() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut writer = BlibWriter::create(temp.path()).unwrap();
+        let file_id = writer
+            .add_source_file("test.mzML", "library.tsv", 0.01)
+            .unwrap();
+
+        let ref_id = writer
+            .add_spectrum(
+                "PEPTCIDE",
+                "PEPTC[UniMod:4]IDE",
+                500.0,
+                2,
+                10.0,
+                9.0,
+                11.0,
+                &[300.0],
+                &[100.0],
+                0.01,
+                file_id,
+                1,
+                0.0,
+            )
+            .unwrap();
+
+        // Read back peptideModSeq — should be mass notation, not UniMod
+        let stored_modseq: String = writer
+            .conn
+            .query_row(
+                "SELECT peptideModSeq FROM RefSpectra WHERE id = ?",
+                params![ref_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            stored_modseq.contains("[+57."),
+            "Expected mass notation, got: {}",
+            stored_modseq
+        );
+        assert!(
+            !stored_modseq.contains("UniMod"),
+            "UniMod notation should be converted: {}",
+            stored_modseq
+        );
+    }
+
+    /// Verifies that protein mappings are correctly stored and retrievable.
+    #[test]
+    fn test_protein_mapping_roundtrip() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut writer = BlibWriter::create(temp.path()).unwrap();
+        let file_id = writer
+            .add_source_file("test.mzML", "library.tsv", 0.01)
+            .unwrap();
+
+        let ref_id = writer
+            .add_spectrum(
+                "PEPTIDE",
+                "PEPTIDE",
+                400.0,
+                2,
+                10.0,
+                9.0,
+                11.0,
+                &[300.0],
+                &[100.0],
+                0.01,
+                file_id,
+                1,
+                0.0,
+            )
+            .unwrap();
+
+        let proteins = vec![
+            "sp|P12345|PROT_HUMAN".to_string(),
+            "sp|P67890|PROT2_HUMAN".to_string(),
+        ];
+        writer.add_protein_mapping(ref_id, &proteins).unwrap();
+
+        // Read back protein accessions via join
+        let mut stmt = writer
+            .conn
+            .prepare(
+                "SELECT p.accession FROM Proteins p \
+                 JOIN RefSpectraProteins rp ON p.id = rp.ProteinID \
+                 WHERE rp.RefSpectraID = ? ORDER BY p.accession",
+            )
+            .unwrap();
+        let accessions: Vec<String> = stmt
+            .query_map(params![ref_id], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(accessions.len(), 2);
+        assert_eq!(accessions[0], "sp|P12345|PROT_HUMAN");
+        assert_eq!(accessions[1], "sp|P67890|PROT2_HUMAN");
+    }
+
+    /// Verifies that multi-run retention times are stored with correct best_spectrum flag.
+    #[test]
+    fn test_retention_times_multirun() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut writer = BlibWriter::create(temp.path()).unwrap();
+
+        let file_id_1 = writer
+            .add_source_file("run1.mzML", "library.tsv", 0.01)
+            .unwrap();
+        let file_id_2 = writer
+            .add_source_file("run2.mzML", "library.tsv", 0.01)
+            .unwrap();
+        let file_id_3 = writer
+            .add_source_file("run3.mzML", "library.tsv", 0.01)
+            .unwrap();
+
+        let ref_id = writer
+            .add_spectrum(
+                "PEPTIDE",
+                "PEPTIDE",
+                400.0,
+                2,
+                10.5,
+                9.5,
+                11.5,
+                &[300.0, 400.0],
+                &[100.0, 80.0],
+                0.005,
+                file_id_1,
+                3,
+                0.0,
+            )
+            .unwrap();
+
+        // Add retention times for 3 runs — run 2 is best
+        writer
+            .add_retention_time(ref_id, file_id_1, 10.5, 9.5, 11.5, 0.008, false)
+            .unwrap();
+        writer
+            .add_retention_time(ref_id, file_id_2, 10.3, 9.3, 11.3, 0.005, true)
+            .unwrap();
+        writer
+            .add_retention_time(ref_id, file_id_3, 10.7, 9.7, 11.7, 0.012, false)
+            .unwrap();
+
+        // Read back RetentionTimes
+        let mut stmt = writer
+            .conn
+            .prepare(
+                "SELECT SpectrumSourceID, retentionTime, bestSpectrum \
+                 FROM RetentionTimes WHERE RefSpectraID = ? \
+                 ORDER BY SpectrumSourceID",
+            )
+            .unwrap();
+        let rows: Vec<(i64, f64, i32)> = stmt
+            .query_map(params![ref_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 3);
+        // Run 1: not best
+        assert_eq!(rows[0].2, 0);
+        assert!((rows[0].1 - 10.5).abs() < 0.01);
+        // Run 2: best
+        assert_eq!(rows[1].2, 1);
+        assert!((rows[1].1 - 10.3).abs() < 0.01);
+        // Run 3: not best
+        assert_eq!(rows[2].2, 0);
+        assert!((rows[2].1 - 10.7).abs() < 0.01);
     }
 }

@@ -628,10 +628,6 @@ pub struct FeatureSet {
     pub dot_product: f64,
     /// LibCosine with sqrt(intensity)*mz² (SMZ) preprocessing
     pub dot_product_smz: f64,
-    /// Pearson intensity correlation
-    pub pearson_correlation: f64,
-    /// Spearman rank correlation
-    pub spearman_correlation: f64,
     /// Fraction of predicted fragments detected
     pub fragment_coverage: f64,
     /// Backbone coverage
@@ -796,8 +792,6 @@ pub struct CoelutionFeatureSet {
     // --- Pairwise coelution features (from fragment XIC correlation matrix) ---
     /// Sum of all pairwise Pearson correlations between fragment XICs
     pub coelution_sum: f64,
-    /// Mean pairwise correlation
-    pub coelution_mean: f64,
     /// Minimum pairwise correlation (worst pair)
     pub coelution_min: f64,
     /// Maximum pairwise correlation (best pair)
@@ -846,10 +840,6 @@ pub struct CoelutionFeatureSet {
     pub dot_product_smz_top5: f64,
     /// SMZ cosine using only top 4 library fragments by intensity
     pub dot_product_smz_top4: f64,
-    /// Pearson correlation of matched fragment intensities
-    pub pearson_correlation: f64,
-    /// Spearman rank correlation of matched fragment intensities
-    pub spearman_correlation: f64,
     /// Fraction of library fragments matched in observed spectrum
     pub fragment_coverage: f64,
     /// Fraction of peptide backbone covered by b/y ions

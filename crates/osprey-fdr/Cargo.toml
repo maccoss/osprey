@@ -10,8 +10,10 @@ repository.workspace = true
 
 [dependencies]
 osprey-core = { workspace = true }
+osprey-ml = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+rayon = { workspace = true }
 sysinfo = { workspace = true }
 
 [dev-dependencies]

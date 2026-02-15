@@ -55,12 +55,12 @@ use osprey_chromatography::{
 };
 use osprey_core::{
     BinConfig, CoelutionFeatureSet, CoelutionScoredEntry, DecoyMethod as CoreDecoyMethod,
-    FeatureSet, FragmentToleranceConfig, LibraryEntry, LibraryFragment, MS1Spectrum, OspreyConfig,
-    OspreyError, RegressionResult, Result, SearchMode, Spectrum, ToleranceUnit,
+    FdrMethod, FeatureSet, FragmentToleranceConfig, LibraryEntry, LibraryFragment, MS1Spectrum,
+    OspreyConfig, OspreyError, RegressionResult, Result, SearchMode, Spectrum, ToleranceUnit,
 };
 use osprey_fdr::{
-    get_pin_feature_names, pin_feature_value, FdrController, MokapotRunner, PsmFeatures,
-    NUM_PIN_FEATURES,
+    coelution_pin_feature_value, get_pin_feature_names, percolator, pin_feature_value,
+    FdrController, MokapotRunner, PsmFeatures, NUM_COELUTION_PIN_FEATURES, NUM_PIN_FEATURES,
 };
 use osprey_io::{load_all_spectra, load_library, BlibWriter, MS1Index};
 use osprey_regression::{Binner, DesignMatrixBuilder, OptimizedSolver, RidgeSolver};
@@ -81,7 +81,7 @@ impl<'a> MS1SpectrumLookup for MS1IndexWrapper<'a> {
     }
 }
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 use osprey_scoring::batch::{pair_calibration_matches, CalibrationMatch};
@@ -269,13 +269,17 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
     // - Free regression results and spectra after each file
     let mut per_file_scored: Vec<(String, Vec<ScoredEntry>)> = Vec::new();
     let mut pin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
-    // Create mokapot output directory upfront
     let output_dir = config
         .output_blib
         .parent()
         .unwrap_or(std::path::Path::new("."));
+
+    // Only write PIN files if mokapot is being used or explicitly requested
+    let write_pin = config.write_pin || config.fdr_method == FdrMethod::Mokapot;
     let mokapot_dir = output_dir.join("mokapot");
-    std::fs::create_dir_all(&mokapot_dir)?;
+    if write_pin {
+        std::fs::create_dir_all(&mokapot_dir)?;
+    }
 
     // Build mokapot runner for PIN file writing
     let mokapot = MokapotRunner::new().with_test_fdr(config.run_fdr);
@@ -373,11 +377,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
             )?;
         }
 
-        // === WRITE PIN FILE IMMEDIATELY ===
-        // Create PSM features and write to disk, freeing memory
-        let psm_features = create_psm_features_for_file(&file_name, &scored_entries, &library);
-        let pin_path = mokapot.write_single_pin_file(&file_name, &psm_features, &mokapot_dir)?;
-        pin_files.insert(file_name.clone(), pin_path);
+        // === WRITE PIN FILE (if mokapot or --write-pin) ===
+        if write_pin {
+            let psm_features = create_psm_features_for_file(&file_name, &scored_entries, &library);
+            let pin_path =
+                mokapot.write_single_pin_file(&file_name, &psm_features, &mokapot_dir)?;
+            pin_files.insert(file_name.clone(), pin_path);
+        }
 
         // Keep only scored entries (small) for FDR update later
         // Regression results and spectra are dropped here, freeing ~150MB per file
@@ -420,10 +426,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
     }
 
     log::info!(
-        "====== Beginning Mokapot Post-Processing on {} Files ======",
+        "====== Beginning FDR Post-Processing ({}) on {} Files ======",
+        config.fdr_method,
         non_empty_files.len()
     );
-    log::info!("Using {} pre-written PIN files", non_empty_pin_files.len());
+    if config.fdr_method == FdrMethod::Mokapot {
+        log::info!("Using {} pre-written PIN files", non_empty_pin_files.len());
+    }
 
     // Run two-level FDR control (run-level + experiment-level)
     // PIN files are already written, pass them to avoid regeneration
@@ -434,6 +443,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         config.experiment_fdr,
         output_dir,
         Some(non_empty_pin_files),
+        config.fdr_method,
     )?;
 
     // Filter to passing entries for blib output (experiment-level FDR)
@@ -442,12 +452,6 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
         .cloned()
         .collect();
-
-    log::info!(
-        "Final results: {} precursors passing {}% experiment-level FDR",
-        passing_entries.len(),
-        config.experiment_fdr * 100.0
-    );
 
     // Write blib output with Mokapot q-values
     if !passing_entries.is_empty() {
@@ -2513,14 +2517,152 @@ fn run_two_level_fdr(
     experiment_fdr: f64,
     output_dir: &std::path::Path,
     pin_files: Option<HashMap<String, std::path::PathBuf>>,
+    fdr_method: FdrMethod,
+) -> Result<Vec<ScoredEntry>> {
+    match fdr_method {
+        FdrMethod::Percolator => {
+            run_percolator_fdr(per_file_results, library, run_fdr, experiment_fdr)
+        }
+        FdrMethod::Mokapot => run_mokapot_fdr(
+            per_file_results,
+            library,
+            run_fdr,
+            experiment_fdr,
+            output_dir,
+            pin_files,
+        ),
+        FdrMethod::Simple => run_simple_fdr(per_file_results, library, run_fdr, experiment_fdr),
+    }
+}
+
+/// Run native Percolator FDR control (linear SVM, cross-validation)
+fn run_percolator_fdr(
+    per_file_results: &mut [(String, Vec<ScoredEntry>)],
+    library: &[LibraryEntry],
+    run_fdr: f64,
+    experiment_fdr: f64,
+) -> Result<Vec<ScoredEntry>> {
+    log::info!("Running native Percolator FDR control (linear SVM)");
+
+    // Convert ScoredEntry → PercolatorEntry
+    let mut perc_entries = Vec::new();
+    for (file_name, entries) in per_file_results.iter() {
+        for entry in entries.iter() {
+            let lib_entry = &library[entry.lib_idx];
+            // Extract feature values (same as PIN file features)
+            let features: Vec<f64> = (0..NUM_PIN_FEATURES)
+                .map(|i| {
+                    let v = pin_feature_value(&entry.features, i);
+                    if v.is_finite() {
+                        v
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+
+            perc_entries.push(percolator::PercolatorEntry {
+                id: entry.psm_id.clone(),
+                file_name: file_name.clone(),
+                peptide: lib_entry.modified_sequence.clone(),
+                charge: lib_entry.charge,
+                is_decoy: entry.is_decoy,
+                entry_id: library[entry.lib_idx].id,
+                features,
+            });
+        }
+    }
+
+    let config = percolator::PercolatorConfig {
+        train_fdr: run_fdr,
+        test_fdr: run_fdr,
+        ..Default::default()
+    };
+
+    let results = percolator::run_percolator(&perc_entries, &config)
+        .map_err(|e| OspreyError::config(format!("Percolator failed: {}", e)))?;
+
+    // Log feature weights
+    let feature_names = get_pin_feature_names();
+    for (fold_idx, weights) in results.fold_weights.iter().enumerate() {
+        let mut weight_pairs: Vec<(usize, f64)> =
+            weights.iter().enumerate().map(|(i, &w)| (i, w)).collect();
+        weight_pairs.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap());
+        let top_features: Vec<String> = weight_pairs
+            .iter()
+            .take(10)
+            .map(|&(i, w)| {
+                let name = if i < feature_names.len() {
+                    feature_names[i]
+                } else {
+                    "unknown"
+                };
+                format!("{}={:.4}", name, w)
+            })
+            .collect();
+        log::info!(
+            "  Fold {} ({} iters): top features: {}",
+            fold_idx + 1,
+            results.iterations_per_fold[fold_idx],
+            top_features.join(", ")
+        );
+    }
+
+    // Build result lookup: psm_id → PercolatorResult
+    let result_map: HashMap<&str, &percolator::PercolatorResult> =
+        results.entries.iter().map(|r| (r.id.as_str(), r)).collect();
+
+    // Map results back to ScoredEntries
+    let mut experiment_entries: Vec<ScoredEntry> = Vec::new();
+    for (_, entries) in per_file_results.iter_mut() {
+        for entry in entries.iter_mut() {
+            if let Some(result) = result_map.get(entry.psm_id.as_str()) {
+                entry.run_qvalue = result.run_precursor_qvalue;
+                entry.pep = result.pep;
+                entry.score = result.score;
+            }
+        }
+    }
+
+    // Report per-file statistics
+    for (file_name, entries) in per_file_results.iter() {
+        report_file_statistics(file_name, entries, library, run_fdr);
+    }
+
+    // Build experiment entries with experiment-level q-values
+    for (_, entries) in per_file_results.iter() {
+        for entry in entries.iter() {
+            let mut entry_copy = entry.clone();
+            if let Some(result) = result_map.get(entry.psm_id.as_str()) {
+                entry_copy.experiment_qvalue = result.experiment_precursor_qvalue;
+            } else {
+                entry_copy.experiment_qvalue = 1.0;
+            }
+            experiment_entries.push(entry_copy);
+        }
+    }
+
+    report_experiment_statistics(&experiment_entries, library, experiment_fdr);
+
+    Ok(experiment_entries)
+}
+
+/// Run external mokapot FDR control (Python subprocess)
+fn run_mokapot_fdr(
+    per_file_results: &mut [(String, Vec<ScoredEntry>)],
+    library: &[LibraryEntry],
+    run_fdr: f64,
+    experiment_fdr: f64,
+    output_dir: &std::path::Path,
+    pin_files: Option<HashMap<String, std::path::PathBuf>>,
 ) -> Result<Vec<ScoredEntry>> {
     // Build mokapot runner
     let mokapot = MokapotRunner::new().with_test_fdr(run_fdr);
 
     let mokapot_available = mokapot.is_available();
     if !mokapot_available {
-        log::warn!("Mokapot not available, using simple target-decoy competition");
-        log::warn!("Install mokapot with: pip install mokapot");
+        log::warn!("Mokapot not available, falling back to native Percolator");
+        return run_percolator_fdr(per_file_results, library, run_fdr, experiment_fdr);
     }
 
     // Create output directory for mokapot files
@@ -2531,11 +2673,7 @@ fn run_two_level_fdr(
     if per_file_results.len() == 1 {
         let (file_name, entries) = per_file_results.iter_mut().next().unwrap();
 
-        if mokapot_available {
-            compute_fdr_with_mokapot(library, entries, file_name, &mokapot_dir, run_fdr, run_fdr)?;
-        } else {
-            apply_simple_fdr(entries, run_fdr)?;
-        }
+        compute_fdr_with_mokapot(library, entries, file_name, &mokapot_dir, run_fdr, run_fdr)?;
 
         // Report single file statistics
         report_file_statistics(file_name, entries, library, run_fdr);
@@ -2550,26 +2688,6 @@ fn run_two_level_fdr(
     }
 
     // ========== Multi-file analysis with two-step mokapot ==========
-    if !mokapot_available {
-        // Fallback: simple target-decoy competition
-        log::info!("Running simple target-decoy competition (mokapot not available)");
-
-        for (file_name, entries) in per_file_results.iter_mut() {
-            apply_simple_fdr(entries, run_fdr)?;
-            report_file_statistics(file_name, entries, library, run_fdr);
-        }
-
-        // Combine for experiment level
-        let mut experiment_entries: Vec<ScoredEntry> = Vec::new();
-        for (_, entries) in per_file_results.iter() {
-            for entry in entries.iter() {
-                experiment_entries.push(entry.clone());
-            }
-        }
-        apply_simple_fdr_experiment(&mut experiment_entries, experiment_fdr)?;
-        report_experiment_statistics(&experiment_entries, library, experiment_fdr);
-        return Ok(experiment_entries);
-    }
 
     // ========== Run two-step mokapot analysis ==========
     // Use pre-written PIN files if provided, otherwise generate them
@@ -2605,8 +2723,6 @@ fn run_two_level_fdr(
         }
     }
 
-    // Per-file results already reported by mokapot.rs, skip redundant output here
-
     // ========== Build experiment entries with Step 2 results ==========
 
     // Build PSM ID to q-value map from experiment results
@@ -2633,6 +2749,32 @@ fn run_two_level_fdr(
         }
     }
 
+    Ok(experiment_entries)
+}
+
+/// Run simple target-decoy competition FDR (no ML rescoring)
+fn run_simple_fdr(
+    per_file_results: &mut [(String, Vec<ScoredEntry>)],
+    library: &[LibraryEntry],
+    run_fdr: f64,
+    experiment_fdr: f64,
+) -> Result<Vec<ScoredEntry>> {
+    log::info!("Running simple target-decoy competition (no ML rescoring)");
+
+    for (file_name, entries) in per_file_results.iter_mut() {
+        apply_simple_fdr(entries, run_fdr)?;
+        report_file_statistics(file_name, entries, library, run_fdr);
+    }
+
+    // Combine for experiment level
+    let mut experiment_entries: Vec<ScoredEntry> = Vec::new();
+    for (_, entries) in per_file_results.iter() {
+        for entry in entries.iter() {
+            experiment_entries.push(entry.clone());
+        }
+    }
+    apply_simple_fdr_experiment(&mut experiment_entries, experiment_fdr)?;
+    report_experiment_statistics(&experiment_entries, library, experiment_fdr);
     Ok(experiment_entries)
 }
 
@@ -3221,24 +3363,20 @@ fn compete_target_decoy_pairs(
     }
 
     let mut winners = Vec::with_capacity(groups.len());
-    let mut n_target_auto = 0usize;
-    let mut n_decoy_auto = 0usize;
     let mut n_target_wins = 0usize;
     let mut n_decoy_wins = 0usize;
-    let mut n_pairs = 0usize;
 
     for (_target_id, (target_opt, decoy_opt)) in groups {
         match (target_opt, decoy_opt) {
             (Some(target), None) => {
-                n_target_auto += 1;
+                n_target_wins += 1;
                 winners.push(target);
             }
             (None, Some(decoy)) => {
-                n_decoy_auto += 1;
+                n_decoy_wins += 1;
                 winners.push(decoy);
             }
             (Some(target), Some(decoy)) => {
-                n_pairs += 1;
                 let t_val = pin_feature_value(&target.features, feat_idx);
                 let d_val = pin_feature_value(&decoy.features, feat_idx);
 
@@ -3273,11 +3411,7 @@ fn compete_target_decoy_pairs(
     }
 
     log::info!(
-        "Target-decoy competition: {} pairs competed, {} target auto-wins, {} decoy auto-wins, \
-         {} target wins, {} decoy wins ({} total winners)",
-        n_pairs,
-        n_target_auto,
-        n_decoy_auto,
+        "Target-decoy competition: {} target wins, {} decoy wins ({} total)",
         n_target_wins,
         n_decoy_wins,
         winners.len()
@@ -3404,6 +3538,50 @@ fn compute_peak_boundaries(scored: &ScoredEntry) -> Option<(f64, f64, f64)> {
     Some((apex_rt, start_rt, end_rt))
 }
 
+/// Build shared peak boundaries per (modified_sequence, file_name) for regression path.
+///
+/// When the same peptide is detected at multiple charge states in the same file,
+/// they elute at the same time. This function selects boundaries from the charge
+/// state with the lowest run q-value (best overall peak quality) for each peptide
+/// per file. Returns the lookup and a count of peptide-file pairs where boundaries
+/// were shared across charge states.
+#[allow(clippy::type_complexity)]
+fn build_shared_regression_boundaries(
+    entries: &[ScoredEntry],
+    library: &[LibraryEntry],
+) -> (HashMap<(String, String), (f64, f64, f64)>, usize) {
+    // Group entries by (modified_sequence, file_name), collecting (run_qvalue, entry)
+    let mut peptide_file_groups: HashMap<(&str, &str), Vec<&ScoredEntry>> = HashMap::new();
+    for entry in entries {
+        let mod_seq = library[entry.lib_idx].modified_sequence.as_str();
+        peptide_file_groups
+            .entry((mod_seq, entry.file_name.as_str()))
+            .or_default()
+            .push(entry);
+    }
+
+    let mut shared_bounds: HashMap<(String, String), (f64, f64, f64)> = HashMap::new();
+    let mut n_shared = 0usize;
+
+    for ((mod_seq, file_name), group) in &peptide_file_groups {
+        // Sort by run_qvalue ascending, pick first with valid boundaries
+        let mut sorted: Vec<&&ScoredEntry> = group.iter().collect();
+        sorted.sort_by(|a, b| a.run_qvalue.total_cmp(&b.run_qvalue));
+
+        if let Some(bounds) = sorted.iter().find_map(|e| compute_peak_boundaries(e)) {
+            shared_bounds.insert((mod_seq.to_string(), file_name.to_string()), bounds);
+        }
+
+        // Count peptide-file pairs with >1 distinct charge state
+        let charges: HashSet<u8> = group.iter().map(|e| library[e.lib_idx].charge).collect();
+        if charges.len() > 1 {
+            n_shared += 1;
+        }
+    }
+
+    (shared_bounds, n_shared)
+}
+
 /// Write scored results to blib format for Skyline
 ///
 /// Groups entries by precursor (lib_idx) to produce one RefSpectra row per unique
@@ -3425,7 +3603,7 @@ fn write_blib_output_with_scores(
         &config.rt_calibration.enabled.to_string(),
     )?;
     writer.add_metadata("run_fdr", &config.run_fdr.to_string())?;
-    writer.add_metadata("fdr_method", "target_decoy_competition")?;
+    writer.add_metadata("fdr_method", &config.fdr_method.to_string())?;
 
     // Determine library name for idFileName in SpectrumSourceFiles
     let library_name = config
@@ -3465,6 +3643,11 @@ fn write_blib_output_with_scores(
     // Begin batch transaction for much faster writes
     writer.begin_batch()?;
 
+    // Build shared boundaries: for each peptide per file, use boundaries from
+    // the charge state with the lowest run q-value (same peptide at different
+    // charge states elutes at the same time)
+    let (shared_bounds, n_shared) = build_shared_regression_boundaries(scored_entries, library);
+
     // Group passing entries by precursor (lib_idx) so we write one RefSpectra per
     // unique precursor, with per-run entries in RetentionTimes
     let mut precursor_entries: HashMap<usize, Vec<&ScoredEntry>> = HashMap::new();
@@ -3486,10 +3669,14 @@ fn write_blib_output_with_scores(
             .min_by(|a, b| a.run_qvalue.total_cmp(&b.run_qvalue))
             .unwrap();
 
-        // Compute boundaries for the best run
-        let (apex_rt, start_rt, end_rt) = match compute_peak_boundaries(best) {
-            Some(bounds) => bounds,
-            None => continue,
+        // Use shared boundaries from the best charge state for this peptide in this file
+        let shared_key = (entry.modified_sequence.clone(), best.file_name.clone());
+        let (apex_rt, start_rt, end_rt) = match shared_bounds.get(&shared_key) {
+            Some(&bounds) => bounds,
+            None => match compute_peak_boundaries(best) {
+                Some(bounds) => bounds,
+                None => continue,
+            },
         };
 
         // Include all runs where this precursor was scored (it passed experiment-level FDR,
@@ -3548,17 +3735,25 @@ fn write_blib_output_with_scores(
             let is_best: bool =
                 std::ptr::eq(*scored as *const ScoredEntry, *best as *const ScoredEntry);
 
-            if let Some((run_apex, run_start, run_end)) = compute_peak_boundaries(scored) {
-                writer.add_retention_time(
-                    ref_id,
-                    run_file_id,
-                    run_apex,
-                    run_start,
-                    run_end,
-                    scored.run_qvalue,
-                    is_best,
-                )?;
-            }
+            // Use shared boundaries for this peptide in this run's file
+            let run_shared_key = (entry.modified_sequence.clone(), scored.file_name.clone());
+            let (run_apex, run_start, run_end) = match shared_bounds.get(&run_shared_key) {
+                Some(&bounds) => bounds,
+                None => match compute_peak_boundaries(scored) {
+                    Some(bounds) => bounds,
+                    None => continue,
+                },
+            };
+
+            writer.add_retention_time(
+                ref_id,
+                run_file_id,
+                run_apex,
+                run_start,
+                run_end,
+                scored.run_qvalue,
+                is_best,
+            )?;
         }
 
         // Add peak boundaries to Osprey extension table
@@ -3597,11 +3792,17 @@ fn write_blib_output_with_scores(
     writer.finalize()?;
 
     log::info!(
-        "Wrote {} unique precursors to blib (from {} total entries across {} files)",
-        n_written,
+        "Wrote {} total entries for {} precursors across {} files",
         scored_entries.len(),
+        n_written,
         input_files.len()
     );
+    if n_shared > 0 {
+        log::info!(
+            "Shared peak boundaries across charge states for {} peptide-file pairs",
+            n_shared
+        );
+    }
 
     Ok(())
 }
@@ -3944,8 +4145,11 @@ fn run_analysis_coelution(config: OspreyConfig) -> Result<Vec<RegressionResult>>
         .output_blib
         .parent()
         .unwrap_or(std::path::Path::new("."));
+    let write_pin = config.write_pin || config.fdr_method == FdrMethod::Mokapot;
     let mokapot_dir = output_dir.join("mokapot");
-    std::fs::create_dir_all(&mokapot_dir)?;
+    if write_pin {
+        std::fs::create_dir_all(&mokapot_dir)?;
+    }
     let mokapot = MokapotRunner::new().with_test_fdr(config.run_fdr);
 
     // Process each file
@@ -4056,14 +4260,15 @@ fn run_analysis_coelution(config: OspreyConfig) -> Result<Vec<RegressionResult>>
         // Mokapot expects only competition winners (no pi0 correction).
         let entries = compete_coelution_entries(entries, &library);
 
-        // Write coelution PIN file (competition winners only)
-        let pin_path = mokapot.write_coelution_pin_file(&file_name, &entries, &mokapot_dir)?;
-        pin_files.insert(file_name.clone(), pin_path);
+        // Write coelution PIN file (competition winners only, if mokapot or --write-pin)
+        if write_pin {
+            let pin_path = mokapot.write_coelution_pin_file(&file_name, &entries, &mokapot_dir)?;
+            pin_files.insert(file_name.clone(), pin_path);
+        }
 
         per_file_entries.push((file_name, entries));
     }
 
-    // Run Mokapot FDR (using the same mokapot runner — just different PIN columns)
     let total_scored: usize = per_file_entries.iter().map(|(_, s)| s.len()).sum();
     log::info!(
         "Coelution analysis complete. {} total scored entries across {} files",
@@ -4076,57 +4281,28 @@ fn run_analysis_coelution(config: OspreyConfig) -> Result<Vec<RegressionResult>>
         return Ok(Vec::new());
     }
 
-    // Run two-step Mokapot FDR (same approach as regression scoring):
-    // Step 1: Train joint model on all files → per-file (run-level) q-values
-    // Step 2: Train with --aggregate → experiment-level q-values
-    log::info!("Running Mokapot FDR control on coelution PIN files...");
+    // Dispatch FDR control based on method
+    log::info!(
+        "Running {} FDR control on coelution results...",
+        config.fdr_method
+    );
 
-    if !mokapot.is_available() {
-        log::warn!("Mokapot not available, using simple target-decoy competition");
-        for (_, entries) in per_file_entries.iter_mut() {
-            apply_simple_coelution_fdr(entries, config.run_fdr)?;
+    match config.fdr_method {
+        FdrMethod::Percolator => {
+            run_coelution_percolator_fdr(&mut per_file_entries, &config)?;
         }
-    } else {
-        match mokapot.run_two_step_analysis(&pin_files, &mokapot_dir) {
-            Ok((per_file_results, experiment_results)) => {
-                // Build experiment-level q-value map (PSM ID → q-value)
-                let experiment_qmap: HashMap<String, f64> = experiment_results
-                    .iter()
-                    .map(|r| (r.psm_id.clone(), r.q_value))
-                    .collect();
-
-                for (file_name, entries) in per_file_entries.iter_mut() {
-                    if let Some(results) = per_file_results.get(file_name) {
-                        let run_qmap: HashMap<String, f64> = results
-                            .iter()
-                            .map(|r| (r.psm_id.clone(), r.q_value))
-                            .collect();
-
-                        for entry in entries.iter_mut() {
-                            let psm_id = format!(
-                                "{}_{}_{}_{}",
-                                file_name, entry.modified_sequence, entry.charge, entry.scan_number
-                            );
-                            // Assign run-level q-value
-                            if let Some(&q) = run_qmap.get(&psm_id) {
-                                entry.run_qvalue = q;
-                            }
-                            // Assign experiment-level q-value;
-                            // fall back to run-level for single-file case
-                            if let Some(&q) = experiment_qmap.get(&psm_id) {
-                                entry.experiment_qvalue = q;
-                            } else if let Some(&q) = run_qmap.get(&psm_id) {
-                                entry.experiment_qvalue = q;
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("Mokapot two-step FDR failed: {}. Using simple FDR.", e);
-                for (_, entries) in per_file_entries.iter_mut() {
-                    apply_simple_coelution_fdr(entries, config.run_fdr)?;
-                }
+        FdrMethod::Mokapot => {
+            run_coelution_mokapot_fdr(
+                &mut per_file_entries,
+                &mokapot,
+                &pin_files,
+                &mokapot_dir,
+                &config,
+            )?;
+        }
+        FdrMethod::Simple => {
+            for (_, entries) in per_file_entries.iter_mut() {
+                apply_simple_coelution_fdr(entries, config.run_fdr)?;
             }
         }
     }
@@ -4138,12 +4314,6 @@ fn run_analysis_coelution(config: OspreyConfig) -> Result<Vec<RegressionResult>>
         .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
         .collect();
 
-    log::info!(
-        "Final results: {} precursors passing {}% experiment-level FDR",
-        passing_entries.len(),
-        config.experiment_fdr * 100.0
-    );
-
     // Write blib output
     if !passing_entries.is_empty() {
         log::info!("Writing blib to {}", config.output_blib.display());
@@ -4153,6 +4323,129 @@ fn run_analysis_coelution(config: OspreyConfig) -> Result<Vec<RegressionResult>>
     }
 
     Ok(Vec::new())
+}
+
+/// Run native Percolator FDR on coelution entries
+fn run_coelution_percolator_fdr(
+    per_file_entries: &mut [(String, Vec<CoelutionScoredEntry>)],
+    config: &OspreyConfig,
+) -> Result<()> {
+    log::info!("Running native Percolator FDR on coelution entries");
+
+    // Convert CoelutionScoredEntry → PercolatorEntry
+    let mut perc_entries = Vec::new();
+    for (file_name, entries) in per_file_entries.iter() {
+        for entry in entries.iter() {
+            let features: Vec<f64> = (0..NUM_COELUTION_PIN_FEATURES)
+                .map(|i| {
+                    let v = coelution_pin_feature_value(&entry.features, i);
+                    if v.is_finite() {
+                        v
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+
+            let psm_id = format!(
+                "{}_{}_{}_{}",
+                file_name, entry.modified_sequence, entry.charge, entry.scan_number
+            );
+
+            perc_entries.push(percolator::PercolatorEntry {
+                id: psm_id,
+                file_name: file_name.clone(),
+                peptide: entry.modified_sequence.clone(),
+                charge: entry.charge,
+                is_decoy: entry.is_decoy,
+                entry_id: entry.entry_id,
+                features,
+            });
+        }
+    }
+
+    let perc_config = percolator::PercolatorConfig {
+        train_fdr: config.run_fdr,
+        test_fdr: config.run_fdr,
+        ..Default::default()
+    };
+
+    let results = percolator::run_percolator(&perc_entries, &perc_config)
+        .map_err(|e| OspreyError::config(format!("Percolator failed: {}", e)))?;
+
+    // Build result lookup
+    let result_map: HashMap<&str, &percolator::PercolatorResult> =
+        results.entries.iter().map(|r| (r.id.as_str(), r)).collect();
+
+    // Map results back to CoelutionScoredEntries
+    for (file_name, entries) in per_file_entries.iter_mut() {
+        for entry in entries.iter_mut() {
+            let psm_id = format!(
+                "{}_{}_{}_{}",
+                file_name, entry.modified_sequence, entry.charge, entry.scan_number
+            );
+            if let Some(result) = result_map.get(psm_id.as_str()) {
+                entry.run_qvalue = result.run_precursor_qvalue;
+                entry.experiment_qvalue = result.experiment_precursor_qvalue;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run external mokapot FDR on coelution entries
+fn run_coelution_mokapot_fdr(
+    per_file_entries: &mut [(String, Vec<CoelutionScoredEntry>)],
+    mokapot: &MokapotRunner,
+    pin_files: &HashMap<String, std::path::PathBuf>,
+    mokapot_dir: &std::path::Path,
+    config: &OspreyConfig,
+) -> Result<()> {
+    if !mokapot.is_available() {
+        log::warn!("Mokapot not available, falling back to native Percolator");
+        return run_coelution_percolator_fdr(per_file_entries, config);
+    }
+
+    match mokapot.run_two_step_analysis(pin_files, mokapot_dir) {
+        Ok((per_file_results, experiment_results)) => {
+            let experiment_qmap: HashMap<String, f64> = experiment_results
+                .iter()
+                .map(|r| (r.psm_id.clone(), r.q_value))
+                .collect();
+
+            for (file_name, entries) in per_file_entries.iter_mut() {
+                if let Some(results) = per_file_results.get(file_name) {
+                    let run_qmap: HashMap<String, f64> = results
+                        .iter()
+                        .map(|r| (r.psm_id.clone(), r.q_value))
+                        .collect();
+
+                    for entry in entries.iter_mut() {
+                        let psm_id = format!(
+                            "{}_{}_{}_{}",
+                            file_name, entry.modified_sequence, entry.charge, entry.scan_number
+                        );
+                        if let Some(&q) = run_qmap.get(&psm_id) {
+                            entry.run_qvalue = q;
+                        }
+                        if let Some(&q) = experiment_qmap.get(&psm_id) {
+                            entry.experiment_qvalue = q;
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "Mokapot two-step FDR failed: {}. Falling back to Percolator.",
+                e
+            );
+            run_coelution_percolator_fdr(per_file_entries, config)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Target-decoy competition for coelution entries.
@@ -4183,16 +4476,12 @@ fn compete_coelution_entries(
 
     // Competition: target vs decoy, higher coelution_sum wins (ties → decoy, conservative)
     let mut winners = Vec::new();
-    let mut n_pairs = 0usize;
     let mut n_target_wins = 0usize;
     let mut n_decoy_wins = 0usize;
-    let mut n_target_auto = 0usize;
-    let mut n_decoy_auto = 0usize;
 
     for (base_id, target) in target_best {
         let target_score = target.features.coelution_sum;
         if let Some(decoy) = decoy_best.remove(&base_id) {
-            n_pairs += 1;
             let decoy_score = decoy.features.coelution_sum;
             if target_score > decoy_score {
                 n_target_wins += 1;
@@ -4202,23 +4491,18 @@ fn compete_coelution_entries(
                 winners.push(decoy);
             }
         } else {
-            n_target_auto += 1;
+            n_target_wins += 1;
             winners.push(target); // No paired decoy
         }
     }
     // Add remaining decoys without targets
     for (_, decoy) in decoy_best {
-        n_decoy_auto += 1;
+        n_decoy_wins += 1;
         winners.push(decoy);
     }
 
     log::info!(
-        "Target-decoy competition (coelution_sum): {} pairs competed, \
-         {} target auto-wins, {} decoy auto-wins, \
-         {} target wins, {} decoy wins ({} total winners)",
-        n_pairs,
-        n_target_auto,
-        n_decoy_auto,
+        "Target-decoy competition (coelution_sum): {} target wins, {} decoy wins ({} total)",
         n_target_wins,
         n_decoy_wins,
         winners.len()
@@ -4431,6 +4715,58 @@ fn apply_simple_coelution_fdr(
     Ok(())
 }
 
+/// Build shared peak boundaries per (modified_sequence, file_name) for coelution path.
+///
+/// When the same peptide is detected at multiple charge states in the same file,
+/// they elute at the same time. This function selects boundaries from the charge
+/// state with the lowest run q-value (best overall peak quality) for each peptide
+/// per file. Returns the lookup and a count of peptide-file pairs where boundaries
+/// were shared across charge states.
+#[allow(clippy::type_complexity)]
+fn build_shared_coelution_boundaries(
+    entries: &[CoelutionScoredEntry],
+) -> (HashMap<(String, String), (f64, f64, f64)>, usize) {
+    // For each (modified_sequence, file_name), keep boundaries from the entry
+    // with the lowest run q-value
+    let mut best_by_key: HashMap<(String, String), (f64, f64, f64, f64)> = HashMap::new();
+    // Track which keys have multiple charge states
+    let mut charges_by_key: HashMap<(String, String), HashSet<u8>> = HashMap::new();
+
+    for entry in entries {
+        let key = (entry.modified_sequence.clone(), entry.file_name.clone());
+
+        charges_by_key
+            .entry(key.clone())
+            .or_default()
+            .insert(entry.charge);
+
+        let should_update = best_by_key
+            .get(&key)
+            .map_or(true, |&(_, _, _, qval)| entry.run_qvalue < qval);
+
+        if should_update {
+            best_by_key.insert(
+                key,
+                (
+                    entry.apex_rt,
+                    entry.peak_bounds.start_rt,
+                    entry.peak_bounds.end_rt,
+                    entry.run_qvalue,
+                ),
+            );
+        }
+    }
+
+    let n_shared = charges_by_key.values().filter(|c| c.len() > 1).count();
+
+    let shared_bounds: HashMap<(String, String), (f64, f64, f64)> = best_by_key
+        .into_iter()
+        .map(|(k, (apex, start, end, _))| (k, (apex, start, end)))
+        .collect();
+
+    (shared_bounds, n_shared)
+}
+
 /// Write coelution-mode blib output for Skyline.
 ///
 /// Mirrors the regression path's `write_blib_output_with_scores`:
@@ -4483,6 +4819,14 @@ fn write_coelution_blib(
 
     writer.begin_batch()?;
 
+    // Build shared boundaries: for each peptide per file, use boundaries from
+    // the charge state with the lowest run q-value (same peptide at different
+    // charge states elutes at the same time)
+    let (shared_bounds, n_shared) = build_shared_coelution_boundaries(entries);
+
+    // Build library ID lookup for O(1) access instead of O(n) linear scan
+    let lib_by_id: HashMap<u32, &LibraryEntry> = library.iter().map(|e| (e.id, e)).collect();
+
     // Group entries by precursor (modified_sequence + charge) so we write one RefSpectra
     // per unique precursor, with per-run entries in RetentionTimes
     let mut precursor_groups: HashMap<(String, u8), Vec<&CoelutionScoredEntry>> = HashMap::new();
@@ -4511,15 +4855,24 @@ fn write_coelution_blib(
 
         let tic: f64 = best.fragment_intensities.iter().map(|&x| x as f64).sum();
 
+        // Use shared boundaries from the best charge state for this peptide in this file
+        let shared_key = (best.modified_sequence.clone(), best.file_name.clone());
+        let (shared_apex, shared_start, shared_end) =
+            shared_bounds.get(&shared_key).copied().unwrap_or((
+                best.apex_rt,
+                best.peak_bounds.start_rt,
+                best.peak_bounds.end_rt,
+            ));
+
         // Score is the experiment q-value — Skyline GENERIC Q-VALUE convention
         let ref_id = writer.add_spectrum(
             &best.sequence,
             &best.modified_sequence,
             best.precursor_mz,
             best.charge as i32,
-            best.apex_rt,
-            best.peak_bounds.start_rt,
-            best.peak_bounds.end_rt,
+            shared_apex,
+            shared_start,
+            shared_end,
             &best.fragment_mzs,
             &best.fragment_intensities,
             best.experiment_qvalue,
@@ -4529,7 +4882,7 @@ fn write_coelution_blib(
         )?;
 
         // Add modifications from library entry if present
-        if let Some(lib_entry) = library.iter().find(|e| e.id == best.entry_id) {
+        if let Some(lib_entry) = lib_by_id.get(&best.entry_id) {
             if !lib_entry.modifications.is_empty() {
                 writer.add_modifications(ref_id, &lib_entry.modifications)?;
             }
@@ -4546,22 +4899,31 @@ fn write_coelution_blib(
                 *best as *const CoelutionScoredEntry,
             );
 
+            // Use shared boundaries for this peptide in this run's file
+            let run_shared_key = (scored.modified_sequence.clone(), scored.file_name.clone());
+            let (run_apex, run_start, run_end) =
+                shared_bounds.get(&run_shared_key).copied().unwrap_or((
+                    scored.apex_rt,
+                    scored.peak_bounds.start_rt,
+                    scored.peak_bounds.end_rt,
+                ));
+
             writer.add_retention_time(
                 ref_id,
                 run_file_id,
-                scored.apex_rt,
-                scored.peak_bounds.start_rt,
-                scored.peak_bounds.end_rt,
+                run_apex,
+                run_start,
+                run_end,
                 scored.run_qvalue,
                 is_best,
             )?;
         }
 
-        // Add peak boundaries to Osprey extension table
+        // Add peak boundaries to Osprey extension table (shared across charge states)
         let boundaries = osprey_core::PeakBoundaries {
-            start_rt: best.peak_bounds.start_rt,
-            end_rt: best.peak_bounds.end_rt,
-            apex_rt: best.apex_rt,
+            start_rt: shared_start,
+            end_rt: shared_end,
+            apex_rt: shared_apex,
             apex_coefficient: best.features.dot_product,
             integrated_area: best.features.peak_area,
             peak_quality: osprey_core::PeakQuality::default(),
@@ -4592,11 +4954,17 @@ fn write_coelution_blib(
     writer.finalize()?;
 
     log::info!(
-        "Wrote {} unique precursors to blib (from {} total entries across {} files)",
-        n_written,
+        "Wrote {} total entries for {} precursors across {} files",
         entries.len(),
+        n_written,
         config.input_files.len()
     );
+    if n_shared > 0 {
+        log::info!(
+            "Shared peak boundaries across charge states for {} peptide-file pairs",
+            n_shared
+        );
+    }
 
     Ok(())
 }
@@ -4929,7 +5297,6 @@ fn run_coelution_search(
                         return None;
                     }
 
-                    let corr_mean = corr_sum / n_pairs as f64;
                     let mut fragment_corr = [0.0f64; 6];
                     let mut n_coeluting = 0u8;
                     for i in 0..n_xics.min(6) {
@@ -5103,10 +5470,15 @@ fn run_coelution_search(
                         .filter(|&c| c == 'K' || c == 'R')
                         .count() as u8;
 
-                    // Fragment m/z and intensities at apex for blib output
-                    let frag_mzs: Vec<f64> = frag_matches.iter().map(|m| m.obs_mz).collect();
-                    let frag_intensities: Vec<f32> =
-                        frag_matches.iter().map(|m| m.obs_intensity).collect();
+                    // Fragment m/z and intensities from library for blib output
+                    // Use library theoretical values (not observed peaks) so Skyline
+                    // can build XICs for the correct b/y ions
+                    let frag_mzs: Vec<f64> = entry.fragments.iter().map(|f| f.mz).collect();
+                    let frag_intensities: Vec<f32> = entry
+                        .fragments
+                        .iter()
+                        .map(|f| f.relative_intensity)
+                        .collect();
 
                     // Reference XIC within peak bounds for blib coefficient series
                     let ref_xic_peak: Vec<(f64, f64)> =
@@ -5115,7 +5487,6 @@ fn run_coelution_search(
                     let features = CoelutionFeatureSet {
                         // Pairwise coelution
                         coelution_sum: corr_sum,
-                        coelution_mean: corr_mean,
                         coelution_min: if corr_min.is_finite() { corr_min } else { 0.0 },
                         coelution_max: if corr_max.is_finite() { corr_max } else { 0.0 },
                         n_coeluting_fragments: n_coeluting,
@@ -5142,8 +5513,6 @@ fn run_coelution_search(
                         dot_product_smz_top6: spectral_score.dot_product_smz_top6,
                         dot_product_smz_top5: spectral_score.dot_product_smz_top5,
                         dot_product_smz_top4: spectral_score.dot_product_smz_top4,
-                        pearson_correlation: spectral_score.pearson_correlation,
-                        spearman_correlation: spectral_score.spearman_correlation,
                         fragment_coverage: spectral_score.fragment_coverage,
                         sequence_coverage: spectral_score.sequence_coverage,
                         consecutive_ions: spectral_score.consecutive_ions as u8,
@@ -5214,7 +5583,9 @@ fn run_coelution_search(
         all_entries.iter().filter(|e| e.is_decoy).count(),
     );
 
-    // Deduplicate: keep best entry per library ID (highest coelution_sum)
+    // Keep best score per precursor (a precursor can be scored in multiple
+    // overlapping DIA windows; keep the one with highest coelution_sum)
+    let pre_count = all_entries.len();
     let mut best_by_id: HashMap<u32, CoelutionScoredEntry> = HashMap::new();
     for entry in all_entries {
         let is_better = best_by_id
@@ -5227,7 +5598,13 @@ fn run_coelution_search(
     }
 
     let deduped: Vec<CoelutionScoredEntry> = best_by_id.into_values().collect();
-    log::info!("After deduplication: {} unique entries", deduped.len());
+    if deduped.len() < pre_count {
+        log::info!(
+            "Best per precursor: {} entries (removed {} duplicate window hits)",
+            deduped.len(),
+            pre_count - deduped.len()
+        );
+    }
 
     Ok(deduped)
 }
@@ -6120,7 +6497,7 @@ mod tests {
 
     /// Unpaired entries (singletons) win automatically.
     #[test]
-    fn test_compete_singleton_auto_wins() {
+    fn test_compete_singleton_wins() {
         let (target_lib, _decoy_lib) = make_library_pair(1);
         // Only put target in library, no decoy scored
         let library = vec![target_lib];
@@ -6129,7 +6506,7 @@ mod tests {
 
         let result = compete_target_decoy_pairs(entries, &library);
         assert_eq!(result.len(), 1);
-        assert!(!result[0].is_decoy, "Singleton target should auto-win");
+        assert!(!result[0].is_decoy, "Singleton target should win");
     }
 
     /// Ties go to the decoy (conservative for FDR estimation).

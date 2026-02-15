@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use clap::Parser;
-use osprey::{run_analysis, ConfigOverrides, OspreyConfig, ResolutionMode, ToleranceUnit};
+use osprey::{
+    run_analysis, ConfigOverrides, FdrMethod, OspreyConfig, ResolutionMode, ToleranceUnit,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -167,6 +169,14 @@ struct Args {
     #[arg(long, default_value = "regression")]
     search_mode: String,
 
+    /// FDR method: percolator (native SVM, default), mokapot (external Python), or simple (no ML)
+    #[arg(long, default_value = "percolator")]
+    fdr_method: String,
+
+    /// Write PIN files for external tools
+    #[arg(long)]
+    write_pin: bool,
+
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -244,6 +254,17 @@ fn main() -> Result<()> {
             }
         });
 
+    // Parse FDR method
+    let fdr_method = match args.fdr_method.to_lowercase().as_str() {
+        "percolator" => Some(FdrMethod::Percolator),
+        "mokapot" => Some(FdrMethod::Mokapot),
+        "simple" => Some(FdrMethod::Simple),
+        other => {
+            log::warn!("Unknown FDR method '{}', defaulting to percolator", other);
+            Some(FdrMethod::Percolator)
+        }
+    };
+
     // Create overrides from CLI args (these take precedence over config file)
     let overrides = ConfigOverrides {
         input_files: args.input,
@@ -260,6 +281,8 @@ fn main() -> Result<()> {
         fragment_unit,
         precursor_tolerance: args.precursor_tolerance,
         precursor_unit,
+        fdr_method,
+        write_pin: args.write_pin,
     };
 
     // Apply CLI overrides

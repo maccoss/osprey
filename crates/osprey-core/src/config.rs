@@ -64,6 +64,15 @@ pub struct OspreyConfig {
     #[serde(default)]
     pub search_mode: SearchMode,
 
+    // FDR method
+    /// FDR method: native Percolator (default), external mokapot, or simple target-decoy
+    #[serde(default)]
+    pub fdr_method: FdrMethod,
+
+    /// Write PIN files for external tools (default: false)
+    #[serde(default)]
+    pub write_pin: bool,
+
     // Performance
     /// Number of threads to use
     pub n_threads: usize,
@@ -89,6 +98,8 @@ impl Default for OspreyConfig {
             max_candidates_per_spectrum: 5250,
             rt_calibration: RTCalibrationConfig::default(),
             search_mode: SearchMode::default(),
+            fdr_method: FdrMethod::default(),
+            write_pin: false,
             regularization_lambda: RegularizationSetting::CrossValidated,
             max_iterations: 1000,
             convergence_threshold: 1e-6,
@@ -226,6 +237,8 @@ run_fdr: 0.01
 experiment_fdr: 0.01
 decoy_method: Reverse  # Options: Reverse, Shuffle, FromLibrary
 decoys_in_library: false
+fdr_method: Percolator  # Options: Percolator (native SVM), Mokapot (external Python), Simple (no ML)
+write_pin: false  # Write PIN files for external tools
 
 # Performance
 n_threads: 0  # 0 = auto-detect
@@ -286,6 +299,12 @@ export_coefficients: false  # Export coefficient time series to parquet
         if let Some(unit) = args.precursor_unit {
             self.precursor_tolerance.unit = unit;
         }
+        if let Some(method) = args.fdr_method {
+            self.fdr_method = method;
+        }
+        if args.write_pin {
+            self.write_pin = true;
+        }
     }
 }
 
@@ -306,6 +325,8 @@ pub struct ConfigOverrides {
     pub fragment_unit: Option<ToleranceUnit>,
     pub precursor_tolerance: Option<f64>,
     pub precursor_unit: Option<ToleranceUnit>,
+    pub fdr_method: Option<FdrMethod>,
+    pub write_pin: bool,
 }
 
 /// RT Calibration configuration
@@ -355,7 +376,7 @@ pub struct RTCalibrationConfig {
 }
 
 fn default_min_rt_tolerance() -> f64 {
-    0.1
+    0.5
 }
 
 fn default_calibration_sample_size() -> usize {
@@ -374,7 +395,7 @@ impl Default for RTCalibrationConfig {
             min_calibration_points: 200,
             rt_tolerance_factor: 3.0,
             fallback_rt_tolerance: 2.0,
-            min_rt_tolerance: 0.1, // 6 seconds minimum (was 0.25 = 15 sec)
+            min_rt_tolerance: 0.5,           // 30 seconds minimum
             initial_tolerance_fraction: 1.0, // 100% of RT range (no RT filtering, like pyXcorrDIA)
             calibration_sample_size: 100000,
             calibration_retry_factor: 2.0,
@@ -447,6 +468,28 @@ pub enum SearchMode {
     Regression,
     /// Coelution: DIA-NN-style fragment XIC correlation without regression
     Coelution,
+}
+
+/// FDR control method
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FdrMethod {
+    /// Native Rust Percolator implementation (linear SVM, default)
+    #[default]
+    Percolator,
+    /// External Python mokapot
+    Mokapot,
+    /// Simple target-decoy competition (no ML rescoring)
+    Simple,
+}
+
+impl std::fmt::Display for FdrMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FdrMethod::Percolator => write!(f, "percolator"),
+            FdrMethod::Mokapot => write!(f, "mokapot"),
+            FdrMethod::Simple => write!(f, "simple"),
+        }
+    }
 }
 
 /// Fragment tolerance configuration for LibCosine scoring

@@ -6,12 +6,13 @@ Osprey uses two-level FDR (False Discovery Rate) control to ensure high-quality 
 
 ```
 FDR Control Workflow:
-  1. Extract 37 features per precursor (targets + decoys)
+  1. Extract features per precursor (37 for regression, 45 for coelution)
   2. Write PIN files (one per mzML file)
   3. Run Mokapot CLI with two-step analysis:
      - Step 1: Train joint model, report per-file q-values
      - Step 2: Reuse model, report experiment-level q-values
   4. Output: run-level and experiment-level q-values per precursor
+  5. Blib output: only precursors passing experiment-level FDR are written
 ```
 
 ## Key Terminology
@@ -94,7 +95,7 @@ Mokapot is a Python tool for semi-supervised learning in proteomics FDR control.
 
 ### PIN File Format
 
-Osprey writes one PIN file per mzML file with 37 features:
+Osprey writes one PIN file per mzML file. The number of feature columns depends on the search mode: 37 for regression, 45 for coelution.
 
 ```
 SpecId  Label  ScanNr  ChargeState  peak_apex  peak_area  ...  Peptide  Proteins
@@ -104,7 +105,7 @@ psm_002   -1    1234           2       0.12       1.1  ...  -.KEDITPEP.-  DECOY_
 
 - `Label`: 1 for target, -1 for decoy
 - `SpecId`: Unique identifier for the PSM
-- 37 feature columns (see Feature Set below)
+- Feature columns (37 for regression, 45 for coelution — see Feature Sets below)
 - `Peptide`: Flanking.SEQUENCE.Flanking format
 - `Proteins`: Protein accessions
 
@@ -159,12 +160,14 @@ Rank   Feature                                  Weight     |Weight|
 ...
 ```
 
-## Feature Set (37 Features)
+## Feature Sets
 
 All intensity-based spectral similarity scores include ALL library fragments
 within the spectrum's mass range, using 0 intensity for unmatched peaks.
 
-### Ridge Regression Features (8)
+### Regression Mode (37 Features)
+
+#### Ridge Regression Features (8)
 
 | Feature | Description | Range |
 |---------|-------------|-------|
@@ -246,6 +249,23 @@ within the spectrum's mass range, using 0 intensity for unmatched peaks.
 | `median_polish_rsquared` | Additive model R^2 in sqrt space | 0-1 |
 | `median_polish_residual_ratio` | sum|obs-pred| / sum(obs), linear | 0+ |
 
+### Coelution Mode (45 Features)
+
+The coelution search mode does not use ridge regression. Instead, it extracts fragment XICs and scores based on pairwise correlations and spectral matching.
+
+| Category | Count | Features |
+|----------|-------|----------|
+| Pairwise coelution | 11 | fragment_coelution_sum/min/max, n_coeluting_fragments, n_fragment_pairs, fragment_corr_0..5 |
+| Peak shape | 7 | peak_apex, peak_area, peak_width, peak_symmetry, signal_to_noise, n_scans, peak_sharpness |
+| Spectral at apex | 15 | hyperscore, xcorr, dot_product, dot_product_smz, dot_product_top6/5/4, dot_product_smz_top6/5/4, fragment_coverage, sequence_coverage, consecutive_ions, explained_intensity, elution_weighted_cosine |
+| Mass accuracy | 3 | mass_accuracy_deviation_mean, abs_mass_accuracy_deviation_mean, mass_accuracy_std |
+| RT deviation | 2 | rt_deviation, abs_rt_deviation |
+| MS1 | 2 | ms1_precursor_coelution, ms1_isotope_cosine |
+| Peptide properties | 2 | peptide_length, missed_cleavages |
+| Tukey median polish | 3 | median_polish_cosine, median_polish_rsquared, median_polish_residual_ratio |
+
+**Key differences from regression mode**: No coefficient_stability, relative_coefficient, xic_signal_to_noise, xcorr_deconv, consecutive_ions_deconv, ln_num_candidates, coef_zscore, coef_zscore_mean. Added hyperscore, dot_product variants (top6/5/4), fragment_coelution_max, n_fragment_pairs, peak_symmetry, peak_sharpness, n_scans, fragment_coverage, sequence_coverage.
+
 ## Target-Decoy Competition
 
 ### Decoy Generation
@@ -320,6 +340,8 @@ Each passing precursor has:
 | `experiment_qvalue` | q-value across all replicates |
 | `mokapot_score` | Combined discriminant score |
 | `pep` | Posterior error probability |
+
+**Important**: Only precursors that pass experiment-level FDR are written to the blib output. Precursors that pass run-level FDR but are not present in Mokapot's experiment-level results retain their default experiment_qvalue of 1.0 and are excluded from the output. The number of precursors in the blib must match the experiment-level FDR count.
 
 ### Terminal Output
 

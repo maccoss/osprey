@@ -4,7 +4,7 @@ This file provides context for Claude Code when working on the Osprey project.
 
 ## Project Overview
 
-Osprey is a Rust-based peptide-centric DIA (Data-Independent Acquisition) analysis tool for mass spectrometry proteomics. It uses ridge regression to deconvolute mixed MS/MS spectra and integrates with Skyline for quantification.
+Osprey is a Rust-based peptide-centric DIA (Data-Independent Acquisition) analysis tool for mass spectrometry proteomics. It supports two search modes: ridge regression (spectrum deconvolution) and coelution (DIA-NN-style fragment XIC correlation). Results integrate with Skyline for quantification.
 
 **Current Status**: Working prototype with 76,169 precursors at 1% FDR from single Astral file.
 
@@ -31,7 +31,7 @@ osprey/
 
 ### Key Components
 
-- **osprey-core**: `LibraryEntry`, `Spectrum`, `OspreyConfig`, `IsolationWindow`, `FeatureSet`
+- **osprey-core**: `LibraryEntry`, `Spectrum`, `OspreyConfig`, `IsolationWindow`, `FeatureSet`, `CoelutionFeatureSet`, `SearchMode`
 - **osprey-io**: `MzmlReader` (uses mzdata crate), `DiannTsvLoader`, `ElibLoader`, `BlibLoader`, `BlibWriter`
 - **osprey-regression**: `RidgeSolver` (Cholesky), `Binner`, `DesignMatrixBuilder`, `SparseRidgeSolver`, `SparseMatrixBuilder` (HRAM)
 - **osprey-chromatography**: `PeakDetector`, `RTCalibrator`, `MzCalibration`, `CalibrationParams`
@@ -78,7 +78,7 @@ CI runs `cargo fmt --check` and `cargo clippy -D warnings` (including test targe
 - `crates/osprey/src/main.rs` - CLI entry point
 - `crates/osprey-fdr/src/mokapot.rs` - Mokapot integration
 - `crates/osprey-io/src/output/blib.rs` - BiblioSpec blib writer
-- `crates/osprey-core/src/types.rs` - FeatureSet (37 features for Mokapot PIN)
+- `crates/osprey-core/src/types.rs` - FeatureSet (37 regression), CoelutionFeatureSet (45 coelution)
 - `crates/osprey-chromatography/src/calibration/` - RT and mass calibration
 
 ## Configuration
@@ -119,22 +119,32 @@ External:
 - Enzyme-aware decoy generation (reversal)
 - RT calibration with LOESS regression
 - MS1/MS2 mass calibration
+- Two search modes: regression (37 features) and coelution (45 features)
 - Ridge regression with NNLS solver (f32)
 - HRAM sparse matrix support (ppm-based matching)
-- Peak detection in coefficient time series
+- Coelution search: DIA-NN-style fragment XIC correlation without regression
+- Peak detection in coefficient/XIC time series
 - Tukey median polish for robust peak boundaries and fragment scoring
-- 37-feature extraction per precursor
 - Two-level FDR control (run + experiment level)
 - Mokapot integration with parallel workers
 - Progress streaming from Mokapot
 - Feature weight inspection (`--save_models`)
-- blib output with Osprey extension tables
+- blib output with Osprey extension tables (library theoretical fragments)
 - YAML configuration
 - CLI with all core options
 - Calibration JSON save/load
 - Calibration HTML report generation
 
-### Feature Set (37 Features for Mokapot PIN)
+### Search Modes
+
+Osprey supports two search modes via `SearchMode` (`--search-mode`):
+
+- **Regression** (default): Ridge regression deconvolutes mixed DIA spectra into individual peptide contributions. 37 features extracted per precursor.
+- **Coelution**: DIA-NN-style fragment XIC correlation without regression. Extracts fragment XICs, computes pairwise correlations, and scores using spectral matching at the apex. 45 features extracted per precursor.
+
+Both modes share: calibration phase, decoy generation, library deduplication, Mokapot FDR, and blib output. The blib always stores library theoretical fragment m/z and intensities (not observed DIA peaks).
+
+### Regression Feature Set (37 Features for Mokapot PIN)
 
 Ridge regression (8):
 - peak_apex, peak_area, peak_width, coefficient_stability
@@ -159,6 +169,30 @@ MS1 features (2): ms1_precursor_coelution, ms1_isotope_cosine
 
 Tukey median polish (3):
 - median_polish_cosine, median_polish_rsquared, median_polish_residual_ratio
+
+### Coelution Feature Set (45 Features for Mokapot PIN)
+
+Pairwise coelution (11):
+- fragment_coelution_sum, fragment_coelution_min, fragment_coelution_max
+- n_coeluting_fragments, n_fragment_pairs
+- fragment_corr_0..5 (per-fragment avg correlation with other fragments)
+
+Peak shape (7):
+- peak_apex, peak_area, peak_width, peak_symmetry
+- signal_to_noise, n_scans, peak_sharpness
+
+Spectral at apex (15):
+- hyperscore, xcorr, dot_product, dot_product_smz
+- dot_product_top6, dot_product_top5, dot_product_top4
+- dot_product_smz_top6, dot_product_smz_top5, dot_product_smz_top4
+- fragment_coverage, sequence_coverage, consecutive_ions
+- explained_intensity, elution_weighted_cosine
+
+Mass accuracy (3): mass_accuracy_deviation_mean, abs_mass_accuracy_deviation_mean, mass_accuracy_std
+RT deviation (2): rt_deviation, abs_rt_deviation
+MS1 features (2): ms1_precursor_coelution, ms1_isotope_cosine
+Peptide properties (2): peptide_length, missed_cleavages
+Tukey median polish (3): median_polish_cosine, median_polish_rsquared, median_polish_residual_ratio
 
 ### TODO (Future)
 
@@ -208,6 +242,11 @@ python scripts/inspect_mokapot_weights.py mokapot.model.pkl
 
 ## Recent Changes
 
+- Added coelution search mode (DIA-NN-style fragment XIC correlation, 45 features)
+- Fixed coelution blib output to write library theoretical fragments (not observed DIA peaks)
+- Fixed experiment-level FDR: entries not in experiment results no longer fall back to run q-values
+- Removed pearson_correlation and spearman_correlation from coelution features (poor discrimination)
+- Added blib round-trip tests (fragment, modseq, protein mapping, multi-run RT)
 - Replaced library-assisted median polish with Tukey median polish for peak boundaries
 - Added 3 median polish features: cosine, R², residual_ratio
 - Fixed all cosine/correlation scoring to include ALL library fragments (0 for unmatched)

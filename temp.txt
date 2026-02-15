@@ -9,6 +9,26 @@ cargo run --release -- -i *.mzML -l ../hela-filtered-SkylineAI_spectral_library.
 python3 visualize_pin_features.py ../example_test_data/stellar/calibrated-GPF-data/mokapot/Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars.pin --output report-stellar.html
 
 
+
+
+[2026-02-14T22:42:52Z INFO  osprey_fdr::mokapot] === Per-file results (run-level FDR at 1%) ===
+[2026-02-14T22:42:53Z INFO  osprey_fdr::mokapot]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_49: 113656 precursors, 106877 peptides
+[2026-02-14T22:42:54Z INFO  osprey_fdr::mokapot]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_55: 113294 precursors, 106577 peptides
+[2026-02-14T22:42:54Z INFO  osprey_fdr::mokapot]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_60: 112569 precursors, 106121 peptides
+[2026-02-14T22:42:54Z INFO  osprey_fdr::mokapot] 
+[2026-02-14T22:42:54Z INFO  osprey_fdr::mokapot] Step 1 total: 339519 unique precursors, 217123 unique peptides across 3 files
+[2026-02-14T22:42:54Z INFO  osprey_fdr::mokapot] Step 2: Training new model for experiment-level FDR...
+[2026-02-14T22:46:43Z INFO  osprey_fdr::mokapot] [mokapot] /mnt/c/Users/macco/Documents/github/maccoss/osprey/.venv/lib/python3.12/site-packages/sklearn/svm/_base.py:1258: ConvergenceWarning: Liblinear failed to converge, increase the number of iterations.
+[2026-02-14T22:48:33Z INFO  osprey_fdr::mokapot] 
+[2026-02-14T22:48:33Z INFO  osprey_fdr::mokapot] === Experiment-level results (1% FDR) ===
+[2026-02-14T22:48:33Z INFO  osprey_fdr::mokapot]   Experiment: 169847 precursors, 112269 peptides
+[2026-02-14T22:48:46Z INFO  osprey::pipeline] Writing blib to astral-ospreyoutput.blib
+[2026-02-14T22:49:18Z INFO  osprey::pipeline] Wrote 169847 total entries for 120951 precursors across 3 files
+
+
+
+
+
 Usage: osprey [OPTIONS]
 
 Options:

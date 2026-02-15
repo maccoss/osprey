@@ -1483,6 +1483,8 @@ dependencies = [
  "approx",
  "log",
  "osprey-core",
+ "osprey-ml",
+ "rayon",
  "sysinfo",
  "thiserror",
 ]

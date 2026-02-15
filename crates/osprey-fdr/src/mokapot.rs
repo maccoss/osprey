@@ -824,7 +824,7 @@ print("SUCCESS")
 
             log::info!("");
             log::info!(
-                "Step 1 total: {} precursors, {} unique peptides across {} files",
+                "Step 1 total: {} unique precursors, {} unique peptides across {} files",
                 total_precursors,
                 total_peptides_set.len(),
                 per_file_results.len()
@@ -1358,8 +1358,8 @@ pub fn write_mokapot_report<P: AsRef<Path>>(results: &[MokapotResult], path: P) 
 // Coelution-mode PIN file support
 // =============================================================================
 
-/// Number of coelution PIN features (48).
-pub const NUM_COELUTION_PIN_FEATURES: usize = 48;
+/// Number of coelution PIN features (47).
+pub const NUM_COELUTION_PIN_FEATURES: usize = 45;
 
 /// Returns the coelution-mode PIN feature header as a tab-separated string.
 fn get_coelution_feature_header() -> String {
@@ -1372,9 +1372,8 @@ fn get_coelution_feature_header() -> String {
 /// fragment_coelution_sum, fragment_coelution_min, mass_accuracy_deviation_mean, etc.
 pub fn get_coelution_pin_feature_names() -> Vec<&'static str> {
     vec![
-        // Pairwise coelution (12)
+        // Pairwise coelution (11)
         "fragment_coelution_sum",
-        "fragment_coelution_mean",
         "fragment_coelution_min",
         "fragment_coelution_max",
         "n_coeluting_fragments",
@@ -1404,8 +1403,6 @@ pub fn get_coelution_pin_feature_names() -> Vec<&'static str> {
         "dot_product_smz_top6",
         "dot_product_smz_top5",
         "dot_product_smz_top4",
-        "pearson_correlation",
-        "spearman_correlation",
         "fragment_coverage",
         "sequence_coverage",
         "consecutive_ions",
@@ -1434,10 +1431,9 @@ pub fn get_coelution_pin_feature_names() -> Vec<&'static str> {
 /// Format coelution features as a tab-separated string for PIN output.
 fn format_coelution_features(f: &CoelutionFeatureSet) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         // Pairwise coelution
         f.coelution_sum,
-        f.coelution_mean,
         f.coelution_min,
         f.coelution_max,
         f.n_coeluting_fragments,
@@ -1467,8 +1463,6 @@ fn format_coelution_features(f: &CoelutionFeatureSet) -> String {
         f.dot_product_smz_top6,
         f.dot_product_smz_top5,
         f.dot_product_smz_top4,
-        f.pearson_correlation,
-        f.spearman_correlation,
         f.fragment_coverage,
         f.sequence_coverage,
         f.consecutive_ions,
@@ -1494,57 +1488,54 @@ fn format_coelution_features(f: &CoelutionFeatureSet) -> String {
     )
 }
 
-/// Returns a coelution PIN feature value by index (0-47).
+/// Returns a coelution PIN feature value by index (0-44).
 pub fn coelution_pin_feature_value(f: &CoelutionFeatureSet, index: usize) -> f64 {
     match index {
         0 => f.coelution_sum,
-        1 => f.coelution_mean,
-        2 => f.coelution_min,
-        3 => f.coelution_max,
-        4 => f.n_coeluting_fragments as f64,
-        5 => f.n_fragment_pairs as f64,
-        6 => f.fragment_corr[0],
-        7 => f.fragment_corr[1],
-        8 => f.fragment_corr[2],
-        9 => f.fragment_corr[3],
-        10 => f.fragment_corr[4],
-        11 => f.fragment_corr[5],
-        12 => f.peak_apex,
-        13 => f.peak_area,
-        14 => f.peak_width,
-        15 => f.peak_symmetry,
-        16 => f.signal_to_noise,
-        17 => f.n_scans as f64,
-        18 => f.peak_sharpness,
-        19 => f.hyperscore,
-        20 => f.xcorr,
-        21 => f.dot_product,
-        22 => f.dot_product_smz,
-        23 => f.dot_product_top6,
-        24 => f.dot_product_top5,
-        25 => f.dot_product_top4,
-        26 => f.dot_product_smz_top6,
-        27 => f.dot_product_smz_top5,
-        28 => f.dot_product_smz_top4,
-        29 => f.pearson_correlation,
-        30 => f.spearman_correlation,
-        31 => f.fragment_coverage,
-        32 => f.sequence_coverage,
-        33 => f.consecutive_ions as f64,
-        34 => f.explained_intensity,
-        35 => f.elution_weighted_cosine,
-        36 => f.mass_accuracy_mean,
-        37 => f.abs_mass_accuracy_mean,
-        38 => f.mass_accuracy_std,
-        39 => f.rt_deviation,
-        40 => f.abs_rt_deviation,
-        41 => f.ms1_precursor_coelution,
-        42 => f.ms1_isotope_cosine,
-        43 => f.peptide_length as f64,
-        44 => f.missed_cleavages as f64,
-        45 => f.median_polish_cosine,
-        46 => f.median_polish_rsquared,
-        47 => f.median_polish_residual_ratio,
+        1 => f.coelution_min,
+        2 => f.coelution_max,
+        3 => f.n_coeluting_fragments as f64,
+        4 => f.n_fragment_pairs as f64,
+        5 => f.fragment_corr[0],
+        6 => f.fragment_corr[1],
+        7 => f.fragment_corr[2],
+        8 => f.fragment_corr[3],
+        9 => f.fragment_corr[4],
+        10 => f.fragment_corr[5],
+        11 => f.peak_apex,
+        12 => f.peak_area,
+        13 => f.peak_width,
+        14 => f.peak_symmetry,
+        15 => f.signal_to_noise,
+        16 => f.n_scans as f64,
+        17 => f.peak_sharpness,
+        18 => f.hyperscore,
+        19 => f.xcorr,
+        20 => f.dot_product,
+        21 => f.dot_product_smz,
+        22 => f.dot_product_top6,
+        23 => f.dot_product_top5,
+        24 => f.dot_product_top4,
+        25 => f.dot_product_smz_top6,
+        26 => f.dot_product_smz_top5,
+        27 => f.dot_product_smz_top4,
+        28 => f.fragment_coverage,
+        29 => f.sequence_coverage,
+        30 => f.consecutive_ions as f64,
+        31 => f.explained_intensity,
+        32 => f.elution_weighted_cosine,
+        33 => f.mass_accuracy_mean,
+        34 => f.abs_mass_accuracy_mean,
+        35 => f.mass_accuracy_std,
+        36 => f.rt_deviation,
+        37 => f.abs_rt_deviation,
+        38 => f.ms1_precursor_coelution,
+        39 => f.ms1_isotope_cosine,
+        40 => f.peptide_length as f64,
+        41 => f.missed_cleavages as f64,
+        42 => f.median_polish_cosine,
+        43 => f.median_polish_rsquared,
+        44 => f.median_polish_residual_ratio,
         _ => 0.0,
     }
 }

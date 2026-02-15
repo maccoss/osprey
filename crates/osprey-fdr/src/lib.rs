@@ -1,12 +1,14 @@
 //! Osprey FDR - False Discovery Rate control
 //!
 //! This crate provides:
+//! - Native Percolator implementation (linear SVM, cross-validation, iterative training)
 //! - Target-decoy competition
 //! - Q-value calculation
 //! - Run-level and experiment-level FDR
-//! - Integration with mokapot for semi-supervised learning
+//! - Integration with mokapot for semi-supervised learning (optional)
 
 pub mod mokapot;
+pub mod percolator;
 
 pub use mokapot::{
     coelution_pin_feature_value, get_coelution_pin_feature_names, get_pin_feature_names,
