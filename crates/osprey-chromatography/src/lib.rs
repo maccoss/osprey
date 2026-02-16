@@ -177,23 +177,31 @@ impl PeakDetector {
 // DIA-NN-style peak detection with valley-based boundary determination
 // =============================================================================
 
-/// Smooth a time series with weighted moving average [0.25, 0.5, 0.25].
+/// Smooth a time series with 5-point Savitzky-Golay quadratic filter.
 ///
-/// Endpoints use asymmetric weights: [2/3, 1/3] for first and [1/3, 2/3] for last.
-/// This matches DIA-NN's smoothing kernel.
-pub fn smooth_weighted_avg(values: &[f64]) -> Vec<f64> {
+/// Coefficients: [-3, 12, 17, 12, -3] / 35
+/// Preserves peak position and shape better than triangular kernels by fitting
+/// a local quadratic polynomial at each point. Endpoints (first 2 and last 2
+/// points) are left unsmoothed. Negative values from the filter are clamped
+/// to zero. Series shorter than 5 points are returned unsmoothed.
+pub fn smooth_savitzky_golay(values: &[f64]) -> Vec<f64> {
     let n = values.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    if n == 1 {
-        return vec![values[0]];
+    if n < 5 {
+        return values.to_vec();
     }
     let mut out = vec![0.0; n];
-    out[0] = (2.0 / 3.0) * values[0] + (1.0 / 3.0) * values[1];
-    out[n - 1] = (2.0 / 3.0) * values[n - 1] + (1.0 / 3.0) * values[n - 2];
-    for i in 1..n - 1 {
-        out[i] = 0.25 * values[i - 1] + 0.5 * values[i] + 0.25 * values[i + 1];
+    out[0] = values[0];
+    out[1] = values[1];
+    out[n - 2] = values[n - 2];
+    out[n - 1] = values[n - 1];
+    for i in 2..n - 2 {
+        out[i] = ((-3.0 * values[i - 2]
+            + 12.0 * values[i - 1]
+            + 17.0 * values[i]
+            + 12.0 * values[i + 1]
+            + -3.0 * values[i + 2])
+            / 35.0)
+            .max(0.0);
     }
     out
 }
@@ -205,7 +213,7 @@ pub fn smooth_weighted_avg(values: &[f64]) -> Vec<f64> {
 /// 2. Find the apex (local maximum nearest to expected_rt, or global max)
 /// 3. Walk left/right from apex to find boundaries using:
 ///    - Intensity falloff: stop when intensity < apex / peak_boundary
-///    - Valley detection: stop at local minimum that is <33% of apex AND <50% of neighbor
+///    - Valley detection: stop at local minimum that is <50% of apex AND <50% of neighbor
 ///
 /// # Arguments
 /// * `xic` - (RT, intensity) pairs, must be sorted by RT
@@ -224,18 +232,62 @@ pub fn detect_xic_peak(
 
     // Extract intensity values and smooth
     let raw_intensities: Vec<f64> = xic.iter().map(|(_, v)| *v).collect();
-    let smoothed = smooth_weighted_avg(&raw_intensities);
+    let smoothed = smooth_savitzky_golay(&raw_intensities);
 
     // Find apex: local maximum above min_height
     let apex_idx = find_apex(&smoothed, min_height, expected_rt, xic)?;
     let apex_intensity = smoothed[apex_idx];
 
+    // Estimate local background from minimum of smoothed intensity.
+    // For low S/N peaks, background can be 20-30% of apex intensity, so computing
+    // the boundary threshold relative to the signal above background prevents
+    // boundaries from extending into baseline noise.
+    let background = smoothed
+        .iter()
+        .cloned()
+        .fold(f64::INFINITY, f64::min)
+        .max(0.0);
+    let signal_above_bg = (apex_intensity - background).max(0.0);
+    let boundary_threshold = background + signal_above_bg / peak_boundary;
+
     // Walk left to find start boundary
-    let boundary_threshold = apex_intensity / peak_boundary;
-    let start_idx = walk_boundary_left(&smoothed, apex_idx, apex_intensity, boundary_threshold);
+    let mut start_idx = walk_boundary_left(&smoothed, apex_idx, apex_intensity, boundary_threshold);
 
     // Walk right to find end boundary
-    let end_idx = walk_boundary_right(&smoothed, apex_idx, apex_intensity, boundary_threshold);
+    let mut end_idx = walk_boundary_right(&smoothed, apex_idx, apex_intensity, boundary_threshold);
+
+    // Asymmetric FWHM-based boundary capping: prevents boundaries from extending
+    // too far on slowly decaying tails. Cap at apex +/- cap_factor * half_width.
+    // Factor 2.0 with HWHM ≈ 1.177σ gives cap at ~2.35σ (~98% Gaussian area).
+    if let Some((left_hw, right_hw)) = compute_asymmetric_half_widths(&smoothed, xic, apex_idx) {
+        let cap_factor = 2.0;
+        let apex_rt = xic[apex_idx].0;
+
+        // Cap left boundary
+        let min_start_rt = apex_rt - cap_factor * left_hw;
+        if xic[start_idx].0 < min_start_rt {
+            if let Some((i, _)) = xic[start_idx..apex_idx]
+                .iter()
+                .enumerate()
+                .find(|(_, (rt, _))| *rt >= min_start_rt)
+            {
+                start_idx += i;
+            }
+        }
+
+        // Cap right boundary
+        let max_end_rt = apex_rt + cap_factor * right_hw;
+        if xic[end_idx].0 > max_end_rt {
+            if let Some((i, _)) = xic[apex_idx..=end_idx]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, (rt, _))| *rt <= max_end_rt)
+            {
+                end_idx = apex_idx + i;
+            }
+        }
+    }
 
     // Need at least 3 points in the peak
     if end_idx - start_idx + 1 < 3 {
@@ -259,6 +311,75 @@ pub fn detect_xic_peak(
         area,
         signal_to_noise: snr,
     })
+}
+
+/// Compute asymmetric half-widths at half-maximum on a smoothed intensity series.
+///
+/// Unlike symmetric FWHM, this returns separate left and right half-widths,
+/// which naturally captures chromatographic peak tailing. Uses linear
+/// interpolation to find exact half-height crossing points.
+///
+/// # Returns
+/// `Some((left_half_width, right_half_width))` in RT units (minutes), measured
+/// from the apex. Returns `None` if either crossing cannot be found (e.g.,
+/// signal never drops below 50% of apex on one side).
+fn compute_asymmetric_half_widths(
+    smoothed: &[f64],
+    xic: &[(f64, f64)],
+    apex_idx: usize,
+) -> Option<(f64, f64)> {
+    let apex_val = smoothed[apex_idx];
+    if apex_val <= 0.0 {
+        return None;
+    }
+    let half = apex_val / 2.0;
+    let apex_rt = xic[apex_idx].0;
+
+    // Scan left from apex to find half-height crossing
+    let left_hw = {
+        let mut found = None;
+        for i in (1..=apex_idx).rev() {
+            if smoothed[i] >= half && smoothed[i - 1] < half {
+                let denom = smoothed[i] - smoothed[i - 1];
+                let crossing_rt = if denom > 1e-30 {
+                    let frac = (smoothed[i] - half) / denom;
+                    xic[i].0 - frac * (xic[i].0 - xic[i - 1].0)
+                } else {
+                    xic[i].0
+                };
+                found = Some(apex_rt - crossing_rt);
+                break;
+            }
+        }
+        found
+    };
+
+    // Scan right from apex to find half-height crossing
+    let right_hw = {
+        let mut found = None;
+        for i in apex_idx..smoothed.len() - 1 {
+            if smoothed[i] >= half && smoothed[i + 1] < half {
+                let denom = smoothed[i] - smoothed[i + 1];
+                let crossing_rt = if denom > 1e-30 {
+                    let frac = (smoothed[i] - half) / denom;
+                    xic[i].0 + frac * (xic[i + 1].0 - xic[i].0)
+                } else {
+                    xic[i].0
+                };
+                found = Some(crossing_rt - apex_rt);
+                break;
+            }
+        }
+        found
+    };
+
+    match (left_hw, right_hw) {
+        (Some(l), Some(r)) if l > 0.0 && r > 0.0 => Some((l, r)),
+        // One side found: use it for both (assume roughly symmetric)
+        (Some(l), None) if l > 0.0 => Some((l, l)),
+        (None, Some(r)) if r > 0.0 => Some((r, r)),
+        _ => None,
+    }
 }
 
 /// Find the best apex in a smoothed intensity series.
@@ -318,7 +439,7 @@ fn find_apex(
 ///
 /// Stops at whichever comes first:
 /// - Intensity drops below `boundary_threshold` (apex / peak_boundary)
-/// - Valley detected: local minimum is <33% of apex AND <50% of the next rising neighbor
+/// - Valley detected: local minimum is <50% of apex AND <50% of the next rising neighbor
 fn walk_boundary_left(
     smoothed: &[f64],
     apex_idx: usize,
@@ -332,8 +453,8 @@ fn walk_boundary_left(
         if smoothed[i] < valley {
             valley = smoothed[i];
             valley_pos = i;
-        } else if valley < apex_intensity / 3.0 && valley < smoothed[i] / 2.0 {
-            // Valley detected: intensity dropped to <33% of apex and is <50% of rising neighbor
+        } else if valley < apex_intensity / 2.0 && valley < smoothed[i] / 2.0 {
+            // Valley detected: intensity dropped to <50% of apex and is <50% of rising neighbor
             return valley_pos;
         }
 
@@ -360,7 +481,7 @@ fn walk_boundary_right(
         if val < valley {
             valley = val;
             valley_pos = i;
-        } else if valley < apex_intensity / 3.0 && valley < val / 2.0 {
+        } else if valley < apex_intensity / 2.0 && valley < val / 2.0 {
             // Valley detected
             return valley_pos;
         }
@@ -510,5 +631,169 @@ mod tests {
         let best = detector.find_best_peak(&peaks, 11.0, 2.0);
         assert!(best.is_some());
         assert!((best.unwrap().apex_rt - 12.0).abs() < 0.1);
+    }
+
+    /// Helper: create a Gaussian XIC with given parameters
+    fn make_gaussian_xic(center: f64, sigma: f64, amplitude: f64, n: usize) -> Vec<(f64, f64)> {
+        (0..n)
+            .map(|i| {
+                let rt = i as f64 * 0.1; // 0.1 min spacing (6 sec cycle time)
+                let intensity =
+                    amplitude * (-((rt - center).powi(2)) / (2.0 * sigma * sigma)).exp();
+                (rt, intensity)
+            })
+            .collect()
+    }
+
+    /// Helper: create a tailing peak (Gaussian rise, exponential decay tail).
+    /// This models real chromatographic tailing where the trailing edge decays
+    /// much slower than Gaussian, causing valley detection to extend too far.
+    fn make_tailing_xic(
+        center: f64,
+        sigma_left: f64,
+        tau: f64,
+        amplitude: f64,
+        n: usize,
+    ) -> Vec<(f64, f64)> {
+        (0..n)
+            .map(|i| {
+                let rt = i as f64 * 0.1;
+                let intensity = if rt <= center {
+                    // Gaussian leading edge
+                    amplitude * (-((rt - center).powi(2)) / (2.0 * sigma_left * sigma_left)).exp()
+                } else {
+                    // Exponential decay trailing edge
+                    amplitude * (-(rt - center) / tau).exp()
+                };
+                (rt, intensity)
+            })
+            .collect()
+    }
+
+    /// Symmetric Gaussian peak: FWHM capping should not significantly change boundaries
+    #[test]
+    fn test_fwhm_cap_symmetric_peak() {
+        let xic = make_gaussian_xic(5.0, 0.3, 1000.0, 100);
+        let peak = detect_xic_peak(&xic, 0.01, 5.0, Some(5.0)).unwrap();
+
+        // For a Gaussian with σ=0.3, FWHM = 2.355 * 0.3 = 0.707 min
+        // Valley detection at 20% stops around ±1.2σ = ±0.36 min
+        // FWHM cap at 2.0 * HWHM = 2.0 * 0.353 = 0.706 min from apex
+        // The cap is wider than the valley boundary, so no tightening expected
+        assert!((peak.apex_rt - 5.0).abs() < 0.15);
+        assert!(peak.end_rt - peak.start_rt > 0.4); // Peak is at least 0.4 min wide
+        assert!(peak.end_rt - peak.start_rt < 2.0); // But not excessively wide
+    }
+
+    /// Tailing peak: FWHM capping should tighten the right boundary.
+    /// Uses Gaussian rise + exponential decay to model chromatographic tailing.
+    /// Exponential tails decay slower than Gaussian, so valley detection (20% threshold)
+    /// extends too far, but FWHM capping (2× half-width) is tighter.
+    #[test]
+    fn test_fwhm_cap_tailing_peak() {
+        // Gaussian leading edge (σ=0.3) + exponential trailing edge (τ=0.8)
+        // The exponential tail is much slower than Gaussian decay
+        let xic = make_tailing_xic(5.0, 0.3, 0.8, 1000.0, 150);
+
+        // Get boundaries without FWHM capping (using raw valley detection)
+        let smoothed: Vec<f64> =
+            smooth_savitzky_golay(&xic.iter().map(|(_, v)| *v).collect::<Vec<_>>());
+        let apex_idx = find_apex(&smoothed, 0.01, Some(5.0), &xic).unwrap();
+        let apex_intensity = smoothed[apex_idx];
+        let threshold = apex_intensity / 5.0;
+        let valley_end = walk_boundary_right(&smoothed, apex_idx, apex_intensity, threshold);
+        let valley_end_rt = xic[valley_end].0;
+
+        // Get boundaries with FWHM capping
+        let peak = detect_xic_peak(&xic, 0.01, 5.0, Some(5.0)).unwrap();
+
+        // The capped right boundary should be tighter than valley detection
+        // For exponential tail: valley at ln(5)*τ = 1.29 min, cap at 2*ln(2)*τ = 1.11 min
+        assert!(
+            peak.end_rt < valley_end_rt,
+            "FWHM cap should tighten trailing edge: capped={:.3} vs valley={:.3}",
+            peak.end_rt,
+            valley_end_rt
+        );
+
+        // Left boundary should still be close to the peak (σ=0.3 is narrow)
+        assert!(peak.apex_rt - peak.start_rt < 1.5);
+    }
+
+    /// Adjacent peaks with valley: valley boundary should be preserved (not widened)
+    #[test]
+    fn test_fwhm_cap_preserves_valley() {
+        // Two peaks: one at RT 3.0, one at RT 5.0, with a valley between them
+        let xic: Vec<(f64, f64)> = (0..100)
+            .map(|i| {
+                let rt = i as f64 * 0.1;
+                let peak1 = 1000.0 * (-((rt - 3.0).powi(2)) / (2.0 * 0.3 * 0.3)).exp();
+                let peak2 = 800.0 * (-((rt - 5.0).powi(2)) / (2.0 * 0.3 * 0.3)).exp();
+                (rt, peak1 + peak2)
+            })
+            .collect();
+
+        // Detect the first peak
+        let peak = detect_xic_peak(&xic, 0.01, 5.0, Some(3.0)).unwrap();
+
+        // The right boundary should stop before the second peak's apex
+        assert!(
+            peak.end_rt < 5.0,
+            "Boundary should not extend into second peak: end_rt={:.3}",
+            peak.end_rt
+        );
+    }
+
+    /// FWHM computation fails gracefully when signal never drops below 50%
+    #[test]
+    fn test_fwhm_cap_fallback() {
+        // Very short XIC where half-height crossing may not be found
+        let xic = vec![
+            (0.0, 100.0),
+            (0.1, 500.0),
+            (0.2, 1000.0),
+            (0.3, 600.0),
+            (0.4, 100.0),
+        ];
+        let result = detect_xic_peak(&xic, 0.01, 5.0, None);
+        // Should still detect a peak (falls back to valley detection)
+        assert!(result.is_some());
+    }
+
+    /// Verify asymmetric half-widths are computed correctly for a tailing peak.
+    /// Uses Gaussian rise + exponential decay to model chromatographic tailing.
+    #[test]
+    fn test_asymmetric_half_widths() {
+        // Gaussian leading edge (σ=0.3) + exponential trailing edge (τ=0.8)
+        let xic = make_tailing_xic(5.0, 0.3, 0.8, 1000.0, 150);
+        let smoothed: Vec<f64> =
+            smooth_savitzky_golay(&xic.iter().map(|(_, v)| *v).collect::<Vec<_>>());
+        let apex_idx = find_apex(&smoothed, 0.01, Some(5.0), &xic).unwrap();
+
+        let (left_hw, right_hw) =
+            compute_asymmetric_half_widths(&smoothed, &xic, apex_idx).unwrap();
+
+        // Right half-width should be larger than left (tailing peak)
+        assert!(
+            right_hw > left_hw,
+            "Right half-width ({:.4}) should exceed left ({:.4}) for tailing peak",
+            right_hw,
+            left_hw
+        );
+
+        // Left HWHM ≈ σ * √(2ln2) = 0.3 * 1.177 = 0.353 (broadened by smoothing)
+        // Right HWHM ≈ τ * ln(2) = 0.8 * 0.693 = 0.554
+        assert!(left_hw > 0.2, "Left half-width too small: {:.4}", left_hw);
+        assert!(left_hw < 0.6, "Left half-width too large: {:.4}", left_hw);
+        assert!(
+            right_hw > 0.4,
+            "Right half-width too small: {:.4}",
+            right_hw
+        );
+        assert!(
+            right_hw < 1.0,
+            "Right half-width too large: {:.4}",
+            right_hw
+        );
     }
 }

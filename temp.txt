@@ -1,15 +1,15 @@
-cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hram
+cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hram --report report.parquet
 
-cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hram --search-mode coelution
+cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hram --search-mode coelution --report report.parquet
 
 
-cargo run --release -- -i *.mzML -l ../hela-filtered-SkylineAI_spectral_library.tsv -o stellar-ospreyoutput.blib --fragment-unit mz --fragment-tolerance 0.25 --resolution unit
+cargo run --release -- -i *.mzML -l ../hela-filtered-SkylineAI_spectral_library.tsv -o stellar-ospreyoutput.blib --fragment-unit mz --fragment-tolerance 0.25 --resolution unit --search-mode coelution --report report.parquet
 
 
 python3 visualize_pin_features.py ../example_test_data/stellar/calibrated-GPF-data/mokapot/Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars.pin --output report-stellar.html
 
 
-
+Coelution with Astral data and Mokapot
 
 [2026-02-14T22:42:52Z INFO  osprey_fdr::mokapot] === Per-file results (run-level FDR at 1%) ===
 [2026-02-14T22:42:53Z INFO  osprey_fdr::mokapot]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_49: 113656 precursors, 106877 peptides
@@ -28,8 +28,21 @@ python3 visualize_pin_features.py ../example_test_data/stellar/calibrated-GPF-da
 
 
 
+Coelution with Stellar GPF and Percolator
+[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator] === Per-file results (run-level FDR at 1%) ===
+[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars: 36823 precursors, 36823 peptides
+[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_500-600_15-mars: 31536 precursors, 31536 peptides
+[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_600-700_16-mars: 18605 precursors, 18605 peptides
+[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_700-800_17-mars: 26809 precursors, 26809 peptides
+[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_800-900_18-mars: 29505 precursors, 29505 peptides
+[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator] 
+[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator] === Experiment-level results (1% FDR) ===
+[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Experiment: 133436 precursors, 118718 peptides
 
-Usage: osprey [OPTIONS]
+
+
+
+
 
 Options:
   -c, --config <CONFIG>
@@ -94,5 +107,24 @@ Options:
       --export-coefficients
           Export coefficient time series to parquet file(s)
 
+      --search-mode <SEARCH_MODE>
+          Search mode: regression (default) or coelution
+          
+          [default: regression]
+
+      --fdr-method <FDR_METHOD>
+          FDR method: percolator (native SVM, default), mokapot (external Python), or simple (no ML)
+          
+          [default: percolator]
+
+      --write-pin
+          Write PIN files for external tools
+
   -v, --verbose
           Verbose output
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

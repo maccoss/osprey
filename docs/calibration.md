@@ -71,11 +71,13 @@ Hyperscore and isotope cosine are intentionally excluded from the LDA — hypers
 
 ### Target-Decoy Competition
 
-Each target competes against its paired decoy (identified by `entry_id & 0x7FFFFFFF`):
+Each target competes against its paired decoy (linked by `base_id = entry_id & 0x7FFFFFFF`):
 - Higher discriminant score wins
 - Ties go to the decoy (conservative for FDR estimation)
 - Only winners enter the FDR walk
-- Q-values computed via KDE posterior error probabilities
+- Q-values computed using the conservative `(decoys + 1) / targets` formula
+
+See [FDR Control](fdr-control.md) for full details on the target-decoy strategy.
 
 ### Quality Filtering
 

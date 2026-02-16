@@ -30,7 +30,10 @@
 //! Note: No additional precursor m/z tolerance is applied - the isolation window
 //! from the mzML is sufficient.
 
-use arrow::array::{ArrayRef, BooleanBuilder, Float32Builder, StringBuilder, UInt8Builder};
+use arrow::array::{
+    ArrayRef, BooleanBuilder, Float32Builder, Float64Builder, StringBuilder, UInt32Builder,
+    UInt8Builder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -57,10 +60,12 @@ use osprey_core::{
     BinConfig, CoelutionFeatureSet, CoelutionScoredEntry, DecoyMethod as CoreDecoyMethod,
     FdrMethod, FeatureSet, FragmentToleranceConfig, LibraryEntry, LibraryFragment, MS1Spectrum,
     OspreyConfig, OspreyError, RegressionResult, Result, SearchMode, Spectrum, ToleranceUnit,
+    XICPeakBounds,
 };
 use osprey_fdr::{
-    coelution_pin_feature_value, get_pin_feature_names, percolator, pin_feature_value,
-    FdrController, MokapotRunner, PsmFeatures, NUM_COELUTION_PIN_FEATURES, NUM_PIN_FEATURES,
+    coelution_pin_feature_value, get_coelution_pin_feature_names, get_pin_feature_names,
+    percolator, pin_feature_value, FdrController, MokapotRunner, PsmFeatures,
+    NUM_COELUTION_PIN_FEATURES, NUM_PIN_FEATURES,
 };
 use osprey_io::{load_all_spectra, load_library, BlibWriter, MS1Index};
 use osprey_regression::{Binner, DesignMatrixBuilder, OptimizedSolver, RidgeSolver};
@@ -83,6 +88,7 @@ impl<'a> MS1SpectrumLookup for MS1IndexWrapper<'a> {
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use osprey_scoring::batch::{pair_calibration_matches, CalibrationMatch};
 
@@ -363,9 +369,6 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
             &config,
         );
 
-        // Target-decoy competition: only winners go to PIN file
-        let scored_entries = compete_target_decoy_pairs(scored_entries, &library);
-
         // Export coefficient matrix to parquet if requested
         if config.export_coefficients {
             write_coefficient_parquet(
@@ -378,8 +381,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         }
 
         // === WRITE PIN FILE (if mokapot or --write-pin) ===
+        // Mokapot expects pre-competed data (winners only).
+        // Native Percolator does internal paired competition, so keep both.
         if write_pin {
-            let psm_features = create_psm_features_for_file(&file_name, &scored_entries, &library);
+            let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
+                compete_target_decoy_pairs(scored_entries.clone(), &library)
+            } else {
+                scored_entries.clone()
+            };
+            let psm_features = create_psm_features_for_file(&file_name, &pin_entries, &library);
             let pin_path =
                 mokapot.write_single_pin_file(&file_name, &psm_features, &mokapot_dir)?;
             pin_files.insert(file_name.clone(), pin_path);
@@ -446,12 +456,53 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
         config.fdr_method,
     )?;
 
-    // Filter to passing entries for blib output (experiment-level FDR)
-    let passing_entries: Vec<ScoredEntry> = experiment_entries
+    // Determine which precursors pass experiment-level FDR
+    // A precursor passes if ANY observation across files has experiment_qvalue <= threshold
+    let passing_precursors: HashSet<(String, u8)> = experiment_entries
         .iter()
         .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
+        .map(|e| {
+            (
+                library[e.lib_idx].modified_sequence.clone(),
+                library[e.lib_idx].charge,
+            )
+        })
+        .collect();
+
+    // Include ALL per-file target observations for passing precursors
+    let mut passing_entries: Vec<ScoredEntry> = experiment_entries
+        .iter()
+        .filter(|e| {
+            !e.is_decoy
+                && passing_precursors.contains(&(
+                    library[e.lib_idx].modified_sequence.clone(),
+                    library[e.lib_idx].charge,
+                ))
+        })
         .cloned()
         .collect();
+
+    // Propagate best experiment_qvalue to all observations of each precursor
+    let mut best_exp_q: HashMap<(String, u8), f64> = HashMap::new();
+    for e in &passing_entries {
+        let key = (
+            library[e.lib_idx].modified_sequence.clone(),
+            library[e.lib_idx].charge,
+        );
+        best_exp_q
+            .entry(key)
+            .and_modify(|q| *q = q.min(e.experiment_qvalue))
+            .or_insert(e.experiment_qvalue);
+    }
+    for e in passing_entries.iter_mut() {
+        let key = (
+            library[e.lib_idx].modified_sequence.clone(),
+            library[e.lib_idx].charge,
+        );
+        if let Some(&q) = best_exp_q.get(&key) {
+            e.experiment_qvalue = q;
+        }
+    }
 
     // Write blib output with Mokapot q-values
     if !passing_entries.is_empty() {
@@ -462,9 +513,20 @@ pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
     }
 
     // Write output report if specified
+    // Parquet includes all entries (targets + decoys) for feature analysis and SVM retraining;
+    // TSV includes only passing entries.
     if let Some(report_path) = &config.output_report {
-        log::info!("Writing report to {}", report_path.display());
-        write_scored_report(report_path, &library, &passing_entries)?;
+        let ext = report_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if ext.eq_ignore_ascii_case("parquet") {
+            log::info!("Writing Parquet report to {}", report_path.display());
+            write_parquet_report(report_path, &library, &experiment_entries)?;
+        } else {
+            log::info!("Writing TSV report to {}", report_path.display());
+            write_scored_report(report_path, &library, &passing_entries)?;
+        }
     }
 
     // Note: With memory-efficient processing, regression results are freed after scoring each file.
@@ -2472,17 +2534,36 @@ fn compute_fdr_with_mokapot(
     // Run mokapot (outputs go to replicate subfolder)
     let results = mokapot.run(&pin_file, &replicate_dir)?;
 
-    // Build lookup from psm_id to mokapot results
+    // Build lookup from psm_id to mokapot precursor-level results
     let result_map: std::collections::HashMap<String, (f64, f64)> = results
         .into_iter()
         .map(|r| (r.psm_id, (r.q_value, r.pep)))
         .collect();
 
+    // Parse peptide-level results for dual FDR control
+    let peptides_file = replicate_dir.join("mokapot.peptides.txt");
+    let peptide_qmap: HashMap<String, f64> = if peptides_file.exists() {
+        mokapot
+            .parse_results(&peptides_file)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                let stripped = osprey_fdr::mokapot::strip_flanking_chars(&r.peptide);
+                (stripped, r.q_value)
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
     // Update run-level q-values and PEPs from mokapot results
+    // Enforce dual FDR: max of precursor and peptide q-values
     let mut updated = 0;
     for entry in scored_entries.iter_mut() {
         if let Some(&(q_value, pep)) = result_map.get(&entry.psm_id) {
-            entry.run_qvalue = q_value;
+            let mod_seq = &library[entry.lib_idx].modified_sequence;
+            let peptide_q = peptide_qmap.get(mod_seq.as_str()).copied().unwrap_or(1.0);
+            entry.run_qvalue = q_value.max(peptide_q);
             entry.pep = pep;
             updated += 1;
         }
@@ -2540,7 +2621,7 @@ fn run_percolator_fdr(
     per_file_results: &mut [(String, Vec<ScoredEntry>)],
     library: &[LibraryEntry],
     run_fdr: f64,
-    experiment_fdr: f64,
+    _experiment_fdr: f64,
 ) -> Result<Vec<ScoredEntry>> {
     log::info!("Running native Percolator FDR control (linear SVM)");
 
@@ -2573,17 +2654,16 @@ fn run_percolator_fdr(
         }
     }
 
+    let feature_names = get_pin_feature_names();
     let config = percolator::PercolatorConfig {
         train_fdr: run_fdr,
         test_fdr: run_fdr,
+        feature_names: Some(feature_names.iter().map(|s| s.to_string()).collect()),
         ..Default::default()
     };
 
     let results = percolator::run_percolator(&perc_entries, &config)
         .map_err(|e| OspreyError::config(format!("Percolator failed: {}", e)))?;
-
-    // Log feature weights
-    let feature_names = get_pin_feature_names();
     for (fold_idx, weights) in results.fold_weights.iter().enumerate() {
         let mut weight_pairs: Vec<(usize, f64)> =
             weights.iter().enumerate().map(|(i, &w)| (i, w)).collect();
@@ -2617,32 +2697,30 @@ fn run_percolator_fdr(
     for (_, entries) in per_file_results.iter_mut() {
         for entry in entries.iter_mut() {
             if let Some(result) = result_map.get(entry.psm_id.as_str()) {
-                entry.run_qvalue = result.run_precursor_qvalue;
+                // Enforce dual FDR: max of precursor and peptide q-values
+                entry.run_qvalue = result.run_precursor_qvalue.max(result.run_peptide_qvalue);
                 entry.pep = result.pep;
                 entry.score = result.score;
             }
         }
     }
 
-    // Report per-file statistics
-    for (file_name, entries) in per_file_results.iter() {
-        report_file_statistics(file_name, entries, library, run_fdr);
-    }
-
     // Build experiment entries with experiment-level q-values
+    // (Per-file and experiment stats already logged by percolator.rs)
     for (_, entries) in per_file_results.iter() {
         for entry in entries.iter() {
             let mut entry_copy = entry.clone();
             if let Some(result) = result_map.get(entry.psm_id.as_str()) {
-                entry_copy.experiment_qvalue = result.experiment_precursor_qvalue;
+                // Enforce dual FDR: max of precursor and peptide q-values
+                entry_copy.experiment_qvalue = result
+                    .experiment_precursor_qvalue
+                    .max(result.experiment_peptide_qvalue);
             } else {
                 entry_copy.experiment_qvalue = 1.0;
             }
             experiment_entries.push(entry_copy);
         }
     }
-
-    report_experiment_statistics(&experiment_entries, library, experiment_fdr);
 
     Ok(experiment_entries)
 }
@@ -2707,6 +2785,31 @@ fn run_mokapot_fdr(
         mokapot.run_two_step_analysis(&pin_files, &mokapot_dir)?;
 
     // ========== Update per-file entries with Step 1 (run-level) results ==========
+    // Parse run-level peptide q-values for dual FDR control
+    let step1_dir = mokapot_dir.join("run_level");
+    let mut run_peptide_qmaps: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    for (file_name, _) in per_file_results.iter() {
+        if let Some(pin_path) = pin_files.get(file_name) {
+            let pin_stem = pin_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+            let peptides_file = step1_dir.join(format!("{}.mokapot.peptides.txt", pin_stem));
+            if peptides_file.exists() {
+                if let Ok(pept_results) = mokapot.parse_results(&peptides_file) {
+                    let pept_map: HashMap<String, f64> = pept_results
+                        .into_iter()
+                        .map(|r| {
+                            let stripped = osprey_fdr::mokapot::strip_flanking_chars(&r.peptide);
+                            (stripped, r.q_value)
+                        })
+                        .collect();
+                    run_peptide_qmaps.insert(file_name.clone(), pept_map);
+                }
+            }
+        }
+    }
+
     for (file_name, entries) in per_file_results.iter_mut() {
         if let Some(results) = per_file_mokapot_results.get(file_name) {
             let result_map: HashMap<String, (f64, f64)> = results
@@ -2714,9 +2817,17 @@ fn run_mokapot_fdr(
                 .map(|r| (r.psm_id.clone(), (r.q_value, r.pep)))
                 .collect();
 
+            let peptide_qmap = run_peptide_qmaps.get(file_name);
+
             for entry in entries.iter_mut() {
                 if let Some(&(q_value, pep)) = result_map.get(&entry.psm_id) {
-                    entry.run_qvalue = q_value;
+                    // Enforce dual FDR: max of precursor and peptide q-values
+                    let mod_seq = &library[entry.lib_idx].modified_sequence;
+                    let peptide_q = peptide_qmap
+                        .and_then(|m| m.get(mod_seq.as_str()))
+                        .copied()
+                        .unwrap_or(1.0);
+                    entry.run_qvalue = q_value.max(peptide_q);
                     entry.pep = pep;
                 }
             }
@@ -2731,6 +2842,25 @@ fn run_mokapot_fdr(
         .map(|r| (r.psm_id.clone(), (r.q_value, r.pep)))
         .collect();
 
+    // Parse experiment-level peptide q-values for dual FDR control
+    let step2_dir = mokapot_dir.join("experiment_level");
+    let exp_peptide_qmap: HashMap<String, f64> = {
+        let peptides_file = step2_dir.join("mokapot.peptides.txt");
+        if peptides_file.exists() {
+            mokapot
+                .parse_results(&peptides_file)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| {
+                    let stripped = osprey_fdr::mokapot::strip_flanking_chars(&r.peptide);
+                    (stripped, r.q_value)
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        }
+    };
+
     // Collect all entries with experiment-level q-values
     let mut experiment_entries: Vec<ScoredEntry> = Vec::new();
     for (_, entries) in per_file_results.iter() {
@@ -2740,7 +2870,13 @@ fn run_mokapot_fdr(
             if entry.is_decoy {
                 entry_copy.experiment_qvalue = 1.0;
             } else if let Some(&(q_value, _pep)) = experiment_result_map.get(&entry.psm_id) {
-                entry_copy.experiment_qvalue = q_value;
+                // Enforce dual FDR: max of precursor and peptide q-values
+                let mod_seq = &library[entry.lib_idx].modified_sequence;
+                let peptide_q = exp_peptide_qmap
+                    .get(mod_seq.as_str())
+                    .copied()
+                    .unwrap_or(1.0);
+                entry_copy.experiment_qvalue = q_value.max(peptide_q);
             } else {
                 entry_copy.experiment_qvalue = 1.0;
             }
@@ -2949,50 +3085,67 @@ fn deduplicate_double_counting(
         })
         .collect();
 
-    // 5. For each isolation window, find and deduplicate overlapping entries
-    let mut removed = vec![false; scored_entries.len()];
+    // 5. Pre-assign entries to isolation windows using a sorted m/z index.
+    //    This replaces the O(n * w) per-window full scan with O(n log n + w log n).
+    let precursor_mzs: Vec<f64> = scored_entries
+        .iter()
+        .map(|e| library[e.lib_idx].precursor_mz)
+        .collect();
+    let mut mz_sorted_indices: Vec<usize> = (0..scored_entries.len()).collect();
+    mz_sorted_indices.sort_by(|&a, &b| precursor_mzs[a].total_cmp(&precursor_mzs[b]));
+    let mz_sorted_vals: Vec<f64> = mz_sorted_indices
+        .iter()
+        .map(|&i| precursor_mzs[i])
+        .collect();
 
-    for &(center, width) in windows {
-        let win_lower = center - width / 2.0;
-        let win_upper = center + width / 2.0;
+    // For each window, binary search for the range of entries
+    let window_entry_indices: Vec<Vec<usize>> = windows
+        .iter()
+        .map(|&(center, width)| {
+            let win_lower = center - width / 2.0;
+            let win_upper = center + width / 2.0;
+            let lo = mz_sorted_vals.partition_point(|&mz| mz < win_lower);
+            let hi = mz_sorted_vals.partition_point(|&mz| mz <= win_upper);
+            mz_sorted_indices[lo..hi].to_vec()
+        })
+        .collect();
 
-        // Collect indices of entries in this window
-        let mut window_indices: Vec<usize> = scored_entries
+    // 6. Process each isolation window in parallel.
+    //    Within each window, sort entries by apex_rt for early termination.
+    let removed: Vec<AtomicBool> = (0..scored_entries.len())
+        .map(|_| AtomicBool::new(false))
+        .collect();
+
+    window_entry_indices.par_iter().for_each(|indices| {
+        if indices.is_empty() {
+            return;
+        }
+
+        // Sort by apex_rt for locality-based early termination
+        let mut rt_sorted: Vec<usize> = indices
             .iter()
-            .enumerate()
-            .filter(|(i, e)| {
-                !removed[*i] && {
-                    let pmz = library[e.lib_idx].precursor_mz;
-                    pmz >= win_lower && pmz <= win_upper
-                }
-            })
-            .map(|(i, _)| i)
+            .copied()
+            .filter(|&i| !removed[i].load(Ordering::Relaxed))
             .collect();
+        rt_sorted.sort_by(|&a, &b| apex_rts[a].total_cmp(&apex_rts[b]));
 
-        // Sort by peak_apex descending (greedy: best entries survive)
-        window_indices.sort_by(|&a, &b| {
-            scored_entries[b]
-                .features
-                .peak_apex
-                .total_cmp(&scored_entries[a].features.peak_apex)
-        });
-
-        // Compare pairs: for each entry, check against subsequent entries
-        for i_pos in 0..window_indices.len() {
-            let idx_a = window_indices[i_pos];
-            if removed[idx_a] {
+        for i_pos in 0..rt_sorted.len() {
+            let idx_a = rt_sorted[i_pos];
+            if removed[idx_a].load(Ordering::Relaxed) {
                 continue;
             }
             let apex_a = apex_rts[idx_a];
 
-            for &idx_b in &window_indices[(i_pos + 1)..] {
-                if removed[idx_b] {
-                    continue;
+            // Scan forward only; break when RT distance exceeds neighborhood
+            for &idx_b in &rt_sorted[(i_pos + 1)..] {
+                let apex_b = apex_rts[idx_b];
+
+                // Early termination: entries are RT-sorted, so all subsequent are farther
+                if apex_b - apex_a > rt_neighborhood {
+                    break;
                 }
 
-                // Check apex RT proximity (±5 spectra)
-                let apex_b = apex_rts[idx_b];
-                if (apex_a - apex_b).abs() > rt_neighborhood {
+                if removed[idx_b].load(Ordering::Relaxed) {
                     continue;
                 }
 
@@ -3013,14 +3166,21 @@ fn deduplicate_double_counting(
                 let threshold = (min_a.min(min_b) as f64 * 0.5).ceil() as usize;
 
                 if overlap >= threshold {
-                    // Remove the lower-scoring entry (idx_b, since sorted descending)
-                    removed[idx_b] = true;
+                    // Remove the entry with lower peak_apex (keep the better one)
+                    if scored_entries[idx_a].features.peak_apex
+                        >= scored_entries[idx_b].features.peak_apex
+                    {
+                        removed[idx_b].store(true, Ordering::Relaxed);
+                    } else {
+                        removed[idx_a].store(true, Ordering::Relaxed);
+                        break; // idx_a is removed, no need to check more pairs
+                    }
                 }
             }
         }
-    }
+    });
 
-    let removed_count = removed.iter().filter(|&&r| r).count();
+    let removed_count = removed.iter().filter(|r| r.load(Ordering::Relaxed)).count();
     if removed_count > 0 {
         log::info!(
             "Deduplication: removed {} double-counted entries ({} remaining)",
@@ -3032,7 +3192,7 @@ fn deduplicate_double_counting(
     scored_entries
         .into_iter()
         .enumerate()
-        .filter(|(i, _)| !removed[*i])
+        .filter(|(i, _)| !removed[*i].load(Ordering::Relaxed))
         .map(|(_, e)| e)
         .collect()
 }
@@ -3252,18 +3412,71 @@ fn collect_psm_features_by_file(
 /// Find the PIN feature that best separates targets from decoys using Cohen's d.
 ///
 /// Returns `(feature_index, higher_is_better)` or `None` if separation cannot be computed.
+/// Compute ROC AUC via the Mann-Whitney U statistic.
+///
+/// AUC > 0.5 means higher values are more target-like (targets rank higher).
+/// AUC < 0.5 means lower values are more target-like (targets rank lower).
+/// AUC = 0.5 means no discrimination.
+fn compute_roc_auc(target_vals: &[f64], decoy_vals: &[f64]) -> f64 {
+    let n_t = target_vals.len();
+    let n_d = decoy_vals.len();
+    if n_t == 0 || n_d == 0 {
+        return 0.5;
+    }
+
+    // Combine all values with labels (true = target)
+    let mut combined: Vec<(f64, bool)> = Vec::with_capacity(n_t + n_d);
+    for &v in target_vals {
+        combined.push((v, true));
+    }
+    for &v in decoy_vals {
+        combined.push((v, false));
+    }
+
+    // Sort ascending by value; ties broken arbitrarily (doesn't affect average rank)
+    combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Assign average ranks for tied groups
+    let n = combined.len();
+    let mut ranks = vec![0.0f64; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && combined[j].0 == combined[i].0 {
+            j += 1;
+        }
+        // Average rank for positions i..j (1-indexed)
+        let avg_rank = (i + 1 + j) as f64 / 2.0;
+        for rank in ranks.iter_mut().take(j).skip(i) {
+            *rank = avg_rank;
+        }
+        i = j;
+    }
+
+    // Sum of target ranks
+    let target_rank_sum: f64 = ranks
+        .iter()
+        .zip(combined.iter())
+        .filter(|(_, (_, is_target))| *is_target)
+        .map(|(r, _)| *r)
+        .sum();
+
+    // U = target_rank_sum - n_t*(n_t+1)/2
+    let u = target_rank_sum - (n_t * (n_t + 1)) as f64 / 2.0;
+    u / (n_t as f64 * n_d as f64)
+}
+
 fn select_best_separating_feature(
     entries: &[ScoredEntry],
     _library: &[LibraryEntry],
 ) -> Option<(usize, bool)> {
     let mut best_index = 0usize;
-    let mut best_abs_d = 0.0f64;
-    let mut best_d = 0.0f64;
+    let mut best_abs_deviation = 0.0f64;
+    let mut best_auc = 0.5f64;
 
     let feature_names = get_pin_feature_names();
 
     for feat_idx in 0..NUM_PIN_FEATURES {
-        // Collect finite target and decoy values for this feature
         let mut target_vals = Vec::new();
         let mut decoy_vals = Vec::new();
 
@@ -3279,45 +3492,29 @@ fn select_best_separating_feature(
             }
         }
 
-        // Need at least 2 of each for meaningful variance
         if target_vals.len() < 2 || decoy_vals.len() < 2 {
             continue;
         }
 
-        let n_t = target_vals.len() as f64;
-        let n_d = decoy_vals.len() as f64;
-        let mean_t = target_vals.iter().sum::<f64>() / n_t;
-        let mean_d = decoy_vals.iter().sum::<f64>() / n_d;
-        let var_t = target_vals
-            .iter()
-            .map(|v| (v - mean_t).powi(2))
-            .sum::<f64>()
-            / (n_t - 1.0);
-        let var_d = decoy_vals.iter().map(|v| (v - mean_d).powi(2)).sum::<f64>() / (n_d - 1.0);
-
-        let pooled_sd = ((var_t + var_d) / 2.0).sqrt();
-        if pooled_sd < 1e-15 {
-            continue; // Zero variance — skip
-        }
-
-        let d = (mean_t - mean_d) / pooled_sd;
-        if d.abs() > best_abs_d {
-            best_abs_d = d.abs();
-            best_d = d;
+        let auc = compute_roc_auc(&target_vals, &decoy_vals);
+        let abs_deviation = (auc - 0.5).abs();
+        if abs_deviation > best_abs_deviation {
+            best_abs_deviation = abs_deviation;
+            best_auc = auc;
             best_index = feat_idx;
         }
     }
 
-    if best_abs_d < 1e-15 {
+    if best_abs_deviation < 1e-10 {
         log::warn!("Target-decoy competition: no feature separates targets from decoys");
         return None;
     }
 
-    let higher_is_better = best_d > 0.0;
+    let higher_is_better = best_auc > 0.5;
     log::info!(
-        "Target-decoy competition: best separating feature = {} (Cohen's d = {:.3}, {})",
+        "Target-decoy competition: best separating feature = {} (ROC AUC = {:.3}, {})",
         feature_names[best_index],
-        best_d,
+        best_auc,
         if higher_is_better {
             "higher is better"
         } else {
@@ -3331,7 +3528,7 @@ fn select_best_separating_feature(
 /// Run target-decoy competition: for each paired target/decoy, only the winner survives.
 ///
 /// Pairs are identified by `library[entry.lib_idx].id & 0x7FFFFFFF`.
-/// The best-separating PIN feature (Cohen's d) is used for head-to-head comparison.
+/// The best-separating PIN feature (by ROC AUC) is used for head-to-head comparison.
 /// Singletons (unpaired entries) win automatically.
 /// Ties go to the decoy (conservative for FDR estimation).
 fn compete_target_decoy_pairs(
@@ -3342,7 +3539,7 @@ fn compete_target_decoy_pairs(
         Some(result) => result,
         None => {
             // Fallback: use peak_apex (index 0, higher is better) when we can't compute
-            // Cohen's d (e.g., too few entries for variance estimation)
+            // ROC AUC (e.g., too few entries)
             log::warn!("Target-decoy competition: using peak_apex as fallback competition feature");
             (0, true)
         }
@@ -3850,6 +4047,352 @@ fn write_scored_report(
     Ok(())
 }
 
+/// Write scored entries to Parquet report (one row per precursor per run, regression mode)
+fn write_parquet_report(
+    path: &std::path::Path,
+    library: &[LibraryEntry],
+    scored_entries: &[ScoredEntry],
+) -> Result<()> {
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    if scored_entries.is_empty() {
+        return Ok(());
+    }
+
+    let n = scored_entries.len();
+    let feature_names = get_pin_feature_names();
+
+    // Build schema: identification + peak/RT + FDR + all features
+    let mut fields: Vec<Field> = vec![
+        Field::new("Run", DataType::Utf8, false),
+        Field::new("Modified.Sequence", DataType::Utf8, false),
+        Field::new("Stripped.Sequence", DataType::Utf8, false),
+        Field::new("Precursor.Charge", DataType::UInt8, false),
+        Field::new("Precursor.Mz", DataType::Float64, false),
+        Field::new("Protein.Ids", DataType::Utf8, true),
+        Field::new("Is.Decoy", DataType::Boolean, false),
+        Field::new("RT", DataType::Float64, false),
+        Field::new("RT.Start", DataType::Float64, false),
+        Field::new("RT.Stop", DataType::Float64, false),
+        Field::new("Peak.Width", DataType::Float64, false),
+        Field::new("Library.RT", DataType::Float64, false),
+        Field::new("Scan.Number", DataType::UInt32, false),
+        Field::new("Score", DataType::Float64, false),
+        Field::new("Q.Value", DataType::Float64, false),
+        Field::new("Global.Q.Value", DataType::Float64, false),
+        Field::new("PEP", DataType::Float64, false),
+        Field::new("Search.Mode", DataType::Utf8, false),
+    ];
+    for name in &feature_names {
+        fields.push(Field::new(*name, DataType::Float64, false));
+    }
+    let schema = std::sync::Arc::new(Schema::new(fields));
+
+    // Build column arrays
+    let mut run_b = StringBuilder::with_capacity(n, n * 20);
+    let mut modseq_b = StringBuilder::with_capacity(n, n * 30);
+    let mut seq_b = StringBuilder::with_capacity(n, n * 20);
+    let mut charge_b = UInt8Builder::with_capacity(n);
+    let mut mz_b = Float64Builder::with_capacity(n);
+    let mut protein_b = StringBuilder::with_capacity(n, n * 15);
+    let mut decoy_b = BooleanBuilder::with_capacity(n);
+    let mut rt_b = Float64Builder::with_capacity(n);
+    let mut rt_start_b = Float64Builder::with_capacity(n);
+    let mut rt_stop_b = Float64Builder::with_capacity(n);
+    let mut width_b = Float64Builder::with_capacity(n);
+    let mut lib_rt_b = Float64Builder::with_capacity(n);
+    let mut scan_b = UInt32Builder::with_capacity(n);
+    let mut score_b = Float64Builder::with_capacity(n);
+    let mut qval_b = Float64Builder::with_capacity(n);
+    let mut gqval_b = Float64Builder::with_capacity(n);
+    let mut pep_b = Float64Builder::with_capacity(n);
+    let mut mode_b = StringBuilder::with_capacity(n, n * 10);
+    let mut feat_builders: Vec<Float64Builder> = (0..feature_names.len())
+        .map(|_| Float64Builder::with_capacity(n))
+        .collect();
+
+    for entry in scored_entries {
+        let lib = &library[entry.lib_idx];
+
+        run_b.append_value(&entry.file_name);
+        modseq_b.append_value(&lib.modified_sequence);
+        seq_b.append_value(&lib.sequence);
+        charge_b.append_value(lib.charge);
+        mz_b.append_value(lib.precursor_mz);
+        protein_b.append_value(lib.protein_ids.join(";"));
+        decoy_b.append_value(entry.is_decoy);
+
+        // Apex RT from coefficient time series
+        let apex_rt = entry
+            .rt_coef_pairs
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(rt, _)| *rt)
+            .unwrap_or(0.0);
+        rt_b.append_value(apex_rt);
+
+        // Peak boundaries from fragment co-elution
+        let (start_rt, end_rt) = entry
+            .fragment_peak_bounds
+            .map(|(s, e, _)| (s, e))
+            .unwrap_or((0.0, 0.0));
+        rt_start_b.append_value(start_rt);
+        rt_stop_b.append_value(end_rt);
+        width_b.append_value(end_rt - start_rt);
+
+        lib_rt_b.append_value(lib.retention_time);
+        scan_b.append_value(entry.apex_scan_number);
+        score_b.append_value(entry.score);
+        qval_b.append_value(entry.run_qvalue);
+        gqval_b.append_value(entry.experiment_qvalue);
+        pep_b.append_value(entry.pep);
+        mode_b.append_value("regression");
+
+        // All 37 features
+        for (i, builder) in feat_builders.iter_mut().enumerate() {
+            let v = pin_feature_value(&entry.features, i);
+            builder.append_value(if v.is_finite() { v } else { 0.0 });
+        }
+    }
+
+    // Assemble columns
+    let mut columns: Vec<ArrayRef> = vec![
+        std::sync::Arc::new(run_b.finish()),
+        std::sync::Arc::new(modseq_b.finish()),
+        std::sync::Arc::new(seq_b.finish()),
+        std::sync::Arc::new(charge_b.finish()),
+        std::sync::Arc::new(mz_b.finish()),
+        std::sync::Arc::new(protein_b.finish()),
+        std::sync::Arc::new(decoy_b.finish()),
+        std::sync::Arc::new(rt_b.finish()),
+        std::sync::Arc::new(rt_start_b.finish()),
+        std::sync::Arc::new(rt_stop_b.finish()),
+        std::sync::Arc::new(width_b.finish()),
+        std::sync::Arc::new(lib_rt_b.finish()),
+        std::sync::Arc::new(scan_b.finish()),
+        std::sync::Arc::new(score_b.finish()),
+        std::sync::Arc::new(qval_b.finish()),
+        std::sync::Arc::new(gqval_b.finish()),
+        std::sync::Arc::new(pep_b.finish()),
+        std::sync::Arc::new(mode_b.finish()),
+    ];
+    for builder in &mut feat_builders {
+        columns.push(std::sync::Arc::new(builder.finish()));
+    }
+
+    // Write parquet with ZSTD compression
+    let file = std::fs::File::create(path).map_err(|e| {
+        OspreyError::OutputError(format!(
+            "Failed to create parquet file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| OspreyError::OutputError(format!("Failed to create RecordBatch: {}", e)))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+        .map_err(|e| OspreyError::OutputError(format!("Failed to create Parquet writer: {}", e)))?;
+    writer
+        .write(&batch)
+        .map_err(|e| OspreyError::OutputError(format!("Failed to write Parquet batch: {}", e)))?;
+    writer
+        .close()
+        .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
+
+    log::info!(
+        "Wrote Parquet report ({} entries, {} columns) to {}",
+        n,
+        18 + feature_names.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Write coelution scored entries to Parquet report (one row per precursor per run)
+fn write_coelution_parquet_report(
+    path: &std::path::Path,
+    entries: &[CoelutionScoredEntry],
+) -> Result<()> {
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let n = entries.len();
+    let feature_names = get_coelution_pin_feature_names();
+
+    // Build schema: identification + peak/RT + FDR + all features
+    let mut fields: Vec<Field> = vec![
+        Field::new("Run", DataType::Utf8, false),
+        Field::new("Modified.Sequence", DataType::Utf8, false),
+        Field::new("Stripped.Sequence", DataType::Utf8, false),
+        Field::new("Precursor.Charge", DataType::UInt8, false),
+        Field::new("Precursor.Mz", DataType::Float64, false),
+        Field::new("Protein.Ids", DataType::Utf8, true),
+        Field::new("Is.Decoy", DataType::Boolean, false),
+        Field::new("RT", DataType::Float64, false),
+        Field::new("RT.Start", DataType::Float64, false),
+        Field::new("RT.Stop", DataType::Float64, false),
+        Field::new("Peak.Width", DataType::Float64, false),
+        Field::new("Library.RT", DataType::Float64, false),
+        Field::new("Scan.Number", DataType::UInt32, false),
+        Field::new("Score", DataType::Float64, false),
+        Field::new("Q.Value", DataType::Float64, false),
+        Field::new("Global.Q.Value", DataType::Float64, false),
+        Field::new("PEP", DataType::Float64, false),
+        Field::new("Search.Mode", DataType::Utf8, false),
+    ];
+    for name in &feature_names {
+        fields.push(Field::new(*name, DataType::Float64, false));
+    }
+    let schema = std::sync::Arc::new(Schema::new(fields));
+
+    // Build column arrays
+    let mut run_b = StringBuilder::with_capacity(n, n * 20);
+    let mut modseq_b = StringBuilder::with_capacity(n, n * 30);
+    let mut seq_b = StringBuilder::with_capacity(n, n * 20);
+    let mut charge_b = UInt8Builder::with_capacity(n);
+    let mut mz_b = Float64Builder::with_capacity(n);
+    let mut protein_b = StringBuilder::with_capacity(n, n * 15);
+    let mut decoy_b = BooleanBuilder::with_capacity(n);
+    let mut rt_b = Float64Builder::with_capacity(n);
+    let mut rt_start_b = Float64Builder::with_capacity(n);
+    let mut rt_stop_b = Float64Builder::with_capacity(n);
+    let mut width_b = Float64Builder::with_capacity(n);
+    let mut lib_rt_b = Float64Builder::with_capacity(n);
+    let mut scan_b = UInt32Builder::with_capacity(n);
+    let mut score_b = Float64Builder::with_capacity(n);
+    let mut qval_b = Float64Builder::with_capacity(n);
+    let mut gqval_b = Float64Builder::with_capacity(n);
+    let mut pep_b = Float64Builder::with_capacity(n);
+    let mut mode_b = StringBuilder::with_capacity(n, n * 10);
+    let mut feat_builders: Vec<Float64Builder> = (0..feature_names.len())
+        .map(|_| Float64Builder::with_capacity(n))
+        .collect();
+
+    for entry in entries {
+        run_b.append_value(&entry.file_name);
+        modseq_b.append_value(&entry.modified_sequence);
+        seq_b.append_value(&entry.sequence);
+        charge_b.append_value(entry.charge);
+        mz_b.append_value(entry.precursor_mz);
+        protein_b.append_value(entry.protein_ids.join(";"));
+        decoy_b.append_value(entry.is_decoy);
+
+        rt_b.append_value(entry.peak_bounds.apex_rt);
+        rt_start_b.append_value(entry.peak_bounds.start_rt);
+        rt_stop_b.append_value(entry.peak_bounds.end_rt);
+        width_b.append_value(entry.peak_bounds.end_rt - entry.peak_bounds.start_rt);
+        lib_rt_b.append_value(0.0); // CoelutionScoredEntry doesn't store library RT
+        scan_b.append_value(entry.scan_number);
+        score_b.append_value(entry.score);
+        qval_b.append_value(entry.run_qvalue);
+        gqval_b.append_value(entry.experiment_qvalue);
+        pep_b.append_value(entry.pep);
+        mode_b.append_value("coelution");
+
+        // All 45 features
+        for (i, builder) in feat_builders.iter_mut().enumerate() {
+            let v = coelution_pin_feature_value(&entry.features, i);
+            builder.append_value(if v.is_finite() { v } else { 0.0 });
+        }
+    }
+
+    // Assemble columns
+    let mut columns: Vec<ArrayRef> = vec![
+        std::sync::Arc::new(run_b.finish()),
+        std::sync::Arc::new(modseq_b.finish()),
+        std::sync::Arc::new(seq_b.finish()),
+        std::sync::Arc::new(charge_b.finish()),
+        std::sync::Arc::new(mz_b.finish()),
+        std::sync::Arc::new(protein_b.finish()),
+        std::sync::Arc::new(decoy_b.finish()),
+        std::sync::Arc::new(rt_b.finish()),
+        std::sync::Arc::new(rt_start_b.finish()),
+        std::sync::Arc::new(rt_stop_b.finish()),
+        std::sync::Arc::new(width_b.finish()),
+        std::sync::Arc::new(lib_rt_b.finish()),
+        std::sync::Arc::new(scan_b.finish()),
+        std::sync::Arc::new(score_b.finish()),
+        std::sync::Arc::new(qval_b.finish()),
+        std::sync::Arc::new(gqval_b.finish()),
+        std::sync::Arc::new(pep_b.finish()),
+        std::sync::Arc::new(mode_b.finish()),
+    ];
+    for builder in &mut feat_builders {
+        columns.push(std::sync::Arc::new(builder.finish()));
+    }
+
+    // Write parquet with ZSTD compression
+    let file = std::fs::File::create(path).map_err(|e| {
+        OspreyError::OutputError(format!(
+            "Failed to create parquet file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| OspreyError::OutputError(format!("Failed to create RecordBatch: {}", e)))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+        .map_err(|e| OspreyError::OutputError(format!("Failed to create Parquet writer: {}", e)))?;
+    writer
+        .write(&batch)
+        .map_err(|e| OspreyError::OutputError(format!("Failed to write Parquet batch: {}", e)))?;
+    writer
+        .close()
+        .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
+
+    log::info!(
+        "Wrote Parquet report ({} entries, {} columns) to {}",
+        n,
+        18 + feature_names.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Write coelution scored entries to TSV report
+fn write_coelution_scored_report(
+    path: &std::path::Path,
+    entries: &[CoelutionScoredEntry],
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path)?;
+    writeln!(
+        file,
+        "modified_sequence\tprecursor_mz\tcharge\tapex_rt\tpeak_apex\tpeak_area\tn_scans\tq_value"
+    )?;
+
+    for entry in entries {
+        writeln!(
+            file,
+            "{}\t{:.4}\t{}\t{:.2}\t{:.4}\t{:.4}\t{}\t{:.6}",
+            entry.modified_sequence,
+            entry.precursor_mz,
+            entry.charge,
+            entry.peak_bounds.apex_rt,
+            entry.features.peak_apex,
+            entry.features.peak_area,
+            entry.features.n_scans,
+            entry.experiment_qvalue
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Write scored entries to PIN file for Mokapot semi-supervised FDR control
 ///
 /// Includes BOTH targets AND decoys, which is required for Mokapot's
@@ -4256,13 +4799,22 @@ fn run_analysis_coelution(config: OspreyConfig) -> Result<Vec<RegressionResult>>
             &config,
         );
 
-        // Target-decoy competition using coelution_sum as the competition score.
-        // Mokapot expects only competition winners (no pi0 correction).
-        let entries = compete_coelution_entries(entries, &library);
+        // Deduplicate: keep best target and best decoy per base_id.
+        // Both target AND paired decoy are passed to Percolator/Mokapot so they
+        // can do proper target-decoy competition using SVM/ML-rescored values.
+        let entries = deduplicate_coelution_pairs(entries);
 
-        // Write coelution PIN file (competition winners only, if mokapot or --write-pin)
+        // Write coelution PIN file (if mokapot or --write-pin)
+        // Mokapot expects pre-competed data (winners only), so compete before writing PIN.
+        // Native Percolator does internal paired competition, so keep both target and decoy.
         if write_pin {
-            let pin_path = mokapot.write_coelution_pin_file(&file_name, &entries, &mokapot_dir)?;
+            let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
+                compete_coelution_target_decoy_pairs(entries.clone())
+            } else {
+                entries.clone()
+            };
+            let pin_path =
+                mokapot.write_coelution_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
             pin_files.insert(file_name.clone(), pin_path);
         }
 
@@ -4307,12 +4859,42 @@ fn run_analysis_coelution(config: OspreyConfig) -> Result<Vec<RegressionResult>>
         }
     }
 
-    // Collect all passing entries (using experiment-level q-values)
-    let passing_entries: Vec<CoelutionScoredEntry> = per_file_entries
+    // Collect all entries (targets + decoys) with q-values assigned
+    let all_entries: Vec<CoelutionScoredEntry> = per_file_entries
         .into_iter()
         .flat_map(|(_, entries)| entries)
-        .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
         .collect();
+
+    // Determine which precursors pass experiment-level FDR (using best observation)
+    let passing_precursors: HashSet<(String, u8)> = all_entries
+        .iter()
+        .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
+        .map(|e| (e.modified_sequence.clone(), e.charge))
+        .collect();
+
+    // Include ALL per-file target observations for passing precursors
+    // (not just the winner — needed for per-file RT boundaries in blib)
+    let mut passing_entries: Vec<CoelutionScoredEntry> = all_entries
+        .iter()
+        .filter(|e| {
+            !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge))
+        })
+        .cloned()
+        .collect();
+
+    // Propagate the best experiment_qvalue to all observations of each precursor
+    let mut best_exp_q: HashMap<(String, u8), f64> = HashMap::new();
+    for e in &passing_entries {
+        best_exp_q
+            .entry((e.modified_sequence.clone(), e.charge))
+            .and_modify(|q| *q = q.min(e.experiment_qvalue))
+            .or_insert(e.experiment_qvalue);
+    }
+    for e in passing_entries.iter_mut() {
+        if let Some(&q) = best_exp_q.get(&(e.modified_sequence.clone(), e.charge)) {
+            e.experiment_qvalue = q;
+        }
+    }
 
     // Write blib output
     if !passing_entries.is_empty() {
@@ -4320,6 +4902,23 @@ fn run_analysis_coelution(config: OspreyConfig) -> Result<Vec<RegressionResult>>
         write_coelution_blib(&config, &library, &passing_entries)?;
     } else {
         log::warn!("No peptides passed FDR threshold, skipping blib output");
+    }
+
+    // Write output report if specified
+    // Parquet includes all entries (targets + decoys) for feature analysis and SVM retraining;
+    // TSV includes only passing entries.
+    if let Some(report_path) = &config.output_report {
+        let ext = report_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if ext.eq_ignore_ascii_case("parquet") {
+            log::info!("Writing Parquet report to {}", report_path.display());
+            write_coelution_parquet_report(report_path, &all_entries)?;
+        } else {
+            log::info!("Writing TSV report to {}", report_path.display());
+            write_coelution_scored_report(report_path, &passing_entries)?;
+        }
     }
 
     Ok(Vec::new())
@@ -4364,9 +4963,16 @@ fn run_coelution_percolator_fdr(
         }
     }
 
+    let coelution_feature_names = get_coelution_pin_feature_names();
     let perc_config = percolator::PercolatorConfig {
         train_fdr: config.run_fdr,
         test_fdr: config.run_fdr,
+        feature_names: Some(
+            coelution_feature_names
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
         ..Default::default()
     };
 
@@ -4385,11 +4991,18 @@ fn run_coelution_percolator_fdr(
                 file_name, entry.modified_sequence, entry.charge, entry.scan_number
             );
             if let Some(result) = result_map.get(psm_id.as_str()) {
-                entry.run_qvalue = result.run_precursor_qvalue;
-                entry.experiment_qvalue = result.experiment_precursor_qvalue;
+                // Enforce dual FDR: max of precursor and peptide q-values
+                entry.run_qvalue = result.run_precursor_qvalue.max(result.run_peptide_qvalue);
+                entry.experiment_qvalue = result
+                    .experiment_precursor_qvalue
+                    .max(result.experiment_peptide_qvalue);
+                entry.score = result.score;
+                entry.pep = result.pep;
             }
         }
     }
+
+    // Per-file and experiment stats already logged by percolator.rs
 
     Ok(())
 }
@@ -4414,23 +5027,92 @@ fn run_coelution_mokapot_fdr(
                 .map(|r| (r.psm_id.clone(), r.q_value))
                 .collect();
 
+            let experiment_score_map: HashMap<String, (f64, f64)> = experiment_results
+                .iter()
+                .map(|r| (r.psm_id.clone(), (r.score, r.pep)))
+                .collect();
+
+            // Parse run-level peptide q-values for dual FDR control
+            let step1_dir = mokapot_dir.join("run_level");
+            let mut run_peptide_qmaps: HashMap<String, HashMap<String, f64>> = HashMap::new();
+            for (file_name, _) in per_file_entries.iter() {
+                if let Some(pin_path) = pin_files.get(file_name) {
+                    let pin_stem = pin_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown");
+                    let peptides_file =
+                        step1_dir.join(format!("{}.mokapot.peptides.txt", pin_stem));
+                    if peptides_file.exists() {
+                        if let Ok(pept_results) = mokapot.parse_results(&peptides_file) {
+                            let pept_map: HashMap<String, f64> = pept_results
+                                .into_iter()
+                                .map(|r| {
+                                    let stripped =
+                                        osprey_fdr::mokapot::strip_flanking_chars(&r.peptide);
+                                    (stripped, r.q_value)
+                                })
+                                .collect();
+                            run_peptide_qmaps.insert(file_name.clone(), pept_map);
+                        }
+                    }
+                }
+            }
+
+            // Parse experiment-level peptide q-values for dual FDR control
+            let step2_dir = mokapot_dir.join("experiment_level");
+            let exp_peptide_qmap: HashMap<String, f64> = {
+                let peptides_file = step2_dir.join("mokapot.peptides.txt");
+                if peptides_file.exists() {
+                    mokapot
+                        .parse_results(&peptides_file)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| {
+                            let stripped = osprey_fdr::mokapot::strip_flanking_chars(&r.peptide);
+                            (stripped, r.q_value)
+                        })
+                        .collect()
+                } else {
+                    HashMap::new()
+                }
+            };
+
             for (file_name, entries) in per_file_entries.iter_mut() {
                 if let Some(results) = per_file_results.get(file_name) {
-                    let run_qmap: HashMap<String, f64> = results
+                    let run_qmap: HashMap<String, (f64, f64, f64)> = results
                         .iter()
-                        .map(|r| (r.psm_id.clone(), r.q_value))
+                        .map(|r| (r.psm_id.clone(), (r.q_value, r.score, r.pep)))
                         .collect();
+
+                    let peptide_qmap = run_peptide_qmaps.get(file_name);
 
                     for entry in entries.iter_mut() {
                         let psm_id = format!(
                             "{}_{}_{}_{}",
                             file_name, entry.modified_sequence, entry.charge, entry.scan_number
                         );
-                        if let Some(&q) = run_qmap.get(&psm_id) {
-                            entry.run_qvalue = q;
+                        if let Some(&(q, score, pep)) = run_qmap.get(&psm_id) {
+                            // Enforce dual FDR: max of precursor and peptide q-values
+                            let peptide_q = peptide_qmap
+                                .and_then(|m| m.get(entry.modified_sequence.as_str()))
+                                .copied()
+                                .unwrap_or(1.0);
+                            entry.run_qvalue = q.max(peptide_q);
+                            entry.score = score;
+                            entry.pep = pep;
                         }
                         if let Some(&q) = experiment_qmap.get(&psm_id) {
-                            entry.experiment_qvalue = q;
+                            // Enforce dual FDR: max of precursor and peptide q-values
+                            let peptide_q = exp_peptide_qmap
+                                .get(entry.modified_sequence.as_str())
+                                .copied()
+                                .unwrap_or(1.0);
+                            entry.experiment_qvalue = q.max(peptide_q);
+                        }
+                        if let Some(&(score, pep)) = experiment_score_map.get(&psm_id) {
+                            entry.score = score;
+                            entry.pep = pep;
                         }
                     }
                 }
@@ -4450,10 +5132,14 @@ fn run_coelution_mokapot_fdr(
 
 /// Target-decoy competition for coelution entries.
 /// Each target competes with its paired decoy — higher coelution_sum wins.
-fn compete_coelution_entries(
-    entries: Vec<CoelutionScoredEntry>,
-    _library: &[LibraryEntry],
-) -> Vec<CoelutionScoredEntry> {
+/// Deduplicate coelution entries: keep the best target AND best decoy per base_id.
+///
+/// When a precursor appears in multiple isolation windows, we may have duplicate
+/// entries. This keeps only the best-scoring target and the best-scoring decoy
+/// for each base_id (paired by `entry_id & 0x7FFFFFFF`). Both are retained so
+/// that Percolator/Mokapot can perform proper target-decoy competition using
+/// ML-rescored values.
+fn deduplicate_coelution_pairs(entries: Vec<CoelutionScoredEntry>) -> Vec<CoelutionScoredEntry> {
     let mut target_best: HashMap<u32, CoelutionScoredEntry> = HashMap::new();
     let mut decoy_best: HashMap<u32, CoelutionScoredEntry> = HashMap::new();
 
@@ -4474,35 +5160,171 @@ fn compete_coelution_entries(
         }
     }
 
-    // Competition: target vs decoy, higher coelution_sum wins (ties → decoy, conservative)
-    let mut winners = Vec::new();
+    let n_targets = target_best.len();
+    let n_decoys = decoy_best.len();
+    let n_paired = target_best
+        .keys()
+        .filter(|k| decoy_best.contains_key(k))
+        .count();
+
+    // Collect all entries (both targets and decoys)
+    let mut all_entries: Vec<CoelutionScoredEntry> =
+        Vec::with_capacity(target_best.len() + decoy_best.len());
+    all_entries.extend(target_best.into_values());
+    all_entries.extend(decoy_best.into_values());
+
+    log::info!(
+        "Deduplicated to {} targets + {} decoys ({} paired, {} total)",
+        n_targets,
+        n_decoys,
+        n_paired,
+        all_entries.len()
+    );
+
+    all_entries
+}
+
+/// Select the best-separating coelution feature by ROC AUC.
+fn select_best_separating_coelution_feature(
+    entries: &[CoelutionScoredEntry],
+) -> Option<(usize, bool)> {
+    let mut best_index = 0usize;
+    let mut best_abs_deviation = 0.0f64;
+    let mut best_auc = 0.5f64;
+
+    let feature_names = get_coelution_pin_feature_names();
+
+    for feat_idx in 0..NUM_COELUTION_PIN_FEATURES {
+        let mut target_vals = Vec::new();
+        let mut decoy_vals = Vec::new();
+
+        for entry in entries {
+            let val = coelution_pin_feature_value(&entry.features, feat_idx);
+            if !val.is_finite() {
+                continue;
+            }
+            if entry.is_decoy {
+                decoy_vals.push(val);
+            } else {
+                target_vals.push(val);
+            }
+        }
+
+        if target_vals.len() < 2 || decoy_vals.len() < 2 {
+            continue;
+        }
+
+        let auc = compute_roc_auc(&target_vals, &decoy_vals);
+        let abs_deviation = (auc - 0.5).abs();
+        if abs_deviation > best_abs_deviation {
+            best_abs_deviation = abs_deviation;
+            best_auc = auc;
+            best_index = feat_idx;
+        }
+    }
+
+    if best_abs_deviation < 1e-10 {
+        log::warn!("Coelution target-decoy competition: no feature separates targets from decoys");
+        return None;
+    }
+
+    let higher_is_better = best_auc > 0.5;
+    log::info!(
+        "Coelution target-decoy competition: best feature = {} (ROC AUC = {:.3}, {})",
+        feature_names[best_index],
+        best_auc,
+        if higher_is_better {
+            "higher is better"
+        } else {
+            "lower is better"
+        }
+    );
+
+    Some((best_index, higher_is_better))
+}
+
+/// Run target-decoy competition on coelution entries for mokapot PIN writing.
+///
+/// Mokapot expects pre-competed data (only winners). This function competes
+/// paired target-decoy entries using the best-separating coelution feature
+/// (selected by ROC AUC). Ties go to the decoy (conservative for FDR).
+fn compete_coelution_target_decoy_pairs(
+    entries: Vec<CoelutionScoredEntry>,
+) -> Vec<CoelutionScoredEntry> {
+    let (feat_idx, higher_is_better) = match select_best_separating_coelution_feature(&entries) {
+        Some(result) => result,
+        None => {
+            // Fallback: coelution_sum (index 0, higher is better)
+            log::warn!(
+                "Coelution target-decoy competition: using coelution_sum as fallback feature"
+            );
+            (0, true)
+        }
+    };
+
+    // Group entries by base_id
+    let mut groups: HashMap<u32, (Option<CoelutionScoredEntry>, Option<CoelutionScoredEntry>)> =
+        HashMap::new();
+
+    for entry in entries {
+        let base_id = entry.entry_id & 0x7FFFFFFF;
+        let slot = groups.entry(base_id).or_insert((None, None));
+        if entry.is_decoy {
+            slot.1 = Some(entry);
+        } else {
+            slot.0 = Some(entry);
+        }
+    }
+
+    let mut winners = Vec::with_capacity(groups.len());
     let mut n_target_wins = 0usize;
     let mut n_decoy_wins = 0usize;
 
-    for (base_id, target) in target_best {
-        let target_score = target.features.coelution_sum;
-        if let Some(decoy) = decoy_best.remove(&base_id) {
-            let decoy_score = decoy.features.coelution_sum;
-            if target_score > decoy_score {
+    for (_base_id, (target_opt, decoy_opt)) in groups {
+        match (target_opt, decoy_opt) {
+            (Some(target), None) => {
                 n_target_wins += 1;
                 winners.push(target);
-            } else {
+            }
+            (None, Some(decoy)) => {
                 n_decoy_wins += 1;
                 winners.push(decoy);
             }
-        } else {
-            n_target_wins += 1;
-            winners.push(target); // No paired decoy
+            (Some(target), Some(decoy)) => {
+                let t_val = coelution_pin_feature_value(&target.features, feat_idx);
+                let d_val = coelution_pin_feature_value(&decoy.features, feat_idx);
+
+                let t_val = if t_val.is_finite() {
+                    t_val
+                } else {
+                    f64::NEG_INFINITY
+                };
+                let d_val = if d_val.is_finite() {
+                    d_val
+                } else {
+                    f64::NEG_INFINITY
+                };
+
+                let target_wins = if higher_is_better {
+                    t_val > d_val // strict: ties go to decoy
+                } else {
+                    t_val < d_val
+                };
+
+                if target_wins {
+                    n_target_wins += 1;
+                    winners.push(target);
+                } else {
+                    n_decoy_wins += 1;
+                    winners.push(decoy);
+                }
+            }
+            (None, None) => {}
         }
-    }
-    // Add remaining decoys without targets
-    for (_, decoy) in decoy_best {
-        n_decoy_wins += 1;
-        winners.push(decoy);
     }
 
     log::info!(
-        "Target-decoy competition (coelution_sum): {} target wins, {} decoy wins ({} total)",
+        "Coelution target-decoy competition: {} target wins, {} decoy wins ({} total)",
         n_target_wins,
         n_decoy_wins,
         winners.len()
@@ -4581,47 +5403,62 @@ fn deduplicate_coelution_double_counting(
     let lib_id_map: HashMap<u32, usize> =
         library.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
 
-    // 5. For each isolation window, find and deduplicate overlapping entries
-    let mut removed = vec![false; entries.len()];
+    // 5. Pre-assign entries to isolation windows using a sorted m/z index.
+    //    This replaces the O(n * w) per-window full scan with O(n log n + w log n).
+    let mut mz_sorted_indices: Vec<usize> = (0..entries.len()).collect();
+    mz_sorted_indices.sort_by(|&a, &b| entries[a].precursor_mz.total_cmp(&entries[b].precursor_mz));
+    let mz_sorted_vals: Vec<f64> = mz_sorted_indices
+        .iter()
+        .map(|&i| entries[i].precursor_mz)
+        .collect();
 
-    for &(center, width) in windows {
-        let win_lower = center - width / 2.0;
-        let win_upper = center + width / 2.0;
+    // For each window, binary search for the range of entries that fall within it
+    let window_entry_indices: Vec<Vec<usize>> = windows
+        .iter()
+        .map(|&(center, width)| {
+            let win_lower = center - width / 2.0;
+            let win_upper = center + width / 2.0;
+            let lo = mz_sorted_vals.partition_point(|&mz| mz < win_lower);
+            let hi = mz_sorted_vals.partition_point(|&mz| mz <= win_upper);
+            mz_sorted_indices[lo..hi].to_vec()
+        })
+        .collect();
 
-        // Collect indices of entries in this window
-        let mut window_indices: Vec<usize> = entries
+    // 6. Process each isolation window in parallel.
+    //    Within each window, sort entries by apex_rt for early termination.
+    //    Use AtomicBool for thread-safe removal marking.
+    let removed: Vec<AtomicBool> = (0..entries.len()).map(|_| AtomicBool::new(false)).collect();
+
+    window_entry_indices.par_iter().for_each(|indices| {
+        if indices.is_empty() {
+            return;
+        }
+
+        // Sort by apex_rt for locality-based early termination
+        let mut rt_sorted: Vec<usize> = indices
             .iter()
-            .enumerate()
-            .filter(|(i, e)| {
-                !removed[*i] && e.precursor_mz >= win_lower && e.precursor_mz <= win_upper
-            })
-            .map(|(i, _)| i)
+            .copied()
+            .filter(|&i| !removed[i].load(Ordering::Relaxed))
             .collect();
+        rt_sorted.sort_by(|&a, &b| entries[a].apex_rt.total_cmp(&entries[b].apex_rt));
 
-        // Sort by coelution_sum descending (greedy: best entries survive)
-        window_indices.sort_by(|&a, &b| {
-            entries[b]
-                .features
-                .coelution_sum
-                .total_cmp(&entries[a].features.coelution_sum)
-        });
-
-        // Compare pairs: for each entry, check against subsequent entries
-        for i_pos in 0..window_indices.len() {
-            let idx_a = window_indices[i_pos];
-            if removed[idx_a] {
+        for i_pos in 0..rt_sorted.len() {
+            let idx_a = rt_sorted[i_pos];
+            if removed[idx_a].load(Ordering::Relaxed) {
                 continue;
             }
             let apex_a = entries[idx_a].apex_rt;
 
-            for &idx_b in &window_indices[(i_pos + 1)..] {
-                if removed[idx_b] {
-                    continue;
+            // Scan forward only; break when RT distance exceeds neighborhood
+            for &idx_b in &rt_sorted[(i_pos + 1)..] {
+                let apex_b = entries[idx_b].apex_rt;
+
+                // Early termination: entries are RT-sorted, so all subsequent are farther
+                if apex_b - apex_a > rt_neighborhood {
+                    break;
                 }
 
-                // Check apex RT proximity (±5 spectra)
-                let apex_b = entries[idx_b].apex_rt;
-                if (apex_a - apex_b).abs() > rt_neighborhood {
+                if removed[idx_b].load(Ordering::Relaxed) {
                     continue;
                 }
 
@@ -4650,13 +5487,21 @@ fn deduplicate_coelution_double_counting(
                 let threshold = (min_a.min(min_b) as f64 * 0.5).ceil() as usize;
 
                 if overlap >= threshold {
-                    removed[idx_b] = true;
+                    // Remove the entry with lower coelution_sum (keep the better one)
+                    if entries[idx_a].features.coelution_sum
+                        >= entries[idx_b].features.coelution_sum
+                    {
+                        removed[idx_b].store(true, Ordering::Relaxed);
+                    } else {
+                        removed[idx_a].store(true, Ordering::Relaxed);
+                        break; // idx_a is removed, no need to check more pairs
+                    }
                 }
             }
         }
-    }
+    });
 
-    let removed_count = removed.iter().filter(|&&r| r).count();
+    let removed_count = removed.iter().filter(|r| r.load(Ordering::Relaxed)).count();
     if removed_count > 0 {
         log::info!(
             "Double-counting deduplication: removed {} entries ({} remaining)",
@@ -4668,7 +5513,7 @@ fn deduplicate_coelution_double_counting(
     entries
         .into_iter()
         .enumerate()
-        .filter(|(i, _)| !removed[*i])
+        .filter(|(i, _)| !removed[*i].load(Ordering::Relaxed))
         .map(|(_, e)| e)
         .collect()
 }
@@ -4994,7 +5839,7 @@ fn run_coelution_search(
     file_name: &str,
 ) -> Result<Vec<CoelutionScoredEntry>> {
     use osprey_chromatography::calibration::calibrated_tolerance_ppm;
-    use osprey_chromatography::detect_xic_peak;
+    use osprey_chromatography::{compute_snr, detect_xic_peak};
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
     use osprey_scoring::{
         compute_elution_weighted_cosine, compute_mass_accuracy, extract_fragment_xics,
@@ -5229,7 +6074,7 @@ fn run_coelution_search(
                         return None;
                     }
 
-                    // 2. Find reference XIC (highest total intensity)
+                    // 2. Find reference XIC (highest total intensity) for scoring
                     let ref_idx = xics
                         .iter()
                         .enumerate()
@@ -5242,8 +6087,46 @@ fn run_coelution_search(
 
                     let ref_xic = &xics[ref_idx].1;
 
-                    // 3. Detect peak on reference XIC using DIA-NN-style valley detection
-                    let peak = detect_xic_peak(ref_xic, 0.01, 5.0, Some(expected_rt))?;
+                    // 3. Detect peak boundaries using median polish elution profile.
+                    // Median polish decomposes fragment XICs into row (fragment) and column
+                    // (time) effects via iterative median sweeps. The elution profile
+                    // (column effects) represents the shared peak shape across all fragments,
+                    // suppressing interference that affects individual fragments. This gives
+                    // tighter boundaries when interference is adjacent to the target peak.
+                    let full_polish = tukey_median_polish(&xics, 10, 0.01);
+                    let peak = {
+                        let mp_peak = full_polish.as_ref().and_then(|mp| {
+                            detect_xic_peak(&mp.elution_profile, 0.01, 5.0, Some(expected_rt))
+                        });
+                        if let Some(bp) = mp_peak {
+                            // Re-compute peak metrics from reference XIC within robust boundaries
+                            let si = bp.start_index;
+                            let ei = bp.end_index;
+                            let (apex_idx, apex_val) = ref_xic[si..=ei]
+                                .iter()
+                                .enumerate()
+                                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                                .map(|(i, &(_, v))| (si + i, v))
+                                .unwrap_or((bp.apex_index, 0.0));
+                            let area = trapezoidal_area(&ref_xic[si..=ei]);
+                            let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+                            let snr = compute_snr(&raw_ints, apex_idx, si, ei);
+                            XICPeakBounds {
+                                apex_rt: ref_xic[apex_idx].0,
+                                apex_intensity: apex_val,
+                                apex_index: apex_idx,
+                                start_rt: ref_xic[si].0,
+                                end_rt: ref_xic[ei].0,
+                                start_index: si,
+                                end_index: ei,
+                                area,
+                                signal_to_noise: snr,
+                            }
+                        } else {
+                            // Fallback: detect peak directly on reference XIC
+                            detect_xic_peak(ref_xic, 0.01, 5.0, Some(expected_rt))?
+                        }
+                    };
 
                     if peak.end_index <= peak.start_index + 1 {
                         pb.inc(1);
@@ -5565,6 +6448,8 @@ fn run_coelution_search(
                         file_name: file_name.to_string(),
                         run_qvalue: 1.0,
                         experiment_qvalue: 1.0,
+                        score: 0.0,
+                        pep: 1.0,
                     })
                 })
                 .collect();

@@ -932,6 +932,10 @@ pub struct CoelutionScoredEntry {
     pub run_qvalue: f64,
     /// Experiment-level q-value (from Mokapot across files, default 1.0)
     pub experiment_qvalue: f64,
+    /// SVM discriminant score (from Percolator/Mokapot, same score used for q-value and PEP)
+    pub score: f64,
+    /// Posterior error probability (computed on the final SVM score)
+    pub pep: f64,
 }
 
 #[cfg(test)]

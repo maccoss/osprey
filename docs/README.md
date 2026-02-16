@@ -10,7 +10,7 @@ Osprey has a **working prototype** that can:
 - Generate enzyme-aware decoys
 - Run auto-calibration with target-decoy FDR control
 - Search via ridge regression (37 features) or coelution (45 features)
-- Run Mokapot semi-supervised FDR control
+- Run FDR control via native Percolator (default), external Mokapot, or simple TDC
 - Output BiblioSpec .blib files for Skyline (library theoretical fragments)
 
 ## Algorithm Documentation
@@ -24,7 +24,7 @@ Osprey has a **working prototype** that can:
 | [Ridge Regression](ridge-regression.md) | NNLS ridge regression for spectrum deconvolution |
 | [Peak Detection](peak-detection.md) | Chromatographic peak detection in coefficient time series |
 | [Decoy Generation](decoy-generation.md) | Enzyme-aware sequence reversal for FDR control |
-| [FDR Control](fdr-control.md) | Two-level FDR with Mokapot integration |
+| [FDR Control](fdr-control.md) | Two-level FDR: native Percolator, Mokapot, and simple TDC |
 | [BiblioSpec Output Schema](blib-output-schema.md) | blib output format and Skyline integration |
 
 ---
@@ -70,7 +70,7 @@ PHASE 4A: POST-REGRESSION SCORING (37 features)
   +- Peak detection -> apex RT, boundaries
   +- Tukey median polish on fragment XICs -> elution profile, FWHM
   +- Score at apex (37 features)
-  +- Write PIN file -> Mokapot FDR -> q-values
+  +- FDR control (Percolator SVM or Mokapot) -> q-values
 
 --- OR ---
 
@@ -86,19 +86,19 @@ PHASE 4B: COELUTION SCORING (45 features)
   +- Peak shape features (apex, area, width, symmetry, S/N)
   +- Spectral matching at apex (hyperscore, xcorr, dot products)
   +- Tukey median polish on fragment XICs
-  +- Write PIN file -> Mokapot FDR -> q-values
+  +- FDR control (Percolator SVM or Mokapot) -> q-values
   |
   v
 OUTPUT (shared)
   +- BiblioSpec (.blib) for Skyline (library theoretical fragments)
-  +- Mokapot model weights (.pkl) for feature analysis
+  +- SVM/Mokapot model weights for feature analysis
 ```
 
 ---
 
 ## Feature Sets
 
-Osprey extracts features per precursor for semi-supervised FDR control via Mokapot. The feature set depends on the search mode: **37 features** for regression, **45 features** for coelution. All intensity-based spectral similarity scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks.
+Osprey extracts features per precursor for semi-supervised FDR control via native Percolator (default) or external Mokapot. The feature set depends on the search mode: **37 features** for regression, **45 features** for coelution. All intensity-based spectral similarity scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks.
 
 ### Regression Mode (37 Features)
 
@@ -292,26 +292,30 @@ The algorithm iterates (max 20 iterations, convergence tolerance 1e-4):
 
 ## FDR Control
 
-Osprey uses **two-level FDR control** via Mokapot:
+Osprey uses **two-level FDR control** with three available methods (`--fdr-method`):
 
-### Run-Level FDR (Step 1)
-- Per-file target-decoy competition
-- All features passed to Mokapot (37 for regression, 45 for coelution)
-- Mokapot trains linear SVM to combine features
-- Q-values assigned per precursor
+- **Percolator** (default): Native linear SVM with cross-validation. Both targets and decoys enter; Percolator does internal paired competition within each fold.
+- **Mokapot**: External Python tool. Requires pre-competed PIN files (only competition winners). Uses ROC AUC to select the best feature for upstream competition.
+- **Simple**: Direct target-decoy competition on the best single feature.
 
-### Experiment-Level FDR (Step 2)
-- Aggregate best precursor across replicates
-- Only runs if multiple replicates provided
-- Single replicate skips to run-level results
-- Precursor = peptide + charge (not just peptide)
+### Run-Level FDR
+- Per-file target-decoy competition and q-value computation
+- All features (37 for regression, 45 for coelution) used by SVM
+- Q-values assigned at both precursor and peptide level
+- Effective q-value: `max(precursor_qvalue, peptide_qvalue)` — must pass both
 
-### Mokapot Integration
-- PIN file format (37 features for regression, 45 for coelution)
-- `--save_models` flag saves feature weights
-- Use `scripts/inspect_mokapot_weights.py` to view feature importance
-- Parallel workers (auto-detected, capped at 8)
-- Progress streaming to console
+### Experiment-Level FDR
+- Takes the **single best-scoring observation** per precursor (modified_sequence + charge) across all files
+- Target-decoy competition on this deduplicated set at both precursor and peptide level
+- Effective q-value: `max(precursor_qvalue, peptide_qvalue)`
+- Single replicate skips experiment-level (uses run-level directly)
+
+### Multi-File Observation Propagation
+- After experiment-level FDR determines passing precursors, **all per-file target observations** for those precursors are included in the blib output
+- Each file gets its own RT boundaries; best experiment_qvalue is propagated to all observations
+- This enables Skyline to use per-file peak boundaries for quantification across replicates/GPF files
+
+See [FDR Control](fdr-control.md) for full algorithm details, fold assignment, and the target-decoy competition strategy.
 
 ---
 
@@ -352,7 +356,7 @@ See: [Calibration](calibration.md)
 
 ## Phase 3: Main Search
 
-Osprey supports two search strategies. Both produce scored entries that feed into Mokapot FDR.
+Osprey supports two search strategies. Both produce scored entries that feed into FDR control (native Percolator or Mokapot).
 
 ### Regression Mode (default)
 
@@ -394,14 +398,10 @@ For each library entry, collect all (RT, coefficient) pairs from regression resu
 
 ### Step 2: Peak Detection
 
-The peak detector identifies elution peaks in the coefficient time series using a **threshold-crossing algorithm**:
+Two complementary peak detectors are used:
 
-1. Scan through the time series
-2. When coefficient crosses above `min_height` (default: 0.05), mark peak start
-3. Track the highest coefficient within the peak as the apex
-4. When coefficient drops below `min_height`, mark peak end
-5. Reject peaks narrower than `min_width` scans (default: 3)
-6. If multiple peaks, select the one with the highest apex coefficient near the expected RT
+1. **Threshold-crossing** (`PeakDetector::detect()`): Scans coefficient series for contiguous regions above `min_height` (0.01). Selects the peak with highest apex coefficient near the expected RT.
+2. **XIC peak detection** (`detect_xic_peak()`): Smoothed apex finding, DIA-NN-style valley-based boundary detection, and asymmetric FWHM capping. Used for signal-to-noise estimation on coefficient series.
 
 See: [Peak Detection](peak-detection.md)
 
@@ -423,13 +423,15 @@ All features are computed within or at the peak boundaries:
 - **MS1 features**: Precursor co-elution and isotope cosine (HRAM only)
 - **Percolator-style**: Peptide length, missed cleavages, charge, RT deviation
 
-### Step 5: FDR Control via Mokapot
+### Step 5: FDR Control
 
-All features (37 for regression, 45 for coelution) for both targets and decoys are written to a PIN file. Mokapot performs semi-supervised learning (linear SVM) to combine features into an optimal discriminant score, then estimates q-values via target-decoy competition.
+All features (37 for regression, 45 for coelution) are combined into an optimal discriminant score via semi-supervised learning (linear SVM). The default native Percolator receives both targets and decoys and performs internal paired competition. For external Mokapot, targets and decoys are pre-competed using the best feature (selected by ROC AUC) and only winners are written to PIN files.
 
-**Two-level FDR**:
-1. **Run-level**: Per-file FDR control
-2. **Experiment-level**: Best precursor per peptide+charge across all files
+**Two-level FDR with dual precursor+peptide control**:
+1. **Run-level**: Per-file FDR at both precursor and peptide level
+2. **Experiment-level**: Best observation per precursor across all files, FDR at both levels
+3. **Effective q-value**: `max(precursor_qvalue, peptide_qvalue)` at each level
+4. **Observation propagation**: All per-file observations for passing precursors included in output
 
 See: [FDR Control](fdr-control.md)
 
@@ -444,7 +446,7 @@ See: [FDR Control](fdr-control.md)
 | **Purpose** | Establish RT/mass calibration | Determine peptide detections |
 | **Method** | XCorr + E-value | Regression or coelution |
 | **Features** | E-value only | 37 (regression) or 45 (coelution) |
-| **FDR method** | Target-decoy on E-value | Mokapot semi-supervised ML |
+| **FDR method** | Target-decoy on LDA score | Semi-supervised SVM (Percolator/Mokapot) |
 | **Scope** | First file only, wide tolerance | All files, tight calibrated tolerance |
 
 ### Regression vs Coelution Search

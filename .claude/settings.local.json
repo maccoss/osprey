@@ -106,7 +106,13 @@
       "WebFetch(domain:mokapot.readthedocs.io)",
       "WebFetch(domain:bmcbioinformatics.biomedcentral.com)",
       "WebFetch(domain:link.springer.com)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(tail:*)",
+      "WebFetch(domain:arrow.apache.org)",
+      "WebFetch(domain:misc.legendu.net)",
+      "Bash(cargo tree:*)",
+      "Bash(xxd:*)",
+      "WebFetch(domain:pubs.acs.org)"
     ],
     "additionalDirectories": [
       "/mnt/c/Users/macco/Documents/github/maccoss/osprey/example_test_data/astral"

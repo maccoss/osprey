@@ -240,6 +240,51 @@ View Mokapot feature weights to identify important features:
 python scripts/inspect_mokapot_weights.py mokapot.model.pkl
 ```
 
+## FDR Control Logic
+
+Osprey enforces FDR at **two levels** (run and experiment) and **two scopes** (precursor and peptide).
+
+### Two-Level FDR
+
+1. **Run-level FDR**: Each file is scored independently. Target-decoy competition determines q-values per file. This controls the per-file false discovery rate.
+
+2. **Experiment-level FDR**: Takes the **single best-scoring observation** per precursor (modified_sequence + charge) across ALL files in the experiment. Target-decoy competition on this deduplicated set determines experiment-level q-values. This controls the experiment-wide false discovery rate.
+
+### Dual Precursor + Peptide FDR
+
+Both Percolator and Mokapot compute q-values at precursor level (modified_sequence + charge) and peptide level (modified_sequence only). A precursor must pass FDR at **both** levels.
+
+This is enforced via: `effective_qvalue = max(precursor_qvalue, peptide_qvalue)`
+
+- `max(0.005, 0.015) = 0.015 > 0.01` → rejected (peptide fails)
+- `max(0.015, 0.005) = 0.015 > 0.01` → rejected (precursor fails)
+- `max(0.003, 0.008) = 0.008 < 0.01` → accepted (both pass)
+
+The max is applied at both run and experiment levels:
+- `run_qvalue = max(run_precursor_qvalue, run_peptide_qvalue)`
+- `experiment_qvalue = max(experiment_precursor_qvalue, experiment_peptide_qvalue)`
+
+For Mokapot: `mokapot.psms.txt` provides precursor-level q-values; `mokapot.peptides.txt` provides peptide-level q-values. Both are parsed and combined via max.
+
+### Multi-File Observation Propagation
+
+After experiment-level FDR determines which precursors pass, **all per-file target observations** for those precursors are included in the output (blib and report). This ensures:
+- Each file gets its own RT boundaries for a passing precursor
+- The best experiment_qvalue is propagated to all observations of that precursor
+- Skyline can use per-file peak boundaries for quantification across replicates/GPF files
+
+### FDR Pipeline Flow (Multi-File)
+
+1. Train model on all data (all files combined)
+2. Score all entries with trained model
+3. Compute run-level q-values per file (precursor + peptide level)
+4. Select best observation per precursor across experiment
+5. Compute experiment-level q-values (precursor + peptide level)
+6. Apply `max(precursor, peptide)` at both run and experiment levels
+7. Determine passing precursors: `experiment_qvalue <= threshold`
+8. Include ALL per-file observations for passing precursors in output
+9. Propagate best experiment_qvalue to all observations
+
 ## Recent Changes
 
 - Added coelution search mode (DIA-NN-style fragment XIC correlation, 45 features)
@@ -261,3 +306,6 @@ python scripts/inspect_mokapot_weights.py mokapot.model.pkl
 - Single replicate now skips experiment-level FDR (uses run-level directly)
 - Added parallel workers to Mokapot (auto-detected, capped at 8)
 - Added progress streaming from Mokapot to console
+- Enforced dual precursor + peptide level FDR via max(precursor_qvalue, peptide_qvalue)
+- Added mokapot.peptides.txt parsing for peptide-level FDR in Mokapot paths
+- Added multi-file observation propagation: all per-file observations for passing precursors included in output

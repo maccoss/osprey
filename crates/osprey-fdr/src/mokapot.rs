@@ -1318,7 +1318,7 @@ fn format_peptide(peptide: &str) -> String {
 /// - `_PEPTIDE_` → `PEPTIDE`
 /// - `K.PEPTIDE.R` → `PEPTIDE`
 /// - `-PEPTIDE-` → `PEPTIDE`
-fn strip_flanking_chars(seq: &str) -> String {
+pub fn strip_flanking_chars(seq: &str) -> String {
     let trimmed = seq.trim_matches(|c| c == '_' || c == '.' || c == '-');
 
     // Also handle internal patterns like "K.PEPTIDE.R" -> "PEPTIDE"

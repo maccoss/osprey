@@ -2369,43 +2369,14 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
     results.sort_by(|a, b| b.xcorr_score.total_cmp(&a.xcorr_score));
 
     // Log scoring statistics
-    let total_ms2_errors: usize = results.iter().map(|m| m.ms2_mass_errors.len()).sum();
-    let ms1_calibrated = results.iter().filter(|m| m.ms1_error.is_some()).count();
     let targets = results.iter().filter(|m| !m.is_decoy).count();
     let decoys = results.iter().filter(|m| m.is_decoy).count();
-
-    // Calculate median XCorr and E-value for summary
-    let mut xcorrs: Vec<f64> = results.iter().map(|m| m.xcorr_score).collect();
-    xcorrs.sort_by(|a, b| a.total_cmp(b));
-    let median_xcorr = if xcorrs.is_empty() {
-        0.0
-    } else {
-        xcorrs[xcorrs.len() / 2]
-    };
-
-    let mut evalues: Vec<f64> = results.iter().map(|m| m.evalue).collect();
-    evalues.sort_by(|a, b| a.total_cmp(b));
-    let median_evalue = if evalues.is_empty() {
-        1.0
-    } else {
-        evalues[evalues.len() / 2]
-    };
 
     log::info!(
         "Scoring complete: {} matches ({} targets, {} decoys)",
         results.len(),
         targets,
         decoys
-    );
-    log::info!(
-        "  - Median XCorr: {:.3}, Median E-value: {:.2e}",
-        median_xcorr,
-        median_evalue
-    );
-    log::info!(
-        "  - MS1 calibrated: {}, Total MS2 fragment matches: {}",
-        ms1_calibrated,
-        total_ms2_errors
     );
 
     results
@@ -2796,30 +2767,14 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
     results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     // Log scoring statistics
-    let total_ms2_errors: usize = results.iter().map(|m| m.ms2_mass_errors.len()).sum();
-    let ms1_calibrated = results.iter().filter(|m| m.ms1_error.is_some()).count();
     let targets = results.iter().filter(|m| !m.is_decoy).count();
     let decoys = results.iter().filter(|m| m.is_decoy).count();
-
-    let mut scores: Vec<f64> = results.iter().map(|m| m.score).collect();
-    scores.sort_by(|a, b| a.total_cmp(b));
-    let median_score = if scores.is_empty() {
-        0.0
-    } else {
-        scores[scores.len() / 2]
-    };
 
     log::info!(
         "Scoring complete: {} matches ({} targets, {} decoys)",
         results.len(),
         targets,
         decoys
-    );
-    log::info!("  - Median co-elution score: {:.3}", median_score,);
-    log::info!(
-        "  - MS1 calibrated: {}, Total MS2 fragment matches: {}",
-        ms1_calibrated,
-        total_ms2_errors
     );
 
     results

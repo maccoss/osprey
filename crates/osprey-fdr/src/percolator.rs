@@ -15,7 +15,7 @@ use osprey_ml::matrix::Matrix;
 use osprey_ml::pep::PepEstimator;
 use osprey_ml::svm::{self, FeatureStandardizer, LinearSvm};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Configuration for the Percolator runner
 #[derive(Debug, Clone)]
@@ -32,6 +32,8 @@ pub struct PercolatorConfig {
     pub seed: u64,
     /// Grid search C values for SVM cost parameter
     pub c_values: Vec<f64>,
+    /// Optional feature names for logging (must match feature count)
+    pub feature_names: Option<Vec<String>>,
 }
 
 impl Default for PercolatorConfig {
@@ -42,7 +44,8 @@ impl Default for PercolatorConfig {
             max_iterations: 10,
             n_folds: 3,
             seed: 42,
-            c_values: vec![0.01, 0.1, 1.0, 10.0],
+            c_values: vec![0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
+            feature_names: None,
         }
     }
 }
@@ -145,15 +148,22 @@ pub fn run_percolator(
     log::debug!("  Features standardized to zero mean, unit variance");
 
     // 3. Assign folds (group by peptide sequence to prevent leakage)
-    let fold_assignments = create_stratified_folds_by_peptide(&labels, &peptides, config.n_folds);
+    let fold_assignments =
+        create_stratified_folds_by_peptide(&labels, &peptides, &entry_ids, config.n_folds);
 
     // 4. Find best initial feature
     let (best_feat_idx, best_feat_passing) =
         find_best_initial_feature(&std_features, &labels, &entry_ids, config.train_fdr);
     let initial_scores: Vec<f64> = (0..n).map(|i| std_features[(i, best_feat_idx)]).collect();
+    let feat_name = config
+        .feature_names
+        .as_ref()
+        .and_then(|names| names.get(best_feat_idx))
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
     log::info!(
-        "  Best initial feature: index {} ({} targets at {:.0}% FDR)",
-        best_feat_idx,
+        "  Best initial feature: {} ({} targets at {:.0}% FDR)",
+        feat_name,
         best_feat_passing,
         config.train_fdr * 100.0
     );
@@ -281,22 +291,83 @@ pub fn run_percolator(
         })
         .collect();
 
-    // Log summary statistics
-    let n_prec_pass = results
-        .iter()
-        .zip(entries)
-        .filter(|(r, e)| !e.is_decoy && r.experiment_precursor_qvalue <= config.test_fdr)
-        .count();
-    let n_pept_pass = results
-        .iter()
-        .zip(entries)
-        .filter(|(r, e)| !e.is_decoy && r.experiment_peptide_qvalue <= config.test_fdr)
-        .count();
+    // Log per-file run-level statistics
+    let mut file_groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        file_groups
+            .entry(entry.file_name.as_str())
+            .or_default()
+            .push(i);
+    }
+    let mut sorted_files: Vec<&str> = file_groups.keys().copied().collect();
+    sorted_files.sort();
+
+    log::info!("");
     log::info!(
-        "Percolator results: {} precursors, {} peptides at {:.0}% FDR",
-        n_prec_pass,
-        n_pept_pass,
+        "=== Per-file results (run-level FDR at {:.0}%) ===",
         config.test_fdr * 100.0
+    );
+    for file_name in &sorted_files {
+        let indices = &file_groups[file_name];
+        let passing: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| {
+                !entries[i].is_decoy
+                    && results[i]
+                        .run_precursor_qvalue
+                        .max(results[i].run_peptide_qvalue)
+                        <= config.test_fdr
+            })
+            .collect();
+        let precursor_count = passing
+            .iter()
+            .map(|&i| (entries[i].peptide.as_str(), entries[i].charge))
+            .collect::<HashSet<_>>()
+            .len();
+        let peptide_count = passing
+            .iter()
+            .map(|&i| entries[i].peptide.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        log::info!(
+            "  {}: {} precursors, {} peptides",
+            file_name,
+            precursor_count,
+            peptide_count
+        );
+    }
+
+    // Log experiment-level statistics (using effective q-value = max of precursor and peptide)
+    let exp_passing: Vec<usize> = (0..results.len())
+        .filter(|&i| {
+            !entries[i].is_decoy
+                && results[i]
+                    .experiment_precursor_qvalue
+                    .max(results[i].experiment_peptide_qvalue)
+                    <= config.test_fdr
+        })
+        .collect();
+    let exp_precursors = exp_passing
+        .iter()
+        .map(|&i| (entries[i].peptide.as_str(), entries[i].charge))
+        .collect::<HashSet<_>>()
+        .len();
+    let exp_peptides = exp_passing
+        .iter()
+        .map(|&i| entries[i].peptide.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+
+    log::info!("");
+    log::info!(
+        "=== Experiment-level results ({:.0}% FDR) ===",
+        config.test_fdr * 100.0
+    );
+    log::info!(
+        "  Experiment: {} precursors, {} peptides",
+        exp_precursors,
+        exp_peptides
     );
 
     Ok(PercolatorResults {
@@ -325,10 +396,22 @@ fn train_fold(
     let mut best_iteration = 0usize;
     let mut consecutive_no_improve = 0usize;
 
-    // Start with no trained model (zero weights), so any SVM that passes targets will be better
+    // Baseline: count initial feature's performance on this fold's training set (for logging)
     let train_labels: Vec<bool> = train_indices.iter().map(|&i| labels[i]).collect();
     let train_entry_ids: Vec<u32> = train_indices.iter().map(|&i| entry_ids[i]).collect();
+    let train_initial_scores: Vec<f64> = train_indices.iter().map(|&i| initial_scores[i]).collect();
+    let initial_passing = count_passing(
+        &train_initial_scores,
+        &train_labels,
+        &train_entry_ids,
+        config.train_fdr,
+    );
     let mut best_passing = 0usize;
+    log::info!(
+        "    Initial feature baseline on training set: {} pass {:.0}% FDR",
+        initial_passing,
+        config.train_fdr * 100.0
+    );
 
     for iteration in 0..config.max_iterations {
         // i. Select positive training set
@@ -367,12 +450,14 @@ fn train_fold(
         let svm_entry_ids: Vec<u32> = svm_indices.iter().map(|&i| train_entry_ids[i]).collect();
 
         // ii. Grid search for best C
+        let svm_peptides: Vec<String> = svm_indices
+            .iter()
+            .map(|&i| peptides[train_indices[i]].clone())
+            .collect();
         let svm_fold_assignments = create_stratified_folds_by_peptide(
             &svm_labels,
-            &svm_indices
-                .iter()
-                .map(|&i| peptides[train_indices[i]].clone())
-                .collect::<Vec<_>>(),
+            &svm_peptides,
+            &svm_entry_ids,
             config.n_folds,
         );
 
@@ -1057,45 +1142,56 @@ fn best_precursor_per_peptide(
 // Fold assignment
 // ============================================================
 
-/// Create stratified fold assignments grouped by peptide sequence
+/// Create stratified fold assignments grouped by target peptide, keeping pairs together.
 ///
-/// All charge states of the same peptide go into the same fold to prevent leakage.
-/// Targets and decoys are assigned independently for class balance.
+/// All charge states of the same peptide AND their paired decoys go into the same fold.
+/// This prevents target-decoy pairs from being split across folds, which would cause
+/// unpaired targets to auto-win competition and inflate the positive training set.
+///
+/// Grouping uses base_id (entry_id & 0x7FFFFFFF) to link each decoy to its paired
+/// target's peptide sequence. All entries sharing a target peptide are assigned together.
 fn create_stratified_folds_by_peptide(
     labels: &[bool],
     peptides: &[String],
+    entry_ids: &[u32],
     n_folds: usize,
 ) -> Vec<usize> {
+    // 1. Build base_id → target peptide mapping
+    let mut base_id_to_target_peptide: HashMap<u32, &str> = HashMap::new();
+    for (i, (&is_decoy, &eid)) in labels.iter().zip(entry_ids).enumerate() {
+        let base_id = eid & 0x7FFFFFFF;
+        if !is_decoy {
+            base_id_to_target_peptide
+                .entry(base_id)
+                .or_insert(peptides[i].as_str());
+        }
+    }
+
+    // 2. Map each entry to its group key (target peptide via base_id).
+    //    Decoys look up their paired target's peptide; unpaired entries use own peptide.
+    let group_keys: Vec<&str> = (0..labels.len())
+        .map(|i| {
+            let base_id = entry_ids[i] & 0x7FFFFFFF;
+            base_id_to_target_peptide
+                .get(&base_id)
+                .copied()
+                .unwrap_or(peptides[i].as_str())
+        })
+        .collect();
+
+    // 3. Group all entries by target peptide
+    let mut peptide_groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, &key) in group_keys.iter().enumerate() {
+        peptide_groups.entry(key).or_default().push(i);
+    }
+
+    // 4. Sort for deterministic assignment, round-robin assign folds
+    let mut sorted_groups: Vec<(&str, &Vec<usize>)> =
+        peptide_groups.iter().map(|(&k, v)| (k, v)).collect();
+    sorted_groups.sort_by_key(|&(k, _)| k);
+
     let mut fold_assignments = vec![0; labels.len()];
-
-    // Group indices by peptide sequence and target/decoy
-    let mut target_peptides: HashMap<&str, Vec<usize>> = HashMap::new();
-    let mut decoy_peptides: HashMap<&str, Vec<usize>> = HashMap::new();
-
-    for (i, (pept, &is_decoy)) in peptides.iter().zip(labels).enumerate() {
-        if is_decoy {
-            decoy_peptides.entry(pept.as_str()).or_default().push(i);
-        } else {
-            target_peptides.entry(pept.as_str()).or_default().push(i);
-        }
-    }
-
-    // Sort for deterministic assignment
-    let mut target_groups: Vec<(&str, &Vec<usize>)> =
-        target_peptides.iter().map(|(&k, v)| (k, v)).collect();
-    let mut decoy_groups: Vec<(&str, &Vec<usize>)> =
-        decoy_peptides.iter().map(|(&k, v)| (k, v)).collect();
-    target_groups.sort_by_key(|&(k, _)| k);
-    decoy_groups.sort_by_key(|&(k, _)| k);
-
-    for (i, (_, indices)) in target_groups.iter().enumerate() {
-        let fold = i % n_folds;
-        for &idx in *indices {
-            fold_assignments[idx] = fold;
-        }
-    }
-
-    for (i, (_, indices)) in decoy_groups.iter().enumerate() {
+    for (i, (_, indices)) in sorted_groups.iter().enumerate() {
         let fold = i % n_folds;
         for &idx in *indices {
             fold_assignments[idx] = fold;
@@ -1141,23 +1237,49 @@ mod tests {
 
     #[test]
     fn test_fold_assignment_peptide_grouping() {
+        // Indices: 0=PEPTIDEK target z2, 1=PEPTIDEK target z3,
+        //          2=ANOTHERONE target, 3=KEDITPEP decoy of PEPTIDEK z2,
+        //          4=KEDITPEP decoy of PEPTIDEK z3, 5=ENOREHTONA decoy of ANOTHERONE
         let labels = vec![false, false, false, true, true, true];
         let peptides = vec![
             "PEPTIDEK".to_string(),
-            "PEPTIDEK".to_string(), // same peptide, different charge
+            "PEPTIDEK".to_string(),
             "ANOTHERONE".to_string(),
-            "PEPTIDEK".to_string(), // decoy
-            "PEPTIDEK".to_string(), // decoy, same peptide
-            "ANOTHERONE".to_string(),
+            "KEDITPEP".to_string(),   // decoy — different sequence
+            "KEDITPEP".to_string(),   // decoy — different sequence
+            "ENOREHTONA".to_string(), // decoy — different sequence
+        ];
+        // entry_ids: base_id links target-decoy pairs, high bit set for decoys
+        let entry_ids: Vec<u32> = vec![
+            1,              // PEPTIDEK z2 target
+            2,              // PEPTIDEK z3 target
+            3,              // ANOTHERONE target
+            1 | 0x80000000, // decoy paired with PEPTIDEK z2
+            2 | 0x80000000, // decoy paired with PEPTIDEK z3
+            3 | 0x80000000, // decoy paired with ANOTHERONE
         ];
 
-        let folds = create_stratified_folds_by_peptide(&labels, &peptides, 3);
+        let folds = create_stratified_folds_by_peptide(&labels, &peptides, &entry_ids, 3);
 
         // All charge states of PEPTIDEK (targets) should be in same fold
         assert_eq!(folds[0], folds[1], "Same peptide targets should share fold");
 
-        // All charge states of PEPTIDEK (decoys) should be in same fold
-        assert_eq!(folds[3], folds[4], "Same peptide decoys should share fold");
+        // Target-decoy pairs must be in the same fold
+        assert_eq!(
+            folds[0], folds[3],
+            "Target PEPTIDEK z2 and its decoy must share fold"
+        );
+        assert_eq!(
+            folds[1], folds[4],
+            "Target PEPTIDEK z3 and its decoy must share fold"
+        );
+        assert_eq!(
+            folds[2], folds[5],
+            "Target ANOTHERONE and its decoy must share fold"
+        );
+
+        // All PEPTIDEK entries (both charges, both targets and decoys) in same fold
+        assert_eq!(folds[0], folds[4], "All PEPTIDEK entries should share fold");
     }
 
     #[test]
