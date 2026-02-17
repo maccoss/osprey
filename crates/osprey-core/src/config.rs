@@ -351,7 +351,7 @@ pub struct RTCalibrationConfig {
 }
 
 fn default_min_rt_tolerance() -> f64 {
-    1.0
+    0.5
 }
 
 fn default_calibration_sample_size() -> usize {
@@ -378,7 +378,7 @@ impl Default for RTCalibrationConfig {
             min_calibration_points: 200,
             rt_tolerance_factor: 3.0,
             fallback_rt_tolerance: 2.0,
-            min_rt_tolerance: 1.0,           // 1 minute minimum
+            min_rt_tolerance: 0.5,           // 0.5 minute minimum
             initial_tolerance_fraction: 1.0, // 100% of RT range (no RT filtering, like pyXcorrDIA)
             calibration_sample_size: 100000,
             calibration_retry_factor: 2.0,
