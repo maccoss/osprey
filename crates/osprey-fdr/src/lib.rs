@@ -11,9 +11,7 @@ pub mod mokapot;
 pub mod percolator;
 
 pub use mokapot::{
-    coelution_pin_feature_value, get_coelution_pin_feature_names, get_pin_feature_names,
-    pin_feature_value, MokapotResult, MokapotRunner, PsmFeatures, NUM_COELUTION_PIN_FEATURES,
-    NUM_PIN_FEATURES,
+    get_pin_feature_names, pin_feature_value, MokapotResult, MokapotRunner, NUM_PIN_FEATURES,
 };
 
 use osprey_core::Result;

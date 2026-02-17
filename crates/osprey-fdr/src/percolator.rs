@@ -34,6 +34,13 @@ pub struct PercolatorConfig {
     pub c_values: Vec<f64>,
     /// Optional feature names for logging (must match feature count)
     pub feature_names: Option<Vec<String>>,
+    /// Maximum paired entries for SVM cross-validation (default: 300_000).
+    /// When total entries exceed this limit, paired peptide groups (target+decoy
+    /// together, same peptide charge states together) are randomly selected until
+    /// this limit is reached. The CV is run on the subset; trained models score
+    /// ALL entries. 300K divides evenly by 3 folds (100K per fold).
+    /// Set to 0 to disable subsampling.
+    pub max_train_size: usize,
 }
 
 impl Default for PercolatorConfig {
@@ -46,6 +53,7 @@ impl Default for PercolatorConfig {
             seed: 42,
             c_values: vec![0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
             feature_names: None,
+            max_train_size: 300_000,
         }
     }
 }
@@ -124,14 +132,21 @@ pub fn run_percolator(
     let n_targets = entries.iter().filter(|e| !e.is_decoy).count();
     let n_decoys = entries.iter().filter(|e| e.is_decoy).count();
 
-    log::info!(
-        "Percolator: {} entries ({} targets, {} decoys), {} features, {}-fold CV",
-        n,
-        n_targets,
-        n_decoys,
-        n_features,
-        config.n_folds
-    );
+    if config.max_train_size > 0 && n > config.max_train_size {
+        log::info!(
+            "Percolator: {} entries ({} targets, {} decoys), {} features, {}-fold CV, SVM training capped at {}",
+            n, n_targets, n_decoys, n_features, config.n_folds, config.max_train_size
+        );
+    } else {
+        log::info!(
+            "Percolator: {} entries ({} targets, {} decoys), {} features, {}-fold CV",
+            n,
+            n_targets,
+            n_decoys,
+            n_features,
+            config.n_folds
+        );
+    }
 
     // 1. Build feature matrix
     let feature_data: Vec<f64> = entries
@@ -143,18 +158,73 @@ pub fn run_percolator(
     let entry_ids: Vec<u32> = entries.iter().map(|e| e.entry_id).collect();
     let peptides: Vec<String> = entries.iter().map(|e| e.peptide.clone()).collect();
 
-    // 2. Standardize features
+    // 2. Standardize features (on ALL entries — standardization must be global)
     let (_standardizer, std_features) = FeatureStandardizer::fit_transform(&features);
     log::debug!("  Features standardized to zero mean, unit variance");
 
-    // 3. Assign folds (group by peptide sequence to prevent leakage)
-    let fold_assignments =
-        create_stratified_folds_by_peptide(&labels, &peptides, &entry_ids, config.n_folds);
+    // 3. Subsample by peptide groups if needed (before fold splitting, per PMC5059416)
+    //    Keeps target-decoy pairs and charge states together.
+    //    The subsampled set is used for fold assignment + SVM training.
+    //    ALL entries are scored with the trained model.
+    let train_subset: Option<Vec<usize>> = if config.max_train_size > 0 && n > config.max_train_size
+    {
+        Some(subsample_by_peptide_group(
+            &labels,
+            &entry_ids,
+            &peptides,
+            config.max_train_size,
+            config.seed,
+        ))
+    } else {
+        None
+    };
 
-    // 4. Find best initial feature
+    let sub_n = train_subset.as_ref().map_or(n, |s| s.len());
+
+    // Build subset-local arrays (or reference full arrays if no subsampling)
+    let sub_labels: Vec<bool> = match &train_subset {
+        Some(indices) => indices.iter().map(|&i| labels[i]).collect(),
+        None => labels.clone(),
+    };
+    let sub_entry_ids: Vec<u32> = match &train_subset {
+        Some(indices) => indices.iter().map(|&i| entry_ids[i]).collect(),
+        None => entry_ids.clone(),
+    };
+    let sub_peptides: Vec<String> = match &train_subset {
+        Some(indices) => indices.iter().map(|&i| peptides[i].clone()).collect(),
+        None => peptides.clone(),
+    };
+    let sub_features = match &train_subset {
+        Some(indices) => extract_rows(&std_features, indices),
+        None => std_features.clone(),
+    };
+
+    if let Some(ref indices) = train_subset {
+        let sub_targets = sub_labels.iter().filter(|&&d| !d).count();
+        let sub_decoys = sub_labels.iter().filter(|&&d| d).count();
+        log::info!(
+            "  Subsampled {} entries ({} targets, {} decoys) from {} for SVM training",
+            indices.len(),
+            sub_targets,
+            sub_decoys,
+            n
+        );
+    }
+
+    // 4. Assign folds on the (possibly subsampled) set
+    let fold_assignments = create_stratified_folds_by_peptide(
+        &sub_labels,
+        &sub_peptides,
+        &sub_entry_ids,
+        config.n_folds,
+    );
+
+    // 5. Find best initial feature (on subsampled set)
     let (best_feat_idx, best_feat_passing) =
-        find_best_initial_feature(&std_features, &labels, &entry_ids, config.train_fdr);
-    let initial_scores: Vec<f64> = (0..n).map(|i| std_features[(i, best_feat_idx)]).collect();
+        find_best_initial_feature(&sub_features, &sub_labels, &sub_entry_ids, config.train_fdr);
+    let initial_scores: Vec<f64> = (0..sub_n)
+        .map(|i| sub_features[(i, best_feat_idx)])
+        .collect();
     let feat_name = config
         .feature_names
         .as_ref()
@@ -168,7 +238,7 @@ pub fn run_percolator(
         config.train_fdr * 100.0
     );
 
-    // 5. Train per-fold models via cross-validation (parallel)
+    // 6. Train per-fold models via cross-validation (parallel)
     let mut final_scores = vec![0.0; n];
     let mut fold_weights: Vec<Vec<f64>> = Vec::new();
     let mut iterations_per_fold: Vec<usize> = Vec::new();
@@ -177,10 +247,12 @@ pub fn run_percolator(
     let fold_results: Vec<(usize, LinearSvm, usize)> = (0..config.n_folds)
         .into_par_iter()
         .map(|fold| {
-            let train_indices: Vec<usize> =
-                (0..n).filter(|&i| fold_assignments[i] != fold).collect();
-            let test_indices: Vec<usize> =
-                (0..n).filter(|&i| fold_assignments[i] == fold).collect();
+            let train_indices: Vec<usize> = (0..sub_n)
+                .filter(|&i| fold_assignments[i] != fold)
+                .collect();
+            let test_indices: Vec<usize> = (0..sub_n)
+                .filter(|&i| fold_assignments[i] == fold)
+                .collect();
 
             log::info!(
                 "  Fold {}/{}: {} train, {} test",
@@ -191,10 +263,10 @@ pub fn run_percolator(
             );
 
             let (best_model, n_iterations) = train_fold(
-                &std_features,
-                &labels,
-                &entry_ids,
-                &peptides,
+                &sub_features,
+                &sub_labels,
+                &sub_entry_ids,
+                &sub_peptides,
                 &train_indices,
                 &initial_scores,
                 config,
@@ -204,15 +276,58 @@ pub fn run_percolator(
         })
         .collect();
 
-    // Merge results sequentially (deterministic order)
-    for (fold, best_model, n_iterations) in &fold_results {
-        let test_indices: Vec<usize> = (0..n).filter(|&i| fold_assignments[i] == *fold).collect();
-        let test_features = extract_rows(&std_features, &test_indices);
-        let test_scores = best_model.decision_function(&test_features);
-        for (i, &idx) in test_indices.iter().enumerate() {
-            final_scores[idx] = test_scores[i];
-        }
+    // Score ALL entries with trained models
+    match &train_subset {
+        Some(indices) => {
+            // Build set of global indices in subset for quick lookup
+            let in_subset: HashSet<usize> = indices.iter().copied().collect();
 
+            // For subset entries: score with the held-out fold model (standard CV)
+            for (fold, best_model, _) in &fold_results {
+                let test_sub_indices: Vec<usize> = (0..sub_n)
+                    .filter(|&i| fold_assignments[i] == *fold)
+                    .collect();
+                let test_global_indices: Vec<usize> =
+                    test_sub_indices.iter().map(|&i| indices[i]).collect();
+                let test_features = extract_rows(&std_features, &test_global_indices);
+                let test_scores = best_model.decision_function(&test_features);
+                for (i, &idx) in test_global_indices.iter().enumerate() {
+                    final_scores[idx] = test_scores[i];
+                }
+            }
+
+            // For non-subset entries: average scores from all fold models
+            let non_subset_indices: Vec<usize> =
+                (0..n).filter(|i| !in_subset.contains(i)).collect();
+            if !non_subset_indices.is_empty() {
+                let non_sub_features = extract_rows(&std_features, &non_subset_indices);
+                let models: Vec<&LinearSvm> = fold_results.iter().map(|(_, m, _)| m).collect();
+                for (i, &idx) in non_subset_indices.iter().enumerate() {
+                    let row = extract_rows(&non_sub_features, &[i]);
+                    let avg_score: f64 = models
+                        .iter()
+                        .map(|m| m.decision_function(&row)[0])
+                        .sum::<f64>()
+                        / models.len() as f64;
+                    final_scores[idx] = avg_score;
+                }
+            }
+        }
+        None => {
+            // No subsampling: score test fold directly (standard CV)
+            for (fold, best_model, _) in &fold_results {
+                let test_indices: Vec<usize> =
+                    (0..n).filter(|&i| fold_assignments[i] == *fold).collect();
+                let test_features = extract_rows(&std_features, &test_indices);
+                let test_scores = best_model.decision_function(&test_features);
+                for (i, &idx) in test_indices.iter().enumerate() {
+                    final_scores[idx] = test_scores[i];
+                }
+            }
+        }
+    }
+
+    for (fold, best_model, n_iterations) in &fold_results {
         fold_weights.push(best_model.weights().to_vec());
         iterations_per_fold.push(*n_iterations);
         log::info!(
@@ -227,15 +342,36 @@ pub fn run_percolator(
         );
     }
 
-    // 5b. Calibrate scores between folds (Granholm et al. 2012)
-    calibrate_scores_between_folds(
-        &mut final_scores,
-        &fold_assignments,
-        &labels,
-        &entry_ids,
-        config.n_folds,
-        config.train_fdr,
-    );
+    // 6b. Calibrate scores between folds (Granholm et al. 2012)
+    // For subsampled runs, calibrate using subset fold assignments;
+    // non-subset entries already have averaged scores (no fold-specific bias).
+    match &train_subset {
+        Some(indices) => {
+            // Build global fold assignments: subset entries get their fold, others get usize::MAX
+            let mut global_fold_assignments = vec![usize::MAX; n];
+            for (sub_i, &global_i) in indices.iter().enumerate() {
+                global_fold_assignments[global_i] = fold_assignments[sub_i];
+            }
+            calibrate_scores_between_folds(
+                &mut final_scores,
+                &global_fold_assignments,
+                &labels,
+                &entry_ids,
+                config.n_folds,
+                config.train_fdr,
+            );
+        }
+        None => {
+            calibrate_scores_between_folds(
+                &mut final_scores,
+                &fold_assignments,
+                &labels,
+                &entry_ids,
+                config.n_folds,
+                config.train_fdr,
+            );
+        }
+    }
 
     // 6. Compute PEP on competition winners
     let (winner_indices, winner_scores, winner_is_decoy) =
@@ -433,12 +569,12 @@ fn train_fold(
             break;
         }
 
-        // Collect all decoy indices in training set
+        // Build SVM training set: selected targets + all decoys.
+        // Subsampling (if needed) is done at the top level before fold splitting,
+        // keeping target-decoy pairs together (per PMC5059416).
         let decoy_indices: Vec<usize> = (0..train_indices.len())
             .filter(|&i| train_labels[i])
             .collect();
-
-        // Build SVM training set: selected targets + all decoys
         let mut svm_indices: Vec<usize> = selected_target_indices.clone();
         svm_indices.extend_from_slice(&decoy_indices);
 
@@ -1199,6 +1335,73 @@ fn create_stratified_folds_by_peptide(
     }
 
     fold_assignments
+}
+
+/// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.
+///
+/// Groups entries by target peptide (via base_id), then randomly selects groups until
+/// the total entry count reaches `max_entries`. Returns sorted global indices.
+///
+/// Per The et al. (2016, PMC5059416): subsample paired PSMs before fold splitting,
+/// then apply CV to the subset. The trained model is applied to ALL entries.
+fn subsample_by_peptide_group(
+    labels: &[bool],
+    entry_ids: &[u32],
+    peptides: &[String],
+    max_entries: usize,
+    seed: u64,
+) -> Vec<usize> {
+    let n = labels.len();
+    if n <= max_entries {
+        return (0..n).collect();
+    }
+
+    // Build peptide groups (same as fold assignment: group by target peptide via base_id)
+    let mut base_id_to_target_peptide: HashMap<u32, &str> = HashMap::new();
+    for (i, (&is_decoy, &eid)) in labels.iter().zip(entry_ids).enumerate() {
+        let base_id = eid & 0x7FFFFFFF;
+        if !is_decoy {
+            base_id_to_target_peptide
+                .entry(base_id)
+                .or_insert(peptides[i].as_str());
+        }
+    }
+
+    let mut peptide_groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let base_id = entry_ids[i] & 0x7FFFFFFF;
+        let key = base_id_to_target_peptide
+            .get(&base_id)
+            .copied()
+            .unwrap_or(peptides[i].as_str());
+        peptide_groups.entry(key).or_default().push(i);
+    }
+
+    // Sort groups deterministically and shuffle with Fisher-Yates
+    let mut groups: Vec<(&str, Vec<usize>)> = peptide_groups.into_iter().collect();
+    groups.sort_by_key(|&(k, _)| k);
+
+    // Fisher-Yates shuffle with xorshift64 RNG
+    let mut rng_state = seed;
+    for i in (1..groups.len()).rev() {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        let j = rng_state as usize % (i + 1);
+        groups.swap(i, j);
+    }
+
+    // Select groups until we reach max_entries
+    let mut selected: Vec<usize> = Vec::with_capacity(max_entries);
+    for (_, indices) in &groups {
+        if selected.len() + indices.len() > max_entries && !selected.is_empty() {
+            break;
+        }
+        selected.extend_from_slice(indices);
+    }
+
+    selected.sort(); // deterministic order for downstream processing
+    selected
 }
 
 /// Extract specific rows from a matrix

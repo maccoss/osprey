@@ -197,6 +197,7 @@ mod tests {
                 n_points: 150,
                 r_squared: 0.98,
                 model_params: None,
+                p20_abs_residual: Some(0.15),
             },
         }
     }

@@ -2,12 +2,13 @@
 """
 Feature Distribution Visualization for Osprey
 
-Reads an Osprey report parquet file or Percolator/Mokapot PIN file and generates
-histograms comparing target vs decoy distributions for each feature. Features are
-ranked by ROC AUC to identify discriminative power.
+Reads an Osprey parquet file (report or scores) or Percolator/Mokapot PIN file and
+generates histograms comparing target vs decoy distributions for each feature.
+Features are ranked by ROC AUC to identify discriminative power.
 
 Usage:
   python scripts/visualize_pin_features.py report.parquet
+  python scripts/visualize_pin_features.py results.scores.parquet
   python scripts/visualize_pin_features.py input.pin
   python scripts/visualize_pin_features.py report.parquet --output report.html
   python scripts/visualize_pin_features.py input.pin --cols-per-row 4
@@ -53,8 +54,9 @@ def load_pin_file(path):
 
 
 def load_parquet_file(path):
-    """Load an Osprey report parquet file into a pandas DataFrame.
+    """Load an Osprey parquet file (report or scores) into a pandas DataFrame.
 
+    Auto-detects format by checking for 'is_decoy' (scores) vs 'Is.Decoy' (report).
     Returns (df, is_target_mask) where is_target_mask is a boolean Series.
     """
     try:
@@ -65,7 +67,14 @@ def load_parquet_file(path):
         sys.exit(1)
 
     df = pd.read_parquet(path)
-    is_target = ~df['Is.Decoy']
+    if 'is_decoy' in df.columns:
+        is_target = ~df['is_decoy']
+    elif 'Is.Decoy' in df.columns:
+        is_target = ~df['Is.Decoy']
+    else:
+        print("Error: Could not find target/decoy column ('is_decoy' or 'Is.Decoy')",
+              file=sys.stderr)
+        sys.exit(1)
     return df, is_target
 
 
@@ -73,13 +82,20 @@ def get_feature_columns(df, is_parquet=False):
     """Get the list of numeric feature columns (excluding metadata)."""
     # Metadata columns to exclude
     pin_metadata = {'SpecId', 'Label', 'ScanNr', 'Peptide', 'Proteins', 'ChargeState'}
-    parquet_metadata = {
+    report_parquet_metadata = {
         'Run', 'Modified.Sequence', 'Stripped.Sequence', 'Precursor.Charge',
         'Precursor.Mz', 'Protein.Ids', 'Is.Decoy', 'RT', 'RT.Start', 'RT.Stop',
         'Peak.Width', 'Library.RT', 'Scan.Number', 'Score', 'Q.Value',
         'Global.Q.Value', 'PEP', 'Search.Mode',
     }
-    metadata_cols = pin_metadata | parquet_metadata
+    scores_parquet_metadata = {
+        'entry_id', 'is_decoy', 'sequence', 'modified_sequence', 'charge',
+        'precursor_mz', 'protein_ids', 'scan_number', 'apex_rt', 'start_rt',
+        'end_rt', 'bounds_area', 'bounds_snr', 'file_name',
+        'fragment_mzs', 'fragment_intensities',
+        'reference_xic_rts', 'reference_xic_intensities',
+    }
+    metadata_cols = pin_metadata | report_parquet_metadata | scores_parquet_metadata
 
     feature_cols = []
     for col in df.columns:

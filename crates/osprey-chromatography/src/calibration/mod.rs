@@ -262,6 +262,9 @@ pub struct RTCalibrationParams {
     /// LOESS model parameters for reconstruction (optional, for reuse)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_params: Option<RTModelParams>,
+    /// 20th percentile of absolute residuals (for percentile-based tolerance)
+    #[serde(default)]
+    pub p20_abs_residual: Option<f64>,
 }
 
 /// LOESS model parameters for serialization
@@ -289,6 +292,7 @@ impl RTCalibrationParams {
             n_points: 0,
             r_squared: 0.0,
             model_params: None,
+            p20_abs_residual: None,
         }
     }
 
@@ -411,6 +415,7 @@ mod tests {
                     fitted_rts: vec![1.0, 11.0, 21.0, 31.0],
                     abs_residuals: vec![0.1, 0.2, 0.3, 0.4],
                 }),
+                p20_abs_residual: Some(0.15),
             },
         };
 

@@ -75,9 +75,8 @@ fn format_duration(duration: std::time::Duration) -> String {
 Osprey is an open-source tool for peptide detection and quantification
 in data-independent acquisition (DIA) mass spectrometry data.
 
-It uses ridge regression to deconvolute mixed MS/MS spectra, aggregates
-evidence across the chromatographic dimension, and uses machine learning
-to score peptide detections with rigorous FDR control.
+It uses fragment XIC co-elution analysis to detect peptides in DIA data,
+with machine learning scoring and rigorous FDR control.
 
 EXAMPLES:
     # Basic analysis with DIA-NN library
@@ -85,9 +84,6 @@ EXAMPLES:
 
     # Multiple input files
     osprey -i *.mzML -l library.tsv -o results.blib
-
-    # Unit resolution mode with specific lambda
-    osprey -i sample.mzML -l library.tsv -o results.blib --resolution unit --lambda 0.5
 
     # Write additional TSV report
     osprey -i sample.mzML -l library.tsv -o results.blib --report results.tsv
@@ -141,10 +137,6 @@ struct Args {
     #[arg(long)]
     no_rt_calibration: bool,
 
-    /// Fixed regularization parameter lambda
-    #[arg(long)]
-    lambda: Option<f64>,
-
     /// Maximum candidates per spectrum (use 0 for unlimited)
     #[arg(long, default_value_t = 5250)]
     max_candidates: usize,
@@ -160,14 +152,6 @@ struct Args {
     /// Write TSV report to this file
     #[arg(long)]
     report: Option<PathBuf>,
-
-    /// Export coefficient time series to parquet file(s)
-    #[arg(long)]
-    export_coefficients: bool,
-
-    /// Search mode: regression (default) or coelution
-    #[arg(long, default_value = "regression")]
-    search_mode: String,
 
     /// FDR method: percolator (native SVM, default), mokapot (external Python), or simple (no ML)
     #[arg(long, default_value = "percolator")]
@@ -274,7 +258,6 @@ fn main() -> Result<()> {
         rt_tolerance: Some(args.rt_tolerance),
         run_fdr: Some(args.run_fdr),
         n_threads: args.threads,
-        lambda: args.lambda,
         verbose: args.verbose,
         disable_rt_calibration: args.no_rt_calibration,
         fragment_tolerance: args.fragment_tolerance,
@@ -324,22 +307,8 @@ fn main() -> Result<()> {
         );
     }
 
-    // Override search mode if specified
-    config.search_mode = match args.search_mode.to_lowercase().as_str() {
-        "coelution" | "coelution-search" => {
-            log::info!("Search mode: coelution (DIA-NN style fragment co-elution)");
-            osprey::SearchMode::Coelution
-        }
-        _ => config.search_mode,
-    };
-
     // Set max candidates
     config.max_candidates_per_spectrum = args.max_candidates;
-
-    // Set export coefficients
-    if args.export_coefficients {
-        config.export_coefficients = true;
-    }
 
     // Set thread count
     if let Some(threads) = args.threads {

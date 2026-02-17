@@ -424,343 +424,49 @@ impl IsolationWindow {
     }
 }
 
-/// Binned spectrum for regression
-#[derive(Debug, Clone)]
-pub struct BinnedSpectrum {
-    /// Which bins have signal
-    pub bin_indices: Vec<u32>,
-    /// Intensity in each bin
-    pub intensities: Vec<f32>,
-}
+// =============================================================================
+// Peak boundary types
+// =============================================================================
 
-impl BinnedSpectrum {
-    /// Create a new binned spectrum
-    pub fn new(bin_indices: Vec<u32>, intensities: Vec<f32>) -> Self {
-        debug_assert_eq!(bin_indices.len(), intensities.len());
-        Self {
-            bin_indices,
-            intensities,
-        }
-    }
-
-    /// Create an empty binned spectrum
-    pub fn empty() -> Self {
-        Self {
-            bin_indices: Vec::new(),
-            intensities: Vec::new(),
-        }
-    }
-
-    /// Get the number of non-zero bins
-    pub fn len(&self) -> usize {
-        self.bin_indices.len()
-    }
-
-    /// Check if the binned spectrum is empty
-    pub fn is_empty(&self) -> bool {
-        self.bin_indices.is_empty()
-    }
-}
-
-/// Regression result for one spectrum
-#[derive(Debug, Clone)]
-pub struct RegressionResult {
-    /// Scan number
-    pub scan_number: u32,
-    /// Retention time
-    pub retention_time: f64,
-    /// Indices into library for candidates with non-zero coefficients
-    pub library_ids: Vec<u32>,
-    /// Corresponding coefficients
-    pub coefficients: Vec<f64>,
-    /// Unexplained intensity (residual = ||Ax - b||²)
-    pub residual: f64,
-    /// Total number of candidates considered in this spectrum
-    pub n_candidates: u32,
-    /// Sum of all coefficients (for relative_coefficient calculation)
-    pub coefficient_sum: f64,
-    /// Observed spectrum norm (||b||² for explained variance calculation)
-    pub observed_norm: f64,
-}
-
-impl RegressionResult {
-    /// Create a new regression result
-    pub fn new(scan_number: u32, retention_time: f64) -> Self {
-        Self {
-            scan_number,
-            retention_time,
-            library_ids: Vec::new(),
-            coefficients: Vec::new(),
-            residual: 0.0,
-            n_candidates: 0,
-            coefficient_sum: 0.0,
-            observed_norm: 0.0,
-        }
-    }
-
-    /// Compute explained variance: 1 - residual / ||b||²
-    pub fn explained_variance(&self) -> f64 {
-        if self.observed_norm > 1e-10 {
-            1.0 - self.residual / self.observed_norm
-        } else {
-            0.0
-        }
-    }
-
-    /// Get relative coefficient for a given library ID
-    pub fn relative_coefficient(&self, lib_id: u32) -> f64 {
-        if self.coefficient_sum > 1e-10 {
-            self.library_ids
-                .iter()
-                .zip(self.coefficients.iter())
-                .find(|(id, _)| **id == lib_id)
-                .map(|(_, coef)| *coef / self.coefficient_sum)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        }
-    }
-}
-
-/// Peptide detection result across the experiment
-#[derive(Debug, Clone)]
-pub struct PeptideDetection {
-    /// Reference to library entry ID
-    pub library_entry_id: u32,
-    /// Results per run
-    pub run_results: Vec<RunDetection>,
-    /// Experiment-level q-value
-    pub experiment_q_value: f64,
-    /// Number of runs with detection
-    pub n_runs_detected: u32,
-    /// Total runs searched
-    pub n_runs_searched: u32,
-    /// Was this detected in Step 1 of two-step search?
-    pub detected_step1: bool,
-}
-
-/// Per-run detection result
-#[derive(Debug, Clone)]
-pub struct RunDetection {
-    /// Run file name
-    pub file_name: String,
-    /// Whether peptide was detected in this run
-    pub detected: bool,
-    /// Peak boundaries if detected
-    pub peak_boundaries: Option<PeakBoundaries>,
-    /// Run-level q-value
-    pub run_q_value: f64,
-    /// Discriminant score from ML model
-    pub discriminant_score: f64,
-    /// Full feature set
-    pub features: FeatureSet,
-}
-
-/// Peak boundary information for Skyline
-#[derive(Debug, Clone, Copy)]
+/// Peak boundaries for blib output and chromatographic peak detection.
+///
+/// Used by the blib writer to store per-run peak boundaries in the
+/// OspreyPeakBoundaries table, and by the chromatographic peak detector.
+#[derive(Debug, Clone, Default)]
 pub struct PeakBoundaries {
-    /// Peak start time (minutes)
+    /// Start retention time (minutes)
     pub start_rt: f64,
-    /// Peak end time (minutes)
+    /// End retention time (minutes)
     pub end_rt: f64,
-    /// Peak apex time (minutes)
+    /// Apex retention time (minutes)
     pub apex_rt: f64,
-    /// Coefficient at apex
+    /// Coefficient or intensity at apex
     pub apex_coefficient: f64,
-    /// Sum of coefficients (for QC, not quant)
+    /// Integrated area under peak
     pub integrated_area: f64,
     /// Peak quality metrics
     pub peak_quality: PeakQuality,
 }
 
-/// Peak quality flags
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PeakQuality {
-    /// R² of EMG fit
-    pub emg_fit_r2: f64,
-    /// Peak appears split
-    pub is_split: bool,
-    /// Peak truncated at gradient edge
-    pub is_truncated: bool,
-    /// Shoulder detected
-    pub has_shoulder: bool,
-    /// Width relative to other peaks (0-100 percentile)
-    pub width_percentile: f64,
-}
-
-/// Complete feature set for scoring
+/// Peak quality metrics
 #[derive(Debug, Clone, Default)]
-pub struct FeatureSet {
-    // Chromatographic features
-    /// Peak apex coefficient (maximum value)
-    pub peak_apex: f64,
-    /// Integrated peak area (AUC of coefficients)
-    pub peak_area: f64,
-    /// EMG fit quality (R²)
-    pub emg_fit_quality: f64,
-    /// Peak width (FWHM in minutes)
-    pub peak_width: f64,
-    /// Peak symmetry (leading/trailing ratio)
-    pub peak_symmetry: f64,
-    /// RT deviation from prediction (minutes)
-    pub rt_deviation: f64,
-    /// Normalized RT deviation
-    pub rt_deviation_normalized: f64,
-    /// Number of scans contributing to peak
-    pub n_contributing_scans: u32,
-    /// Coefficient variance near apex
-    pub coefficient_stability: f64,
-    /// Peak boundary sharpness
-    pub peak_sharpness: f64,
-    /// Peak prominence (apex / baseline)
-    pub peak_prominence: f64,
-    /// Signal-to-noise ratio on coefficient series (peak apex vs background)
+pub struct PeakQuality {
+    /// Signal-to-noise ratio
     pub signal_to_noise: f64,
-    /// Signal-to-noise ratio on best fragment XIC (highest correlation to coefficient series)
-    pub xic_signal_to_noise: f64,
-
-    // Spectral features (from mixed/observed spectrum at apex)
-    /// X!Tandem-style hyperscore: log(n_b!) + log(n_y!) + Σlog(I_f+1)
-    pub hyperscore: f64,
-    /// XCorr score (Comet-style cross-correlation)
-    pub xcorr: f64,
-    /// Dot product (LibCosine with sqrt preprocessing)
-    pub dot_product: f64,
-    /// LibCosine with sqrt(intensity)*mz² (SMZ) preprocessing
-    pub dot_product_smz: f64,
-    /// Fraction of predicted fragments detected
-    pub fragment_coverage: f64,
-    /// Backbone coverage
-    pub sequence_coverage: f64,
-    /// Longest consecutive b/y ion run
-    pub consecutive_ions: u32,
-    /// Rank of base peak in predicted
-    pub base_peak_rank: u32,
-    /// Number of top-6 predicted fragments matched
-    pub top6_matches: u32,
-    /// Fraction of observed intensity explained (at apex spectrum)
-    pub explained_intensity: f64,
-
-    // Deconvoluted spectral features (from summed deconvoluted signal, apex ± 2 scans)
-    // These compare the deconvoluted (coefficient-scaled) contribution to the library,
-    // removing interference from co-eluting peptides.
-    /// Hyperscore from deconvoluted spectrum (apex ± 2 scans)
-    pub hyperscore_deconv: f64,
-    /// XCorr from deconvoluted spectrum
-    pub xcorr_deconv: f64,
-    /// Dot product from deconvoluted spectrum
-    pub dot_product_deconv: f64,
-    /// Dot product SMZ from deconvoluted spectrum
-    pub dot_product_smz_deconv: f64,
-    /// Fragment coverage from deconvoluted spectrum
-    pub fragment_coverage_deconv: f64,
-    /// Sequence coverage from deconvoluted spectrum
-    pub sequence_coverage_deconv: f64,
-    /// Consecutive ions from deconvoluted spectrum
-    pub consecutive_ions_deconv: u32,
-    /// Top-6 matches from deconvoluted spectrum
-    pub top6_matches_deconv: u32,
-
-    // Contextual features (computed at apex regression result)
-    /// Number of competing candidates at apex spectrum
-    pub n_competitors: u32,
-    /// Coefficient relative to sum of all at apex spectrum
-    pub relative_coefficient: f64,
-    /// Mean relative coefficient over apex ± 2 spectra
-    pub relative_coefficient_mean: f64,
-    /// Local peptide density
-    pub local_peptide_density: f64,
-    /// Spectral complexity estimate
-    pub spectral_complexity: f64,
-    /// Regression residual
-    pub regression_residual: f64,
-    /// Number of modifications
-    pub modification_count: u32,
-
-    // Fragment co-elution features (DIA-NN pTimeCorr-inspired)
-    // Computed within peak integration boundaries only (start_rt..end_rt)
-    /// Sum of Pearson correlations between each fragment XIC and the coefficient time series
-    pub fragment_coelution_sum: f64,
-    /// Minimum per-fragment correlation with coefficient time series
-    pub fragment_coelution_min: f64,
-    /// Number of fragments with positive correlation to coefficient series
-    pub n_coeluting_fragments: u32,
-
-    // Per-fragment correlation array (top 6 fragments by library intensity)
-    // Correlations computed within peak integration boundaries only.
-    // Fragments not present in library are 0-padded.
-    /// Correlation of fragment 0 (highest library intensity) XIC vs coefficient series
-    pub fragment_corr_0: f64,
-    /// Correlation of fragment 1 XIC vs coefficient series
-    pub fragment_corr_1: f64,
-    /// Correlation of fragment 2 XIC vs coefficient series
-    pub fragment_corr_2: f64,
-    /// Correlation of fragment 3 XIC vs coefficient series
-    pub fragment_corr_3: f64,
-    /// Correlation of fragment 4 XIC vs coefficient series
-    pub fragment_corr_4: f64,
-    /// Correlation of fragment 5 XIC vs coefficient series
-    pub fragment_corr_5: f64,
-
-    // Elution-weighted spectral similarity
-    /// Cosine similarity computed at each scan within peak boundaries,
-    /// weighted by coefficient², then averaged. Captures whether the library
-    /// pattern holds across the entire peak, not just at the apex.
-    pub elution_weighted_cosine: f64,
-
-    // Per-fragment mass accuracy at apex (ppm for HRAM, Th for unit resolution)
-    /// Signed mean mass error across matched fragments at apex (systematic bias)
-    pub mass_accuracy_deviation_mean: f64,
-    /// Absolute mean mass error across matched fragments at apex
-    pub abs_mass_accuracy_deviation_mean: f64,
-    /// Standard deviation of mass errors across matched fragments at apex
-    pub mass_accuracy_std: f64,
-
-    // Percolator-style features
-    /// Absolute RT deviation (|apex_rt - expected_rt|, minutes)
-    pub abs_rt_deviation: f64,
-    /// Peptide sequence length (unmodified)
-    pub peptide_length: u32,
-    /// Number of missed tryptic cleavages (internal K/R)
-    pub missed_cleavages: u32,
-    /// ln(number of candidates in regression)
-    pub ln_num_candidates: f64,
-    /// Z-score of this peptide's coefficient at apex spectrum
-    /// (how many SDs above the mean of all coefficients in the spectrum)
-    pub coef_zscore: f64,
-    /// Mean z-score across apex ± 2 spectra (smoothed version)
-    pub coef_zscore_mean: f64,
-
-    // MS1-based features (HRAM only, 0.0 for unit resolution or missing MS1)
-    /// Pearson correlation between coefficient time series and MS1 monoisotopic
-    /// precursor XIC within peak integration boundaries.
-    pub ms1_precursor_coelution: f64,
-    /// Cosine similarity between observed MS1 isotope envelope at apex RT and
-    /// theoretical isotope distribution from peptide sequence.
-    pub ms1_isotope_cosine: f64,
-
-    // Tukey median polish features (fragment XIC decomposition)
-    /// Cosine similarity between median-polish row effects (data-derived fragment intensities)
-    /// and library fragment intensities in linear space with sqrt preprocessing.
-    /// Higher = better agreement between observed and expected fragment pattern.
-    pub median_polish_cosine: f64,
-    /// R² of the additive model (μ + α_f + β_s) in linear space.
-    /// Measures how well the shared elution profile + fragment intensities explain
-    /// the observed XIC matrix. Zero-intensity cells included (penalizes missing signal).
-    pub median_polish_rsquared: f64,
-    /// Fraction of total signal unexplained: Σ|obs-pred| / Σobs in linear space.
-    /// Lower = cleaner co-elution. Zero-intensity cells included.
-    pub median_polish_residual_ratio: f64,
+    /// Peak symmetry factor
+    pub symmetry: f64,
+    /// FWHM in minutes
+    pub fwhm: f64,
 }
 
 // =============================================================================
-// Coelution search types (DIA-NN-style fragment coelution without regression)
+// XIC peak types (DIA-NN-style fragment coelution)
 // =============================================================================
 
 /// Peak boundaries detected from fragment XICs using DIA-NN-style valley detection.
 ///
-/// Unlike coefficient-based `PeakBoundaries`, these are derived from fragment
-/// chromatograms with adaptive boundary detection that handles overlapping peaks.
+/// Derived from fragment chromatograms with adaptive boundary detection
+/// that handles overlapping peaks.
 #[derive(Debug, Clone)]
 pub struct XICPeakBounds {
     /// Retention time at peak apex (minutes)
@@ -783,7 +489,7 @@ pub struct XICPeakBounds {
     pub signal_to_noise: f64,
 }
 
-/// Feature set for coelution-based scoring (no ridge regression).
+/// Feature set for coelution-based scoring.
 ///
 /// ~45 features computed from fragment XICs, pairwise correlation,
 /// spectral matching at apex, and peptide properties.

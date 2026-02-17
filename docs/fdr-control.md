@@ -6,7 +6,7 @@ Osprey uses two-level FDR (False Discovery Rate) control to ensure high-quality 
 
 ```
 FDR Control Workflow:
-  1. Extract features per precursor (37 for regression, 45 for coelution)
+  1. Extract 45 features per precursor
   2. Dispatch to selected FDR method:
      - Percolator (default): native linear SVM with cross-validation
      - Mokapot: write PIN files, run external mokapot CLI
@@ -124,6 +124,23 @@ Example with 3 folds:
 ```
 
 This matches the approach of both mokapot (groups by spectrum) and C++ Percolator (groups by scan number). In precursor-centric DIA, the equivalent of a spectrum is the target-decoy pair identified by `base_id`.
+
+**CRITICAL INVARIANT**: Target-decoy pairs and same-peptide charge states must ALWAYS stay together in any data partitioning — fold assignment, subsampling, or any other split. If pairs are separated:
+- Unpaired targets in a training fold auto-win competition, inflating the positive training set
+- The SVM becomes too permissive, silently corrupting FDR estimates
+- This invariant applies to ALL cross-validation code: `percolator.rs`, `calibration_ml.rs`, and any future partitioning
+
+### Training Set Subsampling
+
+For large datasets (millions of entries), SVM training can be very slow (O(n²) with the number of training examples). Following The et al. (2016, PMC5059416), entries can be subsampled before fold splitting:
+
+1. Group all entries by target peptide sequence (via `base_id`)
+2. Randomly sample N peptide groups (keeping all entries in each group: target + decoy + all charge states)
+3. Split the subsampled set into cross-validation folds
+4. Train the SVM on the subsampled folds
+5. Score ALL original entries with the trained model
+
+The default training cap is 250,000 total entries. Subsampling operates on peptide groups to preserve target-decoy pairs and charge state groupings.
 
 ### Initial Feature Selection
 
@@ -282,7 +299,7 @@ When only one mzML file is provided:
 
 ### PIN File Format
 
-Osprey writes one PIN file per mzML file. The number of feature columns depends on the search mode: 37 for regression, 45 for coelution. PIN files contain **only competition winners** (pre-competed using the best feature by ROC AUC).
+Osprey writes one PIN file per mzML file with 45 feature columns. PIN files contain **only competition winners** (pre-competed using the best feature by ROC AUC).
 
 ```
 SpecId  Label  ScanNr  ChargeState  peak_apex  peak_area  ...  Peptide  Proteins
@@ -325,97 +342,11 @@ The subset is used only for model training. All PSMs are still scored using the 
 
 The simplest method applies target-decoy competition directly on the best single feature (selected by ROC AUC) without SVM reranking. Useful as a baseline or when the feature set is small.
 
-## Feature Sets
+## Feature Set (45 Features)
 
 All intensity-based spectral similarity scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks.
 
-### Regression Mode (37 Features)
-
-#### Ridge Regression Features (8)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `peak_apex` | Maximum coefficient value | 0+ |
-| `peak_area` | Integrated area under curve | 0+ |
-| `peak_width` | FWHM from Tukey median polish elution profile | 0+ |
-| `coefficient_stability` | CV of coefficients near apex | 0+ |
-| `relative_coefficient` | Coefficient / sum(all) | 0-1 |
-| `explained_intensity` | Explained/total intensity | 0-1 |
-| `signal_to_noise` | Peak apex / noise estimate | 0+ |
-| `xic_signal_to_noise` | S/N from best-correlated fragment XIC | 0+ |
-
-### Spectral Matching - Mixed (2)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `xcorr` | Comet-style cross-correlation | 0+ |
-| `consecutive_ions` | Longest b/y ion run | 0-n |
-
-### Spectral Matching - Deconvoluted (2)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `xcorr_deconv` | XCorr on deconvoluted spectrum | 0+ |
-| `consecutive_ions_deconv` | Consecutive ions on deconvoluted spectrum | 0-n |
-
-### RT Deviation (1)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `rt_deviation` | Observed - predicted RT (min) | -inf to inf |
-
-### Fragment Co-elution (9)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `fragment_coelution_sum` | Sum of per-fragment correlations | 0+ |
-| `fragment_coelution_min` | Minimum fragment correlation | -1 to 1 |
-| `n_coeluting_fragments` | Fragments with positive correlation | 0-6 |
-| `fragment_corr_0..5` | Per-fragment correlation (ranked by library intensity) | -1 to 1 |
-
-### Elution-Weighted Similarity (1)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `elution_weighted_cosine` | LibCosine at each scan, weighted by coef^2, averaged | 0-1 |
-
-### Mass Accuracy (3)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `mass_accuracy_deviation_mean` | Mean signed mass error (ppm) | -inf to inf |
-| `abs_mass_accuracy_deviation_mean` | Mean |mass error| (ppm) | 0+ |
-| `mass_accuracy_std` | Std dev of mass errors (ppm) | 0+ |
-
-### Percolator-style (6)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `abs_rt_deviation` | |RT deviation| | 0+ |
-| `peptide_length` | Number of amino acids | 5-50 |
-| `missed_cleavages` | Missed enzymatic cleavages | 0+ |
-| `ln_num_candidates` | ln(candidates in regression) | 0+ |
-| `coef_zscore` | Z-score of coefficient at apex | -inf to inf |
-| `coef_zscore_mean` | Mean z-score across peak | -inf to inf |
-
-### MS1 Features (2)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `ms1_precursor_coelution` | Coefficient vs MS1 XIC correlation | -1 to 1 |
-| `ms1_isotope_cosine` | Observed vs theoretical isotope envelope | 0-1 |
-
-### Tukey Median Polish (3)
-
-| Feature | Description | Range |
-|---------|-------------|-------|
-| `median_polish_cosine` | Row effects vs library, sqrt preprocessing | 0-1 |
-| `median_polish_rsquared` | Additive model R^2 in sqrt space | 0-1 |
-| `median_polish_residual_ratio` | sum|obs-pred| / sum(obs), linear | 0+ |
-
-### Coelution Mode (45 Features)
-
-The coelution search mode does not use ridge regression. Instead, it extracts fragment XICs and scores based on pairwise correlations and spectral matching.
+Osprey extracts fragment XICs and scores based on pairwise correlations and spectral matching.
 
 | Category | Count | Features |
 |----------|-------|----------|
@@ -427,8 +358,6 @@ The coelution search mode does not use ridge regression. Instead, it extracts fr
 | MS1 | 2 | ms1_precursor_coelution, ms1_isotope_cosine |
 | Peptide properties | 2 | peptide_length, missed_cleavages |
 | Tukey median polish | 3 | median_polish_cosine, median_polish_rsquared, median_polish_residual_ratio |
-
-**Key differences from regression mode**: No coefficient_stability, relative_coefficient, xic_signal_to_noise, xcorr_deconv, consecutive_ions_deconv, ln_num_candidates, coef_zscore, coef_zscore_mean. Added hyperscore, dot_product variants (top6/5/4), fragment_coelution_max, n_fragment_pairs, peak_symmetry, peak_sharpness, n_scans, fragment_coverage, sequence_coverage.
 
 ## Feature Weight Inspection
 

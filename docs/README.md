@@ -1,6 +1,6 @@
 # Osprey Algorithm Documentation
 
-This folder contains detailed documentation of the algorithms used in Osprey, a peptide-centric DIA analysis tool. Osprey supports two search modes: ridge regression (spectrum deconvolution) and coelution (DIA-NN-style fragment XIC correlation).
+This folder contains detailed documentation of the algorithms used in Osprey, a peptide-centric DIA analysis tool. Osprey uses a coelution search approach (DIA-NN-style fragment XIC correlation) to detect peptides in DIA data.
 
 ## Current Status (Working Prototype)
 
@@ -9,7 +9,7 @@ Osprey has a **working prototype** that can:
 - Load spectral libraries (DIA-NN TSV, EncyclopeDIA elib, BiblioSpec blib)
 - Generate enzyme-aware decoys
 - Run auto-calibration with target-decoy FDR control
-- Search via ridge regression (37 features) or coelution (45 features)
+- Coelution search with 45 features extracted per precursor
 - Run FDR control via native Percolator (default), external Mokapot, or simple TDC
 - Output BiblioSpec .blib files for Skyline (library theoretical fragments)
 
@@ -20,9 +20,7 @@ Osprey has a **working prototype** that can:
 | [Calibration](calibration.md) | RT, MS1, and MS2 calibration with LDA scoring and LOESS fitting |
 | [Spectral Scoring](spectral-scoring.md) | XCorr + E-value scoring (calibration phase) |
 | [XCorr Scoring](xcorr-scoring.md) | Comet-style XCorr implementation |
-| [Deconvolution Scoring](deconvolution-scoring.md) | Post-regression scoring: all scores computed after ridge regression |
-| [Ridge Regression](ridge-regression.md) | NNLS ridge regression for spectrum deconvolution |
-| [Peak Detection](peak-detection.md) | Chromatographic peak detection in coefficient time series |
+| [Peak Detection](peak-detection.md) | Chromatographic peak detection in fragment XIC time series |
 | [Decoy Generation](decoy-generation.md) | Enzyme-aware sequence reversal for FDR control |
 | [FDR Control](fdr-control.md) | Two-level FDR: native Percolator, Mokapot, and simple TDC |
 | [BiblioSpec Output Schema](blib-output-schema.md) | blib output format and Skyline integration |
@@ -31,21 +29,21 @@ Osprey has a **working prototype** that can:
 
 ## Pipeline Overview
 
-Osprey's pipeline has four major phases. Phases 1 and 2 (initialization and calibration) are shared between search modes. Phase 3 diverges: regression mode deconvolutes mixed spectra via ridge regression, while coelution mode extracts and correlates fragment XICs directly. Phase 4 (scoring and FDR) follows the same structure in both modes but extracts different features.
+Osprey's pipeline has four major phases.
 
 ```
 INPUT
   mzML files (DIA data) + Spectral Library (predicted spectra)
   |
   v
-PHASE 1: INITIALIZATION (shared)
+PHASE 1: INITIALIZATION
   +- Load spectral library (DIA-NN TSV, elib, or blib)
   +- Deduplicate by (modified_sequence, charge)
   +- Generate decoys (enzyme-aware reversal)
   +- Build m/z index for candidate lookup
   |
   v
-PHASE 2: CALIBRATION DISCOVERY (first file only, shared)
+PHASE 2: CALIBRATION DISCOVERY (first file only)
   +- Calculate library-to-measured RT mapping
   +- Set wide RT tolerance (20-50% of gradient)
   +- Score all peptides against all spectra:
@@ -58,30 +56,14 @@ PHASE 2: CALIBRATION DISCOVERY (first file only, shared)
   +- Set tight RT tolerance for main search (3x residual SD)
   |
   v
-PHASE 3A: RIDGE REGRESSION (--search-mode Regression)
-  +- Select candidates (isolation window + calibrated RT)
-  +- Build design matrix from pre-binned library
-  +- Solve NNLS ridge regression (f32, projected gradient)
-  +- Output: coefficients per candidate per spectrum
-  |
-  v
-PHASE 4A: POST-REGRESSION SCORING (37 features)
-  +- Aggregate coefficients into time series per precursor
-  +- Peak detection -> apex RT, boundaries
-  +- Tukey median polish on fragment XICs -> elution profile, FWHM
-  +- Score at apex (37 features)
-  +- FDR control (Percolator SVM or Mokapot) -> q-values
-
---- OR ---
-
-PHASE 3B: COELUTION SEARCH (--search-mode Coelution)
+PHASE 3: COELUTION SEARCH
   +- Extract fragment XICs per precursor within RT window
   +- Compute pairwise correlations between fragment XICs
   +- Build reference XIC (best-correlated fragment)
   +- Peak detection on reference XIC -> apex, boundaries
   |
   v
-PHASE 4B: COELUTION SCORING (45 features)
+PHASE 4: COELUTION SCORING (45 features)
   +- Pairwise coelution features (correlations between fragment XICs)
   +- Peak shape features (apex, area, width, symmetry, S/N)
   +- Spectral matching at apex (hyperscore, xcorr, dot products)
@@ -89,124 +71,18 @@ PHASE 4B: COELUTION SCORING (45 features)
   +- FDR control (Percolator SVM or Mokapot) -> q-values
   |
   v
-OUTPUT (shared)
+OUTPUT
   +- BiblioSpec (.blib) for Skyline (library theoretical fragments)
   +- SVM/Mokapot model weights for feature analysis
 ```
 
 ---
 
-## Feature Sets
+## Feature Set (45 Features)
 
-Osprey extracts features per precursor for semi-supervised FDR control via native Percolator (default) or external Mokapot. The feature set depends on the search mode: **37 features** for regression, **45 features** for coelution. All intensity-based spectral similarity scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks.
+Osprey extracts 45 features per precursor for semi-supervised FDR control via native Percolator (default) or external Mokapot. All intensity-based spectral similarity scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks.
 
-### Regression Mode (37 Features)
-
-### Ridge Regression Features (8)
-
-Derived from coefficient time series and chromatographic analysis:
-
-| Feature | Description |
-|---------|-------------|
-| `peak_apex` | Peak apex coefficient (maximum deconvolution value) |
-| `peak_area` | Integrated peak area (AUC of coefficients) |
-| `peak_width` | Peak width (FWHM in minutes), from Tukey median polish elution profile |
-| `coefficient_stability` | Coefficient variance near apex |
-| `relative_coefficient` | Coefficient relative to sum of all candidates |
-| `explained_intensity` | Fraction of observed intensity explained by matched fragments |
-| `signal_to_noise` | Peak apex / noise estimate from coefficient series |
-| `xic_signal_to_noise` | Signal-to-noise from the best-correlated fragment XIC |
-
-### Spectral Matching Features - Mixed (2)
-
-Computed on the observed (mixed) spectrum at apex:
-
-| Feature | Description |
-|---------|-------------|
-| `xcorr` | Comet-style cross-correlation (unit intensity library selector) |
-| `consecutive_ions` | Longest consecutive b/y ion run |
-
-### Spectral Matching Features - Deconvoluted (2)
-
-Computed on coefficient-weighted spectra (apex +/- 2 scans):
-
-| Feature | Description |
-|---------|-------------|
-| `xcorr_deconv` | XCorr on deconvoluted spectrum |
-| `consecutive_ions_deconv` | Consecutive ions on deconvoluted spectrum |
-
-### RT Deviation (1)
-
-| Feature | Description |
-|---------|-------------|
-| `rt_deviation` | Observed apex RT - predicted RT from LOESS calibration (minutes) |
-
-### Fragment Co-elution Features (9)
-
-Computed within peak integration boundaries. Each fragment's XIC is correlated
-against the coefficient time series:
-
-| Feature | Description |
-|---------|-------------|
-| `fragment_coelution_sum` | Sum of Pearson correlations across top 6 fragments |
-| `fragment_coelution_min` | Minimum correlation among scored fragments |
-| `n_coeluting_fragments` | Count of fragments with positive correlation |
-| `fragment_corr_0` | Correlation of highest-intensity library fragment vs coefficient series |
-| `fragment_corr_1` | Correlation of 2nd highest fragment |
-| `fragment_corr_2` | Correlation of 3rd highest fragment |
-| `fragment_corr_3` | Correlation of 4th highest fragment |
-| `fragment_corr_4` | Correlation of 5th highest fragment |
-| `fragment_corr_5` | Correlation of 6th highest fragment |
-
-### Elution-Weighted Spectral Similarity (1)
-
-| Feature | Description |
-|---------|-------------|
-| `elution_weighted_cosine` | LibCosine computed at each scan within peak boundaries, weighted by coefficient^2, averaged. Uses sqrt preprocessing and includes all library fragments (0 for unmatched). |
-
-### Mass Accuracy Features (3)
-
-| Feature | Description |
-|---------|-------------|
-| `mass_accuracy_deviation_mean` | Mean signed mass error (ppm) across matched fragments |
-| `abs_mass_accuracy_deviation_mean` | Mean absolute mass error (ppm) |
-| `mass_accuracy_std` | Standard deviation of mass errors (ppm) |
-
-### Percolator-style Features (6)
-
-| Feature | Description |
-|---------|-------------|
-| `abs_rt_deviation` | Absolute value of RT deviation |
-| `peptide_length` | Number of amino acids in peptide sequence |
-| `missed_cleavages` | Number of missed enzymatic cleavages |
-| `ln_num_candidates` | ln(number of candidates in the regression window) |
-| `coef_zscore` | Z-score of this precursor's coefficient at apex |
-| `coef_zscore_mean` | Mean z-score of coefficients across the peak |
-
-### MS1 Features (2)
-
-HRAM only; 0.0 for unit resolution or when MS1 data is unavailable:
-
-| Feature | Description |
-|---------|-------------|
-| `ms1_precursor_coelution` | Pearson correlation between coefficient series and MS1 monoisotopic precursor XIC |
-| `ms1_isotope_cosine` | Cosine similarity between observed MS1 isotope envelope and theoretical distribution |
-
-### Tukey Median Polish Features (3)
-
-Fragment XIC matrix decomposition via Tukey median polish:
-
-| Feature | Description |
-|---------|-------------|
-| `median_polish_cosine` | Cosine similarity between data-derived fragment intensities (row effects) and library intensities, sqrt preprocessing |
-| `median_polish_rsquared` | R^2 of the additive model in sqrt space. Measures how well the shared elution profile + fragment intensities explain the XIC matrix. |
-| `median_polish_residual_ratio` | Fraction of total signal unexplained by the model: sum|obs-pred| / sum(obs) in linear space. Lower = cleaner co-elution. |
-
-### Coelution Mode (45 Features)
-
-The coelution search mode extracts fragment XICs directly (no regression) and computes pairwise correlations between them. It uses a different feature set optimized for XIC-based scoring.
-
-#### Pairwise Coelution (11)
+### Pairwise Coelution (11)
 
 | Feature | Description |
 |---------|-------------|
@@ -217,7 +93,7 @@ The coelution search mode extracts fragment XICs directly (no regression) and co
 | `n_fragment_pairs` | Number of fragment pairs in correlation matrix |
 | `fragment_corr_0..5` | Per-fragment average correlation with all other fragments (top 6) |
 
-#### Peak Shape (7)
+### Peak Shape (7)
 
 Derived from the reference XIC (best-correlated fragment):
 
@@ -231,7 +107,7 @@ Derived from the reference XIC (best-correlated fragment):
 | `n_scans` | Number of scans within peak boundaries |
 | `peak_sharpness` | Steepness of peak edges |
 
-#### Spectral at Apex (15)
+### Spectral at Apex (15)
 
 | Feature | Description |
 |---------|-------------|
@@ -247,13 +123,46 @@ Derived from the reference XIC (best-correlated fragment):
 | `explained_intensity` | Fraction of observed intensity explained by matches |
 | `elution_weighted_cosine` | LibCosine at each scan, weighted by reference XIC intensity^2, averaged |
 
-#### Mass Accuracy (3), RT Deviation (2), MS1 (2), Peptide Properties (2)
+### Mass Accuracy (3)
 
-Same as regression mode, except coelution includes both `rt_deviation` and `abs_rt_deviation` (2 features) and `peptide_length` + `missed_cleavages` (no ln_num_candidates, coef_zscore, coef_zscore_mean).
+| Feature | Description |
+|---------|-------------|
+| `mass_accuracy_deviation_mean` | Mean signed mass error (ppm) across matched fragments |
+| `abs_mass_accuracy_deviation_mean` | Mean absolute mass error (ppm) |
+| `mass_accuracy_std` | Standard deviation of mass errors (ppm) |
 
-#### Tukey Median Polish (3)
+### RT Deviation (2)
 
-Same as regression mode: `median_polish_cosine`, `median_polish_rsquared`, `median_polish_residual_ratio`.
+| Feature | Description |
+|---------|-------------|
+| `rt_deviation` | Observed apex RT - predicted RT from LOESS calibration (minutes) |
+| `abs_rt_deviation` | Absolute value of RT deviation |
+
+### MS1 Features (2)
+
+HRAM only; 0.0 for unit resolution or when MS1 data is unavailable:
+
+| Feature | Description |
+|---------|-------------|
+| `ms1_precursor_coelution` | Pearson correlation between reference XIC and MS1 monoisotopic precursor XIC |
+| `ms1_isotope_cosine` | Cosine similarity between observed MS1 isotope envelope and theoretical distribution |
+
+### Peptide Properties (2)
+
+| Feature | Description |
+|---------|-------------|
+| `peptide_length` | Number of amino acids in peptide sequence |
+| `missed_cleavages` | Number of missed enzymatic cleavages |
+
+### Tukey Median Polish Features (3)
+
+Fragment XIC matrix decomposition via Tukey median polish:
+
+| Feature | Description |
+|---------|-------------|
+| `median_polish_cosine` | Cosine similarity between data-derived fragment intensities (row effects) and library intensities, sqrt preprocessing |
+| `median_polish_rsquared` | R^2 of the additive model in sqrt space. Measures how well the shared elution profile + fragment intensities explain the XIC matrix. |
+| `median_polish_residual_ratio` | Fraction of total signal unexplained by the model: sum|obs-pred| / sum(obs) in linear space. Lower = cleaner co-elution. |
 
 ---
 
@@ -300,7 +209,7 @@ Osprey uses **two-level FDR control** with three available methods (`--fdr-metho
 
 ### Run-Level FDR
 - Per-file target-decoy competition and q-value computation
-- All features (37 for regression, 45 for coelution) used by SVM
+- All 45 features used by SVM
 - Q-values assigned at both precursor and peptide level
 - Effective q-value: `max(precursor_qvalue, peptide_qvalue)` — must pass both
 
@@ -321,7 +230,7 @@ See [FDR Control](fdr-control.md) for full algorithm details, fold assignment, a
 
 ## Phase 2: Calibration Scoring (Quick Pass)
 
-The calibration phase is a **fast scoring pass** designed to establish RT and mass calibration before the main search. It does NOT use ridge regression. Calibration always uses **unit resolution XCorr** (2001 bins, 1.0005 Da) regardless of data type, providing ~50x faster scoring for HRAM data.
+The calibration phase is a **fast scoring pass** designed to establish RT and mass calibration before the main search. Calibration always uses **unit resolution XCorr** (2001 bins, 1.0005 Da) regardless of data type, providing ~50x faster scoring for HRAM data.
 
 ### How Calibration Scoring Works
 
@@ -356,26 +265,7 @@ See: [Calibration](calibration.md)
 
 ## Phase 3: Main Search
 
-Osprey supports two search strategies. Both produce scored entries that feed into FDR control (native Percolator or Mokapot).
-
-### Regression Mode (default)
-
-Ridge regression deconvolutes each DIA spectrum into individual peptide contributions. Each spectrum contains fragments from multiple co-eluting precursors; regression separates these overlapping signals.
-
-### Per-Spectrum Processing
-
-For each MS2 spectrum:
-
-1. **Candidate selection**: Find library entries whose precursor m/z falls within the isolation window AND whose calibrated RT is within tolerance
-2. **Design matrix**: Columns are pre-binned library spectra (no preprocessing, raw intensity)
-3. **NNLS ridge regression**: Minimize ||Ax - b||^2 + lambda*||x||^2 subject to x >= 0
-4. **Output**: Non-negative coefficient per candidate (how much of the observed signal this peptide explains)
-
-See: [Ridge Regression](ridge-regression.md)
-
-### Coelution Mode
-
-Instead of regression, the coelution search extracts fragment XICs directly from the DIA data and scores precursors based on how well their fragment ion chromatograms co-elute.
+The coelution search extracts fragment XICs directly from the DIA data and scores precursors based on how well their fragment ion chromatograms co-elute.
 
 For each precursor within the RT window:
 
@@ -390,42 +280,36 @@ For each precursor within the RT window:
 
 ## Phase 4: Post-Search Scoring
 
-After the main search, Osprey aggregates results per precursor and computes scoring features. For regression mode, this means coefficient time series; for coelution mode, fragment XIC profiles.
+After the main search, Osprey computes scoring features per precursor from fragment XIC profiles.
 
-### Step 1: Coefficient Time Series
+### Step 1: Peak Detection
 
-For each library entry, collect all (RT, coefficient) pairs from regression results across spectra. This forms a chromatographic profile of the deconvoluted peptide signal.
-
-### Step 2: Peak Detection
-
-Two complementary peak detectors are used:
-
-1. **Threshold-crossing** (`PeakDetector::detect()`): Scans coefficient series for contiguous regions above `min_height` (0.01). Selects the peak with highest apex coefficient near the expected RT.
-2. **XIC peak detection** (`detect_xic_peak()`): Smoothed apex finding, DIA-NN-style valley-based boundary detection, and asymmetric FWHM capping. Used for signal-to-noise estimation on coefficient series.
+XIC peak detection (`detect_xic_peak()`) uses smoothed apex finding, DIA-NN-style valley-based boundary detection, and asymmetric FWHM capping on the reference XIC.
 
 See: [Peak Detection](peak-detection.md)
 
-### Step 3: Tukey Median Polish and Peak Boundaries
+### Step 2: Tukey Median Polish and Peak Boundaries
 
 The top 6 library fragments' XICs are decomposed via Tukey median polish. The column
 effects give a robust shared elution profile (resistant to single-fragment interference).
 FWHM on this profile determines peak integration boundaries at +/-1.96*sigma from apex.
 
-### Step 4: Score Computation
+### Step 3: Score Computation
 
-All features are computed within or at the peak boundaries:
+All 45 features are computed within or at the peak boundaries:
 
-- **Fragment co-elution**: Per-fragment XIC correlations against the coefficient series
-- **Elution-weighted cosine**: LibCosine at each scan, weighted by coefficient^2
+- **Pairwise coelution**: Fragment XIC pairwise correlations
+- **Peak shape**: Apex, area, width, symmetry, S/N, sharpness
+- **Spectral at apex**: Hyperscore, xcorr, dot products, coverage, consecutive ions
+- **Elution-weighted cosine**: LibCosine at each scan, weighted by reference XIC intensity^2
 - **Mass accuracy**: Mean/std of mass errors across matched fragments
-- **XCorr**: Comet-style cross-correlation at the apex spectrum
 - **Tukey median polish features**: Cosine, R^2, residual ratio from the XIC decomposition
 - **MS1 features**: Precursor co-elution and isotope cosine (HRAM only)
-- **Percolator-style**: Peptide length, missed cleavages, charge, RT deviation
+- **Peptide properties**: Peptide length, missed cleavages, RT deviation
 
-### Step 5: FDR Control
+### Step 4: FDR Control
 
-All features (37 for regression, 45 for coelution) are combined into an optimal discriminant score via semi-supervised learning (linear SVM). The default native Percolator receives both targets and decoys and performs internal paired competition. For external Mokapot, targets and decoys are pre-competed using the best feature (selected by ROC AUC) and only winners are written to PIN files.
+All 45 features are combined into an optimal discriminant score via semi-supervised learning (linear SVM). The default native Percolator receives both targets and decoys and performs internal paired competition. For external Mokapot, targets and decoys are pre-competed using the best feature (selected by ROC AUC) and only winners are written to PIN files.
 
 **Two-level FDR with dual precursor+peptide control**:
 1. **Run-level**: Per-file FDR at both precursor and peptide level
@@ -444,20 +328,10 @@ See: [FDR Control](fdr-control.md)
 | Aspect | Calibration (Phase 2) | Main Search (Phase 3-4) |
 |--------|----------------------|---------------------------|
 | **Purpose** | Establish RT/mass calibration | Determine peptide detections |
-| **Method** | XCorr + E-value | Regression or coelution |
-| **Features** | E-value only | 37 (regression) or 45 (coelution) |
+| **Method** | XCorr + E-value | Coelution search |
+| **Features** | E-value only | 45 features |
 | **FDR method** | Target-decoy on LDA score | Semi-supervised SVM (Percolator/Mokapot) |
 | **Scope** | First file only, wide tolerance | All files, tight calibrated tolerance |
-
-### Regression vs Coelution Search
-
-| Aspect | Regression | Coelution |
-|--------|-----------|-----------|
-| **Core method** | Ridge regression deconvolution | Fragment XIC correlation |
-| **Signal source** | Coefficient time series | Fragment XICs directly |
-| **Features** | 37 (regression-specific) | 45 (XIC-specific) |
-| **Unique features** | coefficient_stability, relative_coefficient, xcorr_deconv, coef_zscore | hyperscore, dot_product variants, peak_symmetry, peak_sharpness |
-| **Handles interference** | Via regression (simultaneous fit) | Via pairwise correlation filtering |
 
 ---
 
@@ -465,21 +339,21 @@ See: [FDR Control](fdr-control.md)
 
 Unlike spectrum-centric approaches (e.g., Comet, MSFragger) that identify each spectrum independently, Osprey:
 
-1. **Considers all candidate peptides simultaneously** using ridge regression, handling overlapping signals in wide DIA windows
-2. **Aggregates evidence across the chromatographic dimension** before scoring, using the coefficient time series rather than a single spectrum
-3. **Scores at the best RT** for each peptide, where the deconvoluted signal is strongest
+1. **Aggregates evidence across the chromatographic dimension** before scoring, using fragment XIC profiles rather than a single spectrum
+2. **Scores at the best RT** for each peptide, where the co-elution signal is strongest
+3. **Uses pairwise fragment co-elution** to distinguish true signals from interference
 
-### Why Ridge Regression?
+### Why Coelution Search?
 
-DIA spectra are mixed spectra containing fragments from multiple precursors. Ridge regression:
-- Deconvolutes overlapping signals into individual peptide contributions
-- Provides coefficients proportional to peptide abundance
-- Handles collinearity (similar spectra) gracefully via L2 regularization
-- Is computationally efficient with BLAS and f32 optimizations
+DIA spectra are mixed spectra containing fragments from multiple precursors. The coelution approach:
+- Extracts fragment XICs and measures how well they co-elute (pairwise correlations)
+- Fragments from the same peptide should rise and fall together
+- Robust to interference because co-elution metrics are computed pairwise across fragments
+- Scores spectral similarity at the detected apex for additional discrimination
 
 ### Why RT Calibration?
 
-Library retention times may be predicted by deep learning models (Prosit, DeepLC), measured on different LC systems, or normalized to iRT scale. RT calibration converts library RTs to expected measured RTs, enabling tight RT filtering that reduces the candidate set and improves regression quality.
+Library retention times may be predicted by deep learning models (Prosit, DeepLC), measured on different LC systems, or normalized to iRT scale. RT calibration converts library RTs to expected measured RTs, enabling tight RT filtering that reduces the candidate set and improves search quality.
 
 ---
 
@@ -490,7 +364,7 @@ osprey/
 +-- osprey-core/              # Core types, config, errors, traits
 |   +-- config.rs             # YAML configuration structures
 |   +-- isotope.rs            # Isotope distribution calculations
-|   +-- types.rs              # LibraryEntry, Spectrum, FeatureSet, CoelutionFeatureSet, SearchMode
+|   +-- types.rs              # LibraryEntry, Spectrum, CoelutionFeatureSet
 |   +-- traits.rs             # MS1SpectrumLookup, etc.
 |
 +-- osprey-io/                # File I/O
@@ -508,13 +382,6 @@ osprey/
 +-- osprey-chromatography/    # Chromatographic analysis
 |   +-- lib.rs                # PeakDetector
 |   +-- calibration/          # LOESS RT calibration, mass calibration, I/O
-|
-+-- osprey-regression/        # Ridge regression engine
-|   +-- solver.rs             # Unified f32 CD-NNLS solver (unit res + HRAM)
-|   +-- cd_nnls.rs            # Coordinate Descent NNLS algorithm
-|   +-- ridge.rs              # Dense NNLS solver (f64, reference)
-|   +-- binning.rs            # m/z binning (Comet BIN macro)
-|   +-- matrix.rs             # Design matrix construction
 |
 +-- osprey-fdr/               # FDR control
 |   +-- lib.rs                # Target-decoy competition, q-values
@@ -575,9 +442,6 @@ input_files:
   - sample2.mzML
 spectral_library: library.tsv
 output_blib: results.blib
-
-# Search mode: Regression (default) or Coelution
-search_mode: Regression
 
 # Resolution mode
 resolution_mode:

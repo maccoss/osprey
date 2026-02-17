@@ -41,14 +41,6 @@ pub struct OspreyConfig {
     /// RT calibration configuration
     pub rt_calibration: RTCalibrationConfig,
 
-    // Regression
-    /// Regularization parameter selection
-    pub regularization_lambda: RegularizationSetting,
-    /// Maximum iterations for solver
-    pub max_iterations: usize,
-    /// Convergence threshold
-    pub convergence_threshold: f64,
-
     // FDR control
     /// Run-level FDR threshold
     pub run_fdr: f64,
@@ -58,11 +50,6 @@ pub struct OspreyConfig {
     pub decoy_method: DecoyMethod,
     /// Whether library already contains decoys
     pub decoys_in_library: bool,
-
-    // Search mode
-    /// Search strategy: ridge regression (default) or coelution-based
-    #[serde(default)]
-    pub search_mode: SearchMode,
 
     // FDR method
     /// FDR method: native Percolator (default), external mokapot, or simple target-decoy
@@ -78,10 +65,6 @@ pub struct OspreyConfig {
     pub n_threads: usize,
     /// Memory limit in GB
     pub memory_limit_gb: Option<f64>,
-
-    // Output options
-    /// Export coefficient time series to parquet
-    pub export_coefficients: bool,
 }
 
 impl Default for OspreyConfig {
@@ -97,19 +80,14 @@ impl Default for OspreyConfig {
             precursor_tolerance: FragmentToleranceConfig::hram(10.0), // 10 ppm for precursor
             max_candidates_per_spectrum: 5250,
             rt_calibration: RTCalibrationConfig::default(),
-            search_mode: SearchMode::default(),
             fdr_method: FdrMethod::default(),
             write_pin: false,
-            regularization_lambda: RegularizationSetting::CrossValidated,
-            max_iterations: 1000,
-            convergence_threshold: 1e-6,
             run_fdr: 0.01,
             experiment_fdr: 0.01,
             decoy_method: DecoyMethod::Reverse,
             decoys_in_library: false,
             n_threads: num_cpus(),
             memory_limit_gb: None,
-            export_coefficients: false,
         }
     }
 }
@@ -226,12 +204,6 @@ rt_calibration:
   calibration_sample_size: 100000 # Target peptides to sample for calibration (0 = all)
   calibration_retry_factor: 2.0   # Multiply sample size on retry if too few calibration points
 
-# Regression
-regularization_lambda: CrossValidated
-# Options: CrossValidated, Adaptive, or Fixed with value
-# regularization_lambda:
-#   Fixed: 0.5
-
 # FDR control
 run_fdr: 0.01
 experiment_fdr: 0.01
@@ -244,8 +216,6 @@ write_pin: false  # Write PIN files for external tools
 n_threads: 0  # 0 = auto-detect
 # memory_limit_gb: 16.0  # Optional memory limit
 
-# Output options
-export_coefficients: false  # Export coefficient time series to parquet
 "#;
 
         fs::write(path.as_ref(), template).map_err(|e| {
@@ -281,9 +251,6 @@ export_coefficients: false  # Export coefficient time series to parquet
         if let Some(threads) = args.n_threads {
             self.n_threads = threads;
         }
-        if let Some(lambda) = args.lambda {
-            self.regularization_lambda = RegularizationSetting::Fixed(lambda);
-        }
         if args.verbose {
             // Logging level would be handled separately
         }
@@ -318,7 +285,6 @@ pub struct ConfigOverrides {
     pub rt_tolerance: Option<f64>,
     pub run_fdr: Option<f64>,
     pub n_threads: Option<usize>,
-    pub lambda: Option<f64>,
     pub verbose: bool,
     pub disable_rt_calibration: bool,
     pub fragment_tolerance: Option<f64>,
@@ -373,10 +339,19 @@ pub struct RTCalibrationConfig {
     /// On each retry, sample_size is multiplied by this factor. Final attempt uses all entries.
     #[serde(default = "default_calibration_retry_factor")]
     pub calibration_retry_factor: f64,
+    /// Maximum RT tolerance (minutes). Hard cap to prevent catastrophic widening
+    /// when calibration is poor. Default: 3.0 min.
+    #[serde(default = "default_max_rt_tolerance")]
+    pub max_rt_tolerance: f64,
+    /// Use percentile-based RT tolerance instead of SD-based (DIA-NN approach).
+    /// When true: tolerance = max(2 × P20_abs_error, RT_range / 40)
+    /// When false: tolerance = rt_tolerance_factor × residual_SD
+    #[serde(default = "default_use_percentile_tolerance")]
+    pub use_percentile_tolerance: bool,
 }
 
 fn default_min_rt_tolerance() -> f64 {
-    0.5
+    1.0
 }
 
 fn default_calibration_sample_size() -> usize {
@@ -387,6 +362,14 @@ fn default_calibration_retry_factor() -> f64 {
     2.0
 }
 
+fn default_max_rt_tolerance() -> f64 {
+    3.0
+}
+
+fn default_use_percentile_tolerance() -> bool {
+    true
+}
+
 impl Default for RTCalibrationConfig {
     fn default() -> Self {
         Self {
@@ -395,10 +378,12 @@ impl Default for RTCalibrationConfig {
             min_calibration_points: 200,
             rt_tolerance_factor: 3.0,
             fallback_rt_tolerance: 2.0,
-            min_rt_tolerance: 0.5,           // 30 seconds minimum
+            min_rt_tolerance: 1.0,           // 1 minute minimum
             initial_tolerance_fraction: 1.0, // 100% of RT range (no RT filtering, like pyXcorrDIA)
             calibration_sample_size: 100000,
             calibration_retry_factor: 2.0,
+            max_rt_tolerance: 3.0,          // Hard cap at 3 minutes
+            use_percentile_tolerance: true, // DIA-NN-style percentile tolerance
         }
     }
 }
@@ -436,18 +421,6 @@ pub enum ResolutionMode {
     Auto,
 }
 
-/// Regularization parameter selection strategy
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub enum RegularizationSetting {
-    /// Fixed lambda value
-    Fixed(f64),
-    /// Select via cross-validation
-    #[default]
-    CrossValidated,
-    /// Adaptive per spectrum
-    Adaptive,
-}
-
 /// Decoy generation method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DecoyMethod {
@@ -458,16 +431,6 @@ pub enum DecoyMethod {
     Shuffle,
     /// Use decoys already in library
     FromLibrary,
-}
-
-/// Search strategy for the main analysis
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum SearchMode {
-    /// Ridge regression: deconvolute mixed spectra via NNLS (default)
-    #[default]
-    Regression,
-    /// Coelution: DIA-NN-style fragment XIC correlation without regression
-    Coelution,
 }
 
 /// FDR control method

@@ -1,7 +1,7 @@
 //! Traits for Osprey components
 //!
 //! This module defines the core traits that enable pluggable implementations
-//! for library loading, spectrum sources, and regression solving.
+//! for library loading, spectrum sources, and scoring.
 
 use crate::{LibraryEntry, Result, Spectrum};
 use std::path::Path;
@@ -32,43 +32,6 @@ pub trait SpectrumSource: Iterator<Item = Result<Spectrum>> + Send {
     fn file_path(&self) -> &Path;
 }
 
-/// Trait for regression solvers
-///
-/// Implementations solve the regularized regression problem to deconvolute
-/// mixed spectra into peptide contributions.
-pub trait RegressionSolver: Send + Sync {
-    /// Solve the regression problem
-    ///
-    /// Given design matrix A (m bins × k candidates), observed spectrum b (m × 1),
-    /// and regularization parameter lambda, returns coefficient vector x (k × 1).
-    ///
-    /// The problem solved is: minimize ‖Ax - b‖² + λ‖x‖²
-    fn solve(
-        &self,
-        design_matrix: &[f64], // Flattened row-major m×k matrix
-        observed: &[f64],      // m-element observed spectrum
-        n_bins: usize,         // m
-        n_candidates: usize,   // k
-        lambda: f64,
-    ) -> Result<Vec<f64>>;
-
-    /// Solve with non-negativity constraint
-    ///
-    /// Same as solve, but with additional constraint x ≥ 0
-    fn solve_nonnegative(
-        &self,
-        design_matrix: &[f64],
-        observed: &[f64],
-        n_bins: usize,
-        n_candidates: usize,
-        lambda: f64,
-    ) -> Result<Vec<f64>> {
-        // Default implementation: just solve without constraint
-        // Subclasses should override with proper NNLS
-        self.solve(design_matrix, observed, n_bins, n_candidates, lambda)
-    }
-}
-
 /// Trait for feature extraction
 ///
 /// Implementations compute features from coefficient time series and spectra.
@@ -79,7 +42,7 @@ pub trait FeatureExtractor: Send + Sync {
         library_entry: &LibraryEntry,
         coefficient_series: &[(f64, f64)], // (rt, coefficient) pairs
         apex_spectrum: Option<&Spectrum>,
-    ) -> crate::FeatureSet;
+    ) -> crate::CoelutionFeatureSet;
 }
 
 /// Trait for peak detection

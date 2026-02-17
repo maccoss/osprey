@@ -4,13 +4,13 @@
 
 Peptide-centric DIA analysis with Skyline integration.
 
-Osprey is an open-source tool for peptide detection and quantification in data-independent acquisition (DIA) mass spectrometry data. It uses ridge regression to deconvolute mixed MS/MS spectra, aggregates evidence across the chromatographic dimension, and provides rigorous FDR control for peptide detections.
+Osprey is an open-source tool for peptide detection and quantification in data-independent acquisition (DIA) mass spectrometry data. It uses fragment XIC co-elution analysis to detect peptides in DIA data, with machine learning scoring and rigorous FDR control.
 
 ## Features
 
 - **Peptide-centric analysis**: Directly scores peptide candidates against observed spectra
-- **Ridge regression**: Handles overlapping isolation windows and co-eluting peptides
-- **HRAM support**: Sparse matrix operations with ppm-based peak matching for high-resolution data
+- **Fragment co-elution**: Extracts fragment XICs, computes pairwise correlations, and scores using spectral matching at the apex
+- **High-resolution support**: ppm-based fragment matching for high-resolution instruments (Astral, Orbitrap)
 - **RT calibration**: LOESS-based retention time calibration with stratified sampling
 - **Decoy generation**: Enzyme-aware sequence reversal with fragment m/z recalculation
 - **Skyline integration**: Outputs BiblioSpec (.blib) format for seamless quantification in Skyline
@@ -115,11 +115,6 @@ library_source:
 output_blib: results.blib
 output_report: results.tsv
 
-# Resolution mode (controls tolerance units and fragment matching)
-resolution_mode: Auto  # Auto uses config defaults (ppm)
-# Options: Auto, UnitResolution (Th units), or HRAM (ppm units)
-# Ridge regression always uses ~1 Th bins; HRAM applies ppm matching in scoring
-
 # Candidate selection (precursor filtering uses isolation window from mzML)
 max_candidates_per_spectrum: 5250  # Use 0 for unlimited
 
@@ -132,15 +127,6 @@ rt_calibration:
   min_calibration_points: 50
   rt_tolerance_factor: 3.0 # Multiplier for residual SD
   fallback_rt_tolerance: 2.0  # Used if calibration fails
-
-# Regression
-regularization_lambda: CrossValidated
-# Options: CrossValidated, Adaptive, or Fixed with value
-
-# Two-step search (recommended)
-two_step_search:
-  enabled: true
-  step1_fdr: 0.01
 
 # FDR control
 run_fdr: 0.01
@@ -173,8 +159,6 @@ Options:
           - auto: Use config defaults (ppm tolerances)
           - unit: Use Th (Dalton) tolerances for low-res data
           - hram: Use ppm tolerances for high-res data
-          Note: Ridge regression always uses ~1 Th bins for memory efficiency.
-          HRAM precision is applied via ppm-based fragment matching in scoring.
 
       --fragment-tolerance <VALUE>
           Fragment m/z tolerance (e.g., 10 for 10 ppm, or 0.3 for 0.3 Th)
@@ -194,9 +178,6 @@ Options:
       --no-rt-calibration
           Disable RT calibration (use fixed rt_tolerance instead)
 
-      --lambda <VALUE>
-          Fixed regularization parameter lambda
-
       --max-candidates <N>
           Maximum candidates per spectrum (use 0 for unlimited) [default: 5250]
 
@@ -208,9 +189,6 @@ Options:
 
       --report <FILE>
           Write TSV report to this file
-
-      --export-coefficients
-          Export coefficient time series to parquet file(s)
 
   -v, --verbose
           Verbose output
@@ -253,7 +231,7 @@ When processing multiple files, Osprey uses a **multi-file calibration strategy*
 1. Use **all library peptides** (no sampling)
 2. Assume linear relationship: library RT range ≈ mzML RT range
 3. Wide initial tolerance (20-30% of gradient range)
-4. Run regression and detect peaks
+4. Score peptides and detect peaks
 5. Record (library_RT, measured_apex_RT) pairs
 6. Fit LOESS calibration curve
 7. Calculate residual standard deviation
@@ -265,8 +243,8 @@ When processing multiple files, Osprey uses a **multi-file calibration strategy*
 1. **Reuse calibration** from File 1 (same experiment → similar LC conditions)
 2. Use tight RT tolerance (3× residual SD from File 1)
 3. Apply LOESS to convert library RTs to predicted measured RTs
-4. Run full regression with calibrated candidate selection
-5. Extract coefficient time series and detect peaks
+4. Run full search with calibrated candidate selection
+5. Extract fragment XICs and detect peaks
 
 **Why reuse calibration?** Files within the same experiment have similar LC conditions (same column, gradient, mobile phases). The calibration from File 1 is directly applicable to subsequent files.
 
@@ -295,37 +273,14 @@ Following the [pyXcorrDIA](https://github.com/maccoss/pyXcorrDIA) approach:
 
 3. **Precursor mass preserved**: Same amino acid composition means same precursor m/z
 
-### Ridge Regression
+### Coelution Scoring
 
-For each MS2 spectrum:
-1. Select library peptides within isolation window and RT tolerance
-2. Build design matrix from binned library spectra
-3. Solve regularized least squares: minimize ‖Ax - b‖² + λ‖x‖²
-4. Non-negative coefficients indicate peptide contributions
-
-### Resolution Modes
-
-**Ridge regression always uses unit resolution binning (~1 Th bins, ~2000 bins)** for memory efficiency. Using 0.02 Th bins (100K bins) would create impractically large matrices (~400MB per spectrum per thread).
-
-Resolution mode controls where high-resolution precision is applied:
-
-**Unit Resolution Mode** (`--resolution unit`):
-- Fragment tolerances default to Th (Dalton) units
-- Suitable for low-resolution instruments (e.g., Stellar)
-- Fragment matching uses binned intensities
-
-**HRAM Mode** (`--resolution hram`):
-- Fragment tolerances default to ppm units
-- Suitable for high-resolution instruments (e.g., Astral, Orbitrap)
-- ppm-based fragment matching in:
-  - Fragment pre-filter (has_top3_fragment_match)
-  - Spectral scoring (dot product, XCorr)
-  - Mass accuracy feature calculation
-- Sparse matrix operations for efficient ppm-based scoring
-
-**Auto Mode** (`--resolution auto`, default):
-- Uses tolerance settings from config file (defaults to ppm)
-- Does not auto-detect instrument type
+For each candidate precursor:
+1. Extract fragment XICs across the chromatographic dimension
+2. Compute pairwise fragment co-elution correlations
+3. Detect peaks in the co-elution signal
+4. Score using spectral matching (dot product, XCorr, hyperscore) at the apex
+5. Extract 45 features per precursor for machine learning scoring via Mokapot
 
 ## Development
 
@@ -336,10 +291,10 @@ osprey/
 ├── crates/
 │   ├── osprey-core/          # Core types and configuration
 │   ├── osprey-io/            # File I/O (mzML, blib, libraries)
-│   ├── osprey-regression/    # Ridge regression engine
 │   ├── osprey-chromatography/# Peak detection, RT calibration
 │   ├── osprey-scoring/       # Feature extraction, decoy generation
 │   ├── osprey-fdr/           # FDR control, mokapot integration
+│   ├── osprey-ml/            # Machine learning (SVM, PEP estimation)
 │   └── osprey/               # CLI and pipeline
 ```
 
@@ -347,10 +302,10 @@ osprey/
 
 - **osprey-core**: `LibraryEntry`, `Spectrum`, `OspreyConfig`, `IsolationWindow`
 - **osprey-io**: `MzmlReader`, `DiannTsvLoader`, `ElibLoader`, `BlibLoader`, `BlibWriter`
-- **osprey-regression**: `RidgeSolver`, `Binner`, `DesignMatrixBuilder`, `SparseRidgeSolver`, `SparseMatrixBuilder`
 - **osprey-chromatography**: `PeakDetector`, `RTCalibrator`, `RTStratifiedSampler`
 - **osprey-scoring**: `DecoyGenerator`, `FeatureExtractor`
 - **osprey-fdr**: `FdrController`, `MokapotRunner`
+- **osprey-ml**: `LinearSvmClassifier`, `PepEstimator`
 
 ### Running tests
 
@@ -372,13 +327,12 @@ cargo doc --open
 - DIA-NN TSV library loading
 - EncyclopeDIA elib library loading
 - BiblioSpec blib library loading
-- Ridge regression with Cholesky solver (NNLS, f32)
-- Unit resolution binning with HRAM sparse matrix support (ppm-based matching)
+- Fragment XIC co-elution analysis with ppm-based fragment matching
 - Peak detection with Tukey median polish peak boundaries
 - RT calibration with LOESS regression and stratified sampling
 - MS1/MS2 mass calibration
 - Enzyme-aware decoy generation with fragment recalculation
-- 37-feature extraction per precursor for Mokapot
+- 45-feature extraction per precursor for Mokapot
 - Two-level FDR control (run + experiment level) via Mokapot
 - Tukey median polish for robust elution profiles and fragment scoring
 - Fragment co-elution scoring, elution-weighted cosine

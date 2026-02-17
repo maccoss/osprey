@@ -9,6 +9,20 @@ cargo run --release -- -i *.mzML -l ../hela-filtered-SkylineAI_spectral_library.
 python3 visualize_pin_features.py ../example_test_data/stellar/calibrated-GPF-data/mokapot/Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars.pin --output report-stellar.html
 
 
+Stellar with coelution and Percolator
+
+[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator] === Per-file results (run-level FDR at 1%) ===
+[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars: 53077 precursors, 53077 peptides
+[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_500-600_15-mars: 40766 precursors, 40766 peptides
+[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_600-700_16-mars: 15964 precursors, 15964 peptides
+[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_700-800_17-mars: 30459 precursors, 30459 peptides
+[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_800-900_18-mars: 40145 precursors, 40145 peptides
+[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator] 
+[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator] === Experiment-level results (1% FDR) ===
+[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Experiment: 144709 precursors, 124906 peptides
+
+
+
 Coelution with Astral data and Mokapot
 
 [2026-02-14T22:42:52Z INFO  osprey_fdr::mokapot] === Per-file results (run-level FDR at 1%) ===
@@ -128,3 +142,34 @@ Options:
 
   -V, --version
           Print version
+
+
+
+SVM features removed
+fragment_corr_5
+fragment_corr_4
+fragment_corr_3
+fragment_corr_2
+fragment_corr_1
+fragment_corr_0
+fragment_coelution_min
+dot_product_smz_top6
+dot_product_smz_top5
+dot_product_smz_top4
+signal_to_noise
+dot_product_top6
+peptide_length
+elution_weighted_cosine
+dot_product_top5
+dot_product_top4
+dot_product_smz
+dot_product
+peak_symmetry
+missed_cleavages
+n_fragment_pairs
+peak_width
+n_scans
+fragment_coverage
+hyperscore
+sequence_coverage
+median_polish_rsquared

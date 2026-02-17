@@ -19,7 +19,6 @@ path = "src/lib.rs"
 [dependencies]
 osprey-core = { workspace = true }
 osprey-io = { workspace = true }
-osprey-regression = { workspace = true }
 osprey-chromatography = { workspace = true }
 osprey-scoring = { workspace = true }
 osprey-fdr = { workspace = true }

@@ -299,5 +299,5 @@ Final scores:
 3. **E-value for competition**: E-value (from XCorr survival function) is used for target-decoy competition
 4. **Top-3 for MS2 calibration**: MS2 mass errors come from top-3 fragment matching (binary search), not full fragment matching
 5. **Isotope scoring**: Only available when MS1 spectra are present in the mzML file
-6. **LibCosine in post-regression**: LibCosine (ppm fragment matching) is used during post-regression feature extraction (Phase 4), not during calibration
+6. **LibCosine in main search**: LibCosine (ppm fragment matching) is used during feature extraction (Phase 4), not during calibration
 7. **Multiple scores**: All scores written to debug CSV for analysis

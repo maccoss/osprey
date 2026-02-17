@@ -21,6 +21,11 @@ pub struct RTCalibratorConfig {
     pub min_points: usize,
     /// Number of robustness iterations (0 = no robustness weighting)
     pub robustness_iter: usize,
+    /// Fraction of points to retain after outlier removal (0.8 = keep best 80%).
+    /// After LOESS fitting, points with the largest absolute residuals are removed
+    /// and the fit is repeated on the clean data (mirrors DIA-NN's map_RT approach).
+    /// Set to 1.0 to disable outlier removal.
+    pub outlier_retention: f64,
 }
 
 impl Default for RTCalibratorConfig {
@@ -30,6 +35,7 @@ impl Default for RTCalibratorConfig {
             degree: 1, // Linear local fits
             min_points: 20,
             robustness_iter: 2,
+            outlier_retention: 0.8, // Keep best 80%, remove worst 20% (DIA-NN default)
         }
     }
 }
@@ -139,7 +145,56 @@ impl RTCalibrator {
             final_fitted = self.loess_fit(&x, &y, Some(&weights))?;
         }
 
-        // Compute residuals and absolute residuals
+        // Outlier removal: remove points with largest absolute residuals, then refit
+        // This mirrors DIA-NN's map_RT() approach — fit, remove worst 20%, refit
+        let (x, y, final_fitted) = if self.config.outlier_retention < 1.0 {
+            let abs_resid: Vec<f64> = y
+                .iter()
+                .zip(final_fitted.iter())
+                .map(|(obs, pred)| (obs - pred).abs())
+                .collect();
+            let threshold = percentile_value(&abs_resid, self.config.outlier_retention);
+
+            let keep: Vec<bool> = abs_resid.iter().map(|&r| r <= threshold + 1e-12).collect();
+            let n_keep = keep.iter().filter(|&&k| k).count();
+
+            if n_keep >= self.config.min_points {
+                let x_filtered: Vec<f64> = x
+                    .iter()
+                    .zip(&keep)
+                    .filter(|(_, &k)| k)
+                    .map(|(&v, _)| v)
+                    .collect();
+                let y_filtered: Vec<f64> = y
+                    .iter()
+                    .zip(&keep)
+                    .filter(|(_, &k)| k)
+                    .map(|(&v, _)| v)
+                    .collect();
+
+                log::info!(
+                    "RT outlier removal: kept {}/{} points (threshold={:.3} min)",
+                    n_keep,
+                    x.len(),
+                    threshold
+                );
+
+                // Refit LOESS on clean data (no robustness weights needed)
+                let refitted = self.loess_fit(&x_filtered, &y_filtered, None)?;
+                (x_filtered, y_filtered, refitted)
+            } else {
+                log::warn!(
+                    "Outlier removal would leave too few points ({} < {}), skipping",
+                    n_keep,
+                    self.config.min_points
+                );
+                (x, y, final_fitted)
+            }
+        } else {
+            (x, y, final_fitted)
+        };
+
+        // Compute residuals and absolute residuals on (possibly filtered) data
         let residuals: Vec<f64> = y
             .iter()
             .zip(final_fitted.iter())
@@ -537,13 +592,33 @@ impl RTCalibration {
             0.0
         };
 
+        // Compute percentile stats from absolute residuals
+        let p20_abs_residual = percentile_value(&self.abs_residuals, 0.20);
+        let p80_abs_residual = percentile_value(&self.abs_residuals, 0.80);
+
         RTCalibrationStats {
             n_points: n,
             residual_std: self.residual_std,
             mean_residual,
             max_residual,
             r_squared,
+            p20_abs_residual,
+            p80_abs_residual,
         }
+    }
+
+    /// Compute percentile-based RT tolerance (DIA-NN approach).
+    ///
+    /// Returns `max(2.0 * abs_error_at_percentile, measured_rt_range / 40.0)`.
+    /// This is much more robust to outliers than SD-based tolerance.
+    pub fn percentile_tolerance(&self, percentile: f64) -> f64 {
+        if self.abs_residuals.is_empty() {
+            return self.residual_std * 3.0;
+        }
+        let p_val = percentile_value(&self.abs_residuals, percentile);
+        let (rt_min, rt_max) = self.measured_rt_range();
+        let rt_range = rt_max - rt_min;
+        (2.0 * p_val).max(rt_range / 40.0)
     }
 
     /// Check if a library RT is within the calibration range
@@ -637,6 +712,10 @@ pub struct RTCalibrationStats {
     pub max_residual: f64,
     /// R² (coefficient of determination)
     pub r_squared: f64,
+    /// 20th percentile of absolute residuals (for DIA-NN-style tolerance)
+    pub p20_abs_residual: f64,
+    /// 80th percentile of absolute residuals
+    pub p80_abs_residual: f64,
 }
 
 /// Stratified sampler for RT calibration discovery
@@ -746,6 +825,17 @@ pub fn median(values: &[f64]) -> f64 {
     } else {
         sorted[mid]
     }
+}
+
+/// Compute the value at a given percentile (0.0 to 1.0) of a slice
+pub fn percentile_value(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let idx = (p * (sorted.len() - 1) as f64).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
 }
 
 /// Compute standard deviation of a slice

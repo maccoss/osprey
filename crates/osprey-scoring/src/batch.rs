@@ -13,7 +13,7 @@
 //! - L2 normalization and cosine angle calculation
 //! - Stores mass errors for matched fragments (for calibration)
 //!
-//! ## BatchScorer (XCorr/Ridge Regression)
+//! ## BatchScorer (XCorr)
 //!
 //! The `BatchScorer` uses binning for BLAS-accelerated XCorr calculations:
 //! - Unit resolution: 1.0005079 Da bins, 0.4 offset
@@ -918,6 +918,8 @@ pub struct CalibrationMatch {
     /// Signal-to-noise ratio of reference XIC peak
     /// Signal = apex - background_mean, Noise = background_SD
     pub signal_to_noise: f64,
+    /// Peak width in minutes (from detected XIC boundaries, None for non-XIC paths)
+    pub peak_width_minutes: Option<f64>,
     /// Linear discriminant score (weighted combination of features)
     pub discriminant_score: f64,
     /// Posterior error probability from KDE
@@ -1769,6 +1771,7 @@ pub fn run_windowed_calibration_scoring(
                         top6_matched_apex: 0,
                         hyperscore_apex: 0.0,
                         signal_to_noise: 0.0,
+                        peak_width_minutes: None,
                         discriminant_score: score,
                         posterior_error: 0.0,
                         q_value: 1.0,
@@ -1917,6 +1920,7 @@ pub fn run_calibration_scoring(
                 top6_matched_apex: 0,
                 hyperscore_apex: 0.0,
                 signal_to_noise: 0.0,
+                peak_width_minutes: None,
                 discriminant_score: score,
                 posterior_error: 0.0,
                 q_value: 1.0,
@@ -2180,6 +2184,7 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                             top6_matched_apex: 0,
                             hyperscore_apex: 0.0,
                             signal_to_noise: 0.0,
+                            peak_width_minutes: None,
                             discriminant_score: best_xcorr,
                             posterior_error: 0.0,
                             q_value: 1.0,
@@ -2336,6 +2341,7 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
                             top6_matched_apex: 0,
                             hyperscore_apex: 0.0,
                             signal_to_noise: 0.0,
+                            peak_width_minutes: None,
                             discriminant_score: best_xcorr,
                             posterior_error: 0.0,
                             q_value: 1.0,
@@ -2419,6 +2425,7 @@ pub fn count_top6_matched_at_apex(
 /// 6. Apex RT = RT at the maximum of the reference XIC
 /// 7. Collect MS2 mass errors at the apex spectrum for calibration
 /// 8. Extract M+0 isotope peak from MS1 for accurate mass calibration
+#[allow(clippy::too_many_arguments)]
 pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
     library: &[LibraryEntry],
     spectra: &[Spectrum],
@@ -2426,6 +2433,8 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
     fragment_tolerance: FragmentToleranceConfig,
     precursor_tolerance_ppm: f64,
     rt_tolerance: f64,
+    expected_rt_fn: Option<&(dyn Fn(f64) -> f64 + Sync)>,
+    xcorr_scorer: Option<&SpectralScorer>,
 ) -> Vec<CalibrationMatch> {
     // Group spectra by isolation window
     let window_groups = group_spectra_by_isolation_window(spectra);
@@ -2502,59 +2511,79 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
 
         let ref_xic = &xics[ref_idx].1;
 
-        // Savitzky-Golay 5-point quadratic smooth the reference XIC
-        // Coefficients: [-3, 12, 17, 12, -3] / 35
-        // Preserves peak shape and position better than triangular kernel
-        let n = ref_xic.len();
-        let smoothed_ref: Vec<f64> = (0..n)
-            .map(|i| {
-                if n < 5 || i < 2 || i >= n - 2 {
-                    // Not enough points for 5-point filter: leave unsmoothed
-                    ref_xic[i].1
+        // Pre-filter: count fragments with non-trivial signal
+        // (xics only contains fragments with ≥1 non-zero intensity point)
+        let n_with_signal = xics
+            .iter()
+            .filter(|(_, xic)| xic.iter().any(|(_, v)| *v > 0.01))
+            .count();
+        if n_with_signal < 2 {
+            return None; // Need at least 2 fragments with signal
+        }
+
+        // Peak-detection-first co-elution scoring:
+        // 1. Detect candidate peaks in the reference XIC
+        // 2. Score each peak by pairwise fragment correlation within its boundaries
+        // 3. Pick the peak with the highest co-elution score
+        let candidates = osprey_chromatography::detect_all_xic_peaks(ref_xic, 0.01, 5.0);
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let min_corr_score = 0.5;
+
+        // Score each candidate peak by pairwise fragment correlation
+        let best = candidates
+            .iter()
+            .map(|bp| {
+                let si = bp.start_index;
+                let ei = bp.end_index;
+                let peak_len = ei - si + 1;
+
+                let corr_sum = if peak_len >= 3 {
+                    let vals: Vec<Vec<f64>> = xics
+                        .iter()
+                        .map(|(_, xic)| xic[si..=ei].iter().map(|(_, v)| *v).collect())
+                        .collect();
+                    let mut sum = 0.0f64;
+                    for ii in 0..vals.len() {
+                        for jj in (ii + 1)..vals.len() {
+                            sum += super::pearson_correlation_raw(&vals[ii], &vals[jj]);
+                        }
+                    }
+                    sum
                 } else {
-                    (-3.0 * ref_xic[i - 2].1
-                        + 12.0 * ref_xic[i - 1].1
-                        + 17.0 * ref_xic[i].1
-                        + 12.0 * ref_xic[i + 1].1
-                        + -3.0 * ref_xic[i + 2].1)
-                        / 35.0
-                }
+                    0.0
+                };
+
+                (bp, corr_sum)
             })
-            .map(|v| v.max(0.0)) // SG can produce negative values; clamp to zero
-            .collect();
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap();
 
-        // Correlate each fragment XIC against the smoothed reference
-        let mut coelution_sum = 0.0f64;
-        let mut n_positive = 0u32;
-
-        for (xic_idx, (_frag_idx, xic)) in xics.iter().enumerate() {
-            if xic_idx == ref_idx {
-                // Reference auto-correlates perfectly — count it as 1.0
-                coelution_sum += 1.0;
-                n_positive += 1;
-                continue;
-            }
-
-            let xic_values: Vec<f64> = xic.iter().map(|(_, v)| *v).collect();
-            let corr = super::pearson_correlation_raw(&xic_values, &smoothed_ref);
-
-            if corr > 0.0 {
-                coelution_sum += corr;
-                n_positive += 1;
-            }
+        let coelution_sum = best.1;
+        if coelution_sum < min_corr_score {
+            return None;
         }
 
-        if n_positive < 2 {
-            return None; // Need at least 2 co-eluting fragments
-        }
+        let ref_start = best.0.start_index;
+        let ref_end = best.0.end_index;
 
-        // Detect peak on reference XIC using DIA-NN-style valley detection.
-        // This gives us apex, boundaries, and SNR in one step.
-        let expected_rt = entry.retention_time; // Use library RT as hint
-        let peak = osprey_chromatography::detect_xic_peak(ref_xic, 0.01, 5.0, Some(expected_rt))?;
+        // Apex is the highest-intensity point within the peak boundaries
+        let (apex_idx, _apex_val) = ref_xic[ref_start..=ref_end]
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+            .map(|(i, &(_, v))| (ref_start + i, v))
+            .unwrap_or((best.0.apex_index, 0.0));
+        let apex_rt = ref_xic[apex_idx].0;
+        let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+        let signal_to_noise =
+            osprey_chromatography::compute_snr(&raw_ints, apex_idx, ref_start, ref_end);
 
-        let apex_rt = peak.apex_rt;
-        let signal_to_noise = peak.signal_to_noise;
+        // Peak width from boundaries (in minutes)
+        let peak_width_minutes = ref_xic[ref_end].0 - ref_xic[ref_start].0;
 
         // Find the spectrum closest to apex for mass errors and scan number
         let apex_spec_local_idx = candidate_spectra
@@ -2640,6 +2669,13 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             fragment_tolerance.unit,
         );
 
+        // 4. XCorr at apex (using appropriate HRAM or unit resolution binning)
+        let xcorr_at_apex = if let Some(scorer) = xcorr_scorer {
+            scorer.xcorr(apex_spec, entry).xcorr
+        } else {
+            0.0
+        };
+
         Some(CalibrationMatch {
             entry_id: entry.id,
             is_decoy: entry.is_decoy,
@@ -2653,7 +2689,7 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             avg_ms2_error,
             n_matched_fragments: n_matched,
             n_library_fragments: entry.fragments.len(),
-            xcorr_score: 0.0,
+            xcorr_score: xcorr_at_apex,
             evalue: 0.0,
             isotope_cosine_score,
             sequence: entry.sequence.clone(),
@@ -2669,6 +2705,7 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             top6_matched_apex,
             hyperscore_apex: hyperscore_result.score,
             signal_to_noise,
+            peak_width_minutes: Some(peak_width_minutes),
             discriminant_score: coelution_sum, // Initially use correlation, will be replaced by LDA
             posterior_error: 0.0,              // Will be filled by LDA
             q_value: 1.0,                      // Will be filled by LDA
@@ -2703,7 +2740,11 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
                     .iter()
                     .enumerate()
                     .filter(|(_, spec)| {
-                        let rt_diff = (spec.retention_time - entry.retention_time).abs();
+                        let expected_rt = match expected_rt_fn {
+                            Some(f) => f(entry.retention_time),
+                            None => entry.retention_time,
+                        };
+                        let rt_diff = (spec.retention_time - expected_rt).abs();
                         if rt_diff > rt_tolerance {
                             return false;
                         }

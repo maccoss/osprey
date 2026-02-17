@@ -276,7 +276,7 @@ let xcorr = exp_view.dot(&lib_view) * 0.005;
 
 ### Feature Extraction XCorr (O(n_fragments) optimization)
 
-During post-regression feature extraction, XCorr is computed using an O(n_fragments) shortcut. Since the theoretical spectrum has unit intensities at fragment bin positions, the dot product reduces to summing the preprocessed experimental values at those positions:
+During feature extraction, XCorr is computed using an O(n_fragments) shortcut. Since the theoretical spectrum has unit intensities at fragment bin positions, the dot product reduces to summing the preprocessed experimental values at those positions:
 
 ```rust
 // O(n_fragments) instead of O(n_bins)
@@ -296,7 +296,7 @@ This avoids creating a dense theoretical vector and is faster when n_fragments <
 
 Calibration XCorr always uses **unit resolution bins** (2001 bins, 1.0005 Da) regardless of whether the data is unit resolution or HRAM. This provides ~50x faster scoring for HRAM data while maintaining sufficient discriminating power for calibration.
 
-HRAM-resolution bins (0.02 Da, 100K bins) are only used for the ridge regression phase (Phase 3), not for calibration.
+HRAM-resolution bins (0.02 Da, 100K bins) are used during the main search phase (Phase 3) for fragment matching, not for calibration XCorr.
 
 ## Comparison: XCorr vs LibCosine
 
@@ -306,7 +306,7 @@ HRAM-resolution bins (0.02 Da, 100K bins) are only used for the ridge regression
 | **Normalization** | Window max=50 | L2 normalization |
 | **Matching** | Bin position lookup | ppm tolerance matching |
 | **Score range** | 0-10 typical | 0-1 (cosine similarity) |
-| **Used in** | Calibration (all spectra) + feature extraction | Post-regression feature extraction only |
+| **Used in** | Calibration (all spectra) + feature extraction | Feature extraction only |
 | **Library intensity** | Ignored (unit=1.0) | sqrt-transformed |
 
 ## Example
