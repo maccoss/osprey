@@ -4,25 +4,202 @@ Osprey uses a multi-stage peak detection system that operates on fragment ion ch
 
 ## Overview
 
-Osprey uses **DIA-NN-style XIC peak detection** (`detect_xic_peak()`) with smoothed apex finding, valley-based boundary detection, and asymmetric FWHM capping. This is complemented by **Tukey median polish**, which decomposes fragment XIC matrices to produce robust elution profiles and refined peak boundaries.
+Osprey's primary peak detection method is **CWT (Continuous Wavelet Transform) consensus peak detection** — a multi-transition approach that convolves each fragment XIC with a Mexican Hat wavelet, then takes the pointwise median across all transitions to produce a consensus signal. Peaks are detected in the consensus signal, which is naturally robust to single-fragment interference.
+
+CWT consensus is complemented by **Tukey median polish**, which decomposes the fragment XIC matrix into additive components for robust scoring features and peak boundary refinement.
 
 ```
 Peak Detection Pipeline
 ────────────────────────
 
-  Fragment XICs → pairwise correlation → reference XIC (best-correlated fragment)
-  Reference XIC → detect_xic_peak()   → apex, boundaries, area, S/N
-  Fragment XICs → Tukey median polish  → refined FWHM boundaries
-                                      → scoring features
+  Fragment XICs → Mexican Hat wavelet convolution (per fragment)
+                → Pointwise median (consensus CWT signal)
+                → Local maxima → peak apices
+                → Zero-crossings ±2σ extension (with valley guard) → boundaries
+                → Reference signal (sum of raw XICs) → area, S/N
+
+  Fragment XICs → Tukey median polish → scoring features
+                                      → peak boundaries (blib output)
 ```
 
 ---
 
-## XIC Peak Detection
+## CWT Consensus Peak Detection
+
+### Motivation
+
+The challenge in DIA peak detection is distinguishing true co-eluting fragment signals from interference caused by co-isolated peptides. Individual fragment XICs may contain interfering peaks from other peptides. A multi-transition consensus approach — where a peak is only called if the **majority** of fragments simultaneously show peak-like shapes — naturally rejects single-fragment interference.
+
+The Mexican Hat wavelet is a natural matched filter for Gaussian-like chromatographic peaks: it responds positively to peak shapes and negatively to flat or monotonic regions. Taking the pointwise median of CWT coefficients across fragments means the consensus is only high where most fragments agree.
+
+### Algorithm: `detect_cwt_consensus_peaks()`
+
+```
+detect_cwt_consensus_peaks(xics, min_consensus_height)
+
+  Step 1: Estimate scale parameter (σ) from fragment XICs
+  Step 2: Generate Mexican Hat wavelet kernel
+  Step 3: Convolve each fragment XIC with the kernel
+  Step 4: Compute pointwise median consensus across all transitions
+  Step 5: Find local maxima in consensus signal
+  Step 6: Define boundaries via zero-crossings with ±2σ extension
+  Step 7: Compute area and S/N from reference signal (sum of raw XICs)
+```
+
+#### Step 1: Scale Estimation
+
+The CWT scale parameter (σ) controls which peak widths the wavelet is tuned to detect. Osprey estimates σ from the data:
+
+```
+estimate_cwt_scale(xics):
+  For each fragment XIC with detectable signal:
+    Find apex and measure FWHM via linear interpolation at half-maximum
+  sigma = median(FWHM values) / 2.355    (Gaussian: FWHM = 2.355σ)
+  Clamp to [2.0, 20.0] scan units
+  Fallback: 4.0 scans if no FWHM can be estimated
+```
+
+#### Step 2: Mexican Hat Wavelet Kernel
+
+The Mexican Hat (Ricker) wavelet is the negative normalized second derivative of a Gaussian:
+
+```
+ψ(t) = (2 / sqrt(3σ) π^(1/4)) × (1 - (t/σ)²) × exp(-t²/(2σ²))
+```
+
+Properties:
+- **Positive center, negative tails**: Responds positively to peaks, negatively to flanking regions
+- **Zero-mean**: After discretization, a DC offset correction ensures zero response to constant signals
+- **Symmetric**: Equal sensitivity to leading and trailing edges
+- **Kernel radius**: `ceil(5σ)` points on each side, capturing >99.99% of wavelet energy
+
+#### Step 3: Wavelet Convolution
+
+Each fragment XIC is convolved independently with the Mexican Hat kernel using direct "same"-size convolution (zero-padded at edges). The output length equals the input length.
+
+Direct convolution is O(N×K) per fragment, but with typical XIC lengths (30-200 scans) and kernel sizes (11-51 points), this is trivially fast.
+
+#### Step 4: Pointwise Median Consensus
+
+At each scan position, the median CWT coefficient across all fragments is computed:
+
+```
+For each scan s:
+  consensus[s] = median(cwt_coeffs[f][s] for f in 0..n_fragments)
+```
+
+The **median** (not mean) is the key to interference rejection:
+- If 5/6 fragments have a peak shape at scan s, the median is positive
+- If only 1/6 fragments has interference at scan s, the median suppresses it
+- A peak must be supported by the **majority** of transitions to survive
+
+#### Step 5: Apex Detection
+
+Local maxima in the consensus signal above `min_consensus_height` are identified:
+- Interior: `consensus[i] > consensus[i-1]` AND `consensus[i] > consensus[i+1]`
+- Endpoints checked as potential maxima
+- Sorted by consensus coefficient descending (strongest peaks first)
+
+#### Step 6: Boundary Extension (±2σ with Valley Guard)
+
+Peak boundaries are determined in two stages:
+
+**Stage 1 — Zero-crossings (±σ):**
+Walk outward from the apex to where the consensus signal crosses zero. For a Gaussian peak, zero-crossings occur at approximately ±σ from the apex, capturing ~68% of the peak area.
+
+**Stage 2 — Extend to ±2σ (~95% coverage):**
+The zero-crossing distance gives an asymmetric estimate of σ (left_σ = apex - left_zc, right_σ = right_zc - apex). Boundaries are extended to ±2σ for ~95% Gaussian area coverage:
+
+```
+target_start = apex - 2 × left_σ
+target_end   = apex + 2 × right_σ
+```
+
+**Valley guard:** During extension beyond the zero-crossing, the raw reference signal (sum of fragment intensities) is monitored. If the signal rises more than 5% of the apex value above a running minimum, we've entered a neighboring peak — stop at the valley minimum:
+
+```
+Extend left from zero-crossing toward target_start:
+  Track running_min of raw reference signal
+  If ref_signal[i] - running_min > 0.05 × apex_intensity:
+    Stop at valley minimum (running_min position)
+  Otherwise: continue extending
+
+Extend right: symmetric procedure
+```
+
+The valley guard prevents the ±2σ extension from bleeding into adjacent peaks while still capturing the full width of isolated peaks.
+
+```
+Consensus CWT Signal
+  |
+  |           ╭──╮
+  |          ╱    ╲
+  |    ─────╱      ╲─────────    ← zero line
+  |        ╱ˉˉˉˉˉˉˉˉ╲
+  |       ╱            ╲
+  +──|──|──|────|────|──|──|──→ scan index
+     ^  ^  ^    ^    ^  ^  ^
+     |  |  zc   apex zc |  |
+     |  |               |  |
+     |  target          target
+     |  (2σ)            (2σ)
+     valley guard
+     stopped here
+```
+
+#### Step 7: Area and S/N from Reference Signal
+
+The consensus CWT coefficients are used only for peak detection and boundary definition. Quantitative measures come from the **reference signal** (sum of raw fragment XIC intensities):
+
+- **Apex**: The maximum of the reference signal within the boundary region
+- **Area**: Trapezoidal integration of the reference signal within boundaries
+- **S/N**: Computed from 5 flanking points on each side of the peak in the reference signal
+
+### Output
+
+```rust
+pub struct XICPeakBounds {
+    pub apex_rt: f64,           // Peak apex time (minutes)
+    pub apex_intensity: f64,    // Intensity at apex (from reference signal)
+    pub apex_index: usize,      // Index in XIC array
+    pub start_rt: f64,          // Start boundary time
+    pub end_rt: f64,            // End boundary time
+    pub start_index: usize,     // Index at start boundary
+    pub end_index: usize,       // Index at end boundary
+    pub area: f64,              // Trapezoidal area within boundaries
+    pub signal_to_noise: f64,   // Background-subtracted S/N
+}
+```
+
+### Fallback Chain
+
+If CWT consensus finds no peaks (e.g., too few fragments, very low signal), Osprey falls back to simpler methods:
+
+```
+Priority:
+  1. CWT consensus peak detection (multi-transition)
+  2. Tukey median polish elution profile peak detection (detect_all_xic_peaks)
+  3. Reference XIC peak detection (detect_all_xic_peaks on best-correlated fragment)
+```
+
+The fallback uses `detect_all_xic_peaks()`, which applies Savitzky-Golay smoothing, valley-based boundary detection, and asymmetric FWHM capping on a single signal.
+
+### Where CWT Is Used
+
+CWT consensus peak detection is used in both search phases:
+
+| Phase | File | Purpose |
+|-------|------|---------|
+| Calibration | `osprey-scoring/src/batch.rs` | Peak detection for calibration matches |
+| Main search | `osprey/src/pipeline.rs` | Peak detection for all precursors |
+
+---
+
+## Legacy: SG-Smoothed Peak Detection
 
 ### Algorithm: `detect_xic_peak()`
 
-The primary peak detector used for fragment XICs and calibration scoring. Combines smoothing, adaptive apex finding, valley-based boundary detection, and asymmetric FWHM capping.
+Used as a fallback when CWT consensus finds no peaks, and as the underlying detector in `detect_all_xic_peaks()`. Combines smoothing, adaptive apex finding, valley-based boundary detection, and asymmetric FWHM capping.
 
 ```
 detect_xic_peak(xic, min_height, peak_boundary, expected_rt)
@@ -47,8 +224,6 @@ Short series (< 5 points): returned unsmoothed
 Clamping: negative values from the filter are clamped to zero
 ```
 
-The SG quadratic filter fits a local parabola at each point, preserving peak position and shape better than triangular or moving average kernels. It is the same filter used in calibration coelution scoring (`batch.rs`).
-
 #### Step 2: Apex Finding
 
 ```
@@ -60,8 +235,6 @@ find_apex(smoothed, min_height, expected_rt, xic):
   3. Otherwise: return global maximum
 ```
 
-Using the nearest-to-expected-RT strategy ensures the correct peak is selected when multiple chromatographic peaks are present (e.g., from co-eluting interferences).
-
 #### Step 3: Valley-Based Boundary Detection
 
 Two independent boundary walks from the apex, each stopping at the earlier of:
@@ -72,41 +245,9 @@ Two independent boundary walks from the apex, each stopping at the earlier of:
    - `< 50%` of apex intensity
    - `< 50%` of the neighboring rising peak
 
-```
-Walk left from apex:
-  For i = apex-1 down to 0:
-    If smoothed[i] < threshold → stop (threshold boundary)
-    If smoothed[i] < smoothed[i-1]:  # valley detected
-      If smoothed[i] < 0.5 * apex AND smoothed[i] < 0.5 * smoothed[i-1]:
-        → stop (valley boundary)
-
-Walk right from apex: (symmetric, scanning right)
-```
-
-Valley detection prevents over-extension into adjacent peaks by recognizing the saddle point between two overlapping peaks.
-
 #### Step 4: Asymmetric FWHM Capping
 
-**Problem**: Chromatographic tailing (slow exponential decay on the trailing edge) causes valley detection to extend too far because the tail decays slowly but never reaches a valley or the 20% threshold.
-
-**Solution**: Compute separate left and right half-widths at half-maximum, then cap boundaries at `2.0 x half_width`:
-
-```
-compute_asymmetric_half_widths(smoothed, xic, apex_idx):
-
-  half_max = smoothed[apex_idx] / 2.0
-
-  Scan left from apex to find where smoothed first crosses half_max:
-    Linear interpolate between bracketing points for exact crossing RT
-    left_half_width = apex_rt - crossing_rt
-
-  Scan right similarly:
-    right_half_width = crossing_rt - apex_rt
-
-  Return (left_half_width, right_half_width)
-```
-
-**Applying the cap** (factor = 2.0, chosen for ~98% Gaussian area coverage):
+Compute separate left and right half-widths at half-maximum, then cap boundaries at `2.0 × half_width`:
 
 ```
 If valley_start_rt < apex_rt - 2.0 * left_half_width:
@@ -116,22 +257,7 @@ If valley_end_rt > apex_rt + 2.0 * right_half_width:
   Tighten end_rt to apex_rt + 2.0 * right_half_width
 ```
 
-**Key insight**: Separate left/right half-widths naturally capture chromatographic tailing where `right_hw >> left_hw`. A symmetric FWHM would either over-extend the leading edge or under-capture the trailing edge.
-
-```
-Intensity
-  |       ╭──╮
-  |      ╱    ╲      ← Tailing peak: fast rise, slow decay
-  |     ╱      ╲╲
-  |    ╱        ╲╲╲
-  |───╱──────────╲╲╲╲───── valley too far right
-  |  ╱            ╲╲╲╲╲
-  +──|──|─────|──────|────→ RT
-     ^  ^     ^      ^
-     |  apex  |      valley boundary (too wide)
-     |        FWHM cap (2× right_hw)
-     FWHM cap (2× left_hw)
-```
+Separate left/right half-widths naturally capture chromatographic tailing where `right_hw >> left_hw`.
 
 #### Step 5: Signal-to-Noise
 
@@ -146,22 +272,6 @@ compute_snr(raw_intensities, apex_idx, start_idx, end_idx):
 
 Uses **raw (unsmoothed) intensities** for honest noise estimation.
 
-### Output
-
-```rust
-pub struct XICPeakBounds {
-    pub apex_rt: f64,           // Peak apex time (minutes)
-    pub apex_intensity: f64,    // Intensity at apex (smoothed)
-    pub apex_index: usize,      // Index in XIC array
-    pub start_rt: f64,          // Start boundary time
-    pub end_rt: f64,            // End boundary time
-    pub start_index: usize,     // Index at start boundary
-    pub end_index: usize,       // Index at end boundary
-    pub area: f64,              // Trapezoidal area within boundaries
-    pub signal_to_noise: f64,   // Background-subtracted S/N
-}
-```
-
 ### Parameters
 
 | Parameter | Default | Description |
@@ -175,7 +285,7 @@ pub struct XICPeakBounds {
 
 ## Tukey Median Polish
 
-After initial peak detection, Osprey uses Tukey median polish to decompose the fragment XIC matrix into additive components. This provides both refined peak boundaries and scoring features.
+After peak detection, Osprey uses Tukey median polish to decompose the fragment XIC matrix into additive components. This provides both scoring features and peak boundaries for the blib output.
 
 ### Mathematical Model
 
@@ -236,7 +346,7 @@ From Polish elution profile:
   3. Boundaries: [apex - 1.96σ, apex + 1.96σ]  (~95% Gaussian interval)
 ```
 
-These boundaries are used as **fragment peak bounds** in the blib output for Skyline. Skyline uses these per-file RT boundaries to define integration regions for quantification.
+These boundaries are used as **fragment peak bounds** in the blib output for Skyline.
 
 ### Scoring Features from Median Polish
 
@@ -248,11 +358,6 @@ Three features are extracted from the decomposition:
 | `median_polish_rsquared` | 1 - SS_residual/SS_total in sqrt space | How well does the additive model fit? Higher = cleaner co-elution. |
 | `median_polish_residual_ratio` | Σ\|obs - pred\| / Σ obs in linear space | Fraction of signal unexplained by model. Lower = better. |
 
-**R² computation details:**
-- Uses sqrt preprocessing (appropriate for Poisson-like count data)
-- Predicted values: `exp(μ + α_f + β_s)` converted to linear space, then sqrt
-- Zero observed cells contribute `sqrt(pred)²` to residual (penalizes hallucinated fragments)
-
 ---
 
 ## Data Flow
@@ -262,14 +367,13 @@ Peak detection operates on **fragment ion chromatograms** (XICs) extracted direc
 ```
 Fragment XIC Extraction
   → Extract top 6 fragment XICs within RT window (ppm tolerance)
-  → Compute pairwise Pearson correlations between all fragment pairs
 
-Reference XIC Selection
-  → Fragment with highest mean correlation = reference XIC
-
-Peak Detection on Reference XIC
-  → detect_xic_peak(reference_xic, expected_rt)
-  → Returns: apex, boundaries, area, S/N
+CWT Consensus Peak Detection
+  → Mexican Hat wavelet convolution (per fragment)
+  → Pointwise median consensus
+  → Local maxima → apex candidates
+  → ±2σ boundary extension (with valley guard) → boundaries
+  → Reference signal → area, S/N
 
 Feature Extraction (within peak boundaries)
   → Pairwise coelution features from fragment correlations
@@ -287,112 +391,24 @@ Feature Extraction (within peak boundaries)
 | `peak_area` | Integrated area within boundaries |
 | `peak_width` | end_rt - start_rt (minutes) |
 | `peak_symmetry` | Leading area / trailing area around apex (capped at 10.0) |
-| `signal_to_noise` | S/N from `detect_xic_peak()` |
+| `signal_to_noise` | S/N from peak detection |
 | `n_scans` | Number of spectrum points within peak boundaries |
 | `peak_sharpness` | Average absolute slope at peak edges (intensity/minute) |
-
-### Peak Symmetry
-
-```
-peak_symmetry = left_area / right_area
-
-Where:
-  left_area  = trapezoidal area from start_index to apex_index
-  right_area = trapezoidal area from apex_index to end_index
-```
-
-- Symmetric peak: ~1.0
-- Fronting peak: < 1.0
-- Tailing peak: > 1.0 (capped at 10.0)
-
-### Peak Sharpness
-
-```
-left_slope  = (apex_intensity - start_intensity) / (apex_rt - start_rt)
-right_slope = (apex_intensity - end_intensity) / (end_rt - apex_rt)
-peak_sharpness = (|left_slope| + |right_slope|) / 2
-```
-
-Steeper slopes indicate a sharper, better-defined peak. Broad, noisy peaks have low sharpness.
-
----
-
-## Fragment Co-Elution Analysis
-
-After peak detection determines the integration boundaries, fragment co-elution features are computed **within the peak region only**:
-
-Pairwise correlations between fragment XICs:
-
-```
-For each pair of top 6 fragment XICs (within peak window):
-  Compute Pearson correlation
-Per-fragment: average correlation with all other fragments
-Return: sum, min, max, n_coeluting, n_pairs, per-fragment averages
-```
 
 ---
 
 ## Peak Boundaries for Blib Output
 
-The final peak boundaries written to the blib file for Skyline come from **Tukey median polish** (when successful) or fall back to the initial detection boundaries:
+The final peak boundaries written to the blib file for Skyline come from **Tukey median polish** (when successful) or fall back to the CWT detection boundaries:
 
 ```
 Priority:
   1. Tukey median polish FWHM → σ = FWHM/2.355, boundaries = apex ± 1.96σ
-  2. detect_xic_peak() boundaries (valley detection + FWHM capping)
+  2. CWT consensus boundaries (zero-crossing ±2σ with valley guard)
+  3. detect_xic_peak() boundaries (valley detection + FWHM capping)
 ```
 
 **Important**: Do NOT use integrated area for quantification. XIC intensities are relative measures. Skyline handles quantification using the extracted ion chromatograms within the peak boundaries provided by Osprey.
-
----
-
-## Calibration Scoring
-
-During RT calibration discovery, the same XIC peak detection is used to score calibration matches:
-
-```
-run_coelution_calibration_scoring():
-  For each sampled library entry:
-    Extract top-6 fragment XICs from candidate spectra
-    Compute pairwise correlations
-    detect_xic_peak() on reference XIC → apex, boundaries, S/N
-    Score at apex: libcosine, hyperscore, mass errors
-    → CalibrationMatch with correlation_score, S/N, etc.
-```
-
-This provides the confident matches used for RT and mass calibration fitting.
-
----
-
-## Example
-
-```
-Peptide: PEPTIDEK (charge 2+)
-Library RT: 25.3 min
-Expected RT: 24.8 min
-
-Fragment XICs extracted (top 6 by library intensity):
-  y5+1, y6+1, y7+1, b3+1, b4+1, y4+1
-
-Pairwise correlations:
-  y5-y6: 0.95, y5-y7: 0.92, y6-y7: 0.94, ...
-  Reference XIC: y6+1 (highest mean correlation: 0.93)
-
-detect_xic_peak(reference_xic, expected_rt=24.8):
-  Smoothing: [0.25, 0.5, 0.25] kernel
-  Apex: RT=24.9, intensity=4500 (nearest local max to 24.8)
-  Valley walk: start=24.1, end=25.8
-  FWHM cap: left_hw=0.35, right_hw=0.45
-    → cap_start = 24.9 - 0.70 = 24.2 (no change, valley tighter)
-    → cap_end   = 24.9 + 0.90 = 25.8 (no change, valley matches)
-  Final boundaries: [24.1, 25.8]
-  SNR: 12.5
-
-Features:
-  peak_apex: 4500, peak_area: 28500, peak_width: 1.7 min
-  peak_symmetry: 0.85, n_scans: 14, peak_sharpness: 3200
-  signal_to_noise: 12.5
-```
 
 ---
 
@@ -403,27 +419,47 @@ A peptide may have multiple peaks due to:
 - **False positive signals** from co-eluting peptides with similar spectra
 - **Peak splitting** from chromatographic artifacts
 
-`detect_xic_peak()` selects the local maximum nearest to the expected RT. If no peak meets the minimum height threshold, the peptide is not reported.
+CWT consensus returns all detected peaks sorted by consensus coefficient descending. The best peak candidate closest to the expected RT is selected. If no peak meets the minimum height threshold, the peptide is not reported.
 
 ---
 
 ## Testing
 
-Test coverage in `crates/osprey-chromatography/src/lib.rs`:
+Test coverage:
+
+### CWT tests (`crates/osprey-chromatography/src/cwt.rs`)
 
 | Test | Description |
 |------|-------------|
-| `test_peak_detector` | Simple Gaussian peak detection via threshold-crossing |
+| `test_kernel_zero_mean` | Mexican Hat kernel sums to zero |
+| `test_kernel_symmetric` | Kernel is symmetric around center |
+| `test_kernel_positive_center_negative_tails` | Correct wavelet shape |
+| `test_kernel_size` | Kernel length = 2 × radius + 1 |
+| `test_convolve_same_length` | Output length equals input length |
+| `test_convolve_delta_function` | Delta convolved with kernel reproduces kernel |
+| `test_convolve_gaussian_response` | CWT of Gaussian is positive at center |
+| `test_estimate_scale_known_peak` | Scale estimation from known FWHM |
+| `test_estimate_scale_fallback` | Falls back to 4.0 for all-zero XICs |
+| `test_consensus_single_gaussian_peak` | Finds peak with correct apex and boundaries |
+| `test_consensus_interference_rejection` | Median suppresses single-fragment interference |
+| `test_consensus_two_separated_peaks` | Resolves two peaks at different RTs |
+| `test_consensus_degenerate_single_xic` | Returns empty for < 2 XICs |
+| `test_consensus_degenerate_short_xic` | Returns empty for < 5 scans |
+| `test_consensus_all_zero` | Returns empty for no signal |
+| `test_consensus_peak_bounds_valid` | Boundaries are ordered and within array |
+| `test_consensus_noise_robustness` | Finds correct peak despite noise |
+
+### Legacy peak detection tests (`crates/osprey-chromatography/src/lib.rs`)
+
+| Test | Description |
+|------|-------------|
+| `test_peak_detector` | Simple Gaussian peak detection |
 | `test_find_best_peak` | Peak selection within RT tolerance |
-| `test_fwhm_cap_symmetric_peak` | Symmetric peak: FWHM cap should not tighten boundaries |
-| `test_fwhm_cap_tailing_peak` | Tailing peak: FWHM cap tightens trailing boundary |
-| `test_fwhm_cap_preserves_valley` | Adjacent peaks: valley boundary preserved (not capped) |
+| `test_fwhm_cap_symmetric_peak` | FWHM cap does not tighten symmetric peaks |
+| `test_fwhm_cap_tailing_peak` | FWHM cap tightens trailing boundary |
+| `test_fwhm_cap_preserves_valley` | Valley boundary preserved |
 | `test_fwhm_cap_fallback` | Graceful fallback when FWHM cannot be computed |
 | `test_asymmetric_half_widths` | Half-width computation for asymmetric peaks |
-
-Test helpers generate synthetic data:
-- `make_gaussian_xic(center, sigma, n)`: N(center, sigma) peak
-- `make_tailing_xic(center, sigma, tail_factor, n)`: Gaussian rise + exponential decay
 
 ---
 
@@ -431,7 +467,8 @@ Test helpers generate synthetic data:
 
 | File | Purpose |
 |------|---------|
-| `crates/osprey-chromatography/src/lib.rs` | `PeakDetector::detect()`, `find_best_peak()`, `detect_xic_peak()`, `smooth_weighted_avg()`, `find_apex()`, `walk_boundary_left/right()`, `compute_asymmetric_half_widths()`, `compute_snr()`, `compute_fwhm_interpolated()` |
+| `crates/osprey-chromatography/src/cwt.rs` | `detect_cwt_consensus_peaks()`, `mexican_hat_kernel()`, `estimate_cwt_scale()`, `convolve_same()` |
+| `crates/osprey-chromatography/src/lib.rs` | `PeakDetector::detect()`, `detect_xic_peak()`, `detect_all_xic_peaks()`, `smooth_weighted_avg()`, `find_apex()`, `walk_boundary_left/right()`, `compute_asymmetric_half_widths()`, `compute_snr()` |
 | `crates/osprey-core/src/types.rs` | `PeakBoundaries`, `PeakQuality`, `XICPeakBounds` structs |
-| `crates/osprey-scoring/src/lib.rs` | `tukey_median_polish()`, `TukeyMedianPolishResult`, `compute_fragment_coelution()`, `FeatureExtractor`, scoring features from peak shape |
+| `crates/osprey-scoring/src/lib.rs` | `tukey_median_polish()`, `TukeyMedianPolishResult`, `compute_fragment_coelution()`, scoring features from peak shape |
 | `crates/osprey/src/pipeline.rs` | Peak detection calls in coelution pipeline, Tukey median polish integration, boundary propagation to blib output |

@@ -20,7 +20,9 @@ Osprey has a **working prototype** that can:
 | [Calibration](calibration.md) | RT, MS1, and MS2 calibration with LDA scoring and LOESS fitting |
 | [Spectral Scoring](spectral-scoring.md) | XCorr + E-value scoring (calibration phase) |
 | [XCorr Scoring](xcorr-scoring.md) | Comet-style XCorr implementation |
-| [Peak Detection](peak-detection.md) | Chromatographic peak detection in fragment XIC time series |
+| [Peak Detection](peak-detection.md) | CWT consensus peak detection in fragment XIC time series |
+| [Multi-Charge Consensus](composite-peak-selection.md) | Cross-charge-state peak boundary sharing |
+| [Determinism](determinism.md) | Deterministic analysis: patterns, invariants, and maintenance |
 | [Decoy Generation](decoy-generation.md) | Enzyme-aware sequence reversal for FDR control |
 | [FDR Control](fdr-control.md) | Two-level FDR: native Percolator, Mokapot, and simple TDC |
 | [BiblioSpec Output Schema](blib-output-schema.md) | blib output format and Skyline integration |
@@ -58,9 +60,9 @@ PHASE 2: CALIBRATION DISCOVERY (first file only)
   v
 PHASE 3: COELUTION SEARCH
   +- Extract fragment XICs per precursor within RT window
-  +- Compute pairwise correlations between fragment XICs
-  +- Build reference XIC (best-correlated fragment)
-  +- Peak detection on reference XIC -> apex, boundaries
+  +- CWT consensus peak detection (Mexican Hat wavelet, median across transitions)
+  +- Fallback: median polish profile or reference XIC peak detection
+  +- Peak boundaries: zero-crossings ±2σ (valley guard)
   |
   v
 PHASE 4: COELUTION SCORING (45 features)
@@ -68,6 +70,7 @@ PHASE 4: COELUTION SCORING (45 features)
   +- Peak shape features (apex, area, width, symmetry, S/N)
   +- Spectral matching at apex (hyperscore, xcorr, dot products)
   +- Tukey median polish on fragment XICs
+  +- Multi-charge consensus: all charge states of same peptide share peak boundaries
   +- FDR control (Percolator SVM or Mokapot) -> q-values
   |
   v
@@ -270,11 +273,10 @@ The coelution search extracts fragment XICs directly from the DIA data and score
 For each precursor within the RT window:
 
 1. **Fragment XIC extraction**: Extract chromatograms for each library fragment ion at the expected m/z (ppm tolerance)
-2. **Pairwise correlation**: Compute Pearson correlations between all pairs of fragment XICs. Fragments from the same peptide should co-elute
-3. **Reference XIC**: Select the fragment with highest mean correlation as the reference chromatogram
-4. **Peak detection**: Find the elution peak in the reference XIC
-5. **Spectral scoring**: At the apex scan, score the observed spectrum against the library (hyperscore, xcorr, dot products)
-6. **Tukey median polish**: Decompose fragment XIC matrix for robust peak boundaries and scoring features
+2. **CWT consensus peak detection**: Convolve each fragment XIC with a Mexican Hat wavelet, compute pointwise median across transitions, find peaks in consensus signal. Boundaries via zero-crossings extended to ±2σ with valley guard. See [Peak Detection](peak-detection.md).
+3. **Spectral scoring**: At the apex scan, score the observed spectrum against the library (hyperscore, xcorr, dot products)
+4. **Tukey median polish**: Decompose fragment XIC matrix for robust scoring features and blib peak boundaries
+5. **Multi-charge consensus**: After all windows are processed, all charge states of the same peptide are forced to share the same peak RT and integration boundaries. See [Multi-Charge Consensus](composite-peak-selection.md).
 
 ---
 
@@ -284,7 +286,7 @@ After the main search, Osprey computes scoring features per precursor from fragm
 
 ### Step 1: Peak Detection
 
-XIC peak detection (`detect_xic_peak()`) uses smoothed apex finding, DIA-NN-style valley-based boundary detection, and asymmetric FWHM capping on the reference XIC.
+CWT consensus peak detection uses Mexican Hat wavelet convolution of each fragment XIC, pointwise median across transitions, and ±2σ boundary extension with valley guard. Falls back to SG-smoothed peak detection if CWT finds no peaks.
 
 See: [Peak Detection](peak-detection.md)
 
@@ -328,6 +330,7 @@ See: [FDR Control](fdr-control.md)
 | Aspect | Calibration (Phase 2) | Main Search (Phase 3-4) |
 |--------|----------------------|---------------------------|
 | **Purpose** | Establish RT/mass calibration | Determine peptide detections |
+| **Peak detection** | CWT consensus (with fallback) | CWT consensus (with fallback) |
 | **Method** | XCorr + E-value | Coelution search |
 | **Features** | E-value only | 45 features |
 | **FDR method** | Target-decoy on LDA score | Semi-supervised SVM (Percolator/Mokapot) |
@@ -380,7 +383,8 @@ osprey/
 |   +-- pipeline/             # Streaming pipeline components
 |
 +-- osprey-chromatography/    # Chromatographic analysis
-|   +-- lib.rs                # PeakDetector
+|   +-- lib.rs                # PeakDetector, detect_xic_peak (legacy fallback)
+|   +-- cwt.rs                # CWT consensus peak detection (Mexican Hat wavelet)
 |   +-- calibration/          # LOESS RT calibration, mass calibration, I/O
 |
 +-- osprey-fdr/               # FDR control

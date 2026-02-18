@@ -292,6 +292,55 @@ Final scores:
   Isotope cosine: 0.998
 ```
 
+## Main Search Scoring (Phase 3-4)
+
+The main search uses a fundamentally different scoring approach than calibration. Instead of XCorr with E-value, the main search uses **fragment XIC co-elution analysis** with 45 features.
+
+### Peak Detection
+
+The main search uses **CWT consensus peak detection** to find peaks in fragment XICs. See [Peak Detection](peak-detection.md) for details.
+
+### Spectral Scores at Apex (15 features)
+
+At the detected peak apex, library fragments are matched against the observed spectrum. All intensity-based scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks.
+
+| Score | Description |
+|-------|-------------|
+| `hyperscore` | X!Tandem-style hyperscore |
+| `xcorr` | Comet-style cross-correlation (same as calibration, but at coelution-detected apex) |
+| `dot_product` | Library cosine with sqrt intensity preprocessing |
+| `dot_product_smz` | Library cosine with sqrt(intensity) * mz^2 preprocessing |
+| `dot_product_top6/5/4` | Library cosine using only top N fragments |
+| `dot_product_smz_top6/5/4` | SMZ cosine using only top N fragments |
+| `fragment_coverage` | Fraction of library fragments matched |
+| `sequence_coverage` | Fraction of peptide backbone covered by b/y ions |
+| `consecutive_ions` | Longest consecutive b or y ion series |
+| `explained_intensity` | Fraction of observed intensity explained by matches |
+| `elution_weighted_cosine` | LibCosine at each scan within peak, weighted by reference XIC intensity^2, averaged |
+
+### Co-Elution Features (11 features)
+
+Pairwise Pearson correlations between fragment XICs within the peak boundaries:
+
+| Feature | Description |
+|---------|-------------|
+| `fragment_coelution_sum` | Sum of all pairwise correlations |
+| `fragment_coelution_min` | Minimum pairwise correlation (worst pair) |
+| `fragment_coelution_max` | Maximum pairwise correlation (best pair) |
+| `n_coeluting_fragments` | Number of fragments with positive mean correlation |
+| `n_fragment_pairs` | Number of fragment pairs |
+| `fragment_corr_0..5` | Per-fragment average correlation with all other fragments |
+
+### Multi-Charge Consensus
+
+After the main search, all charge states of the same peptide are forced to share the same peak RT and integration boundaries. See [Multi-Charge Consensus](composite-peak-selection.md) for details.
+
+### Feature Computation
+
+All 45 features are computed via `compute_features_at_peak()`, a reusable function that takes a `FeatureComputeContext` (read-only references to library entry, XICs, spectra, calibration, etc.) and an `XICPeakBounds`. This function is called both during the initial per-precursor search and during multi-charge consensus re-scoring.
+
+---
+
 ## Notes
 
 1. **XCorr for everything**: XCorr is both the RT selection score and the primary calibration score
@@ -301,3 +350,4 @@ Final scores:
 5. **Isotope scoring**: Only available when MS1 spectra are present in the mzML file
 6. **LibCosine in main search**: LibCosine (ppm fragment matching) is used during feature extraction (Phase 4), not during calibration
 7. **Multiple scores**: All scores written to debug CSV for analysis
+8. **CWT peak detection**: Both calibration and main search use CWT consensus peak detection for finding peaks in fragment XICs

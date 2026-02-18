@@ -2732,6 +2732,642 @@ fn write_blib_output(
 
 /// Run coelution-based search for a single file.
 ///
+/// Context for computing coelution features at given peak boundaries.
+///
+/// Bundles read-only references needed by `compute_features_at_peak`, avoiding
+/// a function with 15+ parameters. Used both in the initial per-window scoring
+/// and in the multi-charge consensus re-scoring pass.
+struct FeatureComputeContext<'a> {
+    entry: &'a LibraryEntry,
+    xics: &'a [(usize, Vec<(f64, f64)>)],
+    ref_xic: &'a [(f64, f64)],
+    cand_spectra: &'a [&'a Spectrum],
+    cand_global: &'a [usize],
+    scorer: &'a SpectralScorer,
+    ms1_index: &'a MS1Index,
+    calibration: Option<&'a CalibrationParams>,
+    tol_da: f64,
+    tol_ppm: f64,
+    expected_rt: f64,
+    is_hram: bool,
+    file_name: &'a str,
+}
+
+/// Compute all coelution features and build a `CoelutionScoredEntry` at the
+/// specified peak boundaries.
+///
+/// Returns `None` if the peak has insufficient data (e.g. no pairwise
+/// correlations, no apex spectrum found).
+fn compute_features_at_peak(
+    ctx: &FeatureComputeContext,
+    peak: XICPeakBounds,
+) -> Option<CoelutionScoredEntry> {
+    use osprey_chromatography::calibration::calibrated_tolerance_ppm;
+    use osprey_scoring::{
+        compute_cosine_at_scan, compute_elution_weighted_cosine, compute_mass_accuracy,
+        median_polish_libcosine, median_polish_min_fragment_r2, median_polish_residual_correlation,
+        median_polish_residual_ratio, median_polish_rsquared, pearson_correlation_raw,
+        tukey_median_polish,
+    };
+
+    let entry = ctx.entry;
+    let xics = ctx.xics;
+    let ref_xic = ctx.ref_xic;
+    let cand_spectra = ctx.cand_spectra;
+    let cand_global = ctx.cand_global;
+
+    if peak.end_index <= peak.start_index + 1 {
+        return None;
+    }
+
+    // 1. Pairwise fragment correlations within peak boundaries
+    let n_xics = xics.len();
+    let peak_len = peak.end_index - peak.start_index + 1;
+
+    let xic_peak_values: Vec<Vec<f64>> = xics
+        .iter()
+        .map(|(_, xic)| {
+            xic[peak.start_index..=peak.end_index]
+                .iter()
+                .map(|(_, v)| *v)
+                .collect()
+        })
+        .collect();
+
+    let mut corr_sum = 0.0f64;
+    let mut corr_min = f64::INFINITY;
+    let mut corr_max = f64::NEG_INFINITY;
+    let mut n_pairs = 0u32;
+    let mut per_frag_corr_sum = vec![0.0f64; n_xics];
+    let mut per_frag_corr_count = vec![0u32; n_xics];
+
+    for i in 0..n_xics {
+        for j in (i + 1)..n_xics {
+            let r = pearson_correlation_raw(&xic_peak_values[i], &xic_peak_values[j]);
+            corr_sum += r;
+            if r < corr_min {
+                corr_min = r;
+            }
+            if r > corr_max {
+                corr_max = r;
+            }
+            n_pairs += 1;
+            per_frag_corr_sum[i] += r;
+            per_frag_corr_count[i] += 1;
+            per_frag_corr_sum[j] += r;
+            per_frag_corr_count[j] += 1;
+        }
+    }
+
+    if n_pairs == 0 {
+        return None;
+    }
+
+    let mut fragment_corr = [0.0f64; 6];
+    let mut n_coeluting = 0u8;
+    for i in 0..n_xics.min(6) {
+        if per_frag_corr_count[i] > 0 {
+            fragment_corr[i] = per_frag_corr_sum[i] / per_frag_corr_count[i] as f64;
+            if fragment_corr[i] > 0.0 {
+                n_coeluting += 1;
+            }
+        }
+    }
+
+    // 2. Find the spectrum closest to apex RT for spectral scoring
+    let apex_local_idx = cand_spectra
+        .iter()
+        .enumerate()
+        .min_by(|a, b| {
+            (a.1.retention_time - peak.apex_rt)
+                .abs()
+                .total_cmp(&(b.1.retention_time - peak.apex_rt).abs())
+        })
+        .map(|(i, _)| i)?;
+    let _apex_global_idx = cand_global[apex_local_idx];
+    let apex_spectrum = cand_spectra[apex_local_idx];
+
+    let spectral_score = ctx.scorer.xcorr(apex_spectrum, entry);
+
+    // 2b. SG-weighted spectral scores at apex ±2 scans
+    let sg_weights: [f64; 5] = [
+        -3.0 / 35.0,
+        12.0 / 35.0,
+        17.0 / 35.0,
+        12.0 / 35.0,
+        -3.0 / 35.0,
+    ];
+    let mut sg_xcorr = 0.0;
+    let mut sg_cosine = 0.0;
+    for (offset, &weight) in [-2i32, -1, 0, 1, 2].iter().zip(&sg_weights) {
+        let idx = apex_local_idx as i32 + offset;
+        if idx >= 0 && (idx as usize) < cand_spectra.len() {
+            let spec = cand_spectra[idx as usize];
+            sg_xcorr += ctx.scorer.xcorr_at_scan(spec, entry) * weight;
+            sg_cosine +=
+                compute_cosine_at_scan(&entry.fragments, spec, ctx.tol_da, ctx.tol_ppm) * weight;
+        }
+    }
+
+    // 3. Elution-weighted cosine
+    let elution_weighted_cosine = compute_elution_weighted_cosine(
+        &entry.fragments,
+        ref_xic,
+        cand_spectra,
+        ctx.tol_da,
+        ctx.tol_ppm,
+        peak.start_rt,
+        peak.end_rt,
+    );
+
+    // 4. Mass accuracy at apex
+    let frag_matches = ctx.scorer.match_fragments(apex_spectrum, entry);
+    let fragment_tolerance_unit = if ctx.tol_ppm > 0.0 {
+        ToleranceUnit::Ppm
+    } else {
+        ToleranceUnit::Mz
+    };
+    let (mass_mean, mass_abs_mean, mass_std) =
+        compute_mass_accuracy(&frag_matches, fragment_tolerance_unit);
+
+    // 5. RT deviation
+    let rt_dev = peak.apex_rt - ctx.expected_rt;
+
+    // 6. MS1 features (HRAM only)
+    let (ms1_coelution, ms1_isotope_cos) = if ctx.is_hram && !ctx.ms1_index.is_empty() {
+        let ms1_tol_ppm = ctx
+            .calibration
+            .map(|cal| calibrated_tolerance_ppm(&cal.ms1_calibration, 10.0))
+            .unwrap_or(10.0);
+        let search_mz = ctx
+            .calibration
+            .map(|cal| reverse_calibrate_mz(entry.precursor_mz, &cal.ms1_calibration))
+            .unwrap_or(entry.precursor_mz);
+
+        let mut ms1_coelution_val = 0.0;
+        let peak_rts: Vec<(f64, f64)> = ref_xic[peak.start_index..=peak.end_index].to_vec();
+        if peak_rts.len() >= 3 {
+            let mut ms1_intensities = Vec::with_capacity(peak_rts.len());
+            let mut ref_intensities = Vec::with_capacity(peak_rts.len());
+            for &(rt, ref_val) in &peak_rts {
+                if let Some(ms1) = ctx.ms1_index.find_nearest(rt) {
+                    let intensity = ms1
+                        .find_peak_ppm(search_mz, ms1_tol_ppm)
+                        .map(|(_, int)| int as f64)
+                        .unwrap_or(0.0);
+                    ms1_intensities.push(intensity);
+                    ref_intensities.push(ref_val);
+                }
+            }
+            if ms1_intensities.len() >= 3 {
+                ms1_coelution_val = pearson_correlation_raw(&ms1_intensities, &ref_intensities);
+            }
+        }
+
+        let mut iso_cos = 0.0;
+        if let Some(apex_ms1) = ctx.ms1_index.find_nearest(peak.apex_rt) {
+            let envelope = osprey_core::IsotopeEnvelope::extract(
+                apex_ms1,
+                search_mz,
+                entry.charge,
+                ms1_tol_ppm,
+            );
+            if envelope.has_m0() {
+                iso_cos =
+                    osprey_core::peptide_isotope_cosine(&entry.sequence, &envelope.intensities)
+                        .unwrap_or(0.0);
+            }
+        }
+
+        (ms1_coelution_val, iso_cos)
+    } else {
+        (0.0, 0.0)
+    };
+
+    // 7. Peak shape features
+    let peak_width = peak.end_rt - peak.start_rt;
+    let peak_symmetry = {
+        let left_slice = &ref_xic[peak.start_index..=peak.apex_index];
+        let right_slice = &ref_xic[peak.apex_index..=peak.end_index];
+        let left_area = trapezoidal_area(left_slice);
+        let right_area = trapezoidal_area(right_slice);
+        if right_area > 1e-10 {
+            (left_area / right_area).min(10.0)
+        } else {
+            1.0
+        }
+    };
+    let peak_sharpness = {
+        let left_edge = if peak.apex_index > peak.start_index {
+            let dt = peak.apex_rt - peak.start_rt;
+            if dt > 1e-10 {
+                (peak.apex_intensity - ref_xic[peak.start_index].1) / dt
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let right_edge = if peak.end_index > peak.apex_index {
+            let dt = peak.end_rt - peak.apex_rt;
+            if dt > 1e-10 {
+                (peak.apex_intensity - ref_xic[peak.end_index].1) / dt
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        (left_edge + right_edge) / 2.0
+    };
+
+    // 8. Median polish features
+    let (mp_cosine, mp_rsquared, mp_residual, mp_min_r2, mp_resid_corr) = {
+        let peak_xics: Vec<(usize, Vec<(f64, f64)>)> = xics
+            .iter()
+            .map(|(frag_idx, xic)| {
+                let peak_slice: Vec<(f64, f64)> = xic[peak.start_index..=peak.end_index].to_vec();
+                (*frag_idx, peak_slice)
+            })
+            .collect();
+
+        if let Some(ref mp) = tukey_median_polish(&peak_xics, 10, 0.01) {
+            let cos = median_polish_libcosine(mp, &entry.fragments);
+            let rsq = median_polish_rsquared(mp);
+            let res = median_polish_residual_ratio(mp);
+            let min_r2 = median_polish_min_fragment_r2(mp);
+            let resid_corr = median_polish_residual_correlation(mp);
+            (cos, rsq, res, min_r2, resid_corr)
+        } else {
+            (0.0, 0.0, 1.0, 0.0, 0.0)
+        }
+    };
+
+    // 9. Peptide properties
+    let mod_count = entry.modifications.len() as u8;
+    let pep_len = entry.sequence.len() as u8;
+    let missed_cleav = entry
+        .sequence
+        .chars()
+        .take(entry.sequence.len().saturating_sub(1))
+        .filter(|&c| c == 'K' || c == 'R')
+        .count() as u8;
+
+    // Fragment m/z and intensities from library for blib output
+    let frag_mzs: Vec<f64> = entry.fragments.iter().map(|f| f.mz).collect();
+    let frag_intensities: Vec<f32> = entry
+        .fragments
+        .iter()
+        .map(|f| f.relative_intensity)
+        .collect();
+
+    // Reference XIC within peak bounds for blib coefficient series
+    let ref_xic_peak: Vec<(f64, f64)> = ref_xic[peak.start_index..=peak.end_index].to_vec();
+
+    let features = CoelutionFeatureSet {
+        coelution_sum: corr_sum,
+        coelution_min: if corr_min.is_finite() { corr_min } else { 0.0 },
+        coelution_max: if corr_max.is_finite() { corr_max } else { 0.0 },
+        n_coeluting_fragments: n_coeluting,
+        n_fragment_pairs: n_pairs.min(255) as u8,
+        fragment_corr,
+        peak_apex: peak.apex_intensity,
+        peak_area: peak.area,
+        peak_width,
+        peak_symmetry,
+        signal_to_noise: peak.signal_to_noise,
+        n_scans: peak_len as u16,
+        peak_sharpness,
+        hyperscore: spectral_score.hyperscore,
+        xcorr: spectral_score.xcorr,
+        dot_product: spectral_score.lib_cosine,
+        dot_product_smz: spectral_score.lib_cosine_smz,
+        dot_product_top6: spectral_score.dot_product_top6,
+        dot_product_top5: spectral_score.dot_product_top5,
+        dot_product_top4: spectral_score.dot_product_top4,
+        dot_product_smz_top6: spectral_score.dot_product_smz_top6,
+        dot_product_smz_top5: spectral_score.dot_product_smz_top5,
+        dot_product_smz_top4: spectral_score.dot_product_smz_top4,
+        fragment_coverage: spectral_score.fragment_coverage,
+        sequence_coverage: spectral_score.sequence_coverage,
+        consecutive_ions: spectral_score.consecutive_ions as u8,
+        base_peak_rank: spectral_score.base_peak_rank as u8,
+        top6_matches: spectral_score.top6_matches as u8,
+        explained_intensity: spectral_score.explained_intensity,
+        elution_weighted_cosine,
+        mass_accuracy_mean: mass_mean,
+        abs_mass_accuracy_mean: mass_abs_mean,
+        mass_accuracy_std: mass_std,
+        rt_deviation: rt_dev,
+        abs_rt_deviation: rt_dev.abs(),
+        ms1_precursor_coelution: ms1_coelution,
+        ms1_isotope_cosine: ms1_isotope_cos,
+        modification_count: mod_count,
+        peptide_length: pep_len,
+        missed_cleavages: missed_cleav,
+        median_polish_cosine: mp_cosine,
+        median_polish_rsquared: mp_rsquared,
+        median_polish_residual_ratio: mp_residual,
+        sg_weighted_xcorr: sg_xcorr,
+        sg_weighted_cosine: sg_cosine,
+        median_polish_min_fragment_r2: mp_min_r2,
+        median_polish_residual_correlation: mp_resid_corr,
+    };
+
+    Some(CoelutionScoredEntry {
+        entry_id: entry.id,
+        is_decoy: entry.is_decoy,
+        sequence: entry.sequence.clone(),
+        modified_sequence: entry.modified_sequence.clone(),
+        charge: entry.charge,
+        precursor_mz: entry.precursor_mz,
+        protein_ids: entry.protein_ids.clone(),
+        scan_number: apex_spectrum.scan_number,
+        apex_rt: peak.apex_rt,
+        peak_bounds: peak,
+        features,
+        fragment_mzs: frag_mzs,
+        fragment_intensities: frag_intensities,
+        reference_xic: ref_xic_peak,
+        file_name: ctx.file_name.to_string(),
+        run_qvalue: 1.0,
+        experiment_qvalue: 1.0,
+        score: 0.0,
+        pep: 1.0,
+    })
+}
+
+/// Entry index + consensus RT boundaries (apex_rt, start_rt, end_rt).
+type RescoreTarget = (usize, f64, f64, f64);
+
+/// Multi-charge-state peak consensus: group scored entries by peptide and
+/// ensure all charge states share the same peak boundaries.
+///
+/// Returns `(kept_indices, rescore_targets)`:
+/// - `kept_indices`: indices of entries that already agree with the consensus
+///   (or are the only charge state for their peptide)
+/// - `rescore_targets`: entries that selected a different peak and need re-scoring
+fn select_consensus_peaks(entries: &[CoelutionScoredEntry]) -> (Vec<usize>, Vec<RescoreTarget>) {
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        groups.entry(&entry.modified_sequence).or_default().push(i);
+    }
+
+    let mut kept_indices: Vec<usize> = Vec::new();
+    let mut rescore_targets: Vec<RescoreTarget> = Vec::new();
+
+    for indices in groups.values() {
+        if indices.len() <= 1 {
+            // Single charge state — no consensus needed
+            kept_indices.extend(indices);
+            continue;
+        }
+
+        // Find the charge state with the highest coelution_sum — its peak
+        // boundaries define the consensus (most reliable detection)
+        let &best_idx = indices
+            .iter()
+            .max_by(|&&a, &&b| {
+                entries[a]
+                    .features
+                    .coelution_sum
+                    .total_cmp(&entries[b].features.coelution_sum)
+            })
+            .unwrap();
+
+        let consensus_apex = entries[best_idx].apex_rt;
+        let consensus_start = entries[best_idx].peak_bounds.start_rt;
+        let consensus_end = entries[best_idx].peak_bounds.end_rt;
+        let consensus_width = consensus_end - consensus_start;
+
+        // RT tolerance: half the consensus peak width (min 0.1 min)
+        let rt_match_tol = (consensus_width / 2.0).max(0.1);
+
+        for &idx in indices {
+            if idx == best_idx {
+                kept_indices.push(idx);
+            } else {
+                let apex_diff = (entries[idx].apex_rt - consensus_apex).abs();
+                if apex_diff <= rt_match_tol {
+                    // Already at the same peak — keep as-is
+                    kept_indices.push(idx);
+                } else {
+                    // Different peak — needs re-scoring at consensus boundaries
+                    rescore_targets.push((idx, consensus_apex, consensus_start, consensus_end));
+                }
+            }
+        }
+    }
+
+    (kept_indices, rescore_targets)
+}
+
+/// Re-score precursors at consensus peak boundaries.
+///
+/// For each entry in `rescore_targets`, extracts XICs from the appropriate
+/// isolation window and computes all features at the specified consensus
+/// RT boundaries. Returns `(original_index, Option<CoelutionScoredEntry>)`.
+#[allow(clippy::too_many_arguments)]
+fn rescore_at_consensus(
+    rescore_targets: &[RescoreTarget],
+    entries: &[CoelutionScoredEntry],
+    library: &[LibraryEntry],
+    spectra: &[Spectrum],
+    window_groups: &[((f64, f64), Vec<usize>)],
+    ms1_index: &MS1Index,
+    calibration: Option<&CalibrationParams>,
+    rt_calibration: Option<&RTCalibration>,
+    scorer: &SpectralScorer,
+    tol_da: f64,
+    tol_ppm: f64,
+    rt_tolerance: f64,
+    is_hram: bool,
+    file_name: &str,
+) -> Vec<(usize, Option<CoelutionScoredEntry>)> {
+    use osprey_chromatography::compute_snr;
+    use osprey_scoring::extract_fragment_xics;
+
+    rescore_targets
+        .iter()
+        .map(
+            |&(orig_idx, consensus_apex, consensus_start, consensus_end)| {
+                let orig_entry = &entries[orig_idx];
+
+                // Look up the library entry
+                let lib_entry = if (orig_entry.entry_id as usize) < library.len()
+                    && library[orig_entry.entry_id as usize].id == orig_entry.entry_id
+                {
+                    &library[orig_entry.entry_id as usize]
+                } else {
+                    // Fallback: search by id (decoys have id >= 0x80000000)
+                    match library.iter().find(|e| e.id == orig_entry.entry_id) {
+                        Some(e) => e,
+                        None => return (orig_idx, None),
+                    }
+                };
+
+                // Expected RT for this entry
+                let expected_rt = rt_calibration
+                    .map(|cal| cal.predict(lib_entry.retention_time))
+                    .unwrap_or(lib_entry.retention_time);
+
+                // Find the isolation window containing this precursor's m/z
+                let mut best_result: Option<CoelutionScoredEntry> = None;
+
+                for &((lower, upper), ref spec_indices) in window_groups {
+                    if lib_entry.precursor_mz < lower || lib_entry.precursor_mz > upper {
+                        continue;
+                    }
+
+                    // Gather spectra for this window near the consensus apex
+                    let mut window_pairs: Vec<(usize, &Spectrum)> = spec_indices
+                        .iter()
+                        .filter_map(|&idx| {
+                            let spec = &spectra[idx];
+                            if (spec.retention_time - consensus_apex).abs() <= rt_tolerance {
+                                Some((idx, spec))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    window_pairs.sort_by(|a, b| {
+                        a.1.retention_time
+                            .partial_cmp(&b.1.retention_time)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+
+                    if window_pairs.len() < 3 {
+                        continue;
+                    }
+
+                    let cand_spectra: Vec<&Spectrum> =
+                        window_pairs.iter().map(|(_, s)| *s).collect();
+                    let cand_global: Vec<usize> =
+                        window_pairs.iter().map(|(idx, _)| *idx).collect();
+
+                    // Extract fragment XICs
+                    let xics = extract_fragment_xics(
+                        &lib_entry.fragments,
+                        &cand_spectra,
+                        tol_da,
+                        tol_ppm,
+                        6,
+                    );
+
+                    if xics.len() < 2 {
+                        continue;
+                    }
+
+                    // Reference XIC (highest total intensity fragment)
+                    let ref_idx = xics
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| {
+                            let sum_a: f64 = a.1 .1.iter().map(|(_, v)| *v).sum();
+                            let sum_b: f64 = b.1 .1.iter().map(|(_, v)| *v).sum();
+                            sum_a.total_cmp(&sum_b)
+                        })
+                        .map(|(i, _)| i);
+
+                    let ref_idx = match ref_idx {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    let ref_xic = &xics[ref_idx].1;
+
+                    if ref_xic.len() < 3 {
+                        continue;
+                    }
+
+                    // Map consensus RT boundaries to XIC scan indices
+                    let start_index = ref_xic
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            (a.0 - consensus_start)
+                                .abs()
+                                .total_cmp(&(b.0 - consensus_start).abs())
+                        })
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+
+                    let end_index = ref_xic
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            (a.0 - consensus_end)
+                                .abs()
+                                .total_cmp(&(b.0 - consensus_end).abs())
+                        })
+                        .map(|(i, _)| i)
+                        .unwrap_or(ref_xic.len() - 1);
+
+                    let apex_index = ref_xic
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            (a.0 - consensus_apex)
+                                .abs()
+                                .total_cmp(&(b.0 - consensus_apex).abs())
+                        })
+                        .map(|(i, _)| i)
+                        .unwrap_or(start_index);
+
+                    if end_index <= start_index + 1 {
+                        continue;
+                    }
+
+                    // Compute area and SNR from reference signal at consensus boundaries
+                    let area =
+                        osprey_chromatography::trapezoidal_area(&ref_xic[start_index..=end_index]);
+                    let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+                    let snr = compute_snr(&raw_ints, apex_index, start_index, end_index);
+
+                    let peak = XICPeakBounds {
+                        apex_rt: ref_xic[apex_index].0,
+                        apex_intensity: ref_xic[apex_index].1,
+                        apex_index,
+                        start_rt: ref_xic[start_index].0,
+                        end_rt: ref_xic[end_index].0,
+                        start_index,
+                        end_index,
+                        area,
+                        signal_to_noise: snr,
+                    };
+
+                    let ctx = FeatureComputeContext {
+                        entry: lib_entry,
+                        xics: &xics,
+                        ref_xic,
+                        cand_spectra: &cand_spectra,
+                        cand_global: &cand_global,
+                        scorer,
+                        ms1_index,
+                        calibration,
+                        tol_da,
+                        tol_ppm,
+                        expected_rt,
+                        is_hram,
+                        file_name,
+                    };
+
+                    if let Some(scored_entry) = compute_features_at_peak(&ctx, peak) {
+                        let dominated = best_result.as_ref().is_some_and(|existing| {
+                            existing.features.coelution_sum >= scored_entry.features.coelution_sum
+                        });
+                        if !dominated {
+                            best_result = Some(scored_entry);
+                        }
+                    }
+                }
+
+                (orig_idx, best_result)
+            },
+        )
+        .collect()
+}
+
 /// For each precursor candidate in each isolation window:
 /// 1. Extract top-6 fragment XICs
 /// 2. Detect peak on reference XIC (DIA-NN-style valley detection)
@@ -2750,16 +3386,13 @@ fn run_search(
     config: &OspreyConfig,
     file_name: &str,
 ) -> Result<Vec<CoelutionScoredEntry>> {
-    use osprey_chromatography::calibration::calibrated_tolerance_ppm;
     use osprey_chromatography::{
-        compute_snr, detect_all_xic_peaks, isolate_peak_region, EmgFitter,
+        compute_snr, detect_all_xic_peaks, detect_cwt_consensus_peaks,
+        detect_cwt_consensus_peaks_diagnostic,
     };
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
     use osprey_scoring::{
-        compute_cosine_at_scan, compute_elution_weighted_cosine, compute_mass_accuracy,
-        extract_fragment_xics, median_polish_libcosine, median_polish_min_fragment_r2,
-        median_polish_residual_correlation, median_polish_residual_ratio, median_polish_rsquared,
-        pearson_correlation_raw, tukey_median_polish, SpectralScorer,
+        extract_fragment_xics, pearson_correlation_raw, tukey_median_polish, SpectralScorer,
     };
 
     let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
@@ -3032,22 +3665,36 @@ fn run_search(
 
                     let ref_xic = &xics[ref_idx].1;
 
-                    // 3. Detect candidate peaks and pick the best by coelution score.
-                    // Find all candidate peaks from median polish elution profile (or
-                    // reference XIC as fallback), then evaluate each candidate by computing
-                    // pairwise fragment correlations within its boundaries. The candidate
-                    // with the highest coelution score is selected — the real peak is
-                    // where fragments co-elute.
+                    // 3. Detect candidate peaks using CWT consensus across all transitions.
+                    // The Mexican Hat wavelet convolution of each fragment XIC, followed by
+                    // pointwise median, produces a consensus signal that is only high where
+                    // the majority of transitions exhibit peak-like shapes simultaneously.
+                    // Falls back to median polish profile or reference XIC if CWT finds nothing.
                     let full_polish = tukey_median_polish(&xics, 10, 0.01);
+                    let is_diag_target = entry.modified_sequence.contains("SYELPDGQVITIGNER");
                     let candidates = {
-                        let mp_candidates = full_polish
-                            .as_ref()
-                            .map(|mp| detect_all_xic_peaks(&mp.elution_profile, 0.01, 5.0))
-                            .unwrap_or_default();
-                        if mp_candidates.is_empty() {
-                            detect_all_xic_peaks(ref_xic, 0.01, 5.0)
+                        let cwt_candidates = if is_diag_target {
+                            let label = format!(
+                                "{}+{} win=[{:.1},{:.1}]",
+                                &entry.modified_sequence, entry.charge, lower, upper
+                            );
+                            detect_cwt_consensus_peaks_diagnostic(&xics, 0.0, &label)
                         } else {
-                            mp_candidates
+                            detect_cwt_consensus_peaks(&xics, 0.0)
+                        };
+                        if cwt_candidates.is_empty() {
+                            // Fallback: median polish elution profile, then reference XIC
+                            let mp_candidates = full_polish
+                                .as_ref()
+                                .map(|mp| detect_all_xic_peaks(&mp.elution_profile, 0.01, 5.0))
+                                .unwrap_or_default();
+                            if mp_candidates.is_empty() {
+                                detect_all_xic_peaks(ref_xic, 0.01, 5.0)
+                            } else {
+                                mp_candidates
+                            }
+                        } else {
+                            cwt_candidates
                         }
                     };
 
@@ -3144,425 +3791,26 @@ fn run_search(
                         }
                     };
 
-                    // Refine boundaries via EMG fit to median polish consensus profile.
-                    // The EMG (Exponentially Modified Gaussian) captures LC peak asymmetry
-                    // and gives 95% CDF boundaries that are much tighter than intensity-based
-                    // valley detection. Falls back to original boundaries if fit fails.
-                    //
-                    // CRITICAL: crop the profile to the single peak around the apex before
-                    // fitting. The full profile may contain multiple peaks across the
-                    // extraction window; the EMG is a single-peak model and would produce
-                    // overly broad boundaries if fit to the entire multi-peak profile.
-                    let peak = {
-                        let full_profile = full_polish
-                            .as_ref()
-                            .map(|mp| &mp.elution_profile[..])
-                            .unwrap_or(ref_xic);
-                        let (crop_start, crop_end) =
-                            isolate_peak_region(full_profile, peak.apex_index);
-                        let emg_profile = &full_profile[crop_start..=crop_end];
-                        let fitter = EmgFitter::new();
-                        match fitter.fit(emg_profile) {
-                            Ok(params) if params.r_squared > 0.5 => {
-                                if let Some((left_rt, right_rt)) =
-                                    EmgFitter::boundaries(&params, 0.99)
-                                {
-                                    let apex_rt = ref_xic[peak.apex_index].0;
-                                    // Validate: EMG boundaries must contain the apex
-                                    if left_rt < apex_rt && right_rt > apex_rt {
-                                        // Map EMG CDF boundaries to XIC indices.
-                                        // Don't constrain to original peak boundaries —
-                                        // let the EMG determine its own boundaries.
-                                        let n_xic = ref_xic.len();
-                                        let si = ref_xic
-                                            .partition_point(|(rt, _)| *rt < left_rt)
-                                            .min(peak.apex_index); // safety: si <= apex
-                                        let ei = ref_xic
-                                            .partition_point(|(rt, _)| *rt <= right_rt)
-                                            .saturating_sub(1)
-                                            .min(n_xic - 1)
-                                            .max(peak.apex_index); // safety: ei >= apex
-                                        if ei - si >= 2 {
-                                            let raw_ints: Vec<f64> =
-                                                ref_xic.iter().map(|(_, v)| *v).collect();
-                                            let snr =
-                                                compute_snr(&raw_ints, peak.apex_index, si, ei);
-                                            XICPeakBounds {
-                                                start_index: si,
-                                                end_index: ei,
-                                                start_rt: ref_xic[si].0,
-                                                end_rt: ref_xic[ei].0,
-                                                area: trapezoidal_area(&ref_xic[si..=ei]),
-                                                signal_to_noise: snr,
-                                                ..peak
-                                            }
-                                        } else {
-                                            peak // too narrow
-                                        }
-                                    } else {
-                                        peak // EMG boundaries don't contain apex
-                                    }
-                                } else {
-                                    peak
-                                }
-                            }
-                            _ => peak,
-                        }
-                    };
-
-                    if peak.end_index <= peak.start_index + 1 {
-                        pb.inc(1);
-                        return None;
-                    }
-
-                    // 4. Compute pairwise fragment correlations within peak boundaries
-                    let n_xics = xics.len();
-                    let peak_len = peak.end_index - peak.start_index + 1;
-
-                    // Extract XIC values within peak boundaries
-                    let xic_peak_values: Vec<Vec<f64>> = xics
-                        .iter()
-                        .map(|(_, xic)| {
-                            xic[peak.start_index..=peak.end_index]
-                                .iter()
-                                .map(|(_, v)| *v)
-                                .collect()
-                        })
-                        .collect();
-
-                    // Pairwise correlations
-                    let mut corr_sum = 0.0f64;
-                    let mut corr_min = f64::INFINITY;
-                    let mut corr_max = f64::NEG_INFINITY;
-                    let mut n_pairs = 0u32;
-                    let mut per_frag_corr_sum = vec![0.0f64; n_xics];
-                    let mut per_frag_corr_count = vec![0u32; n_xics];
-
-                    for i in 0..n_xics {
-                        for j in (i + 1)..n_xics {
-                            let r =
-                                pearson_correlation_raw(&xic_peak_values[i], &xic_peak_values[j]);
-                            corr_sum += r;
-                            if r < corr_min {
-                                corr_min = r;
-                            }
-                            if r > corr_max {
-                                corr_max = r;
-                            }
-                            n_pairs += 1;
-                            per_frag_corr_sum[i] += r;
-                            per_frag_corr_count[i] += 1;
-                            per_frag_corr_sum[j] += r;
-                            per_frag_corr_count[j] += 1;
-                        }
-                    }
-
-                    if n_pairs == 0 {
-                        pb.inc(1);
-                        return None;
-                    }
-
-                    let mut fragment_corr = [0.0f64; 6];
-                    let mut n_coeluting = 0u8;
-                    for i in 0..n_xics.min(6) {
-                        if per_frag_corr_count[i] > 0 {
-                            fragment_corr[i] = per_frag_corr_sum[i] / per_frag_corr_count[i] as f64;
-                            if fragment_corr[i] > 0.0 {
-                                n_coeluting += 1;
-                            }
-                        }
-                    }
-
-                    // 5. Find the spectrum closest to apex RT for spectral scoring
-                    let apex_local_idx = cand_spectra
-                        .iter()
-                        .enumerate()
-                        .min_by(|a, b| {
-                            (a.1.retention_time - peak.apex_rt)
-                                .abs()
-                                .total_cmp(&(b.1.retention_time - peak.apex_rt).abs())
-                        })
-                        .map(|(i, _)| i)?;
-                    let _apex_global_idx = cand_global[apex_local_idx];
-                    let apex_spectrum = cand_spectra[apex_local_idx];
-
-                    let spectral_score = scorer.xcorr(apex_spectrum, entry);
-
-                    // 5b. SG-weighted spectral scores at apex ±2 scans
-                    // Savitzky-Golay 5-point quadratic smoothing coefficients
-                    let sg_weights: [f64; 5] = [
-                        -3.0 / 35.0,
-                        12.0 / 35.0,
-                        17.0 / 35.0,
-                        12.0 / 35.0,
-                        -3.0 / 35.0,
-                    ];
-                    let mut sg_xcorr = 0.0;
-                    let mut sg_cosine = 0.0;
-                    for (offset, &weight) in [-2i32, -1, 0, 1, 2].iter().zip(&sg_weights) {
-                        let idx = apex_local_idx as i32 + offset;
-                        if idx >= 0 && (idx as usize) < cand_spectra.len() {
-                            let spec = cand_spectra[idx as usize];
-                            sg_xcorr += scorer.xcorr_at_scan(spec, entry) * weight;
-                            sg_cosine +=
-                                compute_cosine_at_scan(&entry.fragments, spec, tol_da, tol_ppm)
-                                    * weight;
-                        }
-                    }
-
-                    // 6. Elution-weighted cosine (LibCosine at each scan,
-                    //    weighted by reference XIC intensity²)
-                    let elution_weighted_cosine = compute_elution_weighted_cosine(
-                        &entry.fragments,
+                    // CWT zero-crossing boundaries are the final boundaries.
+                    // Compute all 45 features at these boundaries.
+                    let ctx = FeatureComputeContext {
+                        entry,
+                        xics: &xics,
                         ref_xic,
-                        &cand_spectra,
+                        cand_spectra: &cand_spectra,
+                        cand_global: &cand_global,
+                        scorer: &scorer,
+                        ms1_index,
+                        calibration,
                         tol_da,
                         tol_ppm,
-                        peak.start_rt,
-                        peak.end_rt,
-                    );
-
-                    // 7. Mass accuracy at apex
-                    let frag_matches = scorer.match_fragments(apex_spectrum, entry);
-                    let (mass_mean, mass_abs_mean, mass_std) =
-                        compute_mass_accuracy(&frag_matches, fragment_tolerance.unit);
-
-                    // 7. RT deviation
-                    let rt_dev = peak.apex_rt - expected_rt;
-
-                    // 8. MS1 features (HRAM only)
-                    let (ms1_coelution, ms1_isotope_cos) = if is_hram && !ms1_index.is_empty() {
-                        let ms1_tol_ppm = calibration
-                            .map(|cal| calibrated_tolerance_ppm(&cal.ms1_calibration, 10.0))
-                            .unwrap_or(10.0);
-                        let search_mz = calibration
-                            .map(|cal| {
-                                reverse_calibrate_mz(entry.precursor_mz, &cal.ms1_calibration)
-                            })
-                            .unwrap_or(entry.precursor_mz);
-
-                        // MS1 precursor coelution: correlate MS1 M+0 XIC with reference fragment XIC
-                        let mut ms1_coelution_val = 0.0;
-                        let peak_rts: Vec<(f64, f64)> =
-                            ref_xic[peak.start_index..=peak.end_index].to_vec();
-                        if peak_rts.len() >= 3 {
-                            let mut ms1_intensities = Vec::with_capacity(peak_rts.len());
-                            let mut ref_intensities = Vec::with_capacity(peak_rts.len());
-                            for &(rt, ref_val) in &peak_rts {
-                                if let Some(ms1) = ms1_index.find_nearest(rt) {
-                                    let intensity = ms1
-                                        .find_peak_ppm(search_mz, ms1_tol_ppm)
-                                        .map(|(_, int)| int as f64)
-                                        .unwrap_or(0.0);
-                                    ms1_intensities.push(intensity);
-                                    ref_intensities.push(ref_val);
-                                }
-                            }
-                            if ms1_intensities.len() >= 3 {
-                                ms1_coelution_val =
-                                    pearson_correlation_raw(&ms1_intensities, &ref_intensities);
-                            }
-                        }
-
-                        // MS1 isotope cosine at apex RT
-                        let mut iso_cos = 0.0;
-                        if let Some(apex_ms1) = ms1_index.find_nearest(peak.apex_rt) {
-                            let envelope = osprey_core::IsotopeEnvelope::extract(
-                                apex_ms1,
-                                search_mz,
-                                entry.charge,
-                                ms1_tol_ppm,
-                            );
-                            if envelope.has_m0() {
-                                iso_cos = osprey_core::peptide_isotope_cosine(
-                                    &entry.sequence,
-                                    &envelope.intensities,
-                                )
-                                .unwrap_or(0.0);
-                            }
-                        }
-
-                        (ms1_coelution_val, iso_cos)
-                    } else {
-                        (0.0, 0.0)
-                    };
-
-                    // 9. Peak shape features
-                    let peak_width = peak.end_rt - peak.start_rt;
-                    let peak_symmetry = {
-                        let left_slice = &ref_xic[peak.start_index..=peak.apex_index];
-                        let right_slice = &ref_xic[peak.apex_index..=peak.end_index];
-                        let left_area = trapezoidal_area(left_slice);
-                        let right_area = trapezoidal_area(right_slice);
-                        if right_area > 1e-10 {
-                            (left_area / right_area).min(10.0)
-                        } else {
-                            1.0
-                        }
-                    };
-                    let peak_sharpness = {
-                        // Average edge steepness (intensity change per minute)
-                        let left_edge = if peak.apex_index > peak.start_index {
-                            let dt = peak.apex_rt - peak.start_rt;
-                            if dt > 1e-10 {
-                                (peak.apex_intensity - ref_xic[peak.start_index].1) / dt
-                            } else {
-                                0.0
-                            }
-                        } else {
-                            0.0
-                        };
-                        let right_edge = if peak.end_index > peak.apex_index {
-                            let dt = peak.end_rt - peak.apex_rt;
-                            if dt > 1e-10 {
-                                (peak.apex_intensity - ref_xic[peak.end_index].1) / dt
-                            } else {
-                                0.0
-                            }
-                        } else {
-                            0.0
-                        };
-                        (left_edge + right_edge) / 2.0
-                    };
-
-                    // 10. Median polish features
-                    let (mp_cosine, mp_rsquared, mp_residual, mp_min_r2, mp_resid_corr) = {
-                        // Build XIC matrix within peak boundaries
-                        let peak_xics: Vec<(usize, Vec<(f64, f64)>)> = xics
-                            .iter()
-                            .map(|(frag_idx, xic)| {
-                                let peak_slice: Vec<(f64, f64)> =
-                                    xic[peak.start_index..=peak.end_index].to_vec();
-                                (*frag_idx, peak_slice)
-                            })
-                            .collect();
-
-                        if let Some(ref mp) = tukey_median_polish(&peak_xics, 10, 0.01) {
-                            let cos = median_polish_libcosine(mp, &entry.fragments);
-                            let rsq = median_polish_rsquared(mp);
-                            let res = median_polish_residual_ratio(mp);
-                            let min_r2 = median_polish_min_fragment_r2(mp);
-                            let resid_corr = median_polish_residual_correlation(mp);
-                            (cos, rsq, res, min_r2, resid_corr)
-                        } else {
-                            (0.0, 0.0, 1.0, 0.0, 0.0)
-                        }
-                    };
-
-                    // 11. Peptide properties
-                    let mod_count = entry.modifications.len() as u8;
-                    let pep_len = entry.sequence.len() as u8;
-                    let missed_cleav = entry
-                        .sequence
-                        .chars()
-                        .take(entry.sequence.len().saturating_sub(1))
-                        .filter(|&c| c == 'K' || c == 'R')
-                        .count() as u8;
-
-                    // Fragment m/z and intensities from library for blib output
-                    // Use library theoretical values (not observed peaks) so Skyline
-                    // can build XICs for the correct b/y ions
-                    let frag_mzs: Vec<f64> = entry.fragments.iter().map(|f| f.mz).collect();
-                    let frag_intensities: Vec<f32> = entry
-                        .fragments
-                        .iter()
-                        .map(|f| f.relative_intensity)
-                        .collect();
-
-                    // Reference XIC within peak bounds for blib coefficient series
-                    let ref_xic_peak: Vec<(f64, f64)> =
-                        ref_xic[peak.start_index..=peak.end_index].to_vec();
-
-                    let features = CoelutionFeatureSet {
-                        // Pairwise coelution
-                        coelution_sum: corr_sum,
-                        coelution_min: if corr_min.is_finite() { corr_min } else { 0.0 },
-                        coelution_max: if corr_max.is_finite() { corr_max } else { 0.0 },
-                        n_coeluting_fragments: n_coeluting,
-                        n_fragment_pairs: n_pairs.min(255) as u8,
-                        fragment_corr,
-
-                        // Peak shape
-                        peak_apex: peak.apex_intensity,
-                        peak_area: peak.area,
-                        peak_width,
-                        peak_symmetry,
-                        signal_to_noise: peak.signal_to_noise,
-                        n_scans: peak_len as u16,
-                        peak_sharpness,
-
-                        // Spectral at apex
-                        hyperscore: spectral_score.hyperscore,
-                        xcorr: spectral_score.xcorr,
-                        dot_product: spectral_score.lib_cosine,
-                        dot_product_smz: spectral_score.lib_cosine_smz,
-                        dot_product_top6: spectral_score.dot_product_top6,
-                        dot_product_top5: spectral_score.dot_product_top5,
-                        dot_product_top4: spectral_score.dot_product_top4,
-                        dot_product_smz_top6: spectral_score.dot_product_smz_top6,
-                        dot_product_smz_top5: spectral_score.dot_product_smz_top5,
-                        dot_product_smz_top4: spectral_score.dot_product_smz_top4,
-                        fragment_coverage: spectral_score.fragment_coverage,
-                        sequence_coverage: spectral_score.sequence_coverage,
-                        consecutive_ions: spectral_score.consecutive_ions as u8,
-                        base_peak_rank: spectral_score.base_peak_rank as u8,
-                        top6_matches: spectral_score.top6_matches as u8,
-                        explained_intensity: spectral_score.explained_intensity,
-                        elution_weighted_cosine,
-
-                        // Mass accuracy
-                        mass_accuracy_mean: mass_mean,
-                        abs_mass_accuracy_mean: mass_abs_mean,
-                        mass_accuracy_std: mass_std,
-
-                        // RT deviation
-                        rt_deviation: rt_dev,
-                        abs_rt_deviation: rt_dev.abs(),
-
-                        // MS1
-                        ms1_precursor_coelution: ms1_coelution,
-                        ms1_isotope_cosine: ms1_isotope_cos,
-
-                        // Peptide properties
-                        modification_count: mod_count,
-                        peptide_length: pep_len,
-                        missed_cleavages: missed_cleav,
-
-                        // Median polish
-                        median_polish_cosine: mp_cosine,
-                        median_polish_rsquared: mp_rsquared,
-                        median_polish_residual_ratio: mp_residual,
-
-                        // SG-weighted multi-scan scores
-                        sg_weighted_xcorr: sg_xcorr,
-                        sg_weighted_cosine: sg_cosine,
-                        median_polish_min_fragment_r2: mp_min_r2,
-                        median_polish_residual_correlation: mp_resid_corr,
+                        expected_rt,
+                        is_hram,
+                        file_name,
                     };
 
                     pb.inc(1);
-
-                    Some(CoelutionScoredEntry {
-                        entry_id: entry.id,
-                        is_decoy: entry.is_decoy,
-                        sequence: entry.sequence.clone(),
-                        modified_sequence: entry.modified_sequence.clone(),
-                        charge: entry.charge,
-                        precursor_mz: entry.precursor_mz,
-                        protein_ids: entry.protein_ids.clone(),
-                        scan_number: apex_spectrum.scan_number,
-                        apex_rt: peak.apex_rt,
-                        peak_bounds: peak,
-                        features,
-                        fragment_mzs: frag_mzs,
-                        fragment_intensities: frag_intensities,
-                        reference_xic: ref_xic_peak,
-                        file_name: file_name.to_string(),
-                        run_qvalue: 1.0,
-                        experiment_qvalue: 1.0,
-                        score: 0.0,
-                        pep: 1.0,
-                    })
+                    compute_features_at_peak(&ctx, peak)
                 })
                 .collect();
 
@@ -3612,7 +3860,63 @@ fn run_search(
         );
     }
 
-    Ok(deduped)
+    // Multi-charge-state peak consensus: ensure all charge states of the
+    // same peptide share the same peak RT and integration boundaries.
+    let (kept_indices, rescore_targets) = select_consensus_peaks(&deduped);
+
+    if rescore_targets.is_empty() {
+        Ok(deduped)
+    } else {
+        log::info!(
+            "Multi-charge consensus: {} entries need re-scoring at consensus boundaries",
+            rescore_targets.len()
+        );
+
+        let rescored = rescore_at_consensus(
+            &rescore_targets,
+            &deduped,
+            library,
+            spectra_ref,
+            &window_groups,
+            ms1_index,
+            calibration,
+            rt_calibration,
+            &scorer,
+            tol_da,
+            tol_ppm,
+            rt_tolerance,
+            is_hram,
+            file_name,
+        );
+
+        let mut result: Vec<CoelutionScoredEntry> =
+            kept_indices.iter().map(|&i| deduped[i].clone()).collect();
+
+        let mut n_dropped = 0;
+        for (_, rescored_entry) in rescored {
+            if let Some(entry) = rescored_entry {
+                result.push(entry);
+            } else {
+                n_dropped += 1;
+            }
+        }
+
+        if n_dropped > 0 {
+            log::info!(
+                "Multi-charge consensus: {} entries dropped (no evidence at consensus RT)",
+                n_dropped
+            );
+        }
+
+        // Re-sort for determinism
+        result.sort_by(|a, b| {
+            a.entry_id
+                .cmp(&b.entry_id)
+                .then(a.scan_number.cmp(&b.scan_number))
+        });
+
+        Ok(result)
+    }
 }
 
 /// RT-sorted index for fast candidate selection via binary search.
@@ -4276,5 +4580,135 @@ mod tests {
                 first_result[i]
             );
         }
+    }
+
+    /// Helper to create a minimal CoelutionScoredEntry for consensus tests.
+    fn make_scored_entry(
+        entry_id: u32,
+        modified_sequence: &str,
+        charge: u8,
+        apex_rt: f64,
+        start_rt: f64,
+        end_rt: f64,
+        coelution_sum: f64,
+    ) -> CoelutionScoredEntry {
+        CoelutionScoredEntry {
+            entry_id,
+            is_decoy: modified_sequence.starts_with("DECOY_"),
+            sequence: modified_sequence
+                .strip_prefix("DECOY_")
+                .unwrap_or(modified_sequence)
+                .to_string(),
+            modified_sequence: modified_sequence.to_string(),
+            charge,
+            precursor_mz: 500.0,
+            protein_ids: vec![],
+            scan_number: 1,
+            apex_rt,
+            peak_bounds: XICPeakBounds {
+                apex_rt,
+                apex_intensity: 1000.0,
+                apex_index: 50,
+                start_rt,
+                end_rt,
+                start_index: 40,
+                end_index: 60,
+                area: 5000.0,
+                signal_to_noise: 10.0,
+            },
+            features: CoelutionFeatureSet {
+                coelution_sum,
+                ..Default::default()
+            },
+            fragment_mzs: vec![],
+            fragment_intensities: vec![],
+            reference_xic: vec![],
+            file_name: "test".to_string(),
+            run_qvalue: 1.0,
+            experiment_qvalue: 1.0,
+            score: 0.0,
+            pep: 1.0,
+        }
+    }
+
+    #[test]
+    fn test_consensus_single_charge_no_change() {
+        let entries = vec![make_scored_entry(0, "PEPTIDEK", 2, 15.0, 14.5, 15.5, 8.0)];
+        let (kept, rescore) = select_consensus_peaks(&entries);
+        assert_eq!(kept.len(), 1);
+        assert!(rescore.is_empty());
+    }
+
+    #[test]
+    fn test_consensus_two_charges_same_peak() {
+        // Both charges found the same peak (within tolerance)
+        let entries = vec![
+            make_scored_entry(0, "PEPTIDEK", 2, 15.0, 14.5, 15.5, 8.0),
+            make_scored_entry(1, "PEPTIDEK", 3, 15.1, 14.6, 15.6, 6.0),
+        ];
+        let (kept, rescore) = select_consensus_peaks(&entries);
+        assert_eq!(kept.len(), 2);
+        assert!(rescore.is_empty(), "Both charges agree — no re-scoring");
+    }
+
+    #[test]
+    fn test_consensus_two_charges_different_peaks() {
+        // Charge 2+ found the true peak, charge 3+ picked a different one
+        let entries = vec![
+            make_scored_entry(0, "PEPTIDEK", 2, 15.0, 14.5, 15.5, 8.0), // best
+            make_scored_entry(1, "PEPTIDEK", 3, 22.0, 21.5, 22.5, 3.0), // wrong peak
+        ];
+        let (kept, rescore) = select_consensus_peaks(&entries);
+        assert_eq!(kept.len(), 1, "Only the best charge state is kept");
+        assert_eq!(rescore.len(), 1, "The other charge state needs re-scoring");
+
+        // Verify the rescore target has the consensus boundaries from entry 0
+        let (idx, apex, start, end) = rescore[0];
+        assert_eq!(idx, 1);
+        assert!((apex - 15.0).abs() < 0.01);
+        assert!((start - 14.5).abs() < 0.01);
+        assert!((end - 15.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_consensus_three_charges_two_agree() {
+        let entries = vec![
+            make_scored_entry(0, "PEPTIDEK", 2, 15.0, 14.5, 15.5, 8.0), // best
+            make_scored_entry(1, "PEPTIDEK", 3, 15.1, 14.6, 15.6, 6.0), // agrees
+            make_scored_entry(2, "PEPTIDEK", 4, 22.0, 21.5, 22.5, 2.0), // different
+        ];
+        let (kept, rescore) = select_consensus_peaks(&entries);
+        assert_eq!(kept.len(), 2, "Two agree with consensus");
+        assert_eq!(rescore.len(), 1, "One needs re-scoring");
+        assert_eq!(rescore[0].0, 2);
+    }
+
+    #[test]
+    fn test_consensus_decoys_separate_from_targets() {
+        // Target and decoy of same peptide should be in different groups
+        let entries = vec![
+            make_scored_entry(0, "PEPTIDEK", 2, 15.0, 14.5, 15.5, 8.0),
+            make_scored_entry(1, "DECOY_PEPTIDEK", 2, 22.0, 21.5, 22.5, 5.0),
+        ];
+        let (kept, rescore) = select_consensus_peaks(&entries);
+        // Different modified_sequence → different groups → both kept
+        assert_eq!(kept.len(), 2);
+        assert!(rescore.is_empty());
+    }
+
+    #[test]
+    fn test_consensus_multiple_peptides_independent() {
+        let entries = vec![
+            make_scored_entry(0, "PEPTIDEK", 2, 15.0, 14.5, 15.5, 8.0),
+            make_scored_entry(1, "PEPTIDEK", 3, 22.0, 21.5, 22.5, 3.0), // different peak
+            make_scored_entry(2, "ANOTHERPEPTIDER", 2, 10.0, 9.5, 10.5, 7.0),
+            make_scored_entry(3, "ANOTHERPEPTIDER", 3, 10.1, 9.6, 10.6, 5.0), // agrees
+        ];
+        let (kept, rescore) = select_consensus_peaks(&entries);
+        // PEPTIDEK: entry 0 kept, entry 1 rescored
+        // ANOTHERPEPTIDER: both kept (agree)
+        assert_eq!(kept.len(), 3);
+        assert_eq!(rescore.len(), 1);
+        assert_eq!(rescore[0].0, 1);
     }
 }

@@ -2533,10 +2533,17 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
         }
 
         // Peak-detection-first co-elution scoring:
-        // 1. Detect candidate peaks in the reference XIC
+        // 1. Detect candidate peaks using CWT consensus across all transitions
         // 2. Score each peak by pairwise fragment correlation within its boundaries
         // 3. Pick the peak with the highest co-elution score
-        let candidates = osprey_chromatography::detect_all_xic_peaks(ref_xic, 0.01, 5.0);
+        let candidates = {
+            let cwt_candidates = osprey_chromatography::detect_cwt_consensus_peaks(&xics, 0.0);
+            if cwt_candidates.is_empty() {
+                osprey_chromatography::detect_all_xic_peaks(ref_xic, 0.01, 5.0)
+            } else {
+                cwt_candidates
+            }
+        };
 
         if candidates.is_empty() {
             return None;

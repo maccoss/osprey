@@ -9,8 +9,13 @@
 //! - Mass calibration for MS1/MS2 measurements
 
 pub mod calibration;
+pub mod cwt;
 
 use osprey_core::{PeakBoundaries, PeakQuality, Result, XICPeakBounds};
+
+// Re-export CWT consensus peak detection
+pub use cwt::detect_cwt_consensus_peaks;
+pub use cwt::detect_cwt_consensus_peaks_diagnostic;
 
 // Re-export calibration types
 pub use calibration::{

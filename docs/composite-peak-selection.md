@@ -1,117 +1,169 @@
-# Composite Peak Selection for Better Apex RT
+# Multi-Charge-State Peak Consensus
 
 ## Problem
 
-When multiple chromatographic peaks are detected for the same precursor, selecting the correct apex RT is critical. If the wrong RT is picked, ALL downstream features (spectral scores, mass accuracy, explained intensity, coelution) are scored at the wrong location.
+A peptide elutes at one retention time regardless of its ionization charge state. In DIA, different charge states of the same peptide (e.g., PEPTIDEK+2 and PEPTIDEK+3) have different precursor m/z values and therefore fall into **different DIA isolation windows**. Because isolation windows are processed by independent parallel tasks, each charge state finds its peak independently — they may end up selecting different chromatographic peaks.
 
-### Current Flow
+This is physically inconsistent: if a peptide is detected at charge 2+ at RT=25.3 and at charge 3+ at RT=27.1, one of them is wrong. Forcing all charge states to share the same peak RT and integration boundaries improves both accuracy and downstream quantification consistency.
+
+## Solution: Post-Search Consensus
+
+Cross-charge consensus **cannot** happen within the per-window parallel loop because different charge states are in different windows. Instead, Osprey adds a post-processing step after the main search, before FDR control.
+
+### Execution Order in `run_search()`
 
 ```
-Library + Spectra
-      |
-[1] CANDIDATE SELECTION (mz_window + RT_tolerance)
-      |
-[2] FRAGMENT XIC EXTRACTION
-      |
-[3] PEAK DETECTION on reference XIC
-    |-- Pairwise fragment correlations
-    |-- Select reference XIC (best-correlated fragment)
-    |-- detect_xic_peak() → apex, boundaries
-      |
-[4] FEATURE EXTRACTION (all 45 features scored at locked apex_rt)
-      |
-[5] FDR (Percolator/Mokapot)
+1. Parallel per-window search (existing) → all_entries
+2. Overlapping-window dedup → deduped
+3. Multi-charge consensus selection → identifies entries needing re-scoring
+4. Re-scoring at consensus boundaries → replaces entries with corrected features
+5. Return final results
+   ↓
+6. FDR control (caller)
 ```
 
-### How DIA-NN Does It
+---
 
-DIA-NN uses a much more careful approach:
-1. Detects multiple peak candidates via fragment XIC inter-correlation
-2. For each peak, computes ~40 features (spectral, chromatographic, MS1, RT)
-3. Uses a learned linear classifier (Percolator-trained weights) to pick the best peak
-4. Fragment inter-correlation is the key signal -- peaks where fragments co-elute strongly are preferred
-5. Apex must be at 99% of local max (rejects shoulders/noise spikes)
+## Algorithm
 
-## Proposed Approach: Lightweight Composite Peak Scoring
+### Step 1: Group by Modified Sequence
 
-For each detected peak candidate, compute a cheap composite score from orthogonal signals, then select the peak with the highest composite score. This happens BEFORE the expensive full feature extraction.
+Entries are grouped by `modified_sequence`. This naturally separates:
+- **Different charge states** of the same peptide (same modified_sequence, different charge)
+- **Targets from decoys** (decoys have `DECOY_` prefix in modified_sequence)
+- **Different peptides** (different modified_sequence)
 
-### The Signals
+### Step 2: Select Consensus Peak
 
-| Signal | Weight | Description |
-|--------|--------|-------------|
-| Fragment coelution | 0.35 | Per-peak pairwise correlation between fragment XICs. Strongest discriminator: interference peaks have poor fragment coelution. |
-| RT agreement | 0.25 | `1.0 - |peak_apex_rt - expected_rt| / rt_tolerance`, clamped to [0,1]. Peaks near calibrated expected RT preferred. Essentially free. |
-| Peak shape | 0.20 | Combine: (a) n_scans in peak (log-scaled), (b) signal-to-noise, (c) relative area. Real peaks vs noise spikes. |
-| Peak intensity | 0.20 | `log(apex_intensity)` normalized across peaks. The simplest signal, but now one component rather than sole determinant. |
+For each group with multiple charge states:
 
-Each component is normalized to [0, 1] across the peaks for this precursor, then combined with fixed weights.
+1. The charge state with the **highest `coelution_sum`** defines the consensus peak
+   - `coelution_sum` = sum of all pairwise fragment correlations within the peak
+   - Higher coelution_sum means stronger, more reliable fragment co-elution evidence
+   - This charge state's peak boundaries (apex_rt, start_rt, end_rt) become the consensus
 
-### Cost Analysis
+2. For each other charge state in the group:
+   - If its `apex_rt` is within half the consensus peak width (minimum 0.1 min) of the consensus apex → **already agrees**, keep as-is
+   - Otherwise → **mark for re-scoring** at the consensus boundaries
 
-- Fragment XICs are extracted once for the full series, then sliced per peak -- same binary search cost as existing scoring
-- Per-peak Pearson correlation on 5-15 points: negligible
-- RT score and peak shape: arithmetic only
-- Most peptides have 1 peak (no extra work); ~10-20% have 2-3 peaks
-- **Expected overhead: ~5% on scoring phase, ~1-3% on total pipeline**
+### Step 3: Re-Score at Consensus Boundaries
 
-## Implementation Plan
+For entries that selected a different peak than the consensus:
 
-### 1. `crates/osprey-scoring/src/lib.rs` -- Add `score_peak_candidates()`
+1. Look up the library entry and find the correct DIA isolation window for this precursor's m/z
+2. Gather spectra from that window near the consensus apex RT
+3. Extract fragment XICs from those spectra
+4. Map the consensus RT boundaries to XIC scan indices (find closest RT in XIC time grid)
+5. Compute all 45 features at the consensus boundaries via `compute_features_at_peak()`
+6. If no signal is found at the consensus RT (too few spectra, no fragment evidence): **drop the entry** — this charge state has no evidence at the peptide's true elution time
 
-New public function:
+### Step 4: Merge Results
 
-```rust
-pub fn score_peak_candidates(
-    peaks: &[XICPeakBounds],
-    fragment_xics: &[Vec<(f64, f64)>],
-    expected_rt: f64,
-    rt_tolerance: f64,
-) -> Vec<(usize, f64)>  // (peak_index, composite_score)
+The final result combines:
+- Entries that were kept as-is (single charge state, or already agreed with consensus)
+- Re-scored entries with features computed at consensus boundaries
+- Dropped entries are excluded (no evidence at consensus RT)
+
+Results are re-sorted by `(entry_id, scan_number)` for deterministic output.
+
+---
+
+## Why "Best Coelution Sum Wins"
+
+The charge state with the highest pairwise fragment correlation is most likely to have found the true elution peak because:
+- **Fragment co-elution** is the strongest discriminator between true peaks and interference
+- A charge state that happens to pick an interference peak will have low co-elution (fragments don't co-elute at a false peak)
+- The best-co-eluting charge state has the most reliable boundaries for defining where the peptide actually elutes
+
+Alternative strategies considered:
+- **Highest apex intensity**: Biased by ionization efficiency and window interference
+- **Closest to expected RT**: Penalizes real peaks displaced by calibration error
+- **Majority vote**: Complex, and most peptides have only 2-3 charge states
+
+---
+
+## Performance
+
+- **Consensus selection**: O(n) HashMap grouping — negligible
+- **Re-scoring**: Only for entries that selected a different peak than consensus. Expected ~2-6% of entries (most multi-charge peptides already agree on their peak). Each re-scoring has the same cost as initial scoring.
+- **Net overhead**: ~2-6% additional scoring time in `run_search`
+
+---
+
+## Example
+
+```
+Peptide: PEPTIDEK
+  Charge 2+: precursor m/z = 458.25 → DIA window [455, 465]
+  Charge 3+: precursor m/z = 305.83 → DIA window [300, 310]
+
+After independent parallel search:
+  Charge 2+: apex_rt = 25.3, coelution_sum = 8.5, boundaries = [24.8, 25.9]
+  Charge 3+: apex_rt = 27.1, coelution_sum = 3.2, boundaries = [26.6, 27.5]
+
+Consensus selection:
+  Best coelution_sum: charge 2+ (8.5 > 3.2)
+  Consensus: apex = 25.3, boundaries = [24.8, 25.9]
+  Peak width = 1.1, tolerance = max(0.55, 0.1) = 0.55 min
+
+  Charge 2+: apex_diff = 0.0 ≤ 0.55 → keep as-is
+  Charge 3+: apex_diff = 1.8 > 0.55 → needs re-scoring
+
+Re-scoring charge 3+ at consensus boundaries [24.8, 25.9]:
+  Find spectra from window [300, 310] near RT = 25.3
+  Extract fragment XICs
+  Map [24.8, 25.9] to XIC scan indices
+  Compute all 45 features at these boundaries
+
+Result:
+  Both charge states now share RT = 25.3 and boundaries [24.8, 25.9]
+  Each is scored independently at those shared boundaries
 ```
 
-Implementation:
-- For each peak, slice fragment XICs to `[start_rt, end_rt]`
-- Compute lightweight pairwise fragment coelution on the sub-series
-- Compute RT score: `(1.0 - |apex_rt - expected_rt| / rt_tolerance).clamp(0.0, 1.0)`
-- Compute shape score from: `n_scans.ln()`, signal-to-noise, `area / max_area`
-- Compute intensity score: `apex_intensity.ln()` normalized across peaks
-- Normalize each component to [0, 1] across peaks, combine with fixed weights
+---
 
-### 2. `crates/osprey/src/pipeline.rs` -- Use composite scoring in coelution search
+## Scope
 
-In the per-peptide closure, when multiple peaks are detected from `detect_xic_peak()`:
+- **Main search only**: Multi-charge consensus is applied in `pipeline.rs::run_search()`, not during calibration
+- **Per-file**: Consensus is computed within each file independently (different files may have different chromatographic conditions)
+- **Targets and decoys separately**: Grouped by `modified_sequence` which naturally separates targets from decoys (decoys have `DECOY_` prefix)
 
-- Score each peak candidate using `score_peak_candidates()`
-- Select the peak with highest composite score
-- Pass the selected peak's boundaries to feature extraction
+### What stays unchanged
 
-### 3. Logging -- Peak selection diagnostics
+- CWT peak detection within the per-precursor loop
+- All 45 PIN features and Mokapot/Percolator scoring
+- FDR control, blib output, everything downstream
+- Calibration path (`batch.rs`) — does not need multi-charge consensus
+- Existing blib `build_shared_boundaries()` function (uses same grouping pattern for output)
 
-In the scoring phase, after scoring all peptides, log:
-- How many precursors had multiple peak candidates
-- How often the non-highest-intensity peak was selected
-- Distribution of peak counts
+---
 
-This directly measures whether the composite scoring is changing decisions.
+## Determinism
 
-## Existing Code to Reuse
+See [Determinism](determinism.md) for comprehensive determinism documentation.
 
-| Function | Location | Purpose |
-|----------|----------|---------|
-| `pearson_correlation_raw()` | `osprey-scoring/src/lib.rs` | Raw Pearson correlation between two f64 slices |
-| `extract_fragment_xics()` | `osprey-scoring/src/lib.rs` | Extract XICs for top N fragments from spectra |
-| `detect_xic_peak()` | `osprey-chromatography/src/lib.rs` | Returns `XICPeakBounds` with apex, boundaries, area, S/N |
+The multi-charge consensus step follows the project's determinism patterns:
+- After HashMap-based grouping, results are sorted by `(entry_id, scan_number)` before return
+- Re-scoring is done sequentially (not `par_iter`) to avoid nondeterministic floating-point accumulation order
 
-## Verification
+---
 
-1. `cargo fmt && cargo clippy --all-targets --all-features -- -D warnings && cargo test` -- all pass
-2. `cargo build --release`
-3. Run on test data and verify:
-   - Log shows peak selection statistics
-   - Compare FDR results: expect same or better precursor count at 1% FDR
-4. Manual spot-check: find cases where non-max-intensity peak was selected, verify the selected peak is more plausible (closer to expected RT, better fragment coelution)
+## Implementation
 
-## Future Extension: Learned Weights
+| File | Function | Purpose |
+|------|----------|---------|
+| `crates/osprey/src/pipeline.rs` | `select_consensus_peaks()` | Group by modified_sequence, identify consensus, mark re-score targets |
+| `crates/osprey/src/pipeline.rs` | `rescore_at_consensus()` | Re-extract XICs and compute features at consensus boundaries |
+| `crates/osprey/src/pipeline.rs` | `compute_features_at_peak()` | Reusable feature computation (shared with initial search) |
+| `crates/osprey/src/pipeline.rs` | `FeatureComputeContext` | Context struct bundling read-only references for feature computation |
 
-The fixed weights (0.35, 0.25, 0.20, 0.20) can later be replaced with learned weights using the same LDA pattern from `calibration_ml.rs`. After Percolator/Mokapot identifies true positives at stringent FDR, peak selection weights could be optimized to maximize agreement with confirmed results. Not needed for initial implementation.
+### Tests
+
+| Test | Description |
+|------|-------------|
+| `test_consensus_single_charge_no_change` | Single charge state: kept, no re-scoring |
+| `test_consensus_two_charges_same_peak` | Two charges, same apex RT: both kept |
+| `test_consensus_two_charges_different_peaks` | Two charges, different apex RTs: best kept, other marked |
+| `test_consensus_three_charges_two_agree` | Three charges, two agree + one disagrees: two kept, one marked |
+| `test_consensus_decoys_separate_from_targets` | Decoys grouped separately from targets |
+| `test_consensus_multiple_peptides_independent` | Different peptides grouped independently |

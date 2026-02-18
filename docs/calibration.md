@@ -41,8 +41,12 @@ Each sampled peptide is scored using fragment XIC co-elution, not simple XCorr:
 1. Map library RT to expected measured RT (linear mapping if RT scales differ, identity if similar)
 2. Set initial RT tolerance (20% of gradient range if scales similar, 50% if linear mapping needed)
 3. For each library entry, extract fragment XICs from spectra within tolerance
-4. Score co-elution at each scan point, find peak apex
-5. At apex, measure spectral similarity (libcosine), fragment matches, and signal-to-noise
+4. Detect candidate peaks using **CWT consensus peak detection** (Mexican Hat wavelet convolution of each fragment XIC, pointwise median across transitions — see [Peak Detection](peak-detection.md))
+5. For each candidate peak, score pairwise fragment correlation within its boundaries
+6. Select the peak with the highest co-elution score
+7. At apex, measure spectral similarity (libcosine), fragment matches, and signal-to-noise
+
+If CWT consensus finds no peaks, falls back to SG-smoothed peak detection on the reference XIC (`detect_all_xic_peaks`).
 
 ### LDA Scoring
 

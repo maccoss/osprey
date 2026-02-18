@@ -76,11 +76,12 @@ pub struct PeakMetrics {
     pub transition_areas: Vec<f64>,
     pub transition_backgrounds: Vec<f64>,
 }
-
+```
 
 ### 4.2 The Mexican Hat Kernel Generator
-use std::f64::consts::PI;
 
+```rust
+use std::f64::consts::PI;
 /// Generates a discrete Mexican Hat wavelet kernel (normalized).
 pub fn generate_mexican_hat(scale: f64, num_points: usize) -> Array1<f64> {
     let mut kernel = Array1::<f64>::zeros(num_points);
@@ -102,10 +103,10 @@ pub fn generate_mexican_hat(scale: f64, num_points: usize) -> Array1<f64> {
     
     kernel
 }
-
+```
 
 ### 4.3 Consensus Logic & Peak Picking
-
+```rust
 /// Main function to detect peaks and return boundaries
 pub fn detect_peak_boundaries(
     data: &PrecursorData,
@@ -149,8 +150,11 @@ pub fn detect_peak_boundaries(
 
     Some((left_idx, apex_idx, right_idx))
 }
+```
+
 
 ### 4.4 Quantitation (Trapezoidal + Background Subtraction)
+```rust
 pub fn quantify_peak(
     data: &PrecursorData,
     bounds: (usize, usize, usize),
@@ -200,6 +204,7 @@ pub fn quantify_peak(
         transition_backgrounds: backgrounds,
     }
 }
+```
 
 5. Advanced Considerations
 5.1 Handling Interference
