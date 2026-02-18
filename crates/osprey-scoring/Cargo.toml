@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 osprey-core = { workspace = true }
+osprey-chromatography = { workspace = true }
 osprey-io = { workspace = true, optional = true }
 osprey-ml = { workspace = true }
 ndarray = { workspace = true }

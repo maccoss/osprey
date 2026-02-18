@@ -41,14 +41,6 @@ pub struct OspreyConfig {
     /// RT calibration configuration
     pub rt_calibration: RTCalibrationConfig,
 
-    // Regression
-    /// Regularization parameter selection
-    pub regularization_lambda: RegularizationSetting,
-    /// Maximum iterations for solver
-    pub max_iterations: usize,
-    /// Convergence threshold
-    pub convergence_threshold: f64,
-
     // FDR control
     /// Run-level FDR threshold
     pub run_fdr: f64,
@@ -59,15 +51,20 @@ pub struct OspreyConfig {
     /// Whether library already contains decoys
     pub decoys_in_library: bool,
 
+    // FDR method
+    /// FDR method: native Percolator (default), external mokapot, or simple target-decoy
+    #[serde(default)]
+    pub fdr_method: FdrMethod,
+
+    /// Write PIN files for external tools (default: false)
+    #[serde(default)]
+    pub write_pin: bool,
+
     // Performance
     /// Number of threads to use
     pub n_threads: usize,
     /// Memory limit in GB
     pub memory_limit_gb: Option<f64>,
-
-    // Output options
-    /// Export coefficient time series to parquet
-    pub export_coefficients: bool,
 }
 
 impl Default for OspreyConfig {
@@ -83,16 +80,14 @@ impl Default for OspreyConfig {
             precursor_tolerance: FragmentToleranceConfig::hram(10.0), // 10 ppm for precursor
             max_candidates_per_spectrum: 5250,
             rt_calibration: RTCalibrationConfig::default(),
-            regularization_lambda: RegularizationSetting::CrossValidated,
-            max_iterations: 1000,
-            convergence_threshold: 1e-6,
+            fdr_method: FdrMethod::default(),
+            write_pin: false,
             run_fdr: 0.01,
             experiment_fdr: 0.01,
             decoy_method: DecoyMethod::Reverse,
             decoys_in_library: false,
             n_threads: num_cpus(),
             memory_limit_gb: None,
-            export_coefficients: false,
         }
     }
 }
@@ -209,24 +204,18 @@ rt_calibration:
   calibration_sample_size: 100000 # Target peptides to sample for calibration (0 = all)
   calibration_retry_factor: 2.0   # Multiply sample size on retry if too few calibration points
 
-# Regression
-regularization_lambda: CrossValidated
-# Options: CrossValidated, Adaptive, or Fixed with value
-# regularization_lambda:
-#   Fixed: 0.5
-
 # FDR control
 run_fdr: 0.01
 experiment_fdr: 0.01
 decoy_method: Reverse  # Options: Reverse, Shuffle, FromLibrary
 decoys_in_library: false
+fdr_method: Percolator  # Options: Percolator (native SVM), Mokapot (external Python), Simple (no ML)
+write_pin: false  # Write PIN files for external tools
 
 # Performance
 n_threads: 0  # 0 = auto-detect
 # memory_limit_gb: 16.0  # Optional memory limit
 
-# Output options
-export_coefficients: false  # Export coefficient time series to parquet
 "#;
 
         fs::write(path.as_ref(), template).map_err(|e| {
@@ -262,9 +251,6 @@ export_coefficients: false  # Export coefficient time series to parquet
         if let Some(threads) = args.n_threads {
             self.n_threads = threads;
         }
-        if let Some(lambda) = args.lambda {
-            self.regularization_lambda = RegularizationSetting::Fixed(lambda);
-        }
         if args.verbose {
             // Logging level would be handled separately
         }
@@ -280,6 +266,12 @@ export_coefficients: false  # Export coefficient time series to parquet
         if let Some(unit) = args.precursor_unit {
             self.precursor_tolerance.unit = unit;
         }
+        if let Some(method) = args.fdr_method {
+            self.fdr_method = method;
+        }
+        if args.write_pin {
+            self.write_pin = true;
+        }
     }
 }
 
@@ -293,13 +285,14 @@ pub struct ConfigOverrides {
     pub rt_tolerance: Option<f64>,
     pub run_fdr: Option<f64>,
     pub n_threads: Option<usize>,
-    pub lambda: Option<f64>,
     pub verbose: bool,
     pub disable_rt_calibration: bool,
     pub fragment_tolerance: Option<f64>,
     pub fragment_unit: Option<ToleranceUnit>,
     pub precursor_tolerance: Option<f64>,
     pub precursor_unit: Option<ToleranceUnit>,
+    pub fdr_method: Option<FdrMethod>,
+    pub write_pin: bool,
 }
 
 /// RT Calibration configuration
@@ -346,10 +339,19 @@ pub struct RTCalibrationConfig {
     /// On each retry, sample_size is multiplied by this factor. Final attempt uses all entries.
     #[serde(default = "default_calibration_retry_factor")]
     pub calibration_retry_factor: f64,
+    /// Maximum RT tolerance (minutes). Hard cap to prevent catastrophic widening
+    /// when calibration is poor. Default: 3.0 min.
+    #[serde(default = "default_max_rt_tolerance")]
+    pub max_rt_tolerance: f64,
+    /// Use percentile-based RT tolerance instead of SD-based (DIA-NN approach).
+    /// When true: tolerance = max(2 × P20_abs_error, RT_range / 40)
+    /// When false: tolerance = rt_tolerance_factor × residual_SD
+    #[serde(default = "default_use_percentile_tolerance")]
+    pub use_percentile_tolerance: bool,
 }
 
 fn default_min_rt_tolerance() -> f64 {
-    0.1
+    0.5
 }
 
 fn default_calibration_sample_size() -> usize {
@@ -360,6 +362,14 @@ fn default_calibration_retry_factor() -> f64 {
     2.0
 }
 
+fn default_max_rt_tolerance() -> f64 {
+    3.0
+}
+
+fn default_use_percentile_tolerance() -> bool {
+    false
+}
+
 impl Default for RTCalibrationConfig {
     fn default() -> Self {
         Self {
@@ -368,10 +378,12 @@ impl Default for RTCalibrationConfig {
             min_calibration_points: 200,
             rt_tolerance_factor: 3.0,
             fallback_rt_tolerance: 2.0,
-            min_rt_tolerance: 0.1, // 6 seconds minimum (was 0.25 = 15 sec)
+            min_rt_tolerance: 0.5,           // 0.5 minute minimum
             initial_tolerance_fraction: 1.0, // 100% of RT range (no RT filtering, like pyXcorrDIA)
             calibration_sample_size: 100000,
             calibration_retry_factor: 2.0,
+            max_rt_tolerance: 3.0,           // Hard cap at 3 minutes
+            use_percentile_tolerance: false, // Use 3×SD tolerance (covers >99% of peptides)
         }
     }
 }
@@ -409,18 +421,6 @@ pub enum ResolutionMode {
     Auto,
 }
 
-/// Regularization parameter selection strategy
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub enum RegularizationSetting {
-    /// Fixed lambda value
-    Fixed(f64),
-    /// Select via cross-validation
-    #[default]
-    CrossValidated,
-    /// Adaptive per spectrum
-    Adaptive,
-}
-
 /// Decoy generation method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum DecoyMethod {
@@ -431,6 +431,28 @@ pub enum DecoyMethod {
     Shuffle,
     /// Use decoys already in library
     FromLibrary,
+}
+
+/// FDR control method
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FdrMethod {
+    /// Native Rust Percolator implementation (linear SVM, default)
+    #[default]
+    Percolator,
+    /// External Python mokapot
+    Mokapot,
+    /// Simple target-decoy competition (no ML rescoring)
+    Simple,
+}
+
+impl std::fmt::Display for FdrMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FdrMethod::Percolator => write!(f, "percolator"),
+            FdrMethod::Mokapot => write!(f, "mokapot"),
+            FdrMethod::Simple => write!(f, "simple"),
+        }
+    }
 }
 
 /// Fragment tolerance configuration for LibCosine scoring

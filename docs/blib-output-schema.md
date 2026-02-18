@@ -29,7 +29,7 @@ The blib output contains:
 │  OspreyPeakBoundaries │  Peak boundaries per run (StartRT, etc) │
 │  OspreyRunScores      │  Run-level q-values and scores          │
 │  OspreyExperimentScores │  Experiment-level q-values            │
-│  OspreyCoefficients   │  Coefficient time series (optional)     │
+│  OspreyCoefficients   │  XIC time series (optional)             │
 │  OspreyMetadata       │  Analysis metadata (version, settings)  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -116,8 +116,12 @@ Fragment peak data stored as binary blobs.
 | Column | Type | Description |
 |--------|------|-------------|
 | RefSpectraID | INTEGER | FK to RefSpectra.id |
-| peakMZ | BLOB | m/z values (little-endian f64 array) |
-| peakIntensity | BLOB | Intensity values (little-endian f32 array) |
+| peakMZ | BLOB | m/z values (little-endian f64 array, zlib-compressed) |
+| peakIntensity | BLOB | Intensity values (little-endian f32 array, zlib-compressed) |
+
+**Fragment data source**: The m/z and intensity values stored here are the **library theoretical fragments** (b/y ions from the spectral library), not observed peaks from the DIA spectrum. Skyline uses these theoretical fragment m/z values to build extracted-ion chromatograms for the correct transitions.
+
+**Compression**: Blobs are zlib-compressed. If compression does not reduce size (e.g., for very small arrays), the raw bytes are stored instead. To read, attempt zlib decompression; if it fails or the decompressed size doesn't match `numPeaks * sizeof(type)`, treat the blob as raw bytes.
 
 ### RefSpectraPeakAnnotations
 
@@ -196,7 +200,7 @@ Peak boundaries per detection. Useful for quantification and visualization.
 | StartRT | REAL | Peak start time (minutes) |
 | EndRT | REAL | Peak end time (minutes) |
 | ApexRT | REAL | Peak apex time (minutes) |
-| ApexIntensity | REAL | Apex coefficient value |
+| ApexIntensity | REAL | Apex intensity value |
 | IntegratedArea | REAL | Integrated peak area |
 
 ### OspreyRunScores
@@ -226,16 +230,16 @@ Experiment-level scores (aggregated across replicates).
 
 ### OspreyCoefficients
 
-Coefficient time series (optional, enabled with `--export-coefficients`).
+XIC time series data (optional).
 
 | Column | Type | Description |
 |--------|------|-------------|
-| id | INTEGER | Coefficient ID |
+| id | INTEGER | Entry ID |
 | RefSpectraID | INTEGER | FK to RefSpectra.id |
 | FileName | TEXT | Source file name |
 | ScanNumber | INTEGER | Scan number |
 | RT | REAL | Retention time (minutes) |
-| Coefficient | REAL | Regression coefficient value |
+| Coefficient | REAL | XIC intensity value |
 
 ### OspreyMetadata
 
@@ -377,3 +381,20 @@ Key methods:
 - `add_run_scores()` - Add run-level scores
 - `add_experiment_scores()` - Add experiment-level scores
 - `finalize()` - Update spectrum count and close
+
+## Data Flow
+
+How data flows from library through search to blib output:
+
+1. **Library loading**: Spectral library loaded from blib/elib/DIA-NN TSV format
+2. **Deduplication**: Entries grouped by (modified_sequence, charge); best spectrum kept per precursor
+3. **Decoy generation**: Reversed-sequence decoys generated for each target
+4. **Search**: Each library precursor scored against DIA data (coelution search)
+5. **FDR control**: Mokapot semi-supervised learning assigns q-values
+6. **Blib output**: Passing precursors written with:
+   - **RefSpectra**: Peptide sequence, precursor m/z, charge, apex RT, peak boundaries
+   - **RefSpectraPeaks**: Library theoretical fragment m/z and intensities (not observed DIA peaks)
+   - **Modifications**: From library entry (UniMod converted to mass notation)
+   - **Proteins**: From library entry protein accessions
+   - **RetentionTimes**: Per-run peak boundaries for multi-file experiments
+   - **Osprey tables**: Run/experiment q-values, peak boundaries

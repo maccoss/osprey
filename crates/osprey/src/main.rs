@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 use clap::Parser;
-use osprey::{run_analysis, ConfigOverrides, OspreyConfig, ResolutionMode, ToleranceUnit};
+use osprey::{
+    run_analysis, ConfigOverrides, FdrMethod, OspreyConfig, ResolutionMode, ToleranceUnit,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -73,9 +75,8 @@ fn format_duration(duration: std::time::Duration) -> String {
 Osprey is an open-source tool for peptide detection and quantification
 in data-independent acquisition (DIA) mass spectrometry data.
 
-It uses ridge regression to deconvolute mixed MS/MS spectra, aggregates
-evidence across the chromatographic dimension, and uses machine learning
-to score peptide detections with rigorous FDR control.
+It uses fragment XIC co-elution analysis to detect peptides in DIA data,
+with machine learning scoring and rigorous FDR control.
 
 EXAMPLES:
     # Basic analysis with DIA-NN library
@@ -83,9 +84,6 @@ EXAMPLES:
 
     # Multiple input files
     osprey -i *.mzML -l library.tsv -o results.blib
-
-    # Unit resolution mode with specific lambda
-    osprey -i sample.mzML -l library.tsv -o results.blib --resolution unit --lambda 0.5
 
     # Write additional TSV report
     osprey -i sample.mzML -l library.tsv -o results.blib --report results.tsv
@@ -139,10 +137,6 @@ struct Args {
     #[arg(long)]
     no_rt_calibration: bool,
 
-    /// Fixed regularization parameter lambda
-    #[arg(long)]
-    lambda: Option<f64>,
-
     /// Maximum candidates per spectrum (use 0 for unlimited)
     #[arg(long, default_value_t = 5250)]
     max_candidates: usize,
@@ -159,9 +153,13 @@ struct Args {
     #[arg(long)]
     report: Option<PathBuf>,
 
-    /// Export coefficient time series to parquet file(s)
+    /// FDR method: percolator (native SVM, default), mokapot (external Python), or simple (no ML)
+    #[arg(long, default_value = "percolator")]
+    fdr_method: String,
+
+    /// Write PIN files for external tools
     #[arg(long)]
-    export_coefficients: bool,
+    write_pin: bool,
 
     /// Verbose output
     #[arg(short, long)]
@@ -240,6 +238,17 @@ fn main() -> Result<()> {
             }
         });
 
+    // Parse FDR method
+    let fdr_method = match args.fdr_method.to_lowercase().as_str() {
+        "percolator" => Some(FdrMethod::Percolator),
+        "mokapot" => Some(FdrMethod::Mokapot),
+        "simple" => Some(FdrMethod::Simple),
+        other => {
+            log::warn!("Unknown FDR method '{}', defaulting to percolator", other);
+            Some(FdrMethod::Percolator)
+        }
+    };
+
     // Create overrides from CLI args (these take precedence over config file)
     let overrides = ConfigOverrides {
         input_files: args.input,
@@ -249,13 +258,14 @@ fn main() -> Result<()> {
         rt_tolerance: Some(args.rt_tolerance),
         run_fdr: Some(args.run_fdr),
         n_threads: args.threads,
-        lambda: args.lambda,
         verbose: args.verbose,
         disable_rt_calibration: args.no_rt_calibration,
         fragment_tolerance: args.fragment_tolerance,
         fragment_unit,
         precursor_tolerance: args.precursor_tolerance,
         precursor_unit,
+        fdr_method,
+        write_pin: args.write_pin,
     };
 
     // Apply CLI overrides
@@ -299,11 +309,6 @@ fn main() -> Result<()> {
 
     // Set max candidates
     config.max_candidates_per_spectrum = args.max_candidates;
-
-    // Set export coefficients
-    if args.export_coefficients {
-        config.export_coefficients = true;
-    }
 
     // Set thread count
     if let Some(threads) = args.threads {

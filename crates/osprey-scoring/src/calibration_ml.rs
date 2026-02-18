@@ -188,9 +188,9 @@ fn train_lda_single_model(
 
     // Log final weights
     let feature_names = if use_isotope_feature {
-        vec!["correlation", "libcosine", "top6", "snr", "isotope"]
+        vec!["correlation", "libcosine", "top6", "xcorr", "isotope"]
     } else {
-        vec!["correlation", "libcosine", "top6", "snr"]
+        vec!["correlation", "libcosine", "top6", "xcorr"]
     };
 
     log::info!(
@@ -249,7 +249,7 @@ fn train_lda_with_nonnegative_cv(
 
     let n_samples = features.rows;
     let n_features = features.cols;
-    let feature_names = ["correlation", "libcosine", "top6", "snr"];
+    let feature_names = ["correlation", "libcosine", "top6", "xcorr"];
 
     // Create fold assignments (stable across iterations - Percolator-RESET grouping)
     let fold_assignments = create_stratified_folds_by_peptide(decoy_labels, sequences, N_FOLDS);
@@ -341,34 +341,54 @@ fn train_lda_with_nonnegative_cv(
             );
 
             // Train LDA on clean training set
-            let lda = LinearDiscriminantAnalysis::fit(&train_features, &train_labels).ok_or_else(
-                || {
-                    OspreyError::config(format!(
-                        "LDA training failed on fold {}/{}",
+            // If LDA fails (singular scatter matrix), skip this fold
+            match LinearDiscriminantAnalysis::fit(&train_features, &train_labels) {
+                Some(lda) => {
+                    let weights = lda.eigenvector().to_vec();
+
+                    log::debug!(
+                        "    Fold {}/{} weights: {}",
                         fold_idx + 1,
-                        N_FOLDS
-                    ))
-                },
-            )?;
+                        N_FOLDS,
+                        feature_names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, name)| format!("{}={:.3}", name, weights[i]))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
 
-            let weights = lda.eigenvector().to_vec();
-
-            log::debug!(
-                "    Fold {}/{} weights: {}",
-                fold_idx + 1,
-                N_FOLDS,
-                feature_names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| format!("{}={:.3}", name, weights[i]))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-
-            fold_weights.push(weights);
+                    fold_weights.push(weights);
+                }
+                None => {
+                    log::warn!(
+                        "    Fold {}/{}: LDA fit failed (singular matrix, {} targets, {} decoys), skipping",
+                        fold_idx + 1,
+                        N_FOLDS,
+                        selected_target_indices.len(),
+                        decoy_indices.len()
+                    );
+                }
+            }
         }
 
         // Phase 2: Average weights across folds → consensus weights
+        // If all folds failed, skip this iteration entirely
+        if fold_weights.is_empty() {
+            log::warn!(
+                "  Iteration {}: All folds failed, using best single feature as baseline",
+                iteration + 1
+            );
+            break;
+        }
+        if fold_weights.len() < N_FOLDS {
+            log::warn!(
+                "  Iteration {}: {}/{} folds succeeded, averaging available weights",
+                iteration + 1,
+                fold_weights.len(),
+                N_FOLDS
+            );
+        }
         let mut consensus_weights = average_weights(&fold_weights);
 
         // Clip negative weights to zero (non-negative constraint)
@@ -565,8 +585,16 @@ fn compete_calibration_pairs(
         }
     }
 
-    // Sort winners by score descending
-    winners.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+    // Sort winners by score descending, then base_id ascending for deterministic tiebreaking.
+    // IMPORTANT: Use base_id (not array index) as tiebreaker. Array indices depend on input
+    // order (HashMap iteration), and if the input is sorted by entry_id, all targets get low
+    // indices → systematic target-before-decoy bias → artificially inflated FDR estimates.
+    // base_id is intrinsic to the entry and doesn't correlate with target/decoy status.
+    winners.sort_by(|&a, &b| {
+        scores[b]
+            .total_cmp(&scores[a])
+            .then((entry_ids[a] & 0x7FFFFFFF).cmp(&(entry_ids[b] & 0x7FFFFFFF)))
+    });
     winners
 }
 
@@ -707,11 +735,7 @@ fn extract_rows(matrix: &Matrix, row_indices: &[usize]) -> Matrix {
 /// - correlation: 0-1 (typical range 0-6, divided by 6)
 /// - libcosine_apex: 0-1 (already normalized)
 /// - top6_matched_apex: 0-1 (count 0-6, divided by 6)
-/// - signal_to_noise: ~0-1 (ln(x+1) transform, typical max ~100 → ln~5)
-///
-/// Note: hyperscore and isotope are NOT used in calibration LDA:
-/// - hyperscore dominates target-decoy discrimination but doesn't correlate with RT quality
-/// - isotope shows negative correlation and doesn't help RT calibration
+/// - xcorr: ~0-1 (typical range 0-3, divided by 3)
 fn extract_feature_matrix(matches: &[CalibrationMatch], _use_isotope_feature: bool) -> Matrix {
     let n_features = 4;
 
@@ -725,8 +749,8 @@ fn extract_feature_matrix(matches: &[CalibrationMatch], _use_isotope_feature: bo
                 m.libcosine_apex.clamp(0.0, 1.0),
                 // Top-6 count normalized
                 (m.top6_matched_apex as f64 / 6.0).clamp(0.0, 1.0),
-                // Signal-to-noise with log transform (typical range 1-100+)
-                (m.signal_to_noise.ln_1p() / 5.0).clamp(0.0, 1.0),
+                // XCorr normalized (typical range 0-3 for unit resolution, 0-1 for HRAM)
+                (m.xcorr_score / 3.0).clamp(0.0, 1.0),
             ]
         })
         .collect();
@@ -743,23 +767,23 @@ fn log_median_features(matches: &[CalibrationMatch], use_isotope: bool) {
     let mut corrs: Vec<f64> = matches.iter().map(|m| m.correlation_score).collect();
     let mut libcos: Vec<f64> = matches.iter().map(|m| m.libcosine_apex).collect();
     let mut top6s: Vec<f64> = matches.iter().map(|m| m.top6_matched_apex as f64).collect();
-    let mut snrs: Vec<f64> = matches.iter().map(|m| m.signal_to_noise).collect();
+    let mut xcorrs: Vec<f64> = matches.iter().map(|m| m.xcorr_score).collect();
     let mut discrims: Vec<f64> = matches.iter().map(|m| m.discriminant_score).collect();
 
     corrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     libcos.sort_by(|a, b| a.partial_cmp(b).unwrap());
     top6s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    snrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    xcorrs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     discrims.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let mid = matches.len() / 2;
 
     log::info!(
-        "  Median features: corr={:.3}, libcos={:.3}, top6={:.1}, snr={:.1}, discrim={:.3}",
+        "  Median features: corr={:.3}, libcos={:.3}, top6={:.1}, xcorr={:.4}, discrim={:.3}",
         corrs[mid],
         libcos[mid],
         top6s[mid],
-        snrs[mid],
+        xcorrs[mid],
         discrims[mid]
     );
 
@@ -814,7 +838,8 @@ mod tests {
             libcosine_apex: libcosine,
             top6_matched_apex: top6,
             hyperscore_apex: hyperscore,
-            signal_to_noise: 10.0, // Default value for tests
+            signal_to_noise: 10.0,          // Default value for tests
+            peak_width_minutes: Some(0.25), // Default 15 sec for tests
             discriminant_score: 0.0,
             posterior_error: 0.0,
             q_value: 1.0,
@@ -828,7 +853,7 @@ mod tests {
             make_test_match(1 | 0x80000000, 1.5, 0.5, 3, 5.0, Some(0.7), true),
         ];
 
-        // Test 4 features: correlation, libcosine, top6, snr (isotope not used in LDA)
+        // Test 4 features: correlation, libcosine, top6, snr
         let matrix = extract_feature_matrix(&matches, false);
         assert_eq!(matrix.rows, 2);
         assert_eq!(matrix.cols, 4);
@@ -979,5 +1004,47 @@ mod tests {
         let winners = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
         assert_eq!(winners.len(), 1);
         assert_eq!(winners[0], 3); // decoy wins (0.7 > 0.3)
+    }
+
+    /// Verify that compete_calibration_pairs produces deterministic results with tied scores.
+    ///
+    /// Winners are built from HashMap iteration (non-deterministic order), then sorted
+    /// by score with index as tiebreaker. This test verifies tied-score entries always
+    /// appear in the same order across multiple calls.
+    #[test]
+    fn test_compete_calibration_pairs_deterministic_with_ties() {
+        // 4 pairs, targets all score 0.5 (tied), decoys all score 0.1
+        let scores = vec![
+            0.5, 0.5, 0.5, 0.5, // targets (indices 0-3)
+            0.1, 0.1, 0.1, 0.1, // decoys (indices 4-7)
+        ];
+        let entry_ids: Vec<u32> = vec![
+            10,
+            20,
+            30,
+            40, // targets
+            10 | 0x80000000,
+            20 | 0x80000000,
+            30 | 0x80000000,
+            40 | 0x80000000, // decoys
+        ];
+        let is_decoy = vec![false, false, false, false, true, true, true, true];
+        let indices: Vec<usize> = (0..8).collect();
+
+        let first_result = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+
+        // Run multiple times — HashMap iteration order varies, but output must be stable
+        for _ in 0..20 {
+            let result = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+            assert_eq!(
+                result, first_result,
+                "compete_calibration_pairs must be deterministic with tied scores"
+            );
+        }
+
+        // All targets win (0.5 > 0.1), so winners are target indices
+        assert_eq!(first_result.len(), 4);
+        // With tied scores, winners must be sorted by base_id ascending
+        assert_eq!(first_result, vec![0, 1, 2, 3]);
     }
 }

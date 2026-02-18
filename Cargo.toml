@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/osprey-core",
     "crates/osprey-io",
-    "crates/osprey-regression",
     "crates/osprey-chromatography",
     "crates/osprey-scoring",
     "crates/osprey-fdr",
@@ -24,7 +23,6 @@ description = "Peptide-centric DIA analysis tool"
 # Internal crates
 osprey-core = { path = "crates/osprey-core" }
 osprey-io = { path = "crates/osprey-io" }
-osprey-regression = { path = "crates/osprey-regression" }
 osprey-chromatography = { path = "crates/osprey-chromatography" }
 osprey-scoring = { path = "crates/osprey-scoring" }
 osprey-fdr = { path = "crates/osprey-fdr" }
@@ -34,7 +32,6 @@ osprey-ml = { path = "crates/osprey-ml" }
 ndarray = { version = "0.16", features = ["rayon", "blas"] }
 blas-src = { version = "0.10", default-features = false, features = ["openblas"] }
 openblas-src = { version = "0.10", default-features = false, features = ["system", "cblas"] }
-ndarray-linalg = { version = "0.16", features = ["openblas-system"] }
 rayon = "1.10"
 
 # File I/O

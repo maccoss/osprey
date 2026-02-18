@@ -5,9 +5,8 @@
 //!
 //! # Overview
 //!
-//! Osprey uses ridge regression to deconvolute mixed MS/MS spectra,
-//! aggregates evidence across the chromatographic dimension, and uses
-//! machine learning to score peptide detections with rigorous FDR control.
+//! Osprey uses fragment XIC co-elution analysis to detect peptides in DIA data,
+//! with machine learning scoring and rigorous FDR control.
 //!
 //! # Quick Start
 //!
@@ -22,8 +21,7 @@
 //!     ..Default::default()
 //! };
 //!
-//! let results = run_analysis(config)?;
-//! println!("Detected {} peptides", results.len());
+//! run_analysis(config)?;
 //! # Ok::<(), osprey::OspreyError>(())
 //! ```
 
@@ -31,12 +29,7 @@
 pub use osprey_core::*;
 
 // Re-export I/O
-pub use osprey_io::{
-    load_library, BlibLoader, DiannTsvLoader, ElibLoader, MzmlReader, ReportWriter,
-};
-
-// Re-export regression
-pub use osprey_regression::{Binner, DesignMatrixBuilder, RidgeSolver};
+pub use osprey_io::{load_library, BlibLoader, DiannTsvLoader, ElibLoader, MzmlReader};
 
 // Re-export chromatography
 pub use osprey_chromatography::{
@@ -45,10 +38,10 @@ pub use osprey_chromatography::{
 };
 
 // Re-export scoring
-pub use osprey_scoring::{DecoyGenerator, DecoyMethod, Enzyme, FeatureExtractor};
+pub use osprey_scoring::{DecoyGenerator, DecoyMethod, Enzyme};
 
 // Re-export FDR
-pub use osprey_fdr::{FdrController, FdrCounts, MokapotResult, MokapotRunner, PsmFeatures};
+pub use osprey_fdr::{FdrController, FdrCounts, MokapotResult, MokapotRunner};
 
 // Pipeline
 mod pipeline;

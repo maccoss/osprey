@@ -1445,7 +1445,6 @@ dependencies = [
  "osprey-core",
  "osprey-fdr",
  "osprey-io",
- "osprey-regression",
  "osprey-scoring",
  "parquet",
  "pathdiff",
@@ -1483,6 +1482,8 @@ dependencies = [
  "approx",
  "log",
  "osprey-core",
+ "osprey-ml",
+ "rayon",
  "sysinfo",
  "thiserror",
 ]
@@ -1512,20 +1513,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "osprey-regression"
-version = "0.1.0"
-dependencies = [
- "approx",
- "blas-src",
- "log",
- "ndarray",
- "openblas-src",
- "osprey-core",
- "rayon",
- "thiserror",
-]
-
-[[package]]
 name = "osprey-scoring"
 version = "0.1.0"
 dependencies = [
@@ -1535,6 +1522,7 @@ dependencies = [
  "log",
  "ndarray",
  "openblas-src",
+ "osprey-chromatography",
  "osprey-core",
  "osprey-io",
  "osprey-ml",

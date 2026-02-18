@@ -1,108 +1,33 @@
 #!/usr/bin/env python3
-"""Compare retention times between Osprey (mokapot) and DIA-NN for matched peptides.
+"""Compare retention times between Osprey and DIA-NN for matched peptides.
 
-Reads a mokapot peptides output file and a DIA-NN report parquet, matches peptides
+Reads an Osprey parquet report and a DIA-NN report parquet, matches peptides
 by stripped sequence, and creates a density plot + residual plot comparing RTs.
 
-Osprey scan numbers are mapped to RT using the mzML file. DIA-NN RT comes directly
-from the report.
-
 Usage:
-    python compare_scan_numbers.py mokapot_peptides.txt diann_report.parquet mzml_file [--output plot.png]
+    python compare_scan_numbers.py osprey_report.parquet diann_report.parquet [--output plot.png]
 
 Example:
     python scripts/compare_scan_numbers.py \
-        example_test_data/astral/mokapot/run_level/file.mokapot.peptides.txt \
-        example_test_data/astral/carafe/diann_train/report.parquet \
-        example_test_data/astral/file.mzML
+        example_test_data/astral/osprey_report.parquet \
+        example_test_data/astral/carafe/diann_train/report.parquet
 """
 
 import argparse
-import re
 import sys
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from lxml import etree
-
-
-def strip_mokapot_peptide(peptide: str) -> str:
-    """Convert mokapot peptide format to stripped sequence.
-
-    Mokapot format: '-.PEPTC[UniMod:4]IDE.-'
-    Returns: 'PEPTCIDE'
-    """
-    seq = peptide
-    if seq.startswith("-."):
-        seq = seq[2:]
-    if seq.endswith(".-"):
-        seq = seq[:-2]
-    seq = re.sub(r"\[UniMod:\d+\]", "", seq)
-    return seq
-
-
-def build_scan_rt_map(mzml_path: str) -> dict:
-    """Build scan number -> RT (minutes) map from mzML using streaming parse.
-
-    Handles large files efficiently by using iterparse and clearing elements.
-    """
-    scan_rt = {}
-    ns = "http://psi.hupo.org/ms/mzml"
-    spectrum_tag = f"{{{ns}}}spectrum"
-    cv_tag = f"{{{ns}}}cvParam"
-    scan_tag = f"{{{ns}}}scan"
-
-    n_spectra = 0
-    for event, elem in etree.iterparse(mzml_path, events=("end",), tag=spectrum_tag):
-        # Extract scan number from id attribute
-        spec_id = elem.get("id", "")
-        scan_match = re.search(r"scan=(\d+)", spec_id)
-        if not scan_match:
-            elem.clear()
-            continue
-
-        scan_num = int(scan_match.group(1))
-
-        # Find RT in scan/cvParam
-        rt_min = None
-        for scan_elem in elem.iter(scan_tag):
-            for cv in scan_elem.iter(cv_tag):
-                if cv.get("accession") == "MS:1000016":
-                    rt_val = float(cv.get("value"))
-                    unit = cv.get("unitAccession", "")
-                    if unit == "UO:0000010":  # seconds
-                        rt_min = rt_val / 60.0
-                    else:  # assume minutes
-                        rt_min = rt_val
-                    break
-            if rt_min is not None:
-                break
-
-        if rt_min is not None:
-            scan_rt[scan_num] = rt_min
-
-        n_spectra += 1
-        if n_spectra % 50000 == 0:
-            print(f"    Parsed {n_spectra:,} spectra...", flush=True)
-
-        # Free memory
-        elem.clear()
-        while elem.getprevious() is not None:
-            del elem.getparent()[0]
-
-    print(f"    {n_spectra:,} spectra total, {len(scan_rt):,} with RT")
-    return scan_rt
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare retention times: Osprey (mokapot) vs DIA-NN"
+        description="Compare retention times: Osprey vs DIA-NN"
     )
-    parser.add_argument("mokapot_file", help="Mokapot peptides TSV file")
+    parser.add_argument("osprey_file", help="Osprey parquet report file")
     parser.add_argument("diann_file", help="DIA-NN report parquet file")
-    parser.add_argument("mzml_file", help="mzML file for scan number to RT mapping")
     parser.add_argument(
         "--output", "-o", default=None, help="Output plot file (default: show interactive)"
     )
@@ -113,53 +38,68 @@ def main():
         help="FDR threshold for filtering (default: 0.01)",
     )
     parser.add_argument(
+        "--osprey-run",
+        default=None,
+        help="Osprey run name to use (default: auto-detect single run or first run)",
+    )
+    parser.add_argument(
         "--diann-run",
         default=None,
         help="DIA-NN run name to use (default: auto-detect single run or first run)",
     )
     args = parser.parse_args()
 
-    # Build scan -> RT map from mzML
-    print(f"Building scan-to-RT map from {args.mzml_file}")
-    scan_rt = build_scan_rt_map(args.mzml_file)
+    # Load Osprey report
+    print(f"Loading Osprey report from {args.osprey_file}")
+    osprey = pd.read_parquet(
+        args.osprey_file,
+        columns=["Run", "Stripped.Sequence", "RT", "Q.Value", "Global.Q.Value", "Is.Decoy"],
+    )
+    print(f"  {len(osprey)} total entries")
 
-    # Load mokapot peptides
-    print(f"Loading mokapot peptides from {args.mokapot_file}")
-    mok = pd.read_csv(args.mokapot_file, sep="\t")
-    print(f"  {len(mok)} total peptides")
+    # Filter to targets only
+    osprey = osprey[osprey["Is.Decoy"] == False]
+    print(f"  {len(osprey)} target entries")
 
-    # Filter by FDR and target (Label=True)
-    mok = mok[(mok["Label"] == True) & (mok["mokapot q-value"] <= args.fdr)]
-    print(f"  {len(mok)} target peptides at {args.fdr:.0%} FDR")
+    # Select Osprey run
+    osprey_runs = osprey["Run"].unique()
+    if args.osprey_run:
+        osprey = osprey[osprey["Run"] == args.osprey_run]
+    elif len(osprey_runs) > 1:
+        print(f"  Available runs: {osprey_runs.tolist()}")
+        print(f"  Using first run: {osprey_runs[0]}")
+        osprey = osprey[osprey["Run"] == osprey_runs[0]]
 
-    # Strip peptide sequences
-    mok["StrippedSequence"] = mok["Peptide"].apply(strip_mokapot_peptide)
+    osprey_run = osprey["Run"].iloc[0] if len(osprey) > 0 else "unknown"
+    print(f"  Osprey run: {osprey_run}")
 
-    # Map Osprey scan numbers to RT
-    mok["RT_osprey"] = mok["ScanNr"].map(scan_rt)
-    n_mapped = mok["RT_osprey"].notna().sum()
-    n_unmapped = mok["RT_osprey"].isna().sum()
-    print(f"  Mapped {n_mapped} scan numbers to RT ({n_unmapped} unmapped)")
-    mok = mok.dropna(subset=["RT_osprey"])
+    # Use experiment-level q-value (Global.Q.Value) if available, else run-level
+    qval_col = "Global.Q.Value" if osprey["Global.Q.Value"].notna().any() else "Q.Value"
+    osprey = osprey[osprey[qval_col] <= args.fdr]
+    print(f"  {len(osprey)} targets at {args.fdr:.0%} FDR ({qval_col})")
 
-    # Load DIA-NN report (with RT column)
-    print(f"Loading DIA-NN report from {args.diann_file}")
+    # Keep best (lowest q-value) per stripped sequence
+    osprey = osprey.sort_values(qval_col).drop_duplicates(
+        subset=["Stripped.Sequence"], keep="first"
+    )
+    print(f"  {len(osprey)} unique peptides")
+
+    # Load DIA-NN report
+    print(f"\nLoading DIA-NN report from {args.diann_file}")
     diann = pd.read_parquet(
         args.diann_file,
         columns=["Run", "Stripped.Sequence", "RT", "Q.Value"],
     )
     print(f"  {len(diann)} total precursors")
 
-    # Select run
-    runs = diann["Run"].unique()
+    # Select DIA-NN run
+    diann_runs = diann["Run"].unique()
     if args.diann_run:
         diann = diann[diann["Run"] == args.diann_run]
-    elif len(runs) == 1:
-        pass
-    else:
-        print(f"  Available runs: {runs.tolist()}")
-        print(f"  Using first run: {runs[0]}")
-        diann = diann[diann["Run"] == runs[0]]
+    elif len(diann_runs) > 1:
+        print(f"  Available runs: {diann_runs.tolist()}")
+        print(f"  Using first run: {diann_runs[0]}")
+        diann = diann[diann["Run"] == diann_runs[0]]
 
     diann_run = diann["Run"].iloc[0] if len(diann) > 0 else "unknown"
     print(f"  DIA-NN run: {diann_run}")
@@ -168,33 +108,30 @@ def main():
     diann = diann[diann["Q.Value"] <= args.fdr]
     print(f"  {len(diann)} precursors at {args.fdr:.0%} FDR")
 
-    # For DIA-NN, keep best (lowest q-value) per stripped sequence
+    # Keep best (lowest q-value) per stripped sequence
     diann = diann.sort_values("Q.Value").drop_duplicates(
         subset=["Stripped.Sequence"], keep="first"
     )
     print(f"  {len(diann)} unique peptides")
 
     # Merge on stripped sequence
-    merged = mok.merge(
+    merged = osprey.merge(
         diann,
-        left_on="StrippedSequence",
-        right_on="Stripped.Sequence",
+        on="Stripped.Sequence",
         how="inner",
+        suffixes=("_osprey", "_diann"),
     )
     print(f"\n  Matched peptides: {len(merged)}")
-    print(f"  Osprey-only: {len(mok) - len(merged)}")
+    print(f"  Osprey-only: {len(osprey) - len(merged)}")
     print(f"  DIA-NN-only: {len(diann) - len(merged)}")
 
     if len(merged) == 0:
         print("No matching peptides found. Check that files are from the same organism.")
         sys.exit(1)
 
-    # Extract mokapot run name from SpecId
-    mok_run = mok["SpecId"].iloc[0].rsplit("_", 1)[0] if "SpecId" in mok.columns else "Osprey"
-
     # Compute statistics (RT in minutes)
-    x = merged["RT"].values.astype(float)  # DIA-NN RT
-    y = merged["RT_osprey"].values.astype(float)  # Osprey RT from mzML
+    x = merged["RT_diann"].values.astype(float)   # DIA-NN RT
+    y = merged["RT_osprey"].values.astype(float)   # Osprey RT
     residuals = y - x
     median_diff = np.median(residuals)
     mad = np.median(np.abs(residuals - median_diff))
@@ -230,8 +167,8 @@ def main():
 
     ax_density.set_xlim(lo - margin, hi + margin)
     ax_density.set_ylim(lo - margin, hi + margin)
-    ax_density.set_xlabel(f"DIA-NN RT (min)")
-    ax_density.set_ylabel(f"Osprey RT (min)")
+    ax_density.set_xlabel("DIA-NN RT (min)")
+    ax_density.set_ylabel("Osprey RT (min)")
     ax_density.set_title(
         f"RT comparison ({len(merged):,} matched peptides at {args.fdr:.0%} FDR)\n"
         f"median offset={median_diff:.2f} min, MAD={mad:.2f} min, R\u00b2={r2:.4f}"
@@ -254,7 +191,7 @@ def main():
     ax_resid.axhline(median_diff, color="white", linewidth=0.8, alpha=0.7, linestyle="--")
     ax_resid.axhline(0, color="gray", linewidth=0.5, alpha=0.5, linestyle=":")
 
-    ax_resid.set_xlabel(f"DIA-NN RT (min)")
+    ax_resid.set_xlabel("DIA-NN RT (min)")
     ax_resid.set_ylabel("RT difference (min)\n(Osprey \u2212 DIA-NN)")
     ax_resid.set_title("Residuals (RT difference)")
 

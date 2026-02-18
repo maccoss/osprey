@@ -30,45 +30,30 @@
 //! Note: No additional precursor m/z tolerance is applied - the isolation window
 //! from the mzML is sufficient.
 
-use arrow::array::{ArrayRef, BooleanBuilder, Float32Builder, StringBuilder, UInt8Builder};
+use arrow::array::{
+    ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, StringBuilder, UInt32Builder,
+    UInt8Builder,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use indicatif::{ProgressBar, ProgressStyle};
 use osprey_chromatography::{
-    calculate_mz_calibration,
-    calibration_path_for_input,
-    load_calibration,
-    save_calibration,
-    CalibrationMetadata,
-    // Full calibration types
-    CalibrationParams,
-    IsolationScheme,
-    MzCalibration,
-    MzQCData,
-    PeakDetector,
-    RTCalibration,
-    RTCalibrationMethod,
-    RTCalibrationParams,
-    RTCalibrator,
-    RTCalibratorConfig,
+    calculate_mz_calibration, calibration_path_for_input, load_calibration, save_calibration,
+    trapezoidal_area, CalibrationMetadata, CalibrationParams, IsolationScheme, MzQCData,
+    RTCalibration, RTCalibrationMethod, RTCalibrationParams, RTCalibrator, RTCalibratorConfig,
 };
 use osprey_core::{
-    BinConfig, DecoyMethod as CoreDecoyMethod, FeatureSet, FragmentToleranceConfig, LibraryEntry,
-    LibraryFragment, MS1Spectrum, OspreyConfig, OspreyError, RegressionResult, Result, Spectrum,
-    ToleranceUnit,
+    CoelutionFeatureSet, CoelutionScoredEntry, DecoyMethod as CoreDecoyMethod, FdrMethod,
+    FragmentToleranceConfig, LibraryEntry, LibraryFragment, MS1Spectrum, OspreyConfig, OspreyError,
+    Result, Spectrum, ToleranceUnit, XICPeakBounds,
 };
 use osprey_fdr::{
-    get_pin_feature_names, pin_feature_value, FdrController, MokapotRunner, PsmFeatures,
-    NUM_PIN_FEATURES,
+    get_pin_feature_names, percolator, pin_feature_value, MokapotRunner, NUM_PIN_FEATURES,
 };
 use osprey_io::{load_all_spectra, load_library, BlibWriter, MS1Index};
-use osprey_regression::{Binner, DesignMatrixBuilder, OptimizedSolver, RidgeSolver};
 use osprey_scoring::{
-    batch::{
-        run_coelution_calibration_scoring, sample_library_for_calibration, BatchScorer,
-        MS1SpectrumLookup, PreprocessedLibrary, PreprocessedSpectra,
-    },
-    has_topn_fragment_match, DecoyGenerator, DecoyMethod, Enzyme, FeatureExtractor,
+    batch::{run_coelution_calibration_scoring, sample_library_for_calibration, MS1SpectrumLookup},
+    DecoyGenerator, DecoyMethod, Enzyme, SpectralScorer,
 };
 
 /// Wrapper to implement MS1SpectrumLookup for MS1Index
@@ -80,8 +65,9 @@ impl<'a> MS1SpectrumLookup for MS1IndexWrapper<'a> {
     }
 }
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use osprey_scoring::batch::{pair_calibration_matches, CalibrationMatch};
 
@@ -139,800 +125,6 @@ fn extract_isolation_scheme(spectra: &[Spectrum]) -> Option<IsolationScheme> {
 }
 
 /// Run the complete Osprey analysis pipeline
-pub fn run_analysis(config: OspreyConfig) -> Result<Vec<RegressionResult>> {
-    log::info!("Starting Osprey analysis");
-
-    // Validate config
-    if config.input_files.is_empty() {
-        return Err(OspreyError::ConfigError("No input files specified".into()));
-    }
-
-    // Load library
-    log::info!(
-        "Loading spectral library from {:?}",
-        config.library_source.path()
-    );
-    let mut library = load_library(&config.library_source)?;
-    log::info!("Loaded {} library entries", library.len());
-
-    if library.is_empty() {
-        return Err(OspreyError::LibraryLoadError("Library is empty".into()));
-    }
-
-    // Generate decoys if not already in library
-    if !config.decoys_in_library {
-        log::info!("Generating decoys using {:?} method", config.decoy_method);
-
-        let decoy_method = match config.decoy_method {
-            CoreDecoyMethod::Reverse => DecoyMethod::Reverse,
-            CoreDecoyMethod::Shuffle => DecoyMethod::Shuffle,
-            CoreDecoyMethod::FromLibrary => {
-                // Shouldn't reach here since decoys_in_library is false
-                DecoyMethod::Reverse
-            }
-        };
-
-        // Generate decoys with collision detection (pyXcorrDIA approach)
-        let generator = DecoyGenerator::with_enzyme(decoy_method, Enzyme::Trypsin);
-
-        // Only generate decoys for targets
-        let targets: Vec<LibraryEntry> = library.iter().filter(|e| !e.is_decoy).cloned().collect();
-        let n_original_targets = targets.len();
-
-        // Generate decoys with collision detection
-        // This filters out targets that can't have unique decoys
-        let (valid_targets, decoys, _stats) =
-            generator.generate_all_with_collision_detection(&targets);
-
-        log::info!(
-            "Generated {} decoys from {} targets ({} excluded due to collisions)",
-            decoys.len(),
-            n_original_targets,
-            n_original_targets - valid_targets.len()
-        );
-
-        // Replace library with valid targets + decoys
-        library = valid_targets;
-        library.extend(decoys);
-        log::info!("Total library size: {} (targets + decoys)", library.len());
-    } else {
-        // Count existing decoys
-        let n_decoys = library.iter().filter(|e| e.is_decoy).count();
-        let n_targets = library.len() - n_decoys;
-        log::info!(
-            "Library contains {} targets and {} decoys",
-            n_targets,
-            n_decoys
-        );
-    }
-
-    // Ridge regression always uses unit resolution bins (~1 Th, 2000 bins).
-    // HRAM precision (ppm-based matching) is applied separately in:
-    //   - Fragment pre-filter (has_topn_fragment_match with ppm tolerance)
-    //   - Spectral scoring (SpectralScorer with ppm tolerance)
-    //   - Mass accuracy features (ppm-based error computation)
-    // Using 0.02 Th bins (100K bins) for regression creates impractically large
-    // dense design matrices (~400MB per spectrum per thread).
-    let bin_config = BinConfig::unit_resolution();
-
-    let binner = Binner::new(bin_config);
-
-    // Get regularization lambda
-    let lambda = match &config.regularization_lambda {
-        osprey_core::RegularizationSetting::Fixed(l) => *l,
-        _ => 1.0, // Default lambda for now
-    };
-
-    // Create optimized f32 solver (replaces old f64 RidgeSolver)
-    let optimized_solver = OptimizedSolver::new(lambda as f32);
-
-    // Determine if we should use windowed scoring for large libraries
-    // Windowed scoring is more memory-efficient for libraries > 100K entries
-    const WINDOWED_SCORING_THRESHOLD: usize = 100_000;
-    let use_windowed_scoring = library.len() > WINDOWED_SCORING_THRESHOLD;
-
-    // Preprocess library for batch scoring (only for small libraries)
-    let batch_scorer = BatchScorer::new();
-    let preprocessed_library: Option<PreprocessedLibrary> = if use_windowed_scoring {
-        log::info!(
-            "Library has {} entries (> {}), using windowed batch scoring",
-            library.len(),
-            WINDOWED_SCORING_THRESHOLD
-        );
-        None
-    } else {
-        log::info!("Preprocessing library for batch scoring...");
-        let lib = batch_scorer.preprocess_library(&library);
-        log::info!(
-            "Preprocessed {} library entries ({}×{} matrix)",
-            lib.len(),
-            lib.matrix.nrows(),
-            lib.matrix.ncols()
-        );
-        Some(lib)
-    };
-
-    // Process each input file with per-file calibration:
-    // - Each file runs its own calibration discovery (or loads from cache)
-    //
-    // MEMORY-EFFICIENT DESIGN:
-    // - Score immediately after each file's regression
-    // - Write PIN file immediately after scoring
-    // - Keep only scored entries in memory (small, ~5MB per file)
-    // - Free regression results and spectra after each file
-    let mut per_file_scored: Vec<(String, Vec<ScoredEntry>)> = Vec::new();
-    let mut pin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
-    // Create mokapot output directory upfront
-    let output_dir = config
-        .output_blib
-        .parent()
-        .unwrap_or(std::path::Path::new("."));
-    let mokapot_dir = output_dir.join("mokapot");
-    std::fs::create_dir_all(&mokapot_dir)?;
-
-    // Build mokapot runner for PIN file writing
-    let mokapot = MokapotRunner::new().with_test_fdr(config.run_fdr);
-
-    for (file_idx, input_file) in config.input_files.iter().enumerate() {
-        log::info!(
-            "===== Processing file {}/{}: {} =====",
-            file_idx + 1,
-            config.input_files.len(),
-            input_file.display()
-        );
-
-        // Extract file name for identification
-        let file_name = input_file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        // Run regression for this file
-        let (file_results, file_spectra, _file_preprocessed_spectra, calibration_result, ms1_index) =
-            process_file_with_calibration(
-                input_file,
-                &library,
-                &binner,
-                &optimized_solver,
-                &config,
-                preprocessed_library.as_ref(),
-                &batch_scorer,
-                use_windowed_scoring,
-            )?;
-
-        // Extract per-file CalibrationParams for m/z correction during scoring
-        let calibration_params = calibration_result.as_ref().map(|(_, _, params)| params);
-        let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
-
-        // === SCORE IMMEDIATELY after regression ===
-        // This avoids keeping regression results in memory across all files
-        let scored_entries = score_run(
-            &library,
-            &file_results,
-            &file_spectra,
-            &file_name,
-            calibration_params,
-            *binner.config(),
-            &ms1_index,
-            is_hram,
-        )?;
-
-        log::info!(
-            "Scored {} entries ({} targets, {} decoys) for {}",
-            scored_entries.len(),
-            scored_entries.iter().filter(|e| !e.is_decoy).count(),
-            scored_entries.iter().filter(|e| e.is_decoy).count(),
-            file_name
-        );
-
-        // Filter out entries with no spectral evidence before deduplication and competition
-        let pre_filter_count = scored_entries.len();
-        let scored_entries: Vec<ScoredEntry> = scored_entries
-            .into_iter()
-            .filter(|e| e.features.median_polish_cosine > 0.0)
-            .collect();
-        let filtered_count = pre_filter_count - scored_entries.len();
-        if filtered_count > 0 {
-            log::info!(
-                "{}: filtered {}/{} entries with failed median polish (kept {})",
-                file_name,
-                filtered_count,
-                pre_filter_count,
-                scored_entries.len()
-            );
-        }
-
-        // Deduplicate double-counted peptides sharing fragment ions within the same isolation window
-        let scored_entries = deduplicate_double_counting(
-            scored_entries,
-            &library,
-            &file_spectra,
-            calibration_params,
-            &config,
-        );
-
-        // Target-decoy competition: only winners go to PIN file
-        let scored_entries = compete_target_decoy_pairs(scored_entries, &library);
-
-        // Export coefficient matrix to parquet if requested
-        if config.export_coefficients {
-            write_coefficient_parquet(
-                &scored_entries,
-                &library,
-                &file_results,
-                &file_spectra,
-                input_file,
-            )?;
-        }
-
-        // === WRITE PIN FILE IMMEDIATELY ===
-        // Create PSM features and write to disk, freeing memory
-        let psm_features = create_psm_features_for_file(&file_name, &scored_entries, &library);
-        let pin_path = mokapot.write_single_pin_file(&file_name, &psm_features, &mokapot_dir)?;
-        pin_files.insert(file_name.clone(), pin_path);
-
-        // Keep only scored entries (small) for FDR update later
-        // Regression results and spectra are dropped here, freeing ~150MB per file
-        per_file_scored.push((file_name, scored_entries));
-    }
-
-    // Calculate total results for logging
-    let total_scored: usize = per_file_scored.iter().map(|(_, s)| s.len()).sum();
-    log::info!(
-        "Analysis complete. {} total scored entries across {} files",
-        total_scored,
-        config.input_files.len()
-    );
-
-    // Filter out empty files (mokapot can't handle empty PIN files)
-    let non_empty_files: Vec<(String, Vec<ScoredEntry>)> = per_file_scored
-        .into_iter()
-        .filter(|(name, entries)| {
-            if entries.is_empty() {
-                log::warn!(
-                    "Skipping file '{}' with 0 scored entries for FDR control",
-                    name
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
-
-    let non_empty_pin_files: HashMap<String, std::path::PathBuf> = pin_files
-        .into_iter()
-        .filter(|(name, _)| non_empty_files.iter().any(|(n, _)| n == name))
-        .collect();
-
-    if non_empty_files.is_empty() {
-        return Err(OspreyError::config(
-            "No scored entries found across all files. Cannot perform FDR control.",
-        ));
-    }
-
-    log::info!(
-        "====== Beginning Mokapot Post-Processing on {} Files ======",
-        non_empty_files.len()
-    );
-    log::info!("Using {} pre-written PIN files", non_empty_pin_files.len());
-
-    // Run two-level FDR control (run-level + experiment-level)
-    // PIN files are already written, pass them to avoid regeneration
-    let experiment_entries = run_two_level_fdr(
-        &mut non_empty_files.clone(),
-        &library,
-        config.run_fdr,
-        config.experiment_fdr,
-        output_dir,
-        Some(non_empty_pin_files),
-    )?;
-
-    // Filter to passing entries for blib output (experiment-level FDR)
-    let passing_entries: Vec<ScoredEntry> = experiment_entries
-        .iter()
-        .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
-        .cloned()
-        .collect();
-
-    log::info!(
-        "Final results: {} precursors passing {}% experiment-level FDR",
-        passing_entries.len(),
-        config.experiment_fdr * 100.0
-    );
-
-    // Write blib output with Mokapot q-values
-    if !passing_entries.is_empty() {
-        log::info!("Writing blib to {}", config.output_blib.display());
-        write_blib_output_with_scores(&config, &library, &passing_entries, &config.input_files)?;
-    } else {
-        log::warn!("No peptides passed FDR threshold, skipping blib output");
-    }
-
-    // Write output report if specified
-    if let Some(report_path) = &config.output_report {
-        log::info!("Writing report to {}", report_path.display());
-        write_scored_report(report_path, &library, &passing_entries)?;
-    }
-
-    // Note: With memory-efficient processing, regression results are freed after scoring each file.
-    // The primary output is the blib file; return empty vec for backward compatibility.
-    // Callers needing raw regression results should process files individually.
-    Ok(Vec::new())
-}
-
-/// Process a single mzML file with RT calibration
-///
-/// ## Multi-File Strategy
-///
-/// - **First file** (`existing_calibration` is None): Calibrate using ALL peptides
-///   with wide tolerance, return calibration for reuse
-/// - **Subsequent files** (`existing_calibration` is Some): Skip calibration discovery,
-///   use provided calibration directly
-///
-/// Returns: (results, spectra, preprocessed_spectra, Option<(calibration, tolerance)>)
-/// - spectra are returned for spectral scoring in FDR computation
-/// - preprocessed_spectra is returned for reuse in subsequent scoring
-/// - calibration is returned only for first file
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-fn process_file_with_calibration(
-    path: &std::path::Path,
-    library: &[LibraryEntry],
-    binner: &Binner,
-    optimized_solver: &OptimizedSolver,
-    config: &OspreyConfig,
-    preprocessed_library: Option<&PreprocessedLibrary>,
-    batch_scorer: &BatchScorer,
-    use_windowed_scoring: bool,
-) -> Result<(
-    Vec<RegressionResult>,
-    Vec<Spectrum>,
-    Option<PreprocessedSpectra>,
-    Option<(RTCalibration, f64, CalibrationParams)>,
-    MS1Index,
-)> {
-    // Load both MS1 and MS2 spectra in a single pass (more efficient than reading twice)
-    let (spectra, ms1_index) = load_all_spectra(path)?;
-
-    if spectra.is_empty() {
-        return Ok((Vec::new(), Vec::new(), None, None, ms1_index));
-    }
-
-    // Check if RT calibration is enabled
-    if !config.rt_calibration.enabled {
-        log::info!(
-            "RT calibration disabled, using fallback tolerance: {:.2} min",
-            config.rt_calibration.fallback_rt_tolerance
-        );
-        let results = process_spectra_optimized(
-            &spectra,
-            library,
-            binner,
-            optimized_solver,
-            config.rt_calibration.fallback_rt_tolerance,
-            config.max_candidates_per_spectrum,
-            config.rt_calibration.min_rt_tolerance,
-            None,
-            None,
-            config.fragment_tolerance,
-        )?;
-        return Ok((results, spectra, None, None, ms1_index));
-    }
-
-    // Run calibration discovery with ALL peptides
-    log::info!("Calibration Discovery (using all peptides)");
-
-    // Check if a valid calibration file already exists alongside the input file
-    if let Some(input_dir) = path.parent() {
-        let cal_path = calibration_path_for_input(path, input_dir);
-        if cal_path.exists() {
-            log::info!("Found existing calibration file: {}", cal_path.display());
-
-            match load_calibration(&cal_path) {
-                Ok(cal_params) => {
-                    // Check if calibration has model data for RT reconstruction
-                    if cal_params.rt_calibration.has_model_data() && cal_params.is_calibrated() {
-                        log::info!("Reusing existing RT calibration from file");
-
-                        // Reconstruct RTCalibration from model params
-                        let model_params = cal_params.rt_calibration.model_params.as_ref().unwrap();
-                        match RTCalibration::from_model_params(
-                            model_params,
-                            cal_params.rt_calibration.residual_sd,
-                        ) {
-                            Ok(rt_cal) => {
-                                let tolerance = cal_params.rt_calibration.residual_sd
-                                    * config.rt_calibration.rt_tolerance_factor;
-                                let tolerance =
-                                    tolerance.max(config.rt_calibration.min_rt_tolerance);
-
-                                log::info!(
-                                    "Using cached calibration: {} points, R²={:.4}, tolerance={:.2} min",
-                                    cal_params.rt_calibration.n_points,
-                                    cal_params.rt_calibration.r_squared,
-                                    tolerance
-                                );
-
-                                // Log calibration summary
-                                cal_params.log_summary();
-
-                                // Run full search with cached calibration (using calibrated MS2 m/z)
-                                let results = process_spectra_optimized(
-                                    &spectra,
-                                    library,
-                                    binner,
-                                    optimized_solver,
-                                    tolerance,
-                                    config.max_candidates_per_spectrum,
-                                    config.rt_calibration.min_rt_tolerance,
-                                    Some(&rt_cal),
-                                    Some(&cal_params.ms2_calibration),
-                                    config.fragment_tolerance,
-                                )?;
-
-                                return Ok((
-                                    results,
-                                    spectra,
-                                    None,
-                                    Some((rt_cal, tolerance, cal_params)),
-                                    ms1_index,
-                                ));
-                            }
-                            Err(e) => {
-                                log::warn!("Failed to reconstruct calibration from cached file: {}. Re-running calibration.", e);
-                            }
-                        }
-                    } else {
-                        log::info!(
-                            "Cached calibration missing model data. Re-running calibration."
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to load cached calibration: {}. Re-running calibration.",
-                        e
-                    );
-                }
-            }
-        }
-    }
-
-    // Run calibration using appropriate method based on mode and library size
-    let calibration_result = if use_windowed_scoring {
-        // Use windowed scoring for large libraries (memory-efficient)
-        run_calibration_discovery_windowed(library, &spectra, &ms1_index, config)
-    } else if let Some(preproc_lib) = preprocessed_library {
-        // Preprocess spectra for batch scoring (reused later)
-        log::info!(
-            "Preprocessing {} spectra for batch scoring...",
-            spectra.len()
-        );
-        let preprocessed_spectra = batch_scorer.preprocess_spectra(&spectra);
-
-        run_calibration_discovery_with_cache(library, preproc_lib, &preprocessed_spectra, config)
-    } else {
-        // Fallback: use windowed scoring
-        run_calibration_discovery_windowed(library, &spectra, &ms1_index, config)
-    };
-
-    // Determine RT tolerance and extract calibration
-    let (rt_tolerance, calibration_opt, calibration_params_opt) = match calibration_result {
-        Ok((rt_cal, cal_params)) => {
-            // Use calibration residual SD × factor as tolerance
-            let tolerance =
-                cal_params.rt_calibration.residual_sd * config.rt_calibration.rt_tolerance_factor;
-            let tolerance = tolerance.max(config.rt_calibration.min_rt_tolerance);
-            log::info!(
-                "Using calibrated RT tolerance: {:.2} min ({}× residual SD)",
-                tolerance,
-                config.rt_calibration.rt_tolerance_factor
-            );
-
-            // Save calibration to JSON alongside input file (for reuse)
-            if let Some(input_dir) = path.parent() {
-                let cal_path = calibration_path_for_input(path, input_dir);
-                if let Err(e) = save_calibration(&cal_params, &cal_path) {
-                    log::warn!("Failed to save calibration: {}", e);
-                }
-            }
-
-            (tolerance, Some(rt_cal), Some(cal_params))
-        }
-        Err(e) => {
-            log::warn!(
-                "Calibration failed: {}. Using fallback tolerance: {:.2} min",
-                e,
-                config.rt_calibration.fallback_rt_tolerance
-            );
-            (config.rt_calibration.fallback_rt_tolerance, None, None)
-        }
-    };
-
-    // Log calibration summary if available
-    if let Some(ref params) = calibration_params_opt {
-        params.log_summary();
-    }
-
-    // Calibrated full search (using calibrated MS2 m/z)
-    log::info!("Calibrated Full Search");
-
-    // Get MS2 calibration if available
-    let ms2_cal_ref = calibration_params_opt.as_ref().map(|p| &p.ms2_calibration);
-
-    let results = process_spectra_optimized(
-        &spectra,
-        library,
-        binner,
-        optimized_solver,
-        rt_tolerance,
-        config.max_candidates_per_spectrum,
-        config.rt_calibration.min_rt_tolerance,
-        calibration_opt.as_ref(),
-        ms2_cal_ref,
-        config.fragment_tolerance,
-    )?;
-
-    // Return calibration for this file (used during scoring)
-    // Note: preprocessed_spectra is only available when not using windowed scoring
-    let calibration_to_share = match (calibration_opt, calibration_params_opt) {
-        (Some(rt_cal), Some(cal_params)) => Some((rt_cal, rt_tolerance, cal_params)),
-        _ => None,
-    };
-    Ok((results, spectra, None, calibration_to_share, ms1_index))
-}
-
-/// Run RT calibration discovery phase using BLAS-accelerated XCorr scoring
-///
-/// This uses target-decoy competition to identify high-confidence detections,
-/// then uses only peptides passing 1% FDR for RT calibration.
-///
-/// Process:
-/// 1. Preprocess all library entries and spectra (once)
-/// 2. Score all pairs via BLAS matrix multiplication (10-20× faster)
-/// 3. Find best matches with RT filtering
-/// 4. Target-decoy competition → q-values
-/// 5. Use only peptides at 1% FDR for calibration
-/// 6. Fit LOESS on (library_RT, measured_RT) pairs
-///
-/// Note: This is the standalone version. For cached preprocessing, use
-/// `run_calibration_discovery_with_cache` instead.
-#[allow(dead_code)]
-fn run_calibration_discovery(
-    spectra: &[Spectrum],
-    library: &[LibraryEntry],
-    _matrix_builder: &DesignMatrixBuilder,
-    _solver: &RidgeSolver,
-    config: &OspreyConfig,
-) -> Result<RTCalibration> {
-    let rt_config = &config.rt_calibration;
-
-    // Calculate library RT range
-    let library_rts: Vec<f64> = library
-        .iter()
-        .filter(|e| !e.is_decoy)
-        .map(|e| e.retention_time)
-        .collect();
-    let min_rt = library_rts.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_rt = library_rts
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let rt_range = max_rt - min_rt;
-
-    // Get all entries with fragments (both targets and decoys)
-    let entries_with_fragments: Vec<LibraryEntry> = library
-        .iter()
-        .filter(|e| !e.fragments.is_empty())
-        .cloned()
-        .collect();
-
-    let n_targets = entries_with_fragments
-        .iter()
-        .filter(|e| !e.is_decoy)
-        .count();
-    let n_decoys = entries_with_fragments.iter().filter(|e| e.is_decoy).count();
-
-    log::info!(
-        "RT calibration: scoring {} targets + {} decoys (RT range: {:.1}-{:.1} min)",
-        n_targets,
-        n_decoys,
-        min_rt,
-        max_rt
-    );
-
-    // === BLAS-accelerated batch scoring ===
-    log::info!("Preprocessing library entries for batch scoring...");
-    let batch_scorer = BatchScorer::new();
-    let preprocessed_library = batch_scorer.preprocess_library(&entries_with_fragments);
-
-    log::info!(
-        "Preprocessing {} spectra for batch scoring...",
-        spectra.len()
-    );
-    let preprocessed_spectra = batch_scorer.preprocess_spectra(spectra);
-
-    // Get measured RT range from spectra
-    let meas_min_rt = preprocessed_spectra
-        .retention_times
-        .iter()
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
-    let meas_max_rt = preprocessed_spectra
-        .retention_times
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let meas_rt_range = meas_max_rt - meas_min_rt;
-
-    log::info!(
-        "Measured RT range: {:.2}-{:.2} min ({:.2} min total)",
-        meas_min_rt,
-        meas_max_rt,
-        meas_rt_range
-    );
-
-    // Check if RT ranges are similar enough to skip linear mapping
-    // If slope would be close to 1.0 (within 20%), use library RTs directly
-    // This avoids introducing mapping errors when library and measured RTs are already comparable
-    let candidate_slope = if rt_range > 0.0 {
-        meas_rt_range / rt_range
-    } else {
-        1.0
-    };
-    let use_direct_rts = (0.8..=1.2).contains(&candidate_slope);
-
-    let (rt_slope, rt_intercept) = if use_direct_rts {
-        log::info!(
-            "RT ranges are similar (slope would be {:.2}), using library RTs directly",
-            candidate_slope
-        );
-        (1.0, 0.0)
-    } else if rt_range > 0.0 {
-        let slope = candidate_slope;
-        let intercept = meas_min_rt - slope * min_rt;
-        log::info!(
-            "RT mapping: measured_RT = {:.4} × library_RT + {:.4}",
-            slope,
-            intercept
-        );
-        (slope, intercept)
-    } else {
-        // Degenerate case: all library entries have same RT
-        (1.0, 0.0)
-    };
-
-    // RT tolerance depends on whether linear mapping was needed
-    // - Similar RT scales (no mapping): use 20% of RT range
-    // - Different RT scales (linear mapping): use 50% of RT range
-    let tolerance_fraction = if use_direct_rts { 0.2 } else { 0.5 };
-    let initial_tolerance = meas_rt_range * tolerance_fraction;
-    let mapped_tolerance = initial_tolerance; // Already in measured RT scale
-
-    log::info!(
-        "Initial RT tolerance: {:.1} min ({:.0}% of {:.1} min mzML range)",
-        initial_tolerance,
-        tolerance_fraction * 100.0,
-        meas_rt_range
-    );
-
-    // Build library RT lookup (mapped only if ranges differ significantly)
-    let library_rts_mapped: Vec<f64> = preprocessed_library
-        .entry_ids
-        .iter()
-        .filter_map(|id| {
-            entries_with_fragments
-                .iter()
-                .find(|e| e.id == *id)
-                .map(|e| rt_slope * e.retention_time + rt_intercept)
-        })
-        .collect();
-
-    log::info!(
-        "Computing XCorr scores ({} × {} = {} pairs via BLAS)...",
-        preprocessed_library.len(),
-        preprocessed_spectra.len(),
-        preprocessed_library.len() * preprocessed_spectra.len()
-    );
-
-    // Find best matches with RT filtering using BLAS
-    // Now using library RTs mapped to measured RT scale
-    let matches = batch_scorer.find_best_matches_with_rt_filter(
-        &preprocessed_library,
-        &preprocessed_spectra,
-        &library_rts_mapped,
-        mapped_tolerance,
-    );
-
-    log::info!("BLAS scoring complete: {} matches found", matches.len());
-
-    // Build lookup for is_decoy
-    let id_to_entry: HashMap<u32, &LibraryEntry> =
-        entries_with_fragments.iter().map(|e| (e.id, e)).collect();
-
-    // Convert matches to scoring format: (library_rt, measured_rt, score, is_decoy)
-    let all_scores: Vec<(f64, f64, f64, bool)> = matches
-        .into_iter()
-        .filter_map(|(entry_id, _spec_idx, score, measured_rt)| {
-            let entry = id_to_entry.get(&entry_id)?;
-            Some((entry.retention_time, measured_rt, score, entry.is_decoy))
-        })
-        .collect();
-
-    // Separate targets and decoys for FDR computation
-    let mut target_results: Vec<(f64, f64, f64)> = Vec::new(); // (lib_rt, meas_rt, score)
-    let mut decoy_scores: Vec<f64> = Vec::new();
-
-    for (lib_rt, meas_rt, score, is_decoy) in all_scores {
-        if is_decoy {
-            decoy_scores.push(score);
-        } else {
-            target_results.push((lib_rt, meas_rt, score));
-        }
-    }
-
-    log::info!(
-        "Calibration results: {} targets, {} decoys with scores > 0",
-        target_results.len(),
-        decoy_scores.len()
-    );
-
-    // Compute q-values using target-decoy competition
-    let calibration_fdr = 0.01; // 1% FDR for calibration
-    let fdr_controller = FdrController::new(calibration_fdr);
-
-    let target_scores: Vec<f64> = target_results.iter().map(|(_, _, s)| *s).collect();
-    let target_qvalues = fdr_controller.compute_qvalues(&target_scores, &decoy_scores)?;
-
-    // Filter to 1% FDR and extract calibration points
-    let mut library_rts_detected: Vec<f64> = Vec::new();
-    let mut measured_rts_detected: Vec<f64> = Vec::new();
-
-    for (i, (lib_rt, meas_rt, _score)) in target_results.iter().enumerate() {
-        if i < target_qvalues.len() && target_qvalues[i] <= calibration_fdr {
-            library_rts_detected.push(*lib_rt);
-            measured_rts_detected.push(*meas_rt);
-        }
-    }
-
-    log::info!(
-        "RT calibration: {} peptides at 1% FDR (from {} targets, {} decoys)",
-        library_rts_detected.len(),
-        target_results.len(),
-        decoy_scores.len()
-    );
-
-    if library_rts_detected.len() < rt_config.min_calibration_points {
-        return Err(OspreyError::ConfigError(format!(
-            "Insufficient calibration points: {} < {} required",
-            library_rts_detected.len(),
-            rt_config.min_calibration_points
-        )));
-    }
-
-    // Fit LOESS calibration
-    let calibrator_config = RTCalibratorConfig {
-        bandwidth: rt_config.loess_bandwidth,
-        degree: 1,
-        min_points: rt_config.min_calibration_points,
-        robustness_iter: 2,
-    };
-    let calibrator = RTCalibrator::with_config(calibrator_config);
-
-    calibrator.fit(&library_rts_detected, &measured_rts_detected)
-}
-
-/// Run full calibration discovery using windowed batch scoring
-///
-/// This is the memory-efficient version for large libraries. Instead of
-/// preprocessing the entire library at once, it groups spectra by isolation
-/// window and only preprocesses library entries within each window.
-///
-/// For a typical 3mz DIA window with a 500 m/z library range and 3M precursors,
-/// each window only contains ~18K precursors, reducing memory by ~170×.
-///
-/// Returns both the RTCalibration (for prediction) and CalibrationParams (for saving/logging).
 fn run_calibration_discovery_windowed(
     library: &[LibraryEntry],
     spectra: &[Spectrum],
@@ -1060,6 +252,14 @@ fn run_calibration_discovery_windowed(
         );
     }
 
+    // Set up XCorr scorer with appropriate binning for calibration LDA
+    let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
+    let xcorr_scorer = if is_hram {
+        SpectralScorer::hram().with_tolerance_ppm(config.fragment_tolerance.tolerance)
+    } else {
+        SpectralScorer::new().with_tolerance_da(config.fragment_tolerance.tolerance)
+    };
+
     // Calibration sampling with retry loop
     // Attempt 1: sample calibration_sample_size targets
     // Attempt 2: expand by retry_factor (default 2×)
@@ -1125,6 +325,8 @@ fn run_calibration_discovery_windowed(
                 config.fragment_tolerance,
                 config.precursor_tolerance.tolerance,
                 initial_tolerance,
+                None, // First pass: use library RT directly
+                Some(&xcorr_scorer),
             )
         } else {
             run_coelution_calibration_scoring::<MS1IndexWrapper>(
@@ -1134,6 +336,8 @@ fn run_calibration_discovery_windowed(
                 config.fragment_tolerance,
                 config.precursor_tolerance.tolerance,
                 initial_tolerance,
+                None, // First pass: use library RT directly
+                Some(&xcorr_scorer),
             )
         };
 
@@ -1200,20 +404,23 @@ fn run_calibration_discovery_windowed(
         }
 
         // LDA-based scoring on accumulated matches
-        // Only use isotope feature for HRAM mode (isotopes not separated at unit resolution)
-        let use_isotope_feature =
-            matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM) && has_ms1;
+        // Don't use isotope feature during calibration — MS1 isotope scoring
+        // is only reliable after mass calibration, which hasn't happened yet.
+        // Isotope features are used in the full scoring step after calibration.
         let calibration_fdr = 0.01;
 
-        // Convert to Vec for LDA training
+        // Convert to Vec for LDA training.
+        // Sort by base_id for deterministic LDA input: LinearDiscriminantAnalysis::fit()
+        // computes class means by iterating matrix rows, and floating-point addition is
+        // non-associative — different row order → different sums → different eigenvectors.
+        // Sort by (base_id, entry_id) to group target-decoy pairs together.
         let mut all_matches: Vec<CalibrationMatch> =
             accumulated_matches.values().cloned().collect();
+        all_matches.sort_by_key(|m| (m.entry_id & 0x7FFFFFFF, m.entry_id));
 
-        // Train LDA and score
-        let _n_passing = osprey_scoring::calibration_ml::train_and_score_calibration(
-            &mut all_matches,
-            use_isotope_feature,
-        )?;
+        // Train LDA and score (4 features: correlation, libcosine, top6, snr)
+        let _n_passing =
+            osprey_scoring::calibration_ml::train_and_score_calibration(&mut all_matches, false)?;
 
         // Filter to passing targets (q-value <= 1% FDR, not decoys)
         // CRITICAL: Also require minimum S/N for RT calibration quality
@@ -1274,6 +481,31 @@ fn run_calibration_discovery_windowed(
         }
 
         let num_confident_peptides = library_rts_detected.len();
+
+        // Compute median peak width from confident matches for adaptive co-elution window
+        // Log median peak width from calibration matches (diagnostic)
+        {
+            let mut widths: Vec<f64> = passing_targets
+                .iter()
+                .filter_map(|m| m.peak_width_minutes)
+                .filter(|&w| w > 0.0 && w.is_finite())
+                .collect();
+            if widths.len() >= 10 {
+                widths.sort_by(|a, b| a.total_cmp(b));
+                let mid = widths.len() / 2;
+                let median = if widths.len() % 2 == 0 {
+                    (widths[mid - 1] + widths[mid]) / 2.0
+                } else {
+                    widths[mid]
+                };
+                log::info!(
+                    "Measured peak width: median={:.2} min ({:.0} sec) from {} peaks",
+                    median,
+                    median * 60.0,
+                    widths.len()
+                );
+            }
+        }
 
         log::info!(
             "Calibration: {} peptides at {:.0}% FDR (from {} target wins, {} decoy wins)",
@@ -1341,10 +573,133 @@ fn run_calibration_discovery_windowed(
             degree: 1,
             min_points: effective_min_points,
             robustness_iter: 2,
+            outlier_retention: 1.0, // Use all calibration points — LDA + S/N already filtered
         };
         let calibrator = RTCalibrator::with_config(calibrator_config);
-        let rt_calibration = calibrator.fit(&library_rts_detected, &measured_rts_detected)?;
-        let rt_stats = rt_calibration.stats();
+        let mut rt_calibration = calibrator.fit(&library_rts_detected, &measured_rts_detected)?;
+        let mut rt_stats = rt_calibration.stats();
+
+        // === Iterative calibration refinement (2-pass) ===
+        // Compute first-pass tolerance using MAD-based robust estimate
+        // MAD × 1.4826 ≈ SD for normal distribution; 3× that covers ~99.7% of peptides
+        let mad_tolerance = rt_stats.mad * 1.4826 * 3.0;
+        let pass1_tolerance = mad_tolerance
+            .max(config.rt_calibration.min_rt_tolerance)
+            .min(config.rt_calibration.max_rt_tolerance);
+
+        log::info!(
+            "First-pass RT tolerance: {:.2} min (MAD={:.3}, robust_SD={:.3}, residual_SD={:.3}, {} points, R²={:.4})",
+            pass1_tolerance,
+            rt_stats.mad,
+            rt_stats.mad * 1.4826,
+            rt_stats.residual_std,
+            rt_stats.n_points,
+            rt_stats.r_squared
+        );
+
+        // Only refine if tolerance narrowed significantly (at least 2× tighter)
+        if pass1_tolerance < initial_tolerance * 0.5 {
+            log::info!(
+                "Calibration refinement: re-scoring with {:.2} min tolerance (was {:.1} min)",
+                pass1_tolerance,
+                initial_tolerance
+            );
+
+            let predict_fn = |lib_rt: f64| -> f64 { rt_calibration.predict(lib_rt) };
+
+            let refined_matches = if has_ms1 {
+                run_coelution_calibration_scoring(
+                    &calibration_library,
+                    spectra,
+                    Some(&MS1IndexWrapper(ms1_index)),
+                    config.fragment_tolerance,
+                    config.precursor_tolerance.tolerance,
+                    pass1_tolerance,
+                    Some(&predict_fn),
+                    Some(&xcorr_scorer),
+                )
+            } else {
+                run_coelution_calibration_scoring::<MS1IndexWrapper>(
+                    &calibration_library,
+                    spectra,
+                    None,
+                    config.fragment_tolerance,
+                    config.precursor_tolerance.tolerance,
+                    pass1_tolerance,
+                    Some(&predict_fn),
+                    Some(&xcorr_scorer),
+                )
+            };
+
+            // Re-run LDA scoring on refined matches
+            let mut refined_all: Vec<CalibrationMatch> = refined_matches;
+            let _n_passing_refined = osprey_scoring::calibration_ml::train_and_score_calibration(
+                &mut refined_all,
+                false,
+            )?;
+
+            // Filter to passing targets
+            let refined_passing: Vec<&CalibrationMatch> = refined_all
+                .iter()
+                .filter(|m| {
+                    !m.is_decoy
+                        && m.q_value <= calibration_fdr
+                        && m.signal_to_noise >= MIN_SNR_FOR_RT_CAL
+                })
+                .collect();
+
+            let n_refined = refined_passing.len();
+
+            if n_refined >= ABSOLUTE_MIN_CALIBRATION_POINTS {
+                // Refit LOESS on refined points
+                let refined_lib_rts: Vec<f64> =
+                    refined_passing.iter().map(|m| m.library_rt).collect();
+                let refined_meas_rts: Vec<f64> =
+                    refined_passing.iter().map(|m| m.measured_rt).collect();
+
+                let rt_cal_refined = calibrator.fit(&refined_lib_rts, &refined_meas_rts)?;
+                let rt_stats_refined = rt_cal_refined.stats();
+
+                log::info!(
+                    "Refined RT calibration: {} points, R²={:.4}, residual_SD={:.3} min (was {} points, R²={:.4}, {:.3} min)",
+                    rt_stats_refined.n_points,
+                    rt_stats_refined.r_squared,
+                    rt_stats_refined.residual_std,
+                    rt_stats.n_points,
+                    rt_stats.r_squared,
+                    rt_stats.residual_std
+                );
+
+                // Accept refined calibration if R² didn't degrade significantly
+                if rt_stats_refined.r_squared >= rt_stats.r_squared * 0.99 {
+                    rt_calibration = rt_cal_refined;
+                    rt_stats = rt_stats_refined;
+
+                    // Re-collect mass errors from refined matches
+                    mz_qc_data = MzQCData::new(config.fragment_tolerance.unit);
+                    for m in &refined_passing {
+                        if let Some(ms1_error) = m.ms1_error {
+                            mz_qc_data.add_ms1_error(ms1_error);
+                        }
+                        for &ms2_error in &m.ms2_mass_errors {
+                            mz_qc_data.add_ms2_error(ms2_error);
+                        }
+                    }
+                } else {
+                    log::info!(
+                        "Refined calibration not better (R² {:.4} vs {:.4}), keeping original",
+                        rt_stats_refined.r_squared,
+                        rt_stats.r_squared
+                    );
+                }
+            } else {
+                log::info!(
+                    "Refinement pass: only {} points (need {}), keeping original calibration",
+                    n_refined,
+                    ABSOLUTE_MIN_CALIBRATION_POINTS
+                );
+            }
+        }
 
         // Calculate mass calibration
         let (ms1_calibration, ms2_calibration) = calculate_mz_calibration(&mz_qc_data);
@@ -1369,6 +724,8 @@ fn run_calibration_discovery_windowed(
                 n_points: rt_stats.n_points,
                 r_squared: rt_stats.r_squared,
                 model_params: Some(rt_calibration.export_model_params()),
+                p20_abs_residual: Some(rt_stats.p20_abs_residual),
+                mad: Some(rt_stats.mad),
             },
         };
 
@@ -1377,506 +734,6 @@ fn run_calibration_discovery_windowed(
 
     // Should not reach here (loop always returns or errors)
     unreachable!("Calibration retry loop exited without result")
-}
-
-/// Run calibration discovery using pre-cached preprocessed data
-///
-/// This version reuses preprocessed library and spectra matrices,
-/// avoiding redundant preprocessing for each file.
-///
-/// Note: This version does not collect MS1 PPM errors (mass calibration not available).
-/// For full calibration including mass, use `run_calibration_discovery_windowed`.
-fn run_calibration_discovery_with_cache(
-    library: &[LibraryEntry],
-    preprocessed_library: &PreprocessedLibrary,
-    preprocessed_spectra: &PreprocessedSpectra,
-    config: &OspreyConfig,
-) -> Result<(RTCalibration, CalibrationParams)> {
-    let rt_config = &config.rt_calibration;
-
-    // Calculate initial wide tolerance based on library RT range
-    let library_rts: Vec<f64> = library
-        .iter()
-        .filter(|e| !e.is_decoy)
-        .map(|e| e.retention_time)
-        .collect();
-    let min_rt = library_rts.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_rt = library_rts
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let rt_range = max_rt - min_rt;
-
-    let n_targets = library
-        .iter()
-        .filter(|e| !e.is_decoy && !e.fragments.is_empty())
-        .count();
-    let n_decoys = library
-        .iter()
-        .filter(|e| e.is_decoy && !e.fragments.is_empty())
-        .count();
-
-    log::info!(
-        "RT calibration (cached): scoring {} targets + {} decoys (RT range: {:.1}-{:.1} min)",
-        n_targets,
-        n_decoys,
-        min_rt,
-        max_rt
-    );
-
-    // Get measured RT range from spectra
-    let meas_min_rt = preprocessed_spectra
-        .retention_times
-        .iter()
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
-    let meas_max_rt = preprocessed_spectra
-        .retention_times
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let meas_rt_range = meas_max_rt - meas_min_rt;
-
-    log::info!(
-        "Measured RT range: {:.2}-{:.2} min ({:.2} min total)",
-        meas_min_rt,
-        meas_max_rt,
-        meas_rt_range
-    );
-
-    // Check if RT ranges are similar enough to skip linear mapping
-    // If slope would be close to 1.0 (within 20%), use library RTs directly
-    // This avoids introducing mapping errors when library and measured RTs are already comparable
-    let candidate_slope = if rt_range > 0.0 {
-        meas_rt_range / rt_range
-    } else {
-        1.0
-    };
-    let use_direct_rts = (0.8..=1.2).contains(&candidate_slope);
-
-    let (rt_slope, rt_intercept) = if use_direct_rts {
-        log::info!(
-            "RT ranges are similar (slope would be {:.2}), using library RTs directly",
-            candidate_slope
-        );
-        (1.0, 0.0)
-    } else if rt_range > 0.0 {
-        let slope = candidate_slope;
-        let intercept = meas_min_rt - slope * min_rt;
-        log::info!(
-            "RT mapping: measured_RT = {:.4} × library_RT + {:.4}",
-            slope,
-            intercept
-        );
-        (slope, intercept)
-    } else {
-        (1.0, 0.0)
-    };
-
-    // RT tolerance depends on whether linear mapping was needed
-    // - Similar RT scales (no mapping): use 20% of RT range
-    // - Different RT scales (linear mapping): use 50% of RT range
-    let tolerance_fraction = if use_direct_rts { 0.2 } else { 0.5 };
-    let initial_tolerance = meas_rt_range * tolerance_fraction;
-    let mapped_tolerance = initial_tolerance; // Already in measured RT scale
-
-    log::info!(
-        "Initial RT tolerance: {:.1} min ({:.0}% of {:.1} min mzML range)",
-        initial_tolerance,
-        tolerance_fraction * 100.0,
-        meas_rt_range
-    );
-
-    // Build library RT lookup (mapped only if ranges differ significantly)
-    let library_rts_mapped: Vec<f64> = preprocessed_library
-        .entry_ids
-        .iter()
-        .filter_map(|id| {
-            library
-                .iter()
-                .find(|e| e.id == *id)
-                .map(|e| rt_slope * e.retention_time + rt_intercept)
-        })
-        .collect();
-
-    log::info!(
-        "Computing XCorr scores ({} × {} = {} pairs via BLAS, using cached matrices)...",
-        preprocessed_library.len(),
-        preprocessed_spectra.len(),
-        preprocessed_library.len() * preprocessed_spectra.len()
-    );
-
-    // Score all pairs using BLAS matrix multiplication
-    // Now using library RTs mapped to measured RT scale
-    let batch_scorer = BatchScorer::new();
-    let matches = batch_scorer.find_best_matches_with_rt_filter(
-        preprocessed_library,
-        preprocessed_spectra,
-        &library_rts_mapped,
-        mapped_tolerance,
-    );
-
-    log::info!("BLAS scoring complete: {} matches found", matches.len());
-
-    // Build lookup for is_decoy
-    let id_to_entry: HashMap<u32, &LibraryEntry> = library.iter().map(|e| (e.id, e)).collect();
-
-    // Convert matches to scoring format: (library_rt, measured_rt, score, is_decoy)
-    let all_scores: Vec<(f64, f64, f64, bool)> = matches
-        .into_iter()
-        .filter_map(|(entry_id, _spec_idx, score, measured_rt)| {
-            let entry = id_to_entry.get(&entry_id)?;
-            Some((entry.retention_time, measured_rt, score, entry.is_decoy))
-        })
-        .collect();
-
-    // Store total matches count before iteration moves the vector
-    let num_sampled_precursors = all_scores.len();
-
-    // Separate targets and decoys for FDR computation
-    let mut target_results: Vec<(f64, f64, f64)> = Vec::new();
-    let mut decoy_scores: Vec<f64> = Vec::new();
-
-    for (lib_rt, meas_rt, score, is_decoy) in all_scores {
-        if is_decoy {
-            decoy_scores.push(score);
-        } else {
-            target_results.push((lib_rt, meas_rt, score));
-        }
-    }
-
-    log::info!(
-        "Calibration results: {} targets, {} decoys with scores > 0",
-        target_results.len(),
-        decoy_scores.len()
-    );
-
-    // Compute q-values using target-decoy competition
-    let calibration_fdr = 0.01;
-    let fdr_controller = FdrController::new(calibration_fdr);
-
-    let target_scores: Vec<f64> = target_results.iter().map(|(_, _, s)| *s).collect();
-    let target_qvalues = fdr_controller.compute_qvalues(&target_scores, &decoy_scores)?;
-
-    // Filter to 1% FDR and extract calibration points
-    let mut library_rts_detected: Vec<f64> = Vec::new();
-    let mut measured_rts_detected: Vec<f64> = Vec::new();
-
-    for (i, (lib_rt, meas_rt, _score)) in target_results.iter().enumerate() {
-        if i < target_qvalues.len() && target_qvalues[i] <= calibration_fdr {
-            library_rts_detected.push(*lib_rt);
-            measured_rts_detected.push(*meas_rt);
-        }
-    }
-
-    let num_confident_peptides = library_rts_detected.len();
-
-    log::info!(
-        "Calibration: {} peptides at 1% FDR (from {} targets, {} decoys)",
-        num_confident_peptides,
-        target_results.len(),
-        decoy_scores.len()
-    );
-
-    if num_confident_peptides < rt_config.min_calibration_points {
-        return Err(OspreyError::ConfigError(format!(
-            "Insufficient calibration points: {} < {} required",
-            num_confident_peptides, rt_config.min_calibration_points
-        )));
-    }
-
-    // Fit LOESS calibration
-    let calibrator_config = RTCalibratorConfig {
-        bandwidth: rt_config.loess_bandwidth,
-        degree: 1,
-        min_points: rt_config.min_calibration_points,
-        robustness_iter: 2,
-    };
-    let calibrator = RTCalibrator::with_config(calibrator_config);
-    let rt_calibration = calibrator.fit(&library_rts_detected, &measured_rts_detected)?;
-    let rt_stats = rt_calibration.stats();
-
-    // Build CalibrationParams (mass calibration not available in cached path)
-    let calibration_params = CalibrationParams {
-        metadata: CalibrationMetadata {
-            num_confident_peptides,
-            num_sampled_precursors,
-            calibration_successful: true,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            isolation_scheme: None,
-        },
-        ms1_calibration: MzCalibration::uncalibrated(),
-        ms2_calibration: MzCalibration::uncalibrated(),
-        rt_calibration: RTCalibrationParams {
-            method: RTCalibrationMethod::LOESS,
-            residual_sd: rt_stats.residual_std,
-            n_points: rt_stats.n_points,
-            r_squared: rt_stats.r_squared,
-            model_params: Some(rt_calibration.export_model_params()),
-        },
-    };
-
-    log::info!(
-        "RT calibration successful: {} points, R²={:.4}, residual_SD={:.3} min",
-        rt_stats.n_points,
-        rt_stats.r_squared,
-        rt_stats.residual_std
-    );
-    log::warn!("Note: Mass calibration not available in cached preprocessing path");
-
-    Ok((rt_calibration, calibration_params))
-}
-
-/// Optimized process_spectra using pre-binned library and f32 operations
-///
-/// Key optimizations:
-/// - Uses pre-binned library (avoids redundant binning)
-/// - Uses f32 instead of f64 (faster BLAS, less memory)
-/// - Caches binned observed spectra
-/// - Applies MS2 calibration to spectra before binning (if available)
-#[allow(clippy::too_many_arguments)]
-fn process_spectra_optimized(
-    spectra: &[Spectrum],
-    library: &[LibraryEntry],
-    binner: &Binner,
-    solver: &OptimizedSolver,
-    rt_tolerance: f64,
-    max_candidates: usize,
-    min_rt_tolerance: f64,
-    calibration: Option<&RTCalibration>,
-    ms2_calibration: Option<&MzCalibration>,
-    base_fragment_tolerance: FragmentToleranceConfig,
-) -> Result<Vec<RegressionResult>> {
-    use ndarray::{Array1, Array2, ShapeBuilder};
-    use osprey_chromatography::calibration::apply_spectrum_calibration;
-
-    // Apply MS2 m/z calibration to spectra if available
-    // This shifts each centroid by the mean offset so the error distribution is centered at 0
-    let calibrated_spectra: Vec<Spectrum> = if let Some(ms2_cal) = ms2_calibration {
-        if ms2_cal.calibrated {
-            // Correction is: corrected = observed - mean
-            // So if mean = -0.007, we add 0.007 to shift peaks UP
-            log::info!(
-                "Applying MS2 calibration: mean error = {:.4} {} → correcting by {:+.4} {} (using 3×SD = {:.3} {} tolerance)",
-                ms2_cal.mean,
-                ms2_cal.unit,
-                -ms2_cal.mean,  // Show actual correction applied
-                ms2_cal.unit,
-                3.0 * ms2_cal.sd,
-                ms2_cal.unit
-            );
-            spectra
-                .iter()
-                .map(|s| apply_spectrum_calibration(s, ms2_cal))
-                .collect()
-        } else {
-            spectra.to_vec()
-        }
-    } else {
-        spectra.to_vec()
-    };
-
-    // Determine fragment tolerance for top-N pre-filter
-    // Use calibrated 3×SD when available, otherwise use base tolerance
-    let effective_fragment_tolerance = if let Some(ms2_cal) = ms2_calibration {
-        if ms2_cal.calibrated {
-            let tol_3sd = 3.0 * ms2_cal.sd;
-            let unit = if ms2_cal.unit == "Th" {
-                ToleranceUnit::Mz
-            } else {
-                ToleranceUnit::Ppm
-            };
-            // Apply minimum tolerance floor
-            let min_tol = if unit == ToleranceUnit::Mz { 0.05 } else { 1.0 };
-            FragmentToleranceConfig {
-                tolerance: tol_3sd.max(min_tol),
-                unit,
-            }
-        } else {
-            base_fragment_tolerance
-        }
-    } else {
-        base_fragment_tolerance
-    };
-
-    let n_bins = binner.n_bins();
-
-    // Build RT-sorted m/z index (pre-computes expected_rt from calibration)
-    let mz_rt_index = MzRTIndex::build(library, calibration);
-
-    // Search tolerance = rt_tolerance (3× residual_SD) applied uniformly across RT range
-    let search_tolerance = rt_tolerance;
-
-    log::info!(
-        "Regression: {:.4} m/z bins, {} bins, {} spectra (search_tol={:.2} min)",
-        binner.config().bin_width,
-        n_bins,
-        calibrated_spectra.len(),
-        search_tolerance
-    );
-
-    // Set up progress bar
-    let pb = ProgressBar::new(calibrated_spectra.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} spectra",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    // Process spectra in parallel (using calibrated m/z values)
-    // Each spectrum: bin observed → filter candidates → bin candidates on-the-fly → solve
-    let results: Vec<RegressionResult> = calibrated_spectra
-        .par_iter()
-        .filter_map(|spectrum| {
-            // Select candidates using RT-sorted binary search
-            let candidates = select_candidates_with_calibration(
-                spectrum,
-                library,
-                &mz_rt_index,
-                rt_tolerance,
-                max_candidates,
-                min_rt_tolerance,
-                None,
-                calibration,
-                Some(effective_fragment_tolerance),
-                search_tolerance,
-            );
-
-            if candidates.is_empty() {
-                pb.inc(1);
-                return None;
-            }
-
-            // Bin observed spectrum
-            let observed_dense = binner.bin_spectrum_dense_f32(spectrum);
-            let observed_vec = Array1::from_vec(observed_dense);
-
-            // Build design matrix in column-major (Fortran) order for BLAS-optimal column access.
-            // The CD-NNLS solver accesses columns repeatedly (col.dot(&residual), residual updates),
-            // so contiguous columns give cache-friendly BLAS sdot/saxpy operations.
-            let n_candidates = candidates.len();
-            let mut design_matrix = Array2::<f32>::zeros((n_bins, n_candidates).f());
-            let mut library_ids = Vec::with_capacity(n_candidates);
-
-            for (col, &idx) in candidates.iter().enumerate() {
-                let entry = &library[idx];
-                // Write directly into contiguous column slice (column-major = contiguous columns)
-                let mut col_view = design_matrix.column_mut(col);
-                let col_slice = col_view
-                    .as_slice_mut()
-                    .expect("column-major column must be contiguous");
-                binner.bin_library_entry_into(entry, col_slice);
-                library_ids.push(entry.id);
-            }
-
-            let observed_norm = observed_vec.dot(&observed_vec);
-
-            // Solve regression with f32
-            let coefficients = match solver.solve_nonnegative(&design_matrix, &observed_vec, None) {
-                Ok(c) => c,
-                Err(_) => {
-                    pb.inc(1);
-                    return None;
-                }
-            };
-
-            let coefficient_sum: f32 = coefficients.iter().sum();
-
-            // Compute residual
-            let predicted = design_matrix.dot(&coefficients);
-            let diff = &observed_vec - &predicted;
-            let residual = diff.dot(&diff);
-
-            // Filter to non-zero coefficients and convert to RegressionResult
-            let mut result = RegressionResult::new(spectrum.scan_number, spectrum.retention_time);
-            for (id, coef) in library_ids.iter().zip(coefficients.iter()) {
-                if *coef > 1e-6 {
-                    result.library_ids.push(*id);
-                    result.coefficients.push(*coef as f64);
-                }
-            }
-
-            // Set contextual metrics
-            result.residual = residual as f64;
-            result.n_candidates = candidates.len() as u32;
-            result.coefficient_sum = coefficient_sum as f64;
-            result.observed_norm = observed_norm as f64;
-
-            pb.inc(1);
-
-            if result.coefficients.is_empty() {
-                None
-            } else {
-                Some(result)
-            }
-        })
-        .collect();
-
-    pb.finish_with_message("Done");
-
-    log::info!(
-        "Generated {} regression results with non-zero coefficients",
-        results.len()
-    );
-
-    Ok(results)
-}
-
-/// Scored library entry after FDR control
-#[derive(Debug, Clone)]
-struct ScoredEntry {
-    /// Library entry index
-    lib_idx: usize,
-    /// PSM identifier (for matching with Mokapot results)
-    psm_id: String,
-    /// Source file name
-    #[allow(dead_code)]
-    file_name: String,
-    /// mzML scan number at coefficient apex
-    apex_scan_number: u32,
-    /// Coefficient time series
-    rt_coef_pairs: Vec<(f64, f64)>,
-    /// Extracted features
-    features: FeatureSet,
-    /// Primary score (LibCosine)
-    score: f64,
-    /// Run-level q-value (from Mokapot on single file)
-    run_qvalue: f64,
-    /// Experiment-level q-value (from Mokapot across files)
-    experiment_qvalue: f64,
-    /// Posterior error probability (from Mokapot)
-    pep: f64,
-    /// Is decoy
-    is_decoy: bool,
-    /// Fragment-based peak boundaries from co-eluting XICs (start_rt, end_rt, fwhm)
-    fragment_peak_bounds: Option<(f64, f64, f64)>,
-}
-
-/// Results from processing a single run (mzML file)
-#[derive(Debug)]
-#[allow(dead_code)]
-struct RunLevelResults {
-    /// File name
-    file_name: String,
-    /// All scored entries (targets + decoys)
-    scored_entries: Vec<ScoredEntry>,
-    /// Path to the PIN file written for this run
-    pin_path: std::path::PathBuf,
-}
-
-/// Experiment-level aggregated result (best PSM per peptide across runs)
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct ExperimentPsm {
-    /// Modified peptide sequence (unique identifier)
-    peptide: String,
-    /// Best scoring entry across all runs
-    best_entry: ScoredEntry,
-    /// Number of runs where this peptide was detected
-    n_runs_detected: u32,
 }
 
 /// Reverse m/z calibration: find where a theoretical m/z appears in uncalibrated data.
@@ -1898,778 +755,6 @@ fn reverse_calibrate_mz(
         theoretical_mz * (1.0 + calibration.mean / 1e6)
     }
 }
-
-/// Score peptides and extract features for a single run
-///
-/// Uses spectral similarity scoring (LibCosine) as the primary score.
-/// Returns all scored entries (targets + decoys) for subsequent FDR computation.
-///
-/// If calibration is provided, applies m/z correction to spectra and uses
-/// calibrated tolerance (3×SD) for fragment matching.
-#[allow(clippy::too_many_arguments)]
-fn score_run(
-    library: &[LibraryEntry],
-    results: &[RegressionResult],
-    spectra: &[Spectrum],
-    file_name: &str,
-    calibration: Option<&CalibrationParams>,
-    bin_config: BinConfig,
-    ms1_index: &MS1Index,
-    is_hram: bool,
-) -> Result<Vec<ScoredEntry>> {
-    use osprey_chromatography::calibration::{
-        apply_spectrum_calibration, calibrated_tolerance, calibrated_tolerance_ppm,
-    };
-    use osprey_core::ToleranceUnit;
-    use osprey_scoring::SpectralScorer;
-
-    // Build ID-to-index map
-    let id_to_index: HashMap<u32, usize> = library
-        .iter()
-        .enumerate()
-        .map(|(idx, entry)| (entry.id, idx))
-        .collect();
-
-    // Aggregate results by library entry ID
-    // Store both (RT, coef) pairs and indices to RegressionResults for context building
-    let mut entry_data: HashMap<u32, Vec<(f64, f64)>> = HashMap::new(); // (RT, coef)
-    let mut entry_result_indices: HashMap<u32, Vec<usize>> = HashMap::new(); // indices into results
-    for (result_idx, result) in results.iter().enumerate() {
-        for (lib_id, coef) in result.library_ids.iter().zip(result.coefficients.iter()) {
-            entry_data
-                .entry(*lib_id)
-                .or_default()
-                .push((result.retention_time, *coef));
-            entry_result_indices
-                .entry(*lib_id)
-                .or_default()
-                .push(result_idx);
-        }
-    }
-
-    // Extract features and create scored entries (parallelized)
-    let feature_extractor = FeatureExtractor::new();
-
-    // Configure SpectralScorer with calibrated tolerance if available
-    // Use 3×SD from MS2 calibration as the tolerance for fragment matching
-    // This is unit-aware: uses Th for unit resolution, ppm for HRAM
-    let (spectral_scorer, mass_accuracy_unit) = if let Some(cal) = calibration {
-        // Get calibrated tolerance in the appropriate unit
-        let (tol_value, tol_unit) = calibrated_tolerance(
-            &cal.ms2_calibration,
-            20.0, // default 20 ppm for HRAM
-            ToleranceUnit::Ppm,
-        );
-
-        let scorer = match tol_unit {
-            ToleranceUnit::Mz => {
-                log::debug!(
-                    "Using calibrated fragment tolerance: {:.4} Th (3×SD), unit resolution XCorr bins",
-                    tol_value
-                );
-                SpectralScorer::with_bin_config(bin_config).with_tolerance_da(tol_value)
-            }
-            ToleranceUnit::Ppm => {
-                // HRAM data: use 0.02 Th bins for XCorr (not the 1 Th regression bins)
-                log::debug!(
-                    "Using calibrated fragment tolerance: {:.2} ppm (3×SD), HRAM XCorr bins (0.02 Th)",
-                    tol_value
-                );
-                SpectralScorer::with_bin_config(BinConfig::hram()).with_tolerance_ppm(tol_value)
-            }
-        };
-        (scorer, tol_unit)
-    } else {
-        // Default: unit resolution (Th)
-        (
-            SpectralScorer::with_bin_config(bin_config),
-            ToleranceUnit::Mz,
-        )
-    };
-
-    // Pre-calibrate all spectra once upfront (if calibration available)
-    // This avoids cloning/calibrating spectra inside the per-peptide loop
-    let calibrated_spectra: Vec<Spectrum> = if let Some(cal) = calibration {
-        log::debug!(
-            "Pre-calibrating {} spectra with MS2 calibration",
-            spectra.len()
-        );
-        spectra
-            .iter()
-            .map(|s| apply_spectrum_calibration(s, &cal.ms2_calibration))
-            .collect()
-    } else {
-        spectra.to_vec()
-    };
-
-    let peak_detector = PeakDetector::new().with_min_height(0.05);
-
-    // Collect library IDs for parallel iteration
-    let lib_ids: Vec<u32> = entry_data.keys().copied().collect();
-
-    // Set up progress bar for scoring
-    let pb = ProgressBar::new(lib_ids.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} peptides",
-            )
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    let scored_entries: Vec<ScoredEntry> = lib_ids
-        .par_iter()
-        .filter_map(|lib_id| {
-            let result = (|| {
-                let data_points = entry_data.get(lib_id)?;
-                if data_points.len() < 3 {
-                    return None;
-                }
-
-                let lib_idx = id_to_index.get(lib_id).copied()?;
-                let entry = &library[lib_idx];
-
-                // Sort by RT
-                let mut sorted_data = data_points.clone();
-                sorted_data.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-                // Use sorted data directly as RT-coef pairs for peak detection
-                let rt_coef_pairs: Vec<(f64, f64)> = sorted_data.clone();
-
-                // Detect peaks
-                let peaks = peak_detector.detect(&rt_coef_pairs);
-                if peaks.is_empty() {
-                    return None;
-                }
-
-                // Find apex RT (RT with maximum coefficient) and corresponding scan number
-                let apex_rt = sorted_data
-                    .iter()
-                    .max_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(rt, _)| *rt)
-                    .unwrap_or(entry.retention_time);
-
-                // Get the mzML scan number at the apex (data_points and result_indices are in lockstep)
-                let apex_scan_number = {
-                    let (apex_idx, _) = data_points
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                        .unwrap();
-                    let result_indices = entry_result_indices.get(lib_id).unwrap();
-                    results[result_indices[apex_idx]].scan_number
-                };
-
-                // Get RT range from coefficient series for peak region filtering
-                let rt_min = rt_coef_pairs
-                    .iter()
-                    .map(|(rt, _)| *rt)
-                    .fold(f64::INFINITY, f64::min);
-                let rt_max = rt_coef_pairs
-                    .iter()
-                    .map(|(rt, _)| *rt)
-                    .fold(f64::NEG_INFINITY, f64::max);
-
-                // Filter pre-calibrated spectra to those in the peak region:
-                // 1. Isolation window contains the peptide's precursor m/z
-                // 2. RT is within the coefficient series range
-                let peak_region_spectra: Vec<&Spectrum> = calibrated_spectra
-                    .iter()
-                    .filter(|s| {
-                        s.contains_precursor(entry.precursor_mz)
-                            && s.retention_time >= rt_min
-                            && s.retention_time <= rt_max
-                    })
-                    .collect();
-
-                // Extract features with both mixed and deconvoluted scoring
-                // - Mixed: spectral scores from raw observed spectrum at apex
-                // - Deconvoluted: spectral scores from coefficient-weighted aggregated spectrum (apex ± 2)
-                let mut features = feature_extractor.extract_with_deconvolution(
-                    entry,
-                    &rt_coef_pairs,
-                    &peak_region_spectra,
-                    Some(entry.retention_time),
-                );
-
-                // Contextual features from regression results at apex and apex ± 2.
-                // All regression-derived features (z-score, relative_coefficient,
-                // n_competitors, ln_num_candidates) are computed at the apex spectrum
-                // to ensure they reflect the signal at the detected peak.
-                if let Some(result_indices) = entry_result_indices.get(lib_id) {
-                    // Sort data point indices by RT to find apex neighbors
-                    let mut rt_sorted: Vec<usize> = (0..data_points.len()).collect();
-                    rt_sorted.sort_by(|&a, &b| data_points[a].0.total_cmp(&data_points[b].0));
-
-                    // Find apex position in RT-sorted order
-                    let apex_dp_idx = data_points
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    let apex_sorted_pos = rt_sorted
-                        .iter()
-                        .position(|&i| i == apex_dp_idx)
-                        .unwrap_or(0);
-
-                    // --- Features at apex spectrum ---
-                    let apex_result = &results[result_indices[apex_dp_idx]];
-                    let apex_my_coef = data_points[apex_dp_idx].1;
-
-                    // Relative coefficient at apex (this peptide / sum of all)
-                    features.relative_coefficient = apex_result.relative_coefficient(*lib_id);
-
-                    // Number of competitors at apex
-                    features.n_competitors = apex_result.n_candidates;
-                    features.ln_num_candidates = (apex_result.n_candidates.max(1) as f64).ln();
-
-                    // Z-score at apex spectrum
-                    let n_apex = apex_result.coefficients.len() as f64;
-                    if n_apex >= 2.0 {
-                        let mean = apex_result.coefficient_sum / n_apex;
-                        let var = apex_result
-                            .coefficients
-                            .iter()
-                            .map(|c| (c - mean) * (c - mean))
-                            .sum::<f64>()
-                            / n_apex;
-                        let std = var.sqrt();
-                        features.coef_zscore = if std > 1e-12 {
-                            (apex_my_coef - mean) / std
-                        } else {
-                            0.0
-                        };
-                    }
-
-                    // --- Averaged features across apex ± 2 spectra ---
-                    let start = apex_sorted_pos.saturating_sub(2);
-                    let end = (apex_sorted_pos + 3).min(rt_sorted.len());
-                    let mut zscore_sum = 0.0;
-                    let mut zscore_count = 0u32;
-                    let mut rel_coef_sum = 0.0;
-                    let mut rel_coef_count = 0u32;
-                    for &sorted_idx in &rt_sorted[start..end] {
-                        let result = &results[result_indices[sorted_idx]];
-                        let my_coef = data_points[sorted_idx].1;
-                        let n = result.coefficients.len() as f64;
-
-                        // Relative coefficient mean
-                        let rel = result.relative_coefficient(*lib_id);
-                        rel_coef_sum += rel;
-                        rel_coef_count += 1;
-
-                        // Z-score mean
-                        if n >= 2.0 {
-                            let mean = result.coefficient_sum / n;
-                            let var = result
-                                .coefficients
-                                .iter()
-                                .map(|c| (c - mean) * (c - mean))
-                                .sum::<f64>()
-                                / n;
-                            let std = var.sqrt();
-                            if std > 1e-12 {
-                                zscore_sum += (my_coef - mean) / std;
-                                zscore_count += 1;
-                            }
-                        }
-                    }
-                    if zscore_count > 0 {
-                        features.coef_zscore_mean = zscore_sum / zscore_count as f64;
-                    }
-                    if rel_coef_count > 0 {
-                        features.relative_coefficient_mean = rel_coef_sum / rel_coef_count as f64;
-                    }
-                }
-
-                // Find the peak that contains the apex RT for peak integration boundaries
-                let best_peak = peaks
-                    .iter()
-                    .find(|p| apex_rt >= p.start_rt && apex_rt <= p.end_rt)
-                    .or_else(|| {
-                        // Fallback: find peak with apex closest to our apex RT
-                        peaks.iter().min_by(|a, b| {
-                            (a.apex_rt - apex_rt)
-                                .abs()
-                                .partial_cmp(&(b.apex_rt - apex_rt).abs())
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                    });
-                let (peak_start_rt, peak_end_rt) = best_peak
-                    .map(|p| (p.start_rt, p.end_rt))
-                    .unwrap_or((rt_min, rt_max));
-
-                // Fragment co-elution correlation: correlate raw fragment XICs against
-                // the regression coefficient time series (deconvolved elution profile).
-                // Restricted to peak integration boundaries to avoid flanking interference.
-                let coelution_result = osprey_scoring::compute_fragment_coelution(
-                    &entry.fragments,
-                    &rt_coef_pairs,
-                    &peak_region_spectra,
-                    spectral_scorer.tolerance_da(),
-                    spectral_scorer.tolerance_ppm(),
-                    peak_start_rt,
-                    peak_end_rt,
-                );
-                features.fragment_coelution_sum = coelution_result.coelution_sum;
-                features.fragment_coelution_min = coelution_result.coelution_min;
-                features.n_coeluting_fragments = coelution_result.n_positive;
-                features.fragment_corr_0 = coelution_result.per_fragment_corr[0];
-                features.fragment_corr_1 = coelution_result.per_fragment_corr[1];
-                features.fragment_corr_2 = coelution_result.per_fragment_corr[2];
-                features.fragment_corr_3 = coelution_result.per_fragment_corr[3];
-                features.fragment_corr_4 = coelution_result.per_fragment_corr[4];
-                features.fragment_corr_5 = coelution_result.per_fragment_corr[5];
-
-                // Elution-weighted cosine: cosine similarity at each scan within peak
-                // boundaries, weighted by coefficient², then averaged.
-                features.elution_weighted_cosine = osprey_scoring::compute_elution_weighted_cosine(
-                    &entry.fragments,
-                    &rt_coef_pairs,
-                    &peak_region_spectra,
-                    spectral_scorer.tolerance_da(),
-                    spectral_scorer.tolerance_ppm(),
-                    peak_start_rt,
-                    peak_end_rt,
-                );
-
-                // Compute SNR on the best-correlated fragment XIC
-                if let Some(ref xic) = coelution_result.best_xic {
-                    if let Some(xic_apex_idx) = xic
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                        .map(|(i, _)| i)
-                    {
-                        let xic_apex_value = xic[xic_apex_idx].1;
-                        if let Some(snr) = osprey_scoring::compute_signal_to_noise(
-                            xic,
-                            xic_apex_idx,
-                            xic_apex_value,
-                        ) {
-                            features.xic_signal_to_noise = snr;
-                        }
-                    }
-                }
-
-                // Compute fragment-based FWHM from co-eluting XICs for blib boundaries
-                let (fragment_peak_bounds, median_polish) = osprey_scoring::compute_fragment_fwhm(
-                    &entry.fragments,
-                    &rt_coef_pairs,
-                    &peak_region_spectra,
-                    spectral_scorer.tolerance_da(),
-                    spectral_scorer.tolerance_ppm(),
-                );
-
-                // Extract median polish features
-                if let Some(ref mp) = median_polish {
-                    features.median_polish_cosine =
-                        osprey_scoring::median_polish_libcosine(mp, &entry.fragments);
-                    features.median_polish_rsquared = osprey_scoring::median_polish_rsquared(mp);
-                    features.median_polish_residual_ratio =
-                        osprey_scoring::median_polish_residual_ratio(mp);
-                }
-
-                // Find apex spectrum from peak region (closest to apex RT) for spectral scoring
-                let apex_spectrum = peak_region_spectra.iter().min_by(|a, b| {
-                    (a.retention_time - apex_rt)
-                        .abs()
-                        .partial_cmp(&(b.retention_time - apex_rt).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-
-                // Per-fragment mass accuracy at apex spectrum
-                if let Some(spectrum) = apex_spectrum {
-                    let matches = spectral_scorer.match_fragments(spectrum, entry);
-                    let (signed_mean, abs_mean, acc_std) =
-                        osprey_scoring::compute_mass_accuracy(&matches, mass_accuracy_unit);
-                    features.mass_accuracy_deviation_mean = signed_mean;
-                    features.abs_mass_accuracy_deviation_mean = abs_mean;
-                    features.mass_accuracy_std = acc_std;
-                }
-
-                // MS1-based features (HRAM only)
-                if is_hram && !ms1_index.is_empty() {
-                    // Determine MS1 tolerance (ppm) and reverse-calibrated search m/z
-                    let ms1_tol_ppm = calibration
-                        .map(|cal| calibrated_tolerance_ppm(&cal.ms1_calibration, 10.0))
-                        .unwrap_or(10.0);
-                    let search_mz = calibration
-                        .map(|cal| reverse_calibrate_mz(entry.precursor_mz, &cal.ms1_calibration))
-                        .unwrap_or(entry.precursor_mz);
-
-                    // MS1 precursor co-elution: correlate coefficient series with
-                    // MS1 M+0 XIC within peak integration boundaries only
-                    let bounded_pairs: Vec<&(f64, f64)> = rt_coef_pairs
-                        .iter()
-                        .filter(|(rt, _)| *rt >= peak_start_rt && *rt <= peak_end_rt)
-                        .collect();
-                    if bounded_pairs.len() >= 3 {
-                        let mut ms1_intensities = Vec::with_capacity(bounded_pairs.len());
-                        let mut coefs = Vec::with_capacity(bounded_pairs.len());
-                        for &(rt, coef) in &bounded_pairs {
-                            if let Some(ms1) = ms1_index.find_nearest(*rt) {
-                                let intensity = ms1
-                                    .find_peak_ppm(search_mz, ms1_tol_ppm)
-                                    .map(|(_, int)| int as f64)
-                                    .unwrap_or(0.0);
-                                ms1_intensities.push(intensity);
-                                coefs.push(*coef);
-                            }
-                        }
-                        if ms1_intensities.len() >= 3 {
-                            features.ms1_precursor_coelution =
-                                osprey_scoring::pearson_correlation_raw(&ms1_intensities, &coefs);
-                        }
-                    }
-
-                    // MS1 isotope cosine at apex RT
-                    if let Some(apex_ms1) = ms1_index.find_nearest(apex_rt) {
-                        let envelope = osprey_core::IsotopeEnvelope::extract(
-                            apex_ms1,
-                            search_mz,
-                            entry.charge,
-                            ms1_tol_ppm,
-                        );
-                        if envelope.has_m0() {
-                            if let Some(cosine) = osprey_core::peptide_isotope_cosine(
-                                &entry.sequence,
-                                &envelope.intensities,
-                            ) {
-                                features.ms1_isotope_cosine = cosine;
-                            }
-                        }
-                    }
-                }
-
-                // Primary score is LibCosine from extract_with_deconvolution (already computed)
-                // Fall back to peak_apex if no spectral score
-                let score = if features.dot_product > 0.0 {
-                    features.dot_product
-                } else {
-                    features.peak_apex * 0.1 // Scale down chromatographic score
-                };
-
-                // Check if this is a decoy (high bit set in ID)
-                let is_decoy = *lib_id & 0x80000000 != 0;
-
-                // Generate PSM ID for matching with Mokapot results
-                let psm_id = format!("{}_{}", file_name, lib_id);
-
-                Some(ScoredEntry {
-                    lib_idx,
-                    psm_id,
-                    file_name: file_name.to_string(),
-                    apex_scan_number,
-                    rt_coef_pairs,
-                    features,
-                    score,
-                    run_qvalue: 1.0,        // Will be set by Mokapot
-                    experiment_qvalue: 1.0, // Will be set by experiment-level Mokapot
-                    pep: 1.0,               // Will be set by Mokapot
-                    is_decoy,
-                    fragment_peak_bounds,
-                })
-            })();
-            pb.inc(1);
-            result
-        })
-        .collect();
-
-    pb.finish_with_message("Done");
-
-    // Return ALL entries (targets + decoys) for subsequent Mokapot FDR
-    Ok(scored_entries)
-}
-
-/// Compute FDR using Mokapot semi-supervised learning
-///
-/// This function provides an alternative FDR method using Mokapot,
-/// which trains a semi-supervised model on the features to better
-/// separate true and false detections.
-#[allow(dead_code)]
-fn compute_fdr_with_mokapot(
-    library: &[LibraryEntry],
-    scored_entries: &mut [ScoredEntry],
-    file_name: &str,
-    output_dir: &std::path::Path,
-    train_fdr: f64,
-    test_fdr: f64,
-) -> Result<()> {
-    let mokapot = MokapotRunner::new()
-        .with_train_fdr(train_fdr)
-        .with_test_fdr(test_fdr);
-
-    // Check if mokapot is available
-    if !mokapot.is_available() {
-        log::warn!("Mokapot not available, falling back to simple target-decoy competition");
-        log::warn!("Install mokapot with: pip install mokapot");
-        return Ok(());
-    }
-
-    // Convert scored entries to PSM features for mokapot
-    let psm_features: Vec<PsmFeatures> = scored_entries
-        .iter()
-        .map(|entry| {
-            let lib_entry = &library[entry.lib_idx];
-
-            // Use library index as scan_number for mokapot fold splitting
-            // In DIA/Osprey, each PSM represents a peptide detection across a chromatographic
-            // peak (many spectra), not a single spectrum. The library index uniquely identifies
-            // each precursor (peptide + charge), ensuring fold splitting groups by precursor
-            // to avoid data leakage during cross-validation.
-            PsmFeatures {
-                psm_id: entry.psm_id.clone(),
-                peptide: lib_entry.modified_sequence.clone(),
-                proteins: lib_entry.protein_ids.clone(),
-                scan_number: entry.apex_scan_number,
-                file_name: file_name.to_string(),
-                charge: lib_entry.charge,
-                is_decoy: entry.is_decoy,
-                features: entry.features.clone(),
-                initial_score: Some(entry.score),
-            }
-        })
-        .collect();
-
-    // Create replicate-specific output directory for mokapot
-    // Structure: mokapot/replicate_{file_name}/
-    let replicate_dir = output_dir.join(format!("replicate_{}", file_name));
-    std::fs::create_dir_all(&replicate_dir)?;
-
-    // Write PIN file
-    let pin_file = replicate_dir.join(format!("{}.pin", file_name));
-    mokapot.write_pin(&psm_features, &pin_file)?;
-
-    log::info!(
-        "Wrote {} precursors to PIN file: {}",
-        psm_features.len(),
-        pin_file.display()
-    );
-
-    // Run mokapot (outputs go to replicate subfolder)
-    let results = mokapot.run(&pin_file, &replicate_dir)?;
-
-    // Build lookup from psm_id to mokapot results
-    let result_map: std::collections::HashMap<String, (f64, f64)> = results
-        .into_iter()
-        .map(|r| (r.psm_id, (r.q_value, r.pep)))
-        .collect();
-
-    // Update run-level q-values and PEPs from mokapot results
-    let mut updated = 0;
-    for entry in scored_entries.iter_mut() {
-        if let Some(&(q_value, pep)) = result_map.get(&entry.psm_id) {
-            entry.run_qvalue = q_value;
-            entry.pep = pep;
-            updated += 1;
-        }
-    }
-
-    log::info!("Updated {} entries with run-level Mokapot results", updated);
-
-    Ok(())
-}
-
-/// Run two-level FDR control using Mokapot with multi-file support
-///
-/// This implements the two-level FDR strategy using mokapot CLI:
-/// 1. Run-level FDR: mokapot WITHOUT --aggregate + WITH --save_models
-///    → trains ONE model from all files, reports per-file results
-/// 2. Experiment-level FDR: mokapot WITH --aggregate + WITH --load_models
-///    → reuses model from Step 1, reports combined experiment results
-///
-/// # Arguments
-/// * `per_file_results` - Per-file scored entries (will be updated with q-values)
-/// * `library` - Full library for reference
-/// * `run_fdr` - Run-level FDR threshold
-/// * `experiment_fdr` - Experiment-level FDR threshold
-/// * `output_dir` - Output directory for mokapot files
-/// * `pin_files` - Optional pre-written PIN file paths. If provided, skips PIN file generation.
-///
-/// Returns all entries with both run-level and experiment-level q-values populated.
-fn run_two_level_fdr(
-    per_file_results: &mut [(String, Vec<ScoredEntry>)],
-    library: &[LibraryEntry],
-    run_fdr: f64,
-    experiment_fdr: f64,
-    output_dir: &std::path::Path,
-    pin_files: Option<HashMap<String, std::path::PathBuf>>,
-) -> Result<Vec<ScoredEntry>> {
-    // Build mokapot runner
-    let mokapot = MokapotRunner::new().with_test_fdr(run_fdr);
-
-    let mokapot_available = mokapot.is_available();
-    if !mokapot_available {
-        log::warn!("Mokapot not available, using simple target-decoy competition");
-        log::warn!("Install mokapot with: pip install mokapot");
-    }
-
-    // Create output directory for mokapot files
-    let mokapot_dir = output_dir.join("mokapot");
-    std::fs::create_dir_all(&mokapot_dir)?;
-
-    // For single file, use simpler approach
-    if per_file_results.len() == 1 {
-        let (file_name, entries) = per_file_results.iter_mut().next().unwrap();
-
-        if mokapot_available {
-            compute_fdr_with_mokapot(library, entries, file_name, &mokapot_dir, run_fdr, run_fdr)?;
-        } else {
-            apply_simple_fdr(entries, run_fdr)?;
-        }
-
-        // Report single file statistics
-        report_file_statistics(file_name, entries, library, run_fdr);
-
-        // Copy run-level to experiment-level for single file
-        log::info!("Single file - using run-level results as experiment-level");
-        let mut experiment_entries: Vec<ScoredEntry> = entries.clone();
-        for entry in experiment_entries.iter_mut() {
-            entry.experiment_qvalue = entry.run_qvalue;
-        }
-        return Ok(experiment_entries);
-    }
-
-    // ========== Multi-file analysis with two-step mokapot ==========
-    if !mokapot_available {
-        // Fallback: simple target-decoy competition
-        log::info!("Running simple target-decoy competition (mokapot not available)");
-
-        for (file_name, entries) in per_file_results.iter_mut() {
-            apply_simple_fdr(entries, run_fdr)?;
-            report_file_statistics(file_name, entries, library, run_fdr);
-        }
-
-        // Combine for experiment level
-        let mut experiment_entries: Vec<ScoredEntry> = Vec::new();
-        for (_, entries) in per_file_results.iter() {
-            for entry in entries.iter() {
-                experiment_entries.push(entry.clone());
-            }
-        }
-        apply_simple_fdr_experiment(&mut experiment_entries, experiment_fdr)?;
-        report_experiment_statistics(&experiment_entries, library, experiment_fdr);
-        return Ok(experiment_entries);
-    }
-
-    // ========== Run two-step mokapot analysis ==========
-    // Use pre-written PIN files if provided, otherwise generate them
-    let pin_files = if let Some(files) = pin_files {
-        files
-    } else {
-        // Fallback: collect PSM features and write PIN files
-        log::info!("Generating PIN files from scored entries...");
-        let psms_by_file = collect_psm_features_by_file(per_file_results, library);
-        let files = mokapot.write_pin_files(&psms_by_file, &mokapot_dir)?;
-        log::info!("Wrote {} PIN files", files.len());
-        files
-    };
-
-    // Run two-step analysis: trains ONE model, gets both per-file and experiment results
-    let (per_file_mokapot_results, experiment_mokapot_results) =
-        mokapot.run_two_step_analysis(&pin_files, &mokapot_dir)?;
-
-    // ========== Update per-file entries with Step 1 (run-level) results ==========
-    for (file_name, entries) in per_file_results.iter_mut() {
-        if let Some(results) = per_file_mokapot_results.get(file_name) {
-            let result_map: HashMap<String, (f64, f64)> = results
-                .iter()
-                .map(|r| (r.psm_id.clone(), (r.q_value, r.pep)))
-                .collect();
-
-            for entry in entries.iter_mut() {
-                if let Some(&(q_value, pep)) = result_map.get(&entry.psm_id) {
-                    entry.run_qvalue = q_value;
-                    entry.pep = pep;
-                }
-            }
-        }
-    }
-
-    // Per-file results already reported by mokapot.rs, skip redundant output here
-
-    // ========== Build experiment entries with Step 2 results ==========
-
-    // Build PSM ID to q-value map from experiment results
-    let experiment_result_map: HashMap<String, (f64, f64)> = experiment_mokapot_results
-        .iter()
-        .map(|r| (r.psm_id.clone(), (r.q_value, r.pep)))
-        .collect();
-
-    // Collect all entries with experiment-level q-values
-    let mut experiment_entries: Vec<ScoredEntry> = Vec::new();
-    for (_, entries) in per_file_results.iter() {
-        for entry in entries.iter() {
-            let mut entry_copy = entry.clone();
-
-            if entry.is_decoy {
-                entry_copy.experiment_qvalue = 1.0;
-            } else if let Some(&(q_value, _pep)) = experiment_result_map.get(&entry.psm_id) {
-                entry_copy.experiment_qvalue = q_value;
-            } else {
-                entry_copy.experiment_qvalue = 1.0;
-            }
-
-            experiment_entries.push(entry_copy);
-        }
-    }
-
-    Ok(experiment_entries)
-}
-
-/// Report per-file statistics (precursors and peptides)
-fn report_file_statistics(
-    file_name: &str,
-    entries: &[ScoredEntry],
-    library: &[LibraryEntry],
-    fdr: f64,
-) {
-    let passing_entries: Vec<_> = entries
-        .iter()
-        .filter(|e| !e.is_decoy && e.run_qvalue <= fdr)
-        .collect();
-
-    let precursor_count = passing_entries.len();
-
-    let unique_peptides: std::collections::HashSet<_> = passing_entries
-        .iter()
-        .map(|e| &library[e.lib_idx].modified_sequence)
-        .collect();
-    let peptide_count = unique_peptides.len();
-
-    log::info!(
-        "  {}: {} precursors, {} peptides",
-        file_name,
-        precursor_count,
-        peptide_count
-    );
-}
-
-/// Report experiment-level statistics (precursors and peptides)
-fn report_experiment_statistics(entries: &[ScoredEntry], library: &[LibraryEntry], fdr: f64) {
-    let passing_entries: Vec<_> = entries
-        .iter()
-        .filter(|e| !e.is_decoy && e.experiment_qvalue <= fdr)
-        .collect();
-
-    let precursor_count = passing_entries.len();
-
-    let unique_peptides: std::collections::HashSet<_> = passing_entries
-        .iter()
-        .map(|e| &library[e.lib_idx].modified_sequence)
-        .collect();
-    let peptide_count = unique_peptides.len();
-
-    log::info!(
-        "  Experiment: {} precursors, {} peptides",
-        precursor_count,
-        peptide_count
-    );
-}
-
 /// Count how many of entry A's top-N fragments match entry B's top-N fragments
 /// within the given m/z tolerance.
 fn count_topn_fragment_overlap(
@@ -2712,31 +797,1468 @@ fn top_n_fragment_mzs(fragments: &[LibraryFragment], n: usize) -> Vec<f64> {
     indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
     indexed.iter().take(n).map(|(mz, _)| *mz).collect()
 }
+/// Find the PIN feature that best separates targets from decoys using Cohen's d.
+///
+/// Returns `(feature_index, higher_is_better)` or `None` if separation cannot be computed.
+/// Compute ROC AUC via the Mann-Whitney U statistic.
+///
+/// AUC > 0.5 means higher values are more target-like (targets rank higher).
+/// AUC < 0.5 means lower values are more target-like (targets rank lower).
+/// AUC = 0.5 means no discrimination.
+fn compute_roc_auc(target_vals: &[f64], decoy_vals: &[f64]) -> f64 {
+    let n_t = target_vals.len();
+    let n_d = decoy_vals.len();
+    if n_t == 0 || n_d == 0 {
+        return 0.5;
+    }
 
-/// Remove double-counted peptides sharing fragment ions within the same isolation window.
+    // Combine all values with labels (true = target)
+    let mut combined: Vec<(f64, bool)> = Vec::with_capacity(n_t + n_d);
+    for &v in target_vals {
+        combined.push((v, true));
+    }
+    for &v in decoy_vals {
+        combined.push((v, false));
+    }
+
+    // Sort ascending by value; ties broken arbitrarily (doesn't affect average rank)
+    combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Assign average ranks for tied groups
+    let n = combined.len();
+    let mut ranks = vec![0.0f64; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && combined[j].0 == combined[i].0 {
+            j += 1;
+        }
+        // Average rank for positions i..j (1-indexed)
+        let avg_rank = (i + 1 + j) as f64 / 2.0;
+        for rank in ranks.iter_mut().take(j).skip(i) {
+            *rank = avg_rank;
+        }
+        i = j;
+    }
+
+    // Sum of target ranks
+    let target_rank_sum: f64 = ranks
+        .iter()
+        .zip(combined.iter())
+        .filter(|(_, (_, is_target))| *is_target)
+        .map(|(r, _)| *r)
+        .sum();
+
+    // U = target_rank_sum - n_t*(n_t+1)/2
+    let u = target_rank_sum - (n_t * (n_t + 1)) as f64 / 2.0;
+    u / (n_t as f64 * n_d as f64)
+}
+// =============================================================================
+// Per-file score parquet caching
+// =============================================================================
+
+/// Derive the scores parquet path from an input mzML path.
+/// e.g., `/data/sample1.mzML` → `/data/sample1.scores.parquet`
+fn scores_path_for_input(input_path: &std::path::Path) -> std::path::PathBuf {
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
+    parent.join(format!("{}.scores.parquet", stem))
+}
+
+/// Write per-file scored entries to parquet (pre-FDR, includes fragments and XIC for blib).
+fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]) -> Result<()> {
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let n = entries.len();
+    let feature_names = get_pin_feature_names();
+
+    // Build schema
+    let mut fields: Vec<Field> = vec![
+        Field::new("entry_id", DataType::UInt32, false),
+        Field::new("is_decoy", DataType::Boolean, false),
+        Field::new("sequence", DataType::Utf8, false),
+        Field::new("modified_sequence", DataType::Utf8, false),
+        Field::new("charge", DataType::UInt8, false),
+        Field::new("precursor_mz", DataType::Float64, false),
+        Field::new("protein_ids", DataType::Utf8, true),
+        Field::new("scan_number", DataType::UInt32, false),
+        Field::new("apex_rt", DataType::Float64, false),
+        Field::new("start_rt", DataType::Float64, false),
+        Field::new("end_rt", DataType::Float64, false),
+        Field::new("bounds_area", DataType::Float64, false),
+        Field::new("bounds_snr", DataType::Float64, false),
+        Field::new("file_name", DataType::Utf8, false),
+        // Variable-length arrays as binary (LE bytes)
+        Field::new("fragment_mzs", DataType::Binary, true),
+        Field::new("fragment_intensities", DataType::Binary, true),
+        Field::new("reference_xic_rts", DataType::Binary, true),
+        Field::new("reference_xic_intensities", DataType::Binary, true),
+    ];
+    for name in &feature_names {
+        fields.push(Field::new(*name, DataType::Float64, false));
+    }
+    let schema = std::sync::Arc::new(Schema::new(fields));
+
+    // Build column arrays
+    let mut entry_id_b = UInt32Builder::with_capacity(n);
+    let mut decoy_b = BooleanBuilder::with_capacity(n);
+    let mut seq_b = StringBuilder::with_capacity(n, n * 20);
+    let mut modseq_b = StringBuilder::with_capacity(n, n * 30);
+    let mut charge_b = UInt8Builder::with_capacity(n);
+    let mut mz_b = Float64Builder::with_capacity(n);
+    let mut protein_b = StringBuilder::with_capacity(n, n * 15);
+    let mut scan_b = UInt32Builder::with_capacity(n);
+    let mut apex_rt_b = Float64Builder::with_capacity(n);
+    let mut start_rt_b = Float64Builder::with_capacity(n);
+    let mut end_rt_b = Float64Builder::with_capacity(n);
+    let mut area_b = Float64Builder::with_capacity(n);
+    let mut snr_b = Float64Builder::with_capacity(n);
+    let mut fname_b = StringBuilder::with_capacity(n, n * 20);
+    let mut frag_mz_b = BinaryBuilder::with_capacity(n, n * 48);
+    let mut frag_int_b = BinaryBuilder::with_capacity(n, n * 24);
+    let mut xic_rt_b = BinaryBuilder::with_capacity(n, n * 80);
+    let mut xic_int_b = BinaryBuilder::with_capacity(n, n * 80);
+    let mut feat_builders: Vec<Float64Builder> = (0..feature_names.len())
+        .map(|_| Float64Builder::with_capacity(n))
+        .collect();
+
+    for entry in entries {
+        entry_id_b.append_value(entry.entry_id);
+        decoy_b.append_value(entry.is_decoy);
+        seq_b.append_value(&entry.sequence);
+        modseq_b.append_value(&entry.modified_sequence);
+        charge_b.append_value(entry.charge);
+        mz_b.append_value(entry.precursor_mz);
+        protein_b.append_value(entry.protein_ids.join(";"));
+        scan_b.append_value(entry.scan_number);
+        apex_rt_b.append_value(entry.apex_rt);
+        start_rt_b.append_value(entry.peak_bounds.start_rt);
+        end_rt_b.append_value(entry.peak_bounds.end_rt);
+        area_b.append_value(entry.peak_bounds.area);
+        snr_b.append_value(entry.peak_bounds.signal_to_noise);
+        fname_b.append_value(&entry.file_name);
+
+        // Serialize variable-length arrays as contiguous LE bytes
+        let mz_bytes: Vec<u8> = entry
+            .fragment_mzs
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        frag_mz_b.append_value(&mz_bytes);
+
+        let int_bytes: Vec<u8> = entry
+            .fragment_intensities
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        frag_int_b.append_value(&int_bytes);
+
+        let xic_rts: Vec<u8> = entry
+            .reference_xic
+            .iter()
+            .flat_map(|(rt, _)| rt.to_le_bytes())
+            .collect();
+        xic_rt_b.append_value(&xic_rts);
+
+        let xic_ints: Vec<u8> = entry
+            .reference_xic
+            .iter()
+            .flat_map(|(_, intensity)| intensity.to_le_bytes())
+            .collect();
+        xic_int_b.append_value(&xic_ints);
+
+        for (i, builder) in feat_builders.iter_mut().enumerate() {
+            let v = pin_feature_value(&entry.features, i);
+            builder.append_value(if v.is_finite() { v } else { 0.0 });
+        }
+    }
+
+    // Assemble columns
+    let mut columns: Vec<ArrayRef> = vec![
+        std::sync::Arc::new(entry_id_b.finish()),
+        std::sync::Arc::new(decoy_b.finish()),
+        std::sync::Arc::new(seq_b.finish()),
+        std::sync::Arc::new(modseq_b.finish()),
+        std::sync::Arc::new(charge_b.finish()),
+        std::sync::Arc::new(mz_b.finish()),
+        std::sync::Arc::new(protein_b.finish()),
+        std::sync::Arc::new(scan_b.finish()),
+        std::sync::Arc::new(apex_rt_b.finish()),
+        std::sync::Arc::new(start_rt_b.finish()),
+        std::sync::Arc::new(end_rt_b.finish()),
+        std::sync::Arc::new(area_b.finish()),
+        std::sync::Arc::new(snr_b.finish()),
+        std::sync::Arc::new(fname_b.finish()),
+        std::sync::Arc::new(frag_mz_b.finish()),
+        std::sync::Arc::new(frag_int_b.finish()),
+        std::sync::Arc::new(xic_rt_b.finish()),
+        std::sync::Arc::new(xic_int_b.finish()),
+    ];
+    for builder in &mut feat_builders {
+        columns.push(std::sync::Arc::new(builder.finish()));
+    }
+
+    // Write with ZSTD compression
+    let file = std::fs::File::create(path).map_err(|e| {
+        OspreyError::OutputError(format!(
+            "Failed to create scores file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| OspreyError::OutputError(format!("Failed to create RecordBatch: {}", e)))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+        .map_err(|e| OspreyError::OutputError(format!("Failed to create Parquet writer: {}", e)))?;
+    writer
+        .write(&batch)
+        .map_err(|e| OspreyError::OutputError(format!("Failed to write Parquet batch: {}", e)))?;
+    writer
+        .close()
+        .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
+
+    log::info!("Wrote {} scores to {}", n, path.display());
+
+    Ok(())
+}
+
+/// Load per-file scored entries from a cached parquet file.
+fn load_scores_parquet(path: &std::path::Path) -> Result<Vec<CoelutionScoredEntry>> {
+    use arrow::array::{
+        Array, BinaryArray, BooleanArray, Float64Array, StringArray, UInt32Array, UInt8Array,
+    };
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let file = std::fs::File::open(path).map_err(|e| {
+        OspreyError::OutputError(format!(
+            "Failed to open scores file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        OspreyError::OutputError(format!("Failed to read parquet {}: {}", path.display(), e))
+    })?;
+
+    // Validate schema: reject stale scores files from older versions with different features
+    let feature_names = get_pin_feature_names();
+    let parquet_schema = builder.schema();
+    for name in &feature_names {
+        if parquet_schema.column_with_name(name).is_none() {
+            return Err(OspreyError::OutputError(format!(
+                "Stale scores cache {}: missing column '{}'. Delete and re-run.",
+                path.display(),
+                name
+            )));
+        }
+    }
+
+    let reader = builder.build().map_err(|e| {
+        OspreyError::OutputError(format!("Failed to build reader {}: {}", path.display(), e))
+    })?;
+    let mut entries = Vec::new();
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| OspreyError::OutputError(format!("Failed to read batch: {}", e)))?;
+
+        let entry_ids = batch
+            .column_by_name("entry_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let is_decoys = batch
+            .column_by_name("is_decoy")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let sequences = batch
+            .column_by_name("sequence")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mod_sequences = batch
+            .column_by_name("modified_sequence")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let charges = batch
+            .column_by_name("charge")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+        let mzs = batch
+            .column_by_name("precursor_mz")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let proteins = batch
+            .column_by_name("protein_ids")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let scans = batch
+            .column_by_name("scan_number")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let apex_rts = batch
+            .column_by_name("apex_rt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let start_rts = batch
+            .column_by_name("start_rt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let end_rts = batch
+            .column_by_name("end_rt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let areas = batch
+            .column_by_name("bounds_area")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let snrs = batch
+            .column_by_name("bounds_snr")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let file_names = batch
+            .column_by_name("file_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let frag_mz_col = batch
+            .column_by_name("fragment_mzs")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let frag_int_col = batch
+            .column_by_name("fragment_intensities")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let xic_rt_col = batch
+            .column_by_name("reference_xic_rts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let xic_int_col = batch
+            .column_by_name("reference_xic_intensities")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+
+        // Read feature columns
+        let feat_cols: Vec<&Float64Array> = feature_names
+            .iter()
+            .map(|name| {
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+            })
+            .collect();
+
+        for row in 0..batch.num_rows() {
+            // Deserialize binary arrays back to Vecs
+            let frag_mzs: Vec<f64> = frag_mz_col
+                .value(row)
+                .chunks_exact(8)
+                .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let frag_ints: Vec<f32> = frag_int_col
+                .value(row)
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let xic_rts_raw: Vec<f64> = xic_rt_col
+                .value(row)
+                .chunks_exact(8)
+                .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let xic_ints_raw: Vec<f64> = xic_int_col
+                .value(row)
+                .chunks_exact(8)
+                .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let reference_xic: Vec<(f64, f64)> =
+                xic_rts_raw.into_iter().zip(xic_ints_raw).collect();
+
+            let protein_str = proteins.value(row);
+            let protein_ids: Vec<String> = if protein_str.is_empty() {
+                Vec::new()
+            } else {
+                protein_str.split(';').map(|s| s.to_string()).collect()
+            };
+
+            // Reconstruct features from columns
+            let mut features = CoelutionFeatureSet::default();
+            set_features_from_pin_values(&mut features, &feat_cols, row);
+
+            let apex_rt_val = apex_rts.value(row);
+
+            entries.push(CoelutionScoredEntry {
+                entry_id: entry_ids.value(row),
+                is_decoy: is_decoys.value(row),
+                sequence: sequences.value(row).to_string(),
+                modified_sequence: mod_sequences.value(row).to_string(),
+                charge: charges.value(row),
+                precursor_mz: mzs.value(row),
+                protein_ids,
+                scan_number: scans.value(row),
+                apex_rt: apex_rt_val,
+                peak_bounds: XICPeakBounds {
+                    apex_rt: apex_rt_val,
+                    apex_intensity: 0.0,
+                    apex_index: 0,
+                    start_rt: start_rts.value(row),
+                    end_rt: end_rts.value(row),
+                    start_index: 0,
+                    end_index: 0,
+                    area: areas.value(row),
+                    signal_to_noise: snrs.value(row),
+                },
+                features,
+                fragment_mzs: frag_mzs,
+                fragment_intensities: frag_ints,
+                reference_xic,
+                file_name: file_names.value(row).to_string(),
+                run_qvalue: 1.0,
+                experiment_qvalue: 1.0,
+                score: 0.0,
+                pep: 1.0,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Set CoelutionFeatureSet fields from parquet feature columns.
+///
+/// This maps the 17 PIN feature columns back to the struct fields.
+/// Order must match get_pin_feature_names() and pin_feature_value().
+fn set_features_from_pin_values(
+    features: &mut CoelutionFeatureSet,
+    feat_cols: &[&arrow::array::Float64Array],
+    row: usize,
+) {
+    let v = |i: usize| -> f64 { feat_cols[i].value(row) };
+
+    // Pairwise coelution (indices 0-2)
+    features.coelution_sum = v(0);
+    features.coelution_max = v(1);
+    features.n_coeluting_fragments = v(2) as u8;
+
+    // Peak shape (indices 3-5)
+    features.peak_apex = v(3);
+    features.peak_area = v(4);
+    features.peak_sharpness = v(5);
+
+    // Spectral at apex (indices 6-8)
+    features.xcorr = v(6);
+    features.consecutive_ions = v(7) as u8;
+    features.explained_intensity = v(8);
+
+    // Mass accuracy (indices 9-10)
+    features.mass_accuracy_mean = v(9);
+    features.abs_mass_accuracy_mean = v(10);
+
+    // RT deviation (indices 11-12)
+    features.rt_deviation = v(11);
+    features.abs_rt_deviation = v(12);
+
+    // MS1 (indices 13-14)
+    features.ms1_precursor_coelution = v(13);
+    features.ms1_isotope_cosine = v(14);
+
+    // Median polish (indices 15-16)
+    features.median_polish_cosine = v(15);
+    features.median_polish_residual_ratio = v(16);
+
+    // SG-weighted multi-scan (indices 17-20)
+    features.sg_weighted_xcorr = v(17);
+    features.sg_weighted_cosine = v(18);
+    features.median_polish_min_fragment_r2 = v(19);
+    features.median_polish_residual_correlation = v(20);
+}
+
+/// Write coelution scored entries to Parquet report (one row per precursor per run)
+fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]) -> Result<()> {
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let n = entries.len();
+    let feature_names = get_pin_feature_names();
+
+    // Build schema: identification + peak/RT + FDR + all features
+    let mut fields: Vec<Field> = vec![
+        Field::new("Run", DataType::Utf8, false),
+        Field::new("Modified.Sequence", DataType::Utf8, false),
+        Field::new("Stripped.Sequence", DataType::Utf8, false),
+        Field::new("Precursor.Charge", DataType::UInt8, false),
+        Field::new("Precursor.Mz", DataType::Float64, false),
+        Field::new("Protein.Ids", DataType::Utf8, true),
+        Field::new("Is.Decoy", DataType::Boolean, false),
+        Field::new("RT", DataType::Float64, false),
+        Field::new("RT.Start", DataType::Float64, false),
+        Field::new("RT.Stop", DataType::Float64, false),
+        Field::new("Peak.Width", DataType::Float64, false),
+        Field::new("Library.RT", DataType::Float64, false),
+        Field::new("Scan.Number", DataType::UInt32, false),
+        Field::new("Score", DataType::Float64, false),
+        Field::new("Q.Value", DataType::Float64, false),
+        Field::new("Global.Q.Value", DataType::Float64, false),
+        Field::new("PEP", DataType::Float64, false),
+        Field::new("Search.Mode", DataType::Utf8, false),
+    ];
+    for name in &feature_names {
+        fields.push(Field::new(*name, DataType::Float64, false));
+    }
+    let schema = std::sync::Arc::new(Schema::new(fields));
+
+    // Build column arrays
+    let mut run_b = StringBuilder::with_capacity(n, n * 20);
+    let mut modseq_b = StringBuilder::with_capacity(n, n * 30);
+    let mut seq_b = StringBuilder::with_capacity(n, n * 20);
+    let mut charge_b = UInt8Builder::with_capacity(n);
+    let mut mz_b = Float64Builder::with_capacity(n);
+    let mut protein_b = StringBuilder::with_capacity(n, n * 15);
+    let mut decoy_b = BooleanBuilder::with_capacity(n);
+    let mut rt_b = Float64Builder::with_capacity(n);
+    let mut rt_start_b = Float64Builder::with_capacity(n);
+    let mut rt_stop_b = Float64Builder::with_capacity(n);
+    let mut width_b = Float64Builder::with_capacity(n);
+    let mut lib_rt_b = Float64Builder::with_capacity(n);
+    let mut scan_b = UInt32Builder::with_capacity(n);
+    let mut score_b = Float64Builder::with_capacity(n);
+    let mut qval_b = Float64Builder::with_capacity(n);
+    let mut gqval_b = Float64Builder::with_capacity(n);
+    let mut pep_b = Float64Builder::with_capacity(n);
+    let mut mode_b = StringBuilder::with_capacity(n, n * 10);
+    let mut feat_builders: Vec<Float64Builder> = (0..feature_names.len())
+        .map(|_| Float64Builder::with_capacity(n))
+        .collect();
+
+    for entry in entries {
+        run_b.append_value(&entry.file_name);
+        modseq_b.append_value(&entry.modified_sequence);
+        seq_b.append_value(&entry.sequence);
+        charge_b.append_value(entry.charge);
+        mz_b.append_value(entry.precursor_mz);
+        protein_b.append_value(entry.protein_ids.join(";"));
+        decoy_b.append_value(entry.is_decoy);
+
+        rt_b.append_value(entry.peak_bounds.apex_rt);
+        rt_start_b.append_value(entry.peak_bounds.start_rt);
+        rt_stop_b.append_value(entry.peak_bounds.end_rt);
+        width_b.append_value(entry.peak_bounds.end_rt - entry.peak_bounds.start_rt);
+        lib_rt_b.append_value(0.0); // CoelutionScoredEntry doesn't store library RT
+        scan_b.append_value(entry.scan_number);
+        score_b.append_value(entry.score);
+        qval_b.append_value(entry.run_qvalue);
+        gqval_b.append_value(entry.experiment_qvalue);
+        pep_b.append_value(entry.pep);
+        mode_b.append_value("coelution");
+
+        // All 45 features
+        for (i, builder) in feat_builders.iter_mut().enumerate() {
+            let v = pin_feature_value(&entry.features, i);
+            builder.append_value(if v.is_finite() { v } else { 0.0 });
+        }
+    }
+
+    // Assemble columns
+    let mut columns: Vec<ArrayRef> = vec![
+        std::sync::Arc::new(run_b.finish()),
+        std::sync::Arc::new(modseq_b.finish()),
+        std::sync::Arc::new(seq_b.finish()),
+        std::sync::Arc::new(charge_b.finish()),
+        std::sync::Arc::new(mz_b.finish()),
+        std::sync::Arc::new(protein_b.finish()),
+        std::sync::Arc::new(decoy_b.finish()),
+        std::sync::Arc::new(rt_b.finish()),
+        std::sync::Arc::new(rt_start_b.finish()),
+        std::sync::Arc::new(rt_stop_b.finish()),
+        std::sync::Arc::new(width_b.finish()),
+        std::sync::Arc::new(lib_rt_b.finish()),
+        std::sync::Arc::new(scan_b.finish()),
+        std::sync::Arc::new(score_b.finish()),
+        std::sync::Arc::new(qval_b.finish()),
+        std::sync::Arc::new(gqval_b.finish()),
+        std::sync::Arc::new(pep_b.finish()),
+        std::sync::Arc::new(mode_b.finish()),
+    ];
+    for builder in &mut feat_builders {
+        columns.push(std::sync::Arc::new(builder.finish()));
+    }
+
+    // Write parquet with ZSTD compression
+    let file = std::fs::File::create(path).map_err(|e| {
+        OspreyError::OutputError(format!(
+            "Failed to create parquet file {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(Default::default()))
+        .build();
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| OspreyError::OutputError(format!("Failed to create RecordBatch: {}", e)))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+        .map_err(|e| OspreyError::OutputError(format!("Failed to create Parquet writer: {}", e)))?;
+    writer
+        .write(&batch)
+        .map_err(|e| OspreyError::OutputError(format!("Failed to write Parquet batch: {}", e)))?;
+    writer
+        .close()
+        .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
+
+    log::info!(
+        "Wrote Parquet report ({} entries, {} columns) to {}",
+        n,
+        18 + feature_names.len(),
+        path.display()
+    );
+    Ok(())
+}
+
+/// Write coelution scored entries to TSV report
+fn write_scored_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path)?;
+    writeln!(
+        file,
+        "modified_sequence\tprecursor_mz\tcharge\tapex_rt\tpeak_apex\tpeak_area\tn_scans\tq_value"
+    )?;
+
+    for entry in entries {
+        writeln!(
+            file,
+            "{}\t{:.4}\t{}\t{:.2}\t{:.4}\t{:.4}\t{}\t{:.6}",
+            entry.modified_sequence,
+            entry.precursor_mz,
+            entry.charge,
+            entry.peak_bounds.apex_rt,
+            entry.features.peak_apex,
+            entry.features.peak_area,
+            entry.features.n_scans,
+            entry.experiment_qvalue
+        )?;
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Main analysis entry point
+// =============================================================================
+
+/// Run the complete Osprey analysis pipeline.
+///
+/// Uses DIA-NN-style fragment XIC extraction and pairwise correlation scoring.
+/// Calibrates retention time per file, searches for peptide candidates, performs
+/// FDR control, and writes results to blib format for Skyline integration.
+pub fn run_analysis(config: OspreyConfig) -> Result<()> {
+    // Validate config
+    if config.input_files.is_empty() {
+        return Err(OspreyError::ConfigError("No input files specified".into()));
+    }
+
+    // Load library
+    log::info!(
+        "Loading spectral library from {:?}",
+        config.library_source.path()
+    );
+    let mut library = load_library(&config.library_source)?;
+    log::info!("Loaded {} library entries", library.len());
+
+    if library.is_empty() {
+        return Err(OspreyError::LibraryLoadError("Library is empty".into()));
+    }
+
+    // Generate decoys
+    if !config.decoys_in_library {
+        log::info!("Generating decoys using {:?} method", config.decoy_method);
+        let decoy_method = match config.decoy_method {
+            CoreDecoyMethod::Reverse => DecoyMethod::Reverse,
+            CoreDecoyMethod::Shuffle => DecoyMethod::Shuffle,
+            CoreDecoyMethod::FromLibrary => DecoyMethod::Reverse,
+        };
+        let generator = DecoyGenerator::with_enzyme(decoy_method, Enzyme::Trypsin);
+        let targets: Vec<LibraryEntry> = library.iter().filter(|e| !e.is_decoy).cloned().collect();
+        let n_original_targets = targets.len();
+        let (valid_targets, decoys, _stats) =
+            generator.generate_all_with_collision_detection(&targets);
+        log::info!(
+            "Generated {} decoys from {} targets ({} excluded due to collisions)",
+            decoys.len(),
+            n_original_targets,
+            n_original_targets - valid_targets.len()
+        );
+        library = valid_targets;
+        library.extend(decoys);
+        log::info!("Total library size: {} (targets + decoys)", library.len());
+    }
+
+    // Set up output directories
+    let output_dir = config
+        .output_blib
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let write_pin = config.write_pin || config.fdr_method == FdrMethod::Mokapot;
+    let mokapot_dir = output_dir.join("mokapot");
+    if write_pin {
+        std::fs::create_dir_all(&mokapot_dir)?;
+    }
+    let mokapot = MokapotRunner::new().with_test_fdr(config.run_fdr);
+
+    // Process each file
+    let mut per_file_entries: Vec<(String, Vec<CoelutionScoredEntry>)> = Vec::new();
+    let mut pin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
+
+    for (file_idx, input_file) in config.input_files.iter().enumerate() {
+        log::info!("");
+        log::info!(
+            "===== Processing file {}/{}: {} =====",
+            file_idx + 1,
+            config.input_files.len(),
+            input_file.display()
+        );
+
+        let file_name = input_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Check for cached scores parquet (skip search if already scored)
+        let scores_path = scores_path_for_input(input_file);
+        let entries = if scores_path.exists() {
+            match load_scores_parquet(&scores_path) {
+                Ok(entries) => {
+                    log::info!(
+                        "Loaded {} cached scores from {}",
+                        entries.len(),
+                        scores_path.display()
+                    );
+                    entries
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to load cached scores from {}: {}. Re-scoring.",
+                        scores_path.display(),
+                        e
+                    );
+                    // Fall through to scoring below
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        // If we got cached entries, skip loading spectra and scoring
+        let entries = if !entries.is_empty() {
+            entries
+        } else {
+            // Load spectra
+            let (spectra, ms1_index) = load_all_spectra(input_file)?;
+            if spectra.is_empty() {
+                log::warn!("No spectra found in {}", input_file.display());
+                continue;
+            }
+
+            // Run calibration (reuse the windowed calibration discovery)
+            let (rt_cal, cal_params): (Option<RTCalibration>, Option<CalibrationParams>) = if config
+                .rt_calibration
+                .enabled
+            {
+                // Try to load cached calibration
+                let cached = input_file.parent().and_then(|input_dir| {
+                    let cal_path = calibration_path_for_input(input_file, input_dir);
+                    if !cal_path.exists() {
+                        return None;
+                    }
+                    let cal_params = load_calibration(&cal_path).ok()?;
+                    if !cal_params.rt_calibration.has_model_data() || !cal_params.is_calibrated() {
+                        return None;
+                    }
+                    let model_params = cal_params.rt_calibration.model_params.as_ref()?;
+                    let rt_cal = RTCalibration::from_model_params(
+                        model_params,
+                        cal_params.rt_calibration.residual_sd,
+                    )
+                    .ok()?;
+                    log::info!("Reusing cached calibration from {}", cal_path.display());
+                    cal_params.log_summary();
+                    Some((rt_cal, cal_params))
+                });
+
+                if let Some((rt_cal, cal_params)) = cached {
+                    (Some(rt_cal), Some(cal_params))
+                } else {
+                    // Run calibration discovery
+                    match run_calibration_discovery_windowed(
+                        &library, &spectra, &ms1_index, &config,
+                    ) {
+                        Ok((rt_cal, cal_params)) => {
+                            cal_params.log_summary();
+                            if let Some(input_dir) = input_file.parent() {
+                                let cal_path = calibration_path_for_input(input_file, input_dir);
+                                if let Err(e) = save_calibration(&cal_params, &cal_path) {
+                                    log::warn!("Failed to save calibration: {}", e);
+                                }
+                            }
+                            (Some(rt_cal), Some(cal_params))
+                        }
+                        Err(e) => {
+                            log::warn!("Calibration failed: {}. Using fallback tolerance.", e);
+                            (None, None)
+                        }
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+            // Run coelution search
+            let entries = run_search(
+                &library,
+                &spectra,
+                &ms1_index,
+                cal_params.as_ref(),
+                rt_cal.as_ref(),
+                &config,
+                &file_name,
+            )?;
+
+            log::info!(
+                "Scored {} entries ({} targets, {} decoys) for {}",
+                entries.len(),
+                entries.iter().filter(|e| !e.is_decoy).count(),
+                entries.iter().filter(|e| e.is_decoy).count(),
+                file_name
+            );
+
+            // Remove double-counted entries (different precursors sharing fragment ions)
+            let entries = deduplicate_double_counting(
+                entries,
+                &library,
+                &spectra,
+                cal_params.as_ref(),
+                &config,
+            );
+
+            // Deduplicate: keep best target and best decoy per base_id.
+            let entries = deduplicate_pairs(entries);
+
+            // Save scores to parquet for future re-use
+            if let Err(e) = write_scores_parquet(&scores_path, &entries) {
+                log::warn!("Failed to save scores to {}: {}", scores_path.display(), e);
+            }
+
+            entries
+        };
+
+        // Write coelution PIN file (if mokapot or --write-pin)
+        // Mokapot expects pre-competed data (winners only), so compete before writing PIN.
+        // Native Percolator does internal paired competition, so keep both target and decoy.
+        if write_pin {
+            let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
+                compete_target_decoy_pairs(entries.clone())
+            } else {
+                entries.clone()
+            };
+            let pin_path = mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
+            pin_files.insert(file_name.clone(), pin_path);
+        }
+
+        per_file_entries.push((file_name, entries));
+    }
+
+    let total_scored: usize = per_file_entries.iter().map(|(_, s)| s.len()).sum();
+    log::info!(
+        "Coelution analysis complete. {} total scored entries across {} files",
+        total_scored,
+        config.input_files.len()
+    );
+
+    if per_file_entries.is_empty() || total_scored == 0 {
+        log::warn!("No scored entries found. Cannot perform FDR control.");
+        return Ok(());
+    }
+
+    // Dispatch FDR control based on method
+    log::info!("");
+    log::info!(
+        "Running {} FDR control on coelution results...",
+        config.fdr_method
+    );
+
+    match config.fdr_method {
+        FdrMethod::Percolator => {
+            run_percolator_fdr(&mut per_file_entries, &config)?;
+        }
+        FdrMethod::Mokapot => {
+            run_mokapot_fdr(
+                &mut per_file_entries,
+                &mokapot,
+                &pin_files,
+                &mokapot_dir,
+                &config,
+            )?;
+        }
+        FdrMethod::Simple => {
+            for (_, entries) in per_file_entries.iter_mut() {
+                apply_simple_fdr(entries, config.run_fdr)?;
+            }
+        }
+    }
+
+    // Collect all entries (targets + decoys) with q-values assigned
+    let all_entries: Vec<CoelutionScoredEntry> = per_file_entries
+        .into_iter()
+        .flat_map(|(_, entries)| entries)
+        .collect();
+
+    // Determine which precursors pass experiment-level FDR (using best observation)
+    let passing_precursors: HashSet<(String, u8)> = all_entries
+        .iter()
+        .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
+        .map(|e| (e.modified_sequence.clone(), e.charge))
+        .collect();
+
+    // Include ALL per-file target observations for passing precursors
+    // (not just the winner — needed for per-file RT boundaries in blib)
+    let mut passing_entries: Vec<CoelutionScoredEntry> = all_entries
+        .iter()
+        .filter(|e| {
+            !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge))
+        })
+        .cloned()
+        .collect();
+
+    // Propagate the best experiment_qvalue to all observations of each precursor
+    let mut best_exp_q: HashMap<(String, u8), f64> = HashMap::new();
+    for e in &passing_entries {
+        best_exp_q
+            .entry((e.modified_sequence.clone(), e.charge))
+            .and_modify(|q| *q = q.min(e.experiment_qvalue))
+            .or_insert(e.experiment_qvalue);
+    }
+    for e in passing_entries.iter_mut() {
+        if let Some(&q) = best_exp_q.get(&(e.modified_sequence.clone(), e.charge)) {
+            e.experiment_qvalue = q;
+        }
+    }
+
+    // Write blib output
+    if !passing_entries.is_empty() {
+        log::info!("Writing blib to {}", config.output_blib.display());
+        write_blib_output(&config, &library, &passing_entries)?;
+    } else {
+        log::warn!("No peptides passed FDR threshold, skipping blib output");
+    }
+
+    // Write output report if specified
+    // Parquet includes all entries (targets + decoys) for feature analysis and SVM retraining;
+    // TSV includes only passing entries.
+    if let Some(report_path) = &config.output_report {
+        let ext = report_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if ext.eq_ignore_ascii_case("parquet") {
+            log::info!("Writing Parquet report to {}", report_path.display());
+            write_parquet_report(report_path, &all_entries)?;
+        } else {
+            log::info!("Writing TSV report to {}", report_path.display());
+            write_scored_report(report_path, &passing_entries)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Run native Percolator FDR on coelution entries
+fn run_percolator_fdr(
+    per_file_entries: &mut [(String, Vec<CoelutionScoredEntry>)],
+    config: &OspreyConfig,
+) -> Result<()> {
+    log::info!("Running native Percolator FDR on coelution entries");
+
+    // Convert CoelutionScoredEntry → PercolatorEntry
+    let mut perc_entries = Vec::new();
+    for (file_name, entries) in per_file_entries.iter() {
+        for entry in entries.iter() {
+            let features: Vec<f64> = (0..NUM_PIN_FEATURES)
+                .map(|i| {
+                    let v = pin_feature_value(&entry.features, i);
+                    if v.is_finite() {
+                        v
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+
+            let psm_id = format!(
+                "{}_{}_{}_{}",
+                file_name, entry.modified_sequence, entry.charge, entry.scan_number
+            );
+
+            perc_entries.push(percolator::PercolatorEntry {
+                id: psm_id,
+                file_name: file_name.clone(),
+                peptide: entry.modified_sequence.clone(),
+                charge: entry.charge,
+                is_decoy: entry.is_decoy,
+                entry_id: entry.entry_id,
+                features,
+            });
+        }
+    }
+
+    let coelution_feature_names = get_pin_feature_names();
+    let perc_config = percolator::PercolatorConfig {
+        train_fdr: config.run_fdr,
+        test_fdr: config.run_fdr,
+        feature_names: Some(
+            coelution_feature_names
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        ..Default::default()
+    };
+
+    let results = percolator::run_percolator(&perc_entries, &perc_config)
+        .map_err(|e| OspreyError::config(format!("Percolator failed: {}", e)))?;
+
+    // Build result lookup
+    let result_map: HashMap<&str, &percolator::PercolatorResult> =
+        results.entries.iter().map(|r| (r.id.as_str(), r)).collect();
+
+    // Map results back to CoelutionScoredEntries
+    for (file_name, entries) in per_file_entries.iter_mut() {
+        for entry in entries.iter_mut() {
+            let psm_id = format!(
+                "{}_{}_{}_{}",
+                file_name, entry.modified_sequence, entry.charge, entry.scan_number
+            );
+            if let Some(result) = result_map.get(psm_id.as_str()) {
+                // Enforce dual FDR: max of precursor and peptide q-values
+                entry.run_qvalue = result.run_precursor_qvalue.max(result.run_peptide_qvalue);
+                entry.experiment_qvalue = result
+                    .experiment_precursor_qvalue
+                    .max(result.experiment_peptide_qvalue);
+                entry.score = result.score;
+                entry.pep = result.pep;
+            }
+        }
+    }
+
+    // Per-file and experiment stats already logged by percolator.rs
+
+    Ok(())
+}
+
+/// Run external mokapot FDR on coelution entries
+fn run_mokapot_fdr(
+    per_file_entries: &mut [(String, Vec<CoelutionScoredEntry>)],
+    mokapot: &MokapotRunner,
+    pin_files: &HashMap<String, std::path::PathBuf>,
+    mokapot_dir: &std::path::Path,
+    config: &OspreyConfig,
+) -> Result<()> {
+    if !mokapot.is_available() {
+        log::warn!("Mokapot not available, falling back to native Percolator");
+        return run_percolator_fdr(per_file_entries, config);
+    }
+
+    match mokapot.run_two_step_analysis(pin_files, mokapot_dir) {
+        Ok((per_file_results, experiment_results)) => {
+            let experiment_qmap: HashMap<String, f64> = experiment_results
+                .iter()
+                .map(|r| (r.psm_id.clone(), r.q_value))
+                .collect();
+
+            let experiment_score_map: HashMap<String, (f64, f64)> = experiment_results
+                .iter()
+                .map(|r| (r.psm_id.clone(), (r.score, r.pep)))
+                .collect();
+
+            // Parse run-level peptide q-values for dual FDR control
+            let step1_dir = mokapot_dir.join("run_level");
+            let mut run_peptide_qmaps: HashMap<String, HashMap<String, f64>> = HashMap::new();
+            for (file_name, _) in per_file_entries.iter() {
+                if let Some(pin_path) = pin_files.get(file_name) {
+                    let pin_stem = pin_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown");
+                    let peptides_file =
+                        step1_dir.join(format!("{}.mokapot.peptides.txt", pin_stem));
+                    if peptides_file.exists() {
+                        if let Ok(pept_results) = mokapot.parse_results(&peptides_file) {
+                            let pept_map: HashMap<String, f64> = pept_results
+                                .into_iter()
+                                .map(|r| {
+                                    let stripped =
+                                        osprey_fdr::mokapot::strip_flanking_chars(&r.peptide);
+                                    (stripped, r.q_value)
+                                })
+                                .collect();
+                            run_peptide_qmaps.insert(file_name.clone(), pept_map);
+                        }
+                    }
+                }
+            }
+
+            // Parse experiment-level peptide q-values for dual FDR control
+            let step2_dir = mokapot_dir.join("experiment_level");
+            let exp_peptide_qmap: HashMap<String, f64> = {
+                let peptides_file = step2_dir.join("mokapot.peptides.txt");
+                if peptides_file.exists() {
+                    mokapot
+                        .parse_results(&peptides_file)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|r| {
+                            let stripped = osprey_fdr::mokapot::strip_flanking_chars(&r.peptide);
+                            (stripped, r.q_value)
+                        })
+                        .collect()
+                } else {
+                    HashMap::new()
+                }
+            };
+
+            for (file_name, entries) in per_file_entries.iter_mut() {
+                if let Some(results) = per_file_results.get(file_name) {
+                    let run_qmap: HashMap<String, (f64, f64, f64)> = results
+                        .iter()
+                        .map(|r| (r.psm_id.clone(), (r.q_value, r.score, r.pep)))
+                        .collect();
+
+                    let peptide_qmap = run_peptide_qmaps.get(file_name);
+
+                    for entry in entries.iter_mut() {
+                        let psm_id = format!(
+                            "{}_{}_{}_{}",
+                            file_name, entry.modified_sequence, entry.charge, entry.scan_number
+                        );
+                        if let Some(&(q, score, pep)) = run_qmap.get(&psm_id) {
+                            // Enforce dual FDR: max of precursor and peptide q-values
+                            let peptide_q = peptide_qmap
+                                .and_then(|m| m.get(entry.modified_sequence.as_str()))
+                                .copied()
+                                .unwrap_or(1.0);
+                            entry.run_qvalue = q.max(peptide_q);
+                            entry.score = score;
+                            entry.pep = pep;
+                        }
+                        if let Some(&q) = experiment_qmap.get(&psm_id) {
+                            // Enforce dual FDR: max of precursor and peptide q-values
+                            let peptide_q = exp_peptide_qmap
+                                .get(entry.modified_sequence.as_str())
+                                .copied()
+                                .unwrap_or(1.0);
+                            entry.experiment_qvalue = q.max(peptide_q);
+                        }
+                        if let Some(&(score, pep)) = experiment_score_map.get(&psm_id) {
+                            entry.score = score;
+                            entry.pep = pep;
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "Mokapot two-step FDR failed: {}. Falling back to Percolator.",
+                e
+            );
+            run_percolator_fdr(per_file_entries, config)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Target-decoy competition for coelution entries.
+/// Each target competes with its paired decoy — higher coelution_sum wins.
+/// Deduplicate coelution entries: keep the best target AND best decoy per base_id.
+///
+/// When a precursor appears in multiple isolation windows, we may have duplicate
+/// entries. This keeps only the best-scoring target and the best-scoring decoy
+/// for each base_id (paired by `entry_id & 0x7FFFFFFF`). Both are retained so
+/// that Percolator/Mokapot can perform proper target-decoy competition using
+/// ML-rescored values.
+fn deduplicate_pairs(entries: Vec<CoelutionScoredEntry>) -> Vec<CoelutionScoredEntry> {
+    let mut target_best: HashMap<u32, CoelutionScoredEntry> = HashMap::new();
+    let mut decoy_best: HashMap<u32, CoelutionScoredEntry> = HashMap::new();
+
+    for entry in entries {
+        let base_id = entry.entry_id & 0x7FFFFFFF;
+        let map = if entry.is_decoy {
+            &mut decoy_best
+        } else {
+            &mut target_best
+        };
+
+        let is_better = map
+            .get(&base_id)
+            .map(|existing| entry.features.coelution_sum > existing.features.coelution_sum)
+            .unwrap_or(true);
+        if is_better {
+            map.insert(base_id, entry);
+        }
+    }
+
+    let n_targets = target_best.len();
+    let n_decoys = decoy_best.len();
+    let n_paired = target_best
+        .keys()
+        .filter(|k| decoy_best.contains_key(k))
+        .count();
+
+    // Collect all entries (both targets and decoys)
+    let mut all_entries: Vec<CoelutionScoredEntry> =
+        Vec::with_capacity(target_best.len() + decoy_best.len());
+    all_entries.extend(target_best.into_values());
+    all_entries.extend(decoy_best.into_values());
+
+    // Sort by entry_id for deterministic order regardless of HashMap iteration.
+    // Without this, the random HashMap order propagates to SVM feature matrix
+    // row ordering, causing non-deterministic gradient updates and model weights.
+    all_entries.sort_by_key(|e| e.entry_id);
+
+    log::info!(
+        "Deduplicated to {} targets + {} decoys ({} paired, {} total)",
+        n_targets,
+        n_decoys,
+        n_paired,
+        all_entries.len()
+    );
+
+    all_entries
+}
+
+/// Select the best-separating coelution feature by ROC AUC.
+fn select_best_separating_feature(entries: &[CoelutionScoredEntry]) -> Option<(usize, bool)> {
+    let mut best_index = 0usize;
+    let mut best_abs_deviation = 0.0f64;
+    let mut best_auc = 0.5f64;
+
+    let feature_names = get_pin_feature_names();
+
+    for feat_idx in 0..NUM_PIN_FEATURES {
+        let mut target_vals = Vec::new();
+        let mut decoy_vals = Vec::new();
+
+        for entry in entries {
+            let val = pin_feature_value(&entry.features, feat_idx);
+            if !val.is_finite() {
+                continue;
+            }
+            if entry.is_decoy {
+                decoy_vals.push(val);
+            } else {
+                target_vals.push(val);
+            }
+        }
+
+        if target_vals.len() < 2 || decoy_vals.len() < 2 {
+            continue;
+        }
+
+        let auc = compute_roc_auc(&target_vals, &decoy_vals);
+        let abs_deviation = (auc - 0.5).abs();
+        if abs_deviation > best_abs_deviation {
+            best_abs_deviation = abs_deviation;
+            best_auc = auc;
+            best_index = feat_idx;
+        }
+    }
+
+    if best_abs_deviation < 1e-10 {
+        log::warn!("Coelution target-decoy competition: no feature separates targets from decoys");
+        return None;
+    }
+
+    let higher_is_better = best_auc > 0.5;
+    log::info!(
+        "Coelution target-decoy competition: best feature = {} (ROC AUC = {:.3}, {})",
+        feature_names[best_index],
+        best_auc,
+        if higher_is_better {
+            "higher is better"
+        } else {
+            "lower is better"
+        }
+    );
+
+    Some((best_index, higher_is_better))
+}
+
+/// Run target-decoy competition on coelution entries for mokapot PIN writing.
+///
+/// Mokapot expects pre-competed data (only winners). This function competes
+/// paired target-decoy entries using the best-separating coelution feature
+/// (selected by ROC AUC). Ties go to the decoy (conservative for FDR).
+fn compete_target_decoy_pairs(entries: Vec<CoelutionScoredEntry>) -> Vec<CoelutionScoredEntry> {
+    let (feat_idx, higher_is_better) = match select_best_separating_feature(&entries) {
+        Some(result) => result,
+        None => {
+            // Fallback: coelution_sum (index 0, higher is better)
+            log::warn!(
+                "Coelution target-decoy competition: using coelution_sum as fallback feature"
+            );
+            (0, true)
+        }
+    };
+
+    // Group entries by base_id
+    let mut groups: HashMap<u32, (Option<CoelutionScoredEntry>, Option<CoelutionScoredEntry>)> =
+        HashMap::new();
+
+    for entry in entries {
+        let base_id = entry.entry_id & 0x7FFFFFFF;
+        let slot = groups.entry(base_id).or_insert((None, None));
+        if entry.is_decoy {
+            slot.1 = Some(entry);
+        } else {
+            slot.0 = Some(entry);
+        }
+    }
+
+    let mut winners = Vec::with_capacity(groups.len());
+    let mut n_target_wins = 0usize;
+    let mut n_decoy_wins = 0usize;
+
+    for (_base_id, (target_opt, decoy_opt)) in groups {
+        match (target_opt, decoy_opt) {
+            (Some(target), None) => {
+                n_target_wins += 1;
+                winners.push(target);
+            }
+            (None, Some(decoy)) => {
+                n_decoy_wins += 1;
+                winners.push(decoy);
+            }
+            (Some(target), Some(decoy)) => {
+                let t_val = pin_feature_value(&target.features, feat_idx);
+                let d_val = pin_feature_value(&decoy.features, feat_idx);
+
+                let t_val = if t_val.is_finite() {
+                    t_val
+                } else {
+                    f64::NEG_INFINITY
+                };
+                let d_val = if d_val.is_finite() {
+                    d_val
+                } else {
+                    f64::NEG_INFINITY
+                };
+
+                let target_wins = if higher_is_better {
+                    t_val > d_val // strict: ties go to decoy
+                } else {
+                    t_val < d_val
+                };
+
+                if target_wins {
+                    n_target_wins += 1;
+                    winners.push(target);
+                } else {
+                    n_decoy_wins += 1;
+                    winners.push(decoy);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    log::info!(
+        "Coelution target-decoy competition: {} target wins, {} decoy wins ({} total)",
+        n_target_wins,
+        n_decoy_wins,
+        winners.len()
+    );
+
+    winners
+}
+
+/// Remove double-counted coelution entries where different precursors share fragment ions.
 ///
 /// Two entries are considered double-counted if:
 /// 1. Their precursor m/z falls within the same DIA isolation window
 /// 2. Their apex RTs are within ±5 spectra of each other
 /// 3. ≥50% of their top 6 fragment ions match within calibrated m/z tolerance
 ///
-/// The entry with the lower peak_apex coefficient is removed.
+/// The entry with the lower coelution_sum is removed.
 fn deduplicate_double_counting(
-    scored_entries: Vec<ScoredEntry>,
+    entries: Vec<CoelutionScoredEntry>,
     library: &[LibraryEntry],
     spectra: &[Spectrum],
     calibration_params: Option<&CalibrationParams>,
     config: &OspreyConfig,
-) -> Vec<ScoredEntry> {
-    let original_count = scored_entries.len();
+) -> Vec<CoelutionScoredEntry> {
+    let original_count = entries.len();
 
     // 1. Extract unique isolation windows
     let scheme = extract_isolation_scheme(spectra);
     let windows = match &scheme {
         Some(s) => &s.windows,
         None => {
-            log::warn!("Could not extract isolation scheme, skipping deduplication");
-            return scored_entries;
+            log::warn!("Could not extract isolation scheme, skipping double-counting check");
+            return entries;
         }
     };
 
@@ -2763,15 +2285,15 @@ fn deduplicate_double_counting(
 
     // 3. Compute median scan interval for "±5 spectra" RT neighborhood
     let rt_neighborhood = {
-        let mut intervals: Vec<f64> = Vec::new();
         let mut sorted_rts: Vec<f64> = spectra.iter().map(|s| s.retention_time).collect();
         sorted_rts.sort_by(|a, b| a.total_cmp(b));
         sorted_rts.dedup();
+        let mut intervals: Vec<f64> = Vec::new();
         for w in sorted_rts.windows(2) {
             intervals.push(w[1] - w[0]);
         }
         let median_interval = if intervals.is_empty() {
-            0.05 // fallback: 3 seconds
+            0.05
         } else {
             intervals.sort_by(|a, b| a.total_cmp(b));
             intervals[intervals.len() / 2]
@@ -2779,68 +2301,90 @@ fn deduplicate_double_counting(
         5.0 * median_interval
     };
 
-    // 4. Pre-compute apex RT for each entry
-    let apex_rts: Vec<f64> = scored_entries
+    // 4. Build ID-to-index map for library lookup (IDs may not match array indices)
+    let lib_id_map: HashMap<u32, usize> =
+        library.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
+
+    // 5. Pre-assign entries to isolation windows using a sorted m/z index.
+    //    This replaces the O(n * w) per-window full scan with O(n log n + w log n).
+    let mut mz_sorted_indices: Vec<usize> = (0..entries.len()).collect();
+    mz_sorted_indices.sort_by(|&a, &b| entries[a].precursor_mz.total_cmp(&entries[b].precursor_mz));
+    let mz_sorted_vals: Vec<f64> = mz_sorted_indices
         .iter()
-        .map(|e| {
-            e.rt_coef_pairs
-                .iter()
-                .max_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(rt, _)| *rt)
-                .unwrap_or(0.0)
+        .map(|&i| entries[i].precursor_mz)
+        .collect();
+
+    // For each window, binary search for the range of entries that fall within it.
+    // Use exclusive upper bound [lower, upper) so each entry is in at most one window.
+    // Without this, entries at exact window boundaries (e.g., precursor_mz = 500.0 for
+    // adjacent windows [498,500] and [500,502]) would be in two windows, causing race
+    // conditions in the par_iter with AtomicBool below.
+    let window_entry_indices: Vec<Vec<usize>> = windows
+        .iter()
+        .map(|&(center, width)| {
+            let win_lower = center - width / 2.0;
+            let win_upper = center + width / 2.0;
+            let lo = mz_sorted_vals.partition_point(|&mz| mz < win_lower);
+            let hi = mz_sorted_vals.partition_point(|&mz| mz < win_upper);
+            mz_sorted_indices[lo..hi].to_vec()
         })
         .collect();
 
-    // 5. For each isolation window, find and deduplicate overlapping entries
-    let mut removed = vec![false; scored_entries.len()];
+    // 6. Process each isolation window in parallel.
+    //    Within each window, sort entries by apex_rt for early termination.
+    //    Use AtomicBool for thread-safe removal marking.
+    let removed: Vec<AtomicBool> = (0..entries.len()).map(|_| AtomicBool::new(false)).collect();
 
-    for &(center, width) in windows {
-        let win_lower = center - width / 2.0;
-        let win_upper = center + width / 2.0;
+    window_entry_indices.par_iter().for_each(|indices| {
+        if indices.is_empty() {
+            return;
+        }
 
-        // Collect indices of entries in this window
-        let mut window_indices: Vec<usize> = scored_entries
+        // Sort by apex_rt for locality-based early termination
+        let mut rt_sorted: Vec<usize> = indices
             .iter()
-            .enumerate()
-            .filter(|(i, e)| {
-                !removed[*i] && {
-                    let pmz = library[e.lib_idx].precursor_mz;
-                    pmz >= win_lower && pmz <= win_upper
-                }
-            })
-            .map(|(i, _)| i)
+            .copied()
+            .filter(|&i| !removed[i].load(Ordering::Relaxed))
             .collect();
-
-        // Sort by peak_apex descending (greedy: best entries survive)
-        window_indices.sort_by(|&a, &b| {
-            scored_entries[b]
-                .features
-                .peak_apex
-                .total_cmp(&scored_entries[a].features.peak_apex)
+        rt_sorted.sort_by(|&a, &b| {
+            entries[a]
+                .apex_rt
+                .total_cmp(&entries[b].apex_rt)
+                .then((entries[a].entry_id & 0x7FFFFFFF).cmp(&(entries[b].entry_id & 0x7FFFFFFF)))
+                .then(entries[a].entry_id.cmp(&entries[b].entry_id))
         });
 
-        // Compare pairs: for each entry, check against subsequent entries
-        for i_pos in 0..window_indices.len() {
-            let idx_a = window_indices[i_pos];
-            if removed[idx_a] {
+        for i_pos in 0..rt_sorted.len() {
+            let idx_a = rt_sorted[i_pos];
+            if removed[idx_a].load(Ordering::Relaxed) {
                 continue;
             }
-            let apex_a = apex_rts[idx_a];
+            let apex_a = entries[idx_a].apex_rt;
 
-            for &idx_b in &window_indices[(i_pos + 1)..] {
-                if removed[idx_b] {
+            // Scan forward only; break when RT distance exceeds neighborhood
+            for &idx_b in &rt_sorted[(i_pos + 1)..] {
+                let apex_b = entries[idx_b].apex_rt;
+
+                // Early termination: entries are RT-sorted, so all subsequent are farther
+                if apex_b - apex_a > rt_neighborhood {
+                    break;
+                }
+
+                if removed[idx_b].load(Ordering::Relaxed) {
                     continue;
                 }
 
-                // Check apex RT proximity (±5 spectra)
-                let apex_b = apex_rts[idx_b];
-                if (apex_a - apex_b).abs() > rt_neighborhood {
-                    continue;
-                }
-
-                // Check top-6 fragment overlap
-                let entry_a = &library[scored_entries[idx_a].lib_idx];
-                let entry_b = &library[scored_entries[idx_b].lib_idx];
+                // Check top-6 fragment overlap (look up library entries by ID)
+                let lib_idx_a = match lib_id_map.get(&entries[idx_a].entry_id) {
+                    Some(&idx) => idx,
+                    None => continue,
+                };
+                let lib_idx_b = match lib_id_map.get(&entries[idx_b].entry_id) {
+                    Some(&idx) => idx,
+                    None => continue,
+                };
+                let entry_a = &library[lib_idx_a];
+                let entry_b = &library[lib_idx_b];
                 let overlap = count_topn_fragment_overlap(
                     &entry_a.fragments,
                     &entry_b.fragments,
@@ -2855,563 +2399,150 @@ fn deduplicate_double_counting(
                 let threshold = (min_a.min(min_b) as f64 * 0.5).ceil() as usize;
 
                 if overlap >= threshold {
-                    // Remove the lower-scoring entry (idx_b, since sorted descending)
-                    removed[idx_b] = true;
+                    // Remove the entry with lower coelution_sum (keep the better one).
+                    // Use standard f64 comparison (NaN loses, matching original behavior).
+                    // The iteration order is deterministic (entries sorted by apex_rt + entry_id),
+                    // so the >= tiebreaker (outer loop wins ties) is also deterministic.
+                    if entries[idx_a].features.coelution_sum
+                        >= entries[idx_b].features.coelution_sum
+                    {
+                        removed[idx_b].store(true, Ordering::Relaxed);
+                    } else {
+                        removed[idx_a].store(true, Ordering::Relaxed);
+                        break; // idx_a is removed, no need to check more pairs
+                    }
                 }
             }
         }
-    }
+    });
 
-    let removed_count = removed.iter().filter(|&&r| r).count();
+    let removed_count = removed.iter().filter(|r| r.load(Ordering::Relaxed)).count();
     if removed_count > 0 {
         log::info!(
-            "Deduplication: removed {} double-counted entries ({} remaining)",
+            "Double-counting deduplication: removed {} entries ({} remaining)",
             removed_count,
             original_count - removed_count
         );
     }
 
-    scored_entries
+    entries
         .into_iter()
         .enumerate()
-        .filter(|(i, _)| !removed[*i])
+        .filter(|(i, _)| !removed[*i].load(Ordering::Relaxed))
         .map(|(_, e)| e)
         .collect()
 }
 
-/// Write coefficient matrix to a Parquet file.
-///
-/// Each row is a scored peptide, each data column is a spectrum.
-/// Column names encode scan number, precursor m/z, and RT:
-///   `scan_{scan_number}_mz_{precursor_mz:.1}_rt_{rt:.2}`
-///
-/// The file is written alongside the input mzML as `{stem}.coefficients.parquet`.
-fn write_coefficient_parquet(
-    scored_entries: &[ScoredEntry],
-    library: &[LibraryEntry],
-    file_results: &[RegressionResult],
-    spectra: &[Spectrum],
-    input_path: &std::path::Path,
-) -> Result<()> {
-    use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
-    use parquet::file::properties::WriterProperties;
-    use std::collections::HashMap;
+/// Simple target-decoy FDR for coelution entries (fallback when Mokapot unavailable).
+fn apply_simple_fdr(entries: &mut [CoelutionScoredEntry], _fdr_threshold: f64) -> Result<()> {
+    // Sort by coelution_sum descending
+    entries.sort_by(|a, b| {
+        b.features
+            .coelution_sum
+            .total_cmp(&a.features.coelution_sum)
+    });
 
-    if scored_entries.is_empty() {
-        return Ok(());
-    }
+    let mut n_targets = 0usize;
+    let mut n_decoys = 0usize;
 
-    let n_entries = scored_entries.len();
-
-    // Build spectrum info sorted by scan number for column ordering
-    let mut spec_info: Vec<(u32, f64, f64)> = spectra
-        .iter()
-        .map(|s| (s.scan_number, s.precursor_mz, s.retention_time))
-        .collect();
-    spec_info.sort_by_key(|&(scan, _, _)| scan);
-    spec_info.dedup_by_key(|s| s.0);
-
-    // Map lib_idx → row index in scored_entries for fast lookup
-    let entry_row: HashMap<usize, usize> = scored_entries
-        .iter()
-        .enumerate()
-        .map(|(row, e)| (e.lib_idx, row))
-        .collect();
-
-    // Build schema: metadata columns + one Float32 column per spectrum
-    let mut fields: Vec<Field> = vec![
-        Field::new("peptide_sequence", DataType::Utf8, false),
-        Field::new("modified_sequence", DataType::Utf8, false),
-        Field::new("charge", DataType::UInt8, false),
-        Field::new("precursor_mz", DataType::Float32, false),
-        Field::new("protein", DataType::Utf8, false),
-        Field::new("is_decoy", DataType::Boolean, false),
-    ];
-
-    let col_names: Vec<String> = spec_info
-        .iter()
-        .map(|&(scan, mz, rt)| format!("scan_{}_mz_{:.1}_rt_{:.2}", scan, mz, rt))
-        .collect();
-
-    for name in &col_names {
-        fields.push(Field::new(name, DataType::Float32, false));
-    }
-
-    let schema = std::sync::Arc::new(Schema::new(fields));
-
-    // Build metadata columns
-    let mut peptide_builder = StringBuilder::with_capacity(n_entries, n_entries * 20);
-    let mut modified_builder = StringBuilder::with_capacity(n_entries, n_entries * 30);
-    let mut charge_builder = UInt8Builder::with_capacity(n_entries);
-    let mut pmz_builder = Float32Builder::with_capacity(n_entries);
-    let mut protein_builder = StringBuilder::with_capacity(n_entries, n_entries * 15);
-    let mut decoy_builder = BooleanBuilder::with_capacity(n_entries);
-
-    for entry in scored_entries {
-        let lib = &library[entry.lib_idx];
-        peptide_builder.append_value(&lib.sequence);
-        modified_builder.append_value(&lib.modified_sequence);
-        charge_builder.append_value(lib.charge);
-        pmz_builder.append_value(lib.precursor_mz as f32);
-        protein_builder.append_value(lib.protein_ids.join(";"));
-        decoy_builder.append_value(entry.is_decoy);
-    }
-
-    // Map scan_number → index in spec_info for building data columns
-    let scan_to_col: HashMap<u32, usize> = spec_info
-        .iter()
-        .enumerate()
-        .map(|(i, &(scan, _, _))| (scan, i))
-        .collect();
-
-    // Pre-build a matrix: n_entries × n_spectra, row-major
-    // Initialize all zeros
-    let n_spectra = spec_info.len();
-    let mut coef_matrix = vec![0.0f32; n_entries * n_spectra];
-
-    // Fill from regression results (more efficient than scored_entries.rt_coef_pairs
-    // because we get exact scan_number mapping)
-    for result in file_results {
-        if let Some(&col_idx) = scan_to_col.get(&result.scan_number) {
-            for (lib_id, coef) in result.library_ids.iter().zip(result.coefficients.iter()) {
-                let lib_idx = (*lib_id & 0x7FFFFFFF) as usize; // mask off decoy high bit
-                if let Some(&row_idx) = entry_row.get(&lib_idx) {
-                    coef_matrix[row_idx * n_spectra + col_idx] = *coef as f32;
-                }
-            }
+    for entry in entries.iter_mut() {
+        if entry.is_decoy {
+            n_decoys += 1;
+        } else {
+            n_targets += 1;
         }
+
+        let fdr = if n_targets > 0 {
+            n_decoys as f64 / n_targets as f64
+        } else {
+            1.0
+        };
+
+        entry.run_qvalue = fdr;
     }
 
-    // Build Arrow arrays
-    let mut columns: Vec<ArrayRef> = vec![
-        std::sync::Arc::new(peptide_builder.finish()),
-        std::sync::Arc::new(modified_builder.finish()),
-        std::sync::Arc::new(charge_builder.finish()),
-        std::sync::Arc::new(pmz_builder.finish()),
-        std::sync::Arc::new(protein_builder.finish()),
-        std::sync::Arc::new(decoy_builder.finish()),
-    ];
-
-    // Add spectrum columns from the matrix
-    for col_idx in 0..n_spectra {
-        let mut builder = Float32Builder::with_capacity(n_entries);
-        for row_idx in 0..n_entries {
-            builder.append_value(coef_matrix[row_idx * n_spectra + col_idx]);
-        }
-        columns.push(std::sync::Arc::new(builder.finish()));
+    // Convert to q-values (monotonic)
+    let mut min_fdr = 1.0f64;
+    for entry in entries.iter_mut().rev() {
+        min_fdr = min_fdr.min(entry.run_qvalue);
+        entry.run_qvalue = min_fdr;
+        entry.experiment_qvalue = min_fdr; // No two-level distinction in fallback mode
     }
-
-    // Write parquet file
-    let output_path = input_path.with_extension("coefficients.parquet");
-    let file = std::fs::File::create(&output_path).map_err(|e| {
-        OspreyError::OutputError(format!(
-            "Failed to create parquet file {}: {}",
-            output_path.display(),
-            e
-        ))
-    })?;
-
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .build();
-
-    let batch = RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
-        OspreyError::OutputError(format!("Failed to create Arrow RecordBatch: {}", e))
-    })?;
-
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
-        .map_err(|e| OspreyError::OutputError(format!("Failed to create Parquet writer: {}", e)))?;
-
-    writer
-        .write(&batch)
-        .map_err(|e| OspreyError::OutputError(format!("Failed to write Parquet batch: {}", e)))?;
-
-    writer
-        .close()
-        .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
-
-    log::info!(
-        "Wrote coefficient matrix ({} peptides × {} spectra) to {}",
-        n_entries,
-        n_spectra,
-        output_path.display()
-    );
 
     Ok(())
 }
 
-/// Create PSM features for a single file
+/// Build shared peak boundaries per (modified_sequence, file_name) for coelution path.
 ///
-/// This is used for memory-efficient processing where each file's PSM features
-/// are created immediately after scoring and written to a PIN file.
-///
-/// Entries where the median polish failed (cosine == 0.0) are filtered out,
-/// since the default feature values (0.0) would mislead Mokapot into treating
-/// failed decompositions as perfect signals.
-fn create_psm_features_for_file(
-    file_name: &str,
-    entries: &[ScoredEntry],
-    library: &[LibraryEntry],
-) -> Vec<PsmFeatures> {
-    // Note: median_polish_cosine > 0.0 filter is applied earlier in the pipeline
-    // (before deduplication and target-decoy competition)
-    entries
-        .iter()
-        .map(|entry| {
-            let lib_entry = &library[entry.lib_idx];
-            PsmFeatures {
-                psm_id: entry.psm_id.clone(),
-                peptide: lib_entry.modified_sequence.clone(),
-                proteins: lib_entry.protein_ids.clone(),
-                scan_number: entry.apex_scan_number,
-                file_name: file_name.to_string(),
-                charge: lib_entry.charge,
-                is_decoy: entry.is_decoy,
-                features: entry.features.clone(),
-                initial_score: Some(entry.score),
-            }
-        })
-        .collect()
-}
-
-/// Collect PSM features by file for multi-file mokapot (legacy - used when PIN files not pre-written)
-#[allow(dead_code)]
-fn collect_psm_features_by_file(
-    per_file_results: &[(String, Vec<ScoredEntry>)],
-    library: &[LibraryEntry],
-) -> HashMap<String, Vec<PsmFeatures>> {
-    let mut psms_by_file = HashMap::new();
-
-    for (file_name, entries) in per_file_results.iter() {
-        let psm_features = create_psm_features_for_file(file_name, entries, library);
-        psms_by_file.insert(file_name.clone(), psm_features);
-    }
-
-    psms_by_file
-}
-
-/// Find the PIN feature that best separates targets from decoys using Cohen's d.
-///
-/// Returns `(feature_index, higher_is_better)` or `None` if separation cannot be computed.
-fn select_best_separating_feature(
-    entries: &[ScoredEntry],
-    _library: &[LibraryEntry],
-) -> Option<(usize, bool)> {
-    let mut best_index = 0usize;
-    let mut best_abs_d = 0.0f64;
-    let mut best_d = 0.0f64;
-
-    let feature_names = get_pin_feature_names();
-
-    for feat_idx in 0..NUM_PIN_FEATURES {
-        // Collect finite target and decoy values for this feature
-        let mut target_vals = Vec::new();
-        let mut decoy_vals = Vec::new();
-
-        for entry in entries {
-            let val = pin_feature_value(&entry.features, feat_idx);
-            if !val.is_finite() {
-                continue;
-            }
-            if entry.is_decoy {
-                decoy_vals.push(val);
-            } else {
-                target_vals.push(val);
-            }
-        }
-
-        // Need at least 2 of each for meaningful variance
-        if target_vals.len() < 2 || decoy_vals.len() < 2 {
-            continue;
-        }
-
-        let n_t = target_vals.len() as f64;
-        let n_d = decoy_vals.len() as f64;
-        let mean_t = target_vals.iter().sum::<f64>() / n_t;
-        let mean_d = decoy_vals.iter().sum::<f64>() / n_d;
-        let var_t = target_vals
-            .iter()
-            .map(|v| (v - mean_t).powi(2))
-            .sum::<f64>()
-            / (n_t - 1.0);
-        let var_d = decoy_vals.iter().map(|v| (v - mean_d).powi(2)).sum::<f64>() / (n_d - 1.0);
-
-        let pooled_sd = ((var_t + var_d) / 2.0).sqrt();
-        if pooled_sd < 1e-15 {
-            continue; // Zero variance — skip
-        }
-
-        let d = (mean_t - mean_d) / pooled_sd;
-        if d.abs() > best_abs_d {
-            best_abs_d = d.abs();
-            best_d = d;
-            best_index = feat_idx;
-        }
-    }
-
-    if best_abs_d < 1e-15 {
-        log::warn!("Target-decoy competition: no feature separates targets from decoys");
-        return None;
-    }
-
-    let higher_is_better = best_d > 0.0;
-    log::info!(
-        "Target-decoy competition: best separating feature = {} (Cohen's d = {:.3}, {})",
-        feature_names[best_index],
-        best_d,
-        if higher_is_better {
-            "higher is better"
-        } else {
-            "lower is better"
-        }
-    );
-
-    Some((best_index, higher_is_better))
-}
-
-/// Run target-decoy competition: for each paired target/decoy, only the winner survives.
-///
-/// Pairs are identified by `library[entry.lib_idx].id & 0x7FFFFFFF`.
-/// The best-separating PIN feature (Cohen's d) is used for head-to-head comparison.
-/// Singletons (unpaired entries) win automatically.
-/// Ties go to the decoy (conservative for FDR estimation).
-fn compete_target_decoy_pairs(
-    entries: Vec<ScoredEntry>,
-    library: &[LibraryEntry],
-) -> Vec<ScoredEntry> {
-    let (feat_idx, higher_is_better) = match select_best_separating_feature(&entries, library) {
-        Some(result) => result,
-        None => {
-            // Fallback: use peak_apex (index 0, higher is better) when we can't compute
-            // Cohen's d (e.g., too few entries for variance estimation)
-            log::warn!("Target-decoy competition: using peak_apex as fallback competition feature");
-            (0, true)
-        }
-    };
-
-    // Group entries by target_id (clear decoy bit)
-    let mut groups: std::collections::HashMap<u32, (Option<ScoredEntry>, Option<ScoredEntry>)> =
-        std::collections::HashMap::new();
+/// When the same peptide is detected at multiple charge states in the same file,
+/// they elute at the same time. This function selects boundaries from the charge
+/// state with the lowest run q-value (best overall peak quality) for each peptide
+/// per file. Returns the lookup and a count of peptide-file pairs where boundaries
+/// were shared across charge states.
+#[allow(clippy::type_complexity)]
+fn build_shared_boundaries(
+    entries: &[CoelutionScoredEntry],
+) -> (HashMap<(String, String), (f64, f64, f64)>, usize) {
+    // For each (modified_sequence, file_name), keep boundaries from the entry
+    // with the lowest run q-value
+    let mut best_by_key: HashMap<(String, String), (f64, f64, f64, f64)> = HashMap::new();
+    // Track which keys have multiple charge states
+    let mut charges_by_key: HashMap<(String, String), HashSet<u8>> = HashMap::new();
 
     for entry in entries {
-        let target_id = library[entry.lib_idx].id & 0x7FFFFFFF;
-        let slot = groups.entry(target_id).or_insert((None, None));
-        if entry.is_decoy {
-            slot.1 = Some(entry);
-        } else {
-            slot.0 = Some(entry);
+        let key = (entry.modified_sequence.clone(), entry.file_name.clone());
+
+        charges_by_key
+            .entry(key.clone())
+            .or_default()
+            .insert(entry.charge);
+
+        let should_update = best_by_key
+            .get(&key)
+            .map_or(true, |&(_, _, _, qval)| entry.run_qvalue < qval);
+
+        if should_update {
+            best_by_key.insert(
+                key,
+                (
+                    entry.apex_rt,
+                    entry.peak_bounds.start_rt,
+                    entry.peak_bounds.end_rt,
+                    entry.run_qvalue,
+                ),
+            );
         }
     }
 
-    let mut winners = Vec::with_capacity(groups.len());
-    let mut n_target_auto = 0usize;
-    let mut n_decoy_auto = 0usize;
-    let mut n_target_wins = 0usize;
-    let mut n_decoy_wins = 0usize;
-    let mut n_pairs = 0usize;
+    let n_shared = charges_by_key.values().filter(|c| c.len() > 1).count();
 
-    for (_target_id, (target_opt, decoy_opt)) in groups {
-        match (target_opt, decoy_opt) {
-            (Some(target), None) => {
-                n_target_auto += 1;
-                winners.push(target);
-            }
-            (None, Some(decoy)) => {
-                n_decoy_auto += 1;
-                winners.push(decoy);
-            }
-            (Some(target), Some(decoy)) => {
-                n_pairs += 1;
-                let t_val = pin_feature_value(&target.features, feat_idx);
-                let d_val = pin_feature_value(&decoy.features, feat_idx);
-
-                // NaN treated as -infinity (automatic loss)
-                let t_val = if t_val.is_finite() {
-                    t_val
-                } else {
-                    f64::NEG_INFINITY
-                };
-                let d_val = if d_val.is_finite() {
-                    d_val
-                } else {
-                    f64::NEG_INFINITY
-                };
-
-                let target_wins = if higher_is_better {
-                    t_val > d_val // strict: ties go to decoy
-                } else {
-                    t_val < d_val // strict: ties go to decoy
-                };
-
-                if target_wins {
-                    n_target_wins += 1;
-                    winners.push(target);
-                } else {
-                    n_decoy_wins += 1;
-                    winners.push(decoy);
-                }
-            }
-            (None, None) => {} // shouldn't happen
-        }
-    }
-
-    log::info!(
-        "Target-decoy competition: {} pairs competed, {} target auto-wins, {} decoy auto-wins, \
-         {} target wins, {} decoy wins ({} total winners)",
-        n_pairs,
-        n_target_auto,
-        n_decoy_auto,
-        n_target_wins,
-        n_decoy_wins,
-        winners.len()
-    );
-
-    winners
-}
-
-/// Fallback: Apply simple target-decoy FDR to run-level q-values
-fn apply_simple_fdr(entries: &mut [ScoredEntry], fdr_threshold: f64) -> Result<()> {
-    let fdr_controller = FdrController::new(fdr_threshold);
-
-    let target_scores: Vec<f64> = entries
-        .iter()
-        .filter(|e| !e.is_decoy)
-        .map(|e| e.score)
+    let shared_bounds: HashMap<(String, String), (f64, f64, f64)> = best_by_key
+        .into_iter()
+        .map(|(k, (apex, start, end, _))| (k, (apex, start, end)))
         .collect();
 
-    let decoy_scores: Vec<f64> = entries
-        .iter()
-        .filter(|e| e.is_decoy)
-        .map(|e| e.score)
-        .collect();
-
-    let qvalues = fdr_controller.compute_qvalues(&target_scores, &decoy_scores)?;
-
-    let mut target_idx = 0;
-    for entry in entries.iter_mut() {
-        if !entry.is_decoy && target_idx < qvalues.len() {
-            entry.run_qvalue = qvalues[target_idx];
-            target_idx += 1;
-        }
-    }
-
-    Ok(())
+    (shared_bounds, n_shared)
 }
 
-/// Fallback: Apply simple target-decoy FDR to experiment-level q-values
-fn apply_simple_fdr_experiment(entries: &mut [ScoredEntry], fdr_threshold: f64) -> Result<()> {
-    let fdr_controller = FdrController::new(fdr_threshold);
-
-    let target_scores: Vec<f64> = entries
-        .iter()
-        .filter(|e| !e.is_decoy)
-        .map(|e| e.score)
-        .collect();
-
-    let decoy_scores: Vec<f64> = entries
-        .iter()
-        .filter(|e| e.is_decoy)
-        .map(|e| e.score)
-        .collect();
-
-    let qvalues = fdr_controller.compute_qvalues(&target_scores, &decoy_scores)?;
-
-    let mut target_idx = 0;
-    for entry in entries.iter_mut() {
-        if !entry.is_decoy && target_idx < qvalues.len() {
-            entry.experiment_qvalue = qvalues[target_idx];
-            target_idx += 1;
-        }
-    }
-
-    Ok(())
-}
-
-/// Compute peak boundaries and apex for a scored entry, ensuring apex is within bounds
-fn compute_peak_boundaries(scored: &ScoredEntry) -> Option<(f64, f64, f64)> {
-    // Find apex from coefficient time series
-    let (coef_apex_rt, apex_coef) = scored
-        .rt_coef_pairs
-        .iter()
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(rt, c)| (*rt, *c))
-        .unwrap_or((0.0, 0.0));
-
-    if apex_coef <= 0.0 {
-        return None;
-    }
-
-    let (start_rt, end_rt) = if let Some((start, end, _fwhm)) = scored.fragment_peak_bounds {
-        // Fragment-based boundaries from co-eluting XICs (preferred)
-        (start, end)
-    } else if let Some((fwhm, _, _)) =
-        osprey_scoring::compute_fwhm_interpolated(&scored.rt_coef_pairs)
-    {
-        // Fallback: coefficient series FWHM with 95% Gaussian boundaries
-        let sigma = fwhm / 2.355;
-        (coef_apex_rt - 1.96 * sigma, coef_apex_rt + 1.96 * sigma)
-    } else {
-        // Final fallback: use first/last non-zero coefficient as boundaries
-        let first_rt = scored
-            .rt_coef_pairs
-            .iter()
-            .find(|(_, c)| *c > 0.0)
-            .map(|(rt, _)| *rt)
-            .unwrap_or(coef_apex_rt);
-        let last_rt = scored
-            .rt_coef_pairs
-            .iter()
-            .rev()
-            .find(|(_, c)| *c > 0.0)
-            .map(|(rt, _)| *rt)
-            .unwrap_or(coef_apex_rt);
-        (first_rt, last_rt)
-    };
-
-    // Ensure apex RT is within [startTime, endTime]
-    // If coefficient apex falls outside fragment bounds, use the highest-coefficient
-    // point within the bounds, or clamp to the midpoint
-    let apex_rt = if coef_apex_rt >= start_rt && coef_apex_rt <= end_rt {
-        coef_apex_rt
-    } else {
-        // Find the highest coefficient within the bounds
-        scored
-            .rt_coef_pairs
-            .iter()
-            .filter(|(rt, _)| *rt >= start_rt && *rt <= end_rt)
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(rt, _)| *rt)
-            .unwrap_or((start_rt + end_rt) / 2.0)
-    };
-
-    Some((apex_rt, start_rt, end_rt))
-}
-
-/// Write scored results to blib format for Skyline
+/// Write coelution-mode blib output for Skyline.
 ///
-/// Groups entries by precursor (lib_idx) to produce one RefSpectra row per unique
-/// precursor, with per-run data in the RetentionTimes table. The best-scoring run's
-/// data is used for the RefSpectra entry. Entries from each run where the precursor
-/// passed run-level FDR are included in RetentionTimes.
-fn write_blib_output_with_scores(
+/// Implementation details:
+/// - Groups entries by precursor (modified_sequence + charge)
+/// - Uses the best run (lowest run q-value) for the RefSpectra entry
+/// - Writes per-run RetentionTimes entries with run-level q-values
+/// - Populates OspreyRunScores and OspreyExperimentScores tables
+fn write_blib_output(
     config: &OspreyConfig,
     library: &[LibraryEntry],
-    scored_entries: &[ScoredEntry],
-    input_files: &[std::path::PathBuf],
+    entries: &[CoelutionScoredEntry],
 ) -> Result<()> {
     let mut writer = BlibWriter::create(&config.output_blib)?;
 
-    // Add metadata
     writer.add_metadata("osprey_version", env!("CARGO_PKG_VERSION"))?;
-    writer.add_metadata(
-        "rt_calibration_enabled",
-        &config.rt_calibration.enabled.to_string(),
-    )?;
+    writer.add_metadata("search_mode", "coelution")?;
     writer.add_metadata("run_fdr", &config.run_fdr.to_string())?;
-    writer.add_metadata("fdr_method", "target_decoy_competition")?;
+    writer.add_metadata("experiment_fdr", &config.experiment_fdr.to_string())?;
 
-    // Determine library name for idFileName in SpectrumSourceFiles
     let library_name = config
         .library_source
         .path()
@@ -3420,11 +2551,10 @@ fn write_blib_output_with_scores(
         .unwrap_or("library")
         .to_string();
 
-    // Add source files - build lookup by file stem for matching with ScoredEntry.file_name
-    // Use relative paths from blib location for cross-platform compatibility (WSL2 → Windows)
+    // Add source files — build lookup by file stem for matching with entry.file_name
     let blib_dir = config.output_blib.parent();
     let mut file_stem_to_id: HashMap<String, i64> = HashMap::new();
-    for input_file in input_files {
+    for input_file in &config.input_files {
         let file_name = input_file
             .file_name()
             .and_then(|n| n.to_str())
@@ -3433,8 +2563,6 @@ fn write_blib_output_with_scores(
             .file_stem()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
-        // Compute relative path from blib directory to mzML file
-        // Falls back to just filename if relative path can't be computed
         let source_path = if let Some(blib_parent) = blib_dir {
             pathdiff::diff_paths(input_file, blib_parent)
                 .map(|p| p.to_string_lossy().to_string())
@@ -3446,123 +2574,126 @@ fn write_blib_output_with_scores(
         file_stem_to_id.insert(file_stem.to_string(), file_id);
     }
 
-    // Begin batch transaction for much faster writes
     writer.begin_batch()?;
 
-    // Group passing entries by precursor (lib_idx) so we write one RefSpectra per
-    // unique precursor, with per-run entries in RetentionTimes
-    let mut precursor_entries: HashMap<usize, Vec<&ScoredEntry>> = HashMap::new();
-    for scored in scored_entries {
-        precursor_entries
-            .entry(scored.lib_idx)
+    // Build shared boundaries: for each peptide per file, use boundaries from
+    // the charge state with the lowest run q-value (same peptide at different
+    // charge states elutes at the same time)
+    let (shared_bounds, n_shared) = build_shared_boundaries(entries);
+
+    // Build library ID lookup for O(1) access instead of O(n) linear scan
+    let lib_by_id: HashMap<u32, &LibraryEntry> = library.iter().map(|e| (e.id, e)).collect();
+
+    // Group entries by precursor (modified_sequence + charge) so we write one RefSpectra
+    // per unique precursor, with per-run entries in RetentionTimes
+    let mut precursor_groups: HashMap<(String, u8), Vec<&CoelutionScoredEntry>> = HashMap::new();
+    for entry in entries {
+        precursor_groups
+            .entry((entry.modified_sequence.clone(), entry.charge))
             .or_default()
-            .push(scored);
+            .push(entry);
     }
 
     let mut n_written = 0usize;
 
-    for (lib_idx, entries) in &precursor_entries {
-        let entry = &library[*lib_idx];
-
-        // Find the best-scoring run for this precursor (lowest run q-value)
-        let best = entries
+    for ((_mod_seq, _charge), group) in &precursor_groups {
+        // Find the best run (lowest run q-value) for this precursor
+        let best = group
             .iter()
             .min_by(|a, b| a.run_qvalue.total_cmp(&b.run_qvalue))
             .unwrap();
 
-        // Compute boundaries for the best run
-        let (apex_rt, start_rt, end_rt) = match compute_peak_boundaries(best) {
-            Some(bounds) => bounds,
-            None => continue,
-        };
+        if best.fragment_mzs.is_empty() {
+            continue;
+        }
 
-        // Include all runs where this precursor was scored (it passed experiment-level FDR,
-        // so we report boundaries for every run — Skyline needs RetentionTimes per run for IDs)
-        let n_runs_detected = entries.len() as i32;
-
-        // Look up file_id for the best run
+        let n_runs_detected = group.len() as i32;
         let file_id = *file_stem_to_id.get(&best.file_name).unwrap_or(&1);
 
-        // Get fragment peaks from library entry
-        let mzs: Vec<f64> = entry.fragments.iter().map(|f| f.mz).collect();
-        let intensities: Vec<f32> = entry
-            .fragments
-            .iter()
-            .map(|f| f.relative_intensity)
-            .collect();
+        let tic: f64 = best.fragment_intensities.iter().map(|&x| x as f64).sum();
 
-        // Compute total ion current as sum of log intensities (matching DIA-NN convention)
-        let total_ion_current: f64 = intensities
-            .iter()
-            .filter(|&&i| i > 0.0)
-            .map(|&i| (i as f64).ln())
-            .sum();
+        // Use shared boundaries from the best charge state for this peptide in this file
+        let shared_key = (best.modified_sequence.clone(), best.file_name.clone());
+        let (shared_apex, shared_start, shared_end) =
+            shared_bounds.get(&shared_key).copied().unwrap_or((
+                best.apex_rt,
+                best.peak_bounds.start_rt,
+                best.peak_bounds.end_rt,
+            ));
 
-        // Score is the raw q-value (lower is better) — Skyline GENERIC Q-VALUE convention
+        // Score is the experiment q-value — Skyline GENERIC Q-VALUE convention
         let ref_id = writer.add_spectrum(
-            &entry.sequence,
-            &entry.modified_sequence,
-            entry.precursor_mz,
-            entry.charge as i32,
-            apex_rt,
-            start_rt,
-            end_rt,
-            &mzs,
-            &intensities,
+            &best.sequence,
+            &best.modified_sequence,
+            best.precursor_mz,
+            best.charge as i32,
+            shared_apex,
+            shared_start,
+            shared_end,
+            &best.fragment_mzs,
+            &best.fragment_intensities,
             best.experiment_qvalue,
             file_id,
             n_runs_detected,
-            total_ion_current,
+            tic,
         )?;
 
-        // Add modifications if present
-        if !entry.modifications.is_empty() {
-            writer.add_modifications(ref_id, &entry.modifications)?;
-        }
-
-        // Add protein mappings if present
-        if !entry.protein_ids.is_empty() {
-            writer.add_protein_mapping(ref_id, &entry.protein_ids)?;
-        }
-
-        // Write RetentionTimes entries for every run where this precursor was scored
-        // (precursor already passed experiment-level FDR; Skyline needs per-run entries for IDs)
-        for scored in entries {
-            let run_file_id = *file_stem_to_id.get(&scored.file_name).unwrap_or(&1);
-            let is_best: bool =
-                std::ptr::eq(*scored as *const ScoredEntry, *best as *const ScoredEntry);
-
-            if let Some((run_apex, run_start, run_end)) = compute_peak_boundaries(scored) {
-                writer.add_retention_time(
-                    ref_id,
-                    run_file_id,
-                    run_apex,
-                    run_start,
-                    run_end,
-                    scored.run_qvalue,
-                    is_best,
-                )?;
+        // Add modifications from library entry if present
+        if let Some(lib_entry) = lib_by_id.get(&best.entry_id) {
+            if !lib_entry.modifications.is_empty() {
+                writer.add_modifications(ref_id, &lib_entry.modifications)?;
+            }
+            if !lib_entry.protein_ids.is_empty() {
+                writer.add_protein_mapping(ref_id, &lib_entry.protein_ids)?;
             }
         }
 
-        // Add peak boundaries to Osprey extension table
+        // Write RetentionTimes entries for every run where this precursor was detected
+        for scored in group {
+            let run_file_id = *file_stem_to_id.get(&scored.file_name).unwrap_or(&1);
+            let is_best = std::ptr::eq(
+                *scored as *const CoelutionScoredEntry,
+                *best as *const CoelutionScoredEntry,
+            );
+
+            // Use shared boundaries for this peptide in this run's file
+            let run_shared_key = (scored.modified_sequence.clone(), scored.file_name.clone());
+            let (run_apex, run_start, run_end) =
+                shared_bounds.get(&run_shared_key).copied().unwrap_or((
+                    scored.apex_rt,
+                    scored.peak_bounds.start_rt,
+                    scored.peak_bounds.end_rt,
+                ));
+
+            writer.add_retention_time(
+                ref_id,
+                run_file_id,
+                run_apex,
+                run_start,
+                run_end,
+                scored.run_qvalue,
+                is_best,
+            )?;
+        }
+
+        // Add peak boundaries to Osprey extension table (shared across charge states)
         let boundaries = osprey_core::PeakBoundaries {
-            start_rt,
-            end_rt,
-            apex_rt,
-            apex_coefficient: best.score,
+            start_rt: shared_start,
+            end_rt: shared_end,
+            apex_rt: shared_apex,
+            apex_coefficient: best.features.dot_product,
             integrated_area: best.features.peak_area,
             peak_quality: osprey_core::PeakQuality::default(),
         };
         writer.add_peak_boundaries(ref_id, &best.file_name, &boundaries)?;
 
-        // Add run scores for best run
+        // Add run-level scores for best run
         writer.add_run_scores(
             ref_id,
             &best.file_name,
             best.run_qvalue,
-            best.score,
-            best.pep,
+            best.features.dot_product,
+            0.0, // No PEP from coelution scoring yet
         )?;
 
         // Add experiment-level scores
@@ -3570,303 +2701,918 @@ fn write_blib_output_with_scores(
             ref_id,
             best.experiment_qvalue,
             n_runs_detected,
-            input_files.len() as i32,
+            config.input_files.len() as i32,
         )?;
 
         n_written += 1;
     }
 
-    // Commit the batch transaction
     writer.commit()?;
     writer.finalize()?;
 
     log::info!(
-        "Wrote {} unique precursors to blib (from {} total entries across {} files)",
+        "Wrote {} total entries for {} precursors across {} files",
+        entries.len(),
         n_written,
-        scored_entries.len(),
-        input_files.len()
+        config.input_files.len()
     );
-
-    Ok(())
-}
-
-/// Write scored report to TSV
-fn write_scored_report(
-    path: &std::path::Path,
-    library: &[LibraryEntry],
-    scored_entries: &[ScoredEntry],
-) -> Result<()> {
-    use std::io::Write;
-
-    let mut file = std::fs::File::create(path)?;
-
-    // Write header
-    writeln!(
-        file,
-        "modified_sequence\tprecursor_mz\tcharge\tapex_rt\tpeak_apex\tpeak_area\tn_scans\tq_value"
-    )?;
-
-    // Write entries
-    for scored in scored_entries {
-        let entry = &library[scored.lib_idx];
-        let apex_rt = scored
-            .rt_coef_pairs
-            .iter()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(rt, _)| *rt)
-            .unwrap_or(0.0);
-
-        writeln!(
-            file,
-            "{}\t{:.4}\t{}\t{:.2}\t{:.4}\t{:.4}\t{}\t{:.6}",
-            entry.modified_sequence,
-            entry.precursor_mz,
-            entry.charge,
-            apex_rt,
-            scored.features.peak_apex,
-            scored.features.peak_area,
-            scored.features.n_contributing_scans,
-            scored.experiment_qvalue
-        )?;
+    if n_shared > 0 {
+        log::info!(
+            "Shared peak boundaries across charge states for {} peptide-file pairs",
+            n_shared
+        );
     }
 
     Ok(())
 }
 
-/// Write scored entries to PIN file for Mokapot semi-supervised FDR control
+// =============================================================================
+// Coelution-based search (DIA-NN style)
+// =============================================================================
+
+/// Run coelution-based search for a single file.
 ///
-/// Includes BOTH targets AND decoys, which is required for Mokapot's
-/// semi-supervised learning approach.
-#[allow(dead_code)]
-fn write_pin_output(
-    pin_path: &std::path::Path,
+/// For each precursor candidate in each isolation window:
+/// 1. Extract top-6 fragment XICs
+/// 2. Detect peak on reference XIC (DIA-NN-style valley detection)
+/// 3. Compute pairwise fragment correlations within peak boundaries
+/// 4. Score spectrum at apex (spectral similarity, mass accuracy)
+/// 5. Compute peak shape, RT deviation, MS1, and median polish features
+///
+/// Returns `CoelutionScoredEntry` for each detected precursor (targets + decoys).
+#[allow(clippy::too_many_arguments)]
+fn run_search(
     library: &[LibraryEntry],
-    scored_entries: &[ScoredEntry],
+    spectra: &[Spectrum],
+    ms1_index: &MS1Index,
+    calibration: Option<&CalibrationParams>,
+    rt_calibration: Option<&RTCalibration>,
+    config: &OspreyConfig,
     file_name: &str,
-) -> Result<()> {
-    let mokapot_runner = MokapotRunner::new();
+) -> Result<Vec<CoelutionScoredEntry>> {
+    use osprey_chromatography::calibration::calibrated_tolerance_ppm;
+    use osprey_chromatography::{
+        compute_snr, detect_all_xic_peaks, isolate_peak_region, EmgFitter,
+    };
+    use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
+    use osprey_scoring::{
+        compute_cosine_at_scan, compute_elution_weighted_cosine, compute_mass_accuracy,
+        extract_fragment_xics, median_polish_libcosine, median_polish_min_fragment_r2,
+        median_polish_residual_correlation, median_polish_residual_ratio, median_polish_rsquared,
+        pearson_correlation_raw, tukey_median_polish, SpectralScorer,
+    };
 
-    // Convert ScoredEntries to PsmFeatures for all entries (targets AND decoys)
-    let psm_features: Vec<PsmFeatures> = scored_entries
-        .iter()
-        .map(|scored| {
-            let entry = &library[scored.lib_idx];
+    let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
 
-            // Find apex scan from coefficient series (highest coefficient)
-            let apex_scan = scored
-                .rt_coef_pairs
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                .map(|(scan_idx, _)| scan_idx as u32)
-                .unwrap_or(0);
-
-            PsmFeatures {
-                psm_id: scored.psm_id.clone(),
-                peptide: entry.modified_sequence.clone(),
-                proteins: entry.protein_ids.clone(),
-                scan_number: apex_scan,
-                file_name: file_name.to_string(),
-                charge: entry.charge,
-                is_decoy: scored.is_decoy,
-                features: scored.features.clone(),
-                initial_score: Some(scored.score),
+    // Set up fragment tolerance (calibrated if available)
+    let fragment_tolerance = if let Some(cal) = calibration {
+        let (tol_val, tol_unit) = osprey_chromatography::calibrated_tolerance(
+            &cal.ms2_calibration,
+            config.fragment_tolerance.tolerance,
+            config.fragment_tolerance.unit,
+        );
+        log::info!(
+            "Coelution search using calibrated fragment tolerance: {:.4} {}",
+            tol_val,
+            match tol_unit {
+                ToleranceUnit::Ppm => "ppm",
+                ToleranceUnit::Mz => "Th",
             }
+        );
+        FragmentToleranceConfig {
+            tolerance: tol_val,
+            unit: tol_unit,
+        }
+    } else {
+        config.fragment_tolerance
+    };
+
+    let tol_da = match fragment_tolerance.unit {
+        ToleranceUnit::Mz => fragment_tolerance.tolerance,
+        ToleranceUnit::Ppm => 0.0,
+    };
+    let tol_ppm = match fragment_tolerance.unit {
+        ToleranceUnit::Ppm => fragment_tolerance.tolerance,
+        ToleranceUnit::Mz => 0.0,
+    };
+
+    // Apply MS2 calibration offset to spectra if available
+    // This shifts each centroid by the mean offset so the error distribution is centered at 0
+    let calibrated_spectra: Option<Vec<Spectrum>> = calibration.and_then(|cal| {
+        if cal.ms2_calibration.calibrated {
+            log::info!(
+                "Applying MS2 calibration: mean error = {:.4} {} → correcting by {:+.4} {} (using 3×SD = {:.3} {} tolerance)",
+                cal.ms2_calibration.mean,
+                cal.ms2_calibration.unit,
+                -cal.ms2_calibration.mean,
+                cal.ms2_calibration.unit,
+                3.0 * cal.ms2_calibration.sd,
+                cal.ms2_calibration.unit
+            );
+            Some(
+                spectra
+                    .iter()
+                    .map(|s| {
+                        osprey_chromatography::apply_spectrum_calibration(s, &cal.ms2_calibration)
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    });
+    let spectra_ref = calibrated_spectra.as_deref().unwrap_or(spectra);
+
+    // RT tolerance for candidate selection
+    // Use MAD-based robust tolerance: 3 × MAD × 1.4826 covers ~99.7% of peptides
+    let rt_tolerance = if let Some(cal) = calibration {
+        let (raw_tol, method_desc) = if let Some(mad) = cal.rt_calibration.mad {
+            let robust_sd = mad * 1.4826;
+            let tol = 3.0 * robust_sd;
+            (
+                tol,
+                format!("3×MAD×1.4826: MAD={:.3}, robust_SD={:.3}", mad, robust_sd),
+            )
+        } else {
+            // Fallback for old calibration files without MAD
+            let tol = cal.rt_calibration.residual_sd * config.rt_calibration.rt_tolerance_factor;
+            (
+                tol,
+                format!(
+                    "{}× residual SD {:.2} min (MAD unavailable)",
+                    config.rt_calibration.rt_tolerance_factor, cal.rt_calibration.residual_sd
+                ),
+            )
+        };
+
+        let tol = raw_tol.max(config.rt_calibration.min_rt_tolerance);
+        let tol = tol.min(config.rt_calibration.max_rt_tolerance);
+
+        if raw_tol > config.rt_calibration.max_rt_tolerance {
+            log::warn!(
+                "RT tolerance capped at {:.2} min (uncapped: {:.2} min, {}). \
+                 Poor RT calibration may reduce search sensitivity.",
+                tol,
+                raw_tol,
+                method_desc
+            );
+        } else {
+            log::info!(
+                "Using calibrated RT tolerance: {:.2} min ({})",
+                tol,
+                method_desc
+            );
+        }
+        tol
+    } else {
+        log::info!(
+            "Using fallback RT tolerance: {:.2} min",
+            config.rt_calibration.fallback_rt_tolerance
+        );
+        config.rt_calibration.fallback_rt_tolerance
+    };
+
+    // Build MzRT index for candidate selection
+    let mz_rt_index = MzRTIndex::build(library, rt_calibration);
+
+    // Group spectra by isolation window
+    let window_groups = group_spectra_by_isolation_window(spectra_ref);
+    if window_groups.is_empty() {
+        log::warn!("No spectra with isolation windows found");
+        return Ok(Vec::new());
+    }
+
+    log::info!(
+        "Coelution search: {} spectra in {} windows, {} library entries",
+        spectra_ref.len(),
+        window_groups.len(),
+        library.len()
+    );
+
+    // Set up spectral scorer with appropriate XCorr binning
+    let scorer = if is_hram {
+        log::debug!(
+            "HRAM XCorr bins (0.02 Th), fragment tolerance: {:.2} ppm",
+            fragment_tolerance.tolerance
+        );
+        SpectralScorer::hram().with_tolerance_ppm(fragment_tolerance.tolerance)
+    } else {
+        log::debug!(
+            "Unit resolution XCorr bins (1.0 Th), fragment tolerance: {:.4} Th",
+            fragment_tolerance.tolerance
+        );
+        SpectralScorer::new().with_tolerance_da(fragment_tolerance.tolerance)
+    };
+
+    // Progress bar
+    let total_candidates = library.len() as u64;
+    let pb = ProgressBar::new(total_candidates);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} precursors ({per_sec})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+
+    // Process each isolation window — candidates within each window in parallel
+    let all_entries: Vec<CoelutionScoredEntry> = window_groups
+        .par_iter()
+        .flat_map(|((lower, upper), spectrum_indices)| {
+            // Gather spectra for this window, sorted by RT
+            let mut window_pairs: Vec<(usize, &Spectrum)> = spectrum_indices
+                .iter()
+                .map(|&idx| (idx, &spectra_ref[idx]))
+                .collect();
+            window_pairs.sort_by(|a, b| {
+                a.1.retention_time
+                    .partial_cmp(&b.1.retention_time)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            if window_pairs.len() < MIN_COELUTION_SPECTRA {
+                return Vec::new();
+            }
+
+            let window_spectra: Vec<&Spectrum> = window_pairs.iter().map(|(_, s)| *s).collect();
+            let _global_indices: Vec<usize> = window_pairs.iter().map(|(idx, _)| *idx).collect();
+
+            // Find candidate library entries for this window using MzRTIndex
+            // Collect unique library indices whose precursor_mz falls in this window
+            let _window_center = (*lower + *upper) / 2.0;
+            let lower_bin = lower.floor() as i32;
+            let upper_bin = upper.ceil() as i32;
+
+            let mut candidate_indices: Vec<usize> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+
+            // Get median RT of spectra in this window for RT range filtering
+            let window_rt_min = window_spectra
+                .first()
+                .map(|s| s.retention_time)
+                .unwrap_or(0.0);
+            let window_rt_max = window_spectra
+                .last()
+                .map(|s| s.retention_time)
+                .unwrap_or(0.0);
+
+            for bin in lower_bin..=upper_bin {
+                if let Some(entries) = mz_rt_index.get(bin) {
+                    for &(expected_rt, idx) in entries {
+                        if seen.contains(&idx) {
+                            continue;
+                        }
+                        // Check m/z falls within isolation window
+                        let entry = &library[idx];
+                        if entry.precursor_mz < *lower || entry.precursor_mz > *upper {
+                            continue;
+                        }
+                        // Check RT is within a reasonable range of window spectra
+                        if expected_rt < window_rt_min - rt_tolerance
+                            || expected_rt > window_rt_max + rt_tolerance
+                        {
+                            continue;
+                        }
+                        seen.insert(idx);
+                        candidate_indices.push(idx);
+                    }
+                }
+            }
+
+            // Score each candidate precursor
+            let window_entries: Vec<CoelutionScoredEntry> = candidate_indices
+                .iter()
+                .filter_map(|&lib_idx| {
+                    let entry = &library[lib_idx];
+
+                    // Expected RT for this entry
+                    let expected_rt = rt_calibration
+                        .map(|cal| cal.predict(entry.retention_time))
+                        .unwrap_or(entry.retention_time);
+
+                    // Filter spectra within RT tolerance of expected RT
+                    let rt_spec_pairs: Vec<(usize, &Spectrum)> = window_pairs
+                        .iter()
+                        .filter(|(_, spec)| {
+                            (spec.retention_time - expected_rt).abs() <= rt_tolerance
+                        })
+                        .map(|(idx, spec)| (*idx, *spec))
+                        .collect();
+
+                    if rt_spec_pairs.len() < MIN_COELUTION_SPECTRA {
+                        pb.inc(1);
+                        return None;
+                    }
+
+                    let cand_spectra: Vec<&Spectrum> =
+                        rt_spec_pairs.iter().map(|(_, s)| *s).collect();
+                    let cand_global: Vec<usize> =
+                        rt_spec_pairs.iter().map(|(idx, _)| *idx).collect();
+
+                    // 1. Extract top-6 fragment XICs
+                    let xics =
+                        extract_fragment_xics(&entry.fragments, &cand_spectra, tol_da, tol_ppm, 6);
+
+                    if xics.len() < 2 {
+                        pb.inc(1);
+                        return None;
+                    }
+
+                    // 2. Find reference XIC (highest total intensity) for scoring
+                    let ref_idx = xics
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| {
+                            let sum_a: f64 = a.1 .1.iter().map(|(_, v)| *v).sum();
+                            let sum_b: f64 = b.1 .1.iter().map(|(_, v)| *v).sum();
+                            sum_a.total_cmp(&sum_b)
+                        })
+                        .map(|(i, _)| i)?;
+
+                    let ref_xic = &xics[ref_idx].1;
+
+                    // 3. Detect candidate peaks and pick the best by coelution score.
+                    // Find all candidate peaks from median polish elution profile (or
+                    // reference XIC as fallback), then evaluate each candidate by computing
+                    // pairwise fragment correlations within its boundaries. The candidate
+                    // with the highest coelution score is selected — the real peak is
+                    // where fragments co-elute.
+                    let full_polish = tukey_median_polish(&xics, 10, 0.01);
+                    let candidates = {
+                        let mp_candidates = full_polish
+                            .as_ref()
+                            .map(|mp| detect_all_xic_peaks(&mp.elution_profile, 0.01, 5.0))
+                            .unwrap_or_default();
+                        if mp_candidates.is_empty() {
+                            detect_all_xic_peaks(ref_xic, 0.01, 5.0)
+                        } else {
+                            mp_candidates
+                        }
+                    };
+
+                    if candidates.is_empty() {
+                        pb.inc(1);
+                        return None;
+                    }
+
+                    // Score each candidate by mean pairwise fragment correlation
+                    let peak = if candidates.len() == 1 {
+                        let bp = &candidates[0];
+                        let si = bp.start_index;
+                        let ei = bp.end_index;
+                        let (apex_idx, apex_val) = ref_xic[si..=ei]
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                            .map(|(i, &(_, v))| (si + i, v))
+                            .unwrap_or((bp.apex_index, 0.0));
+                        let area = trapezoidal_area(&ref_xic[si..=ei]);
+                        let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+                        let snr = compute_snr(&raw_ints, apex_idx, si, ei);
+                        XICPeakBounds {
+                            apex_rt: ref_xic[apex_idx].0,
+                            apex_intensity: apex_val,
+                            apex_index: apex_idx,
+                            start_rt: ref_xic[si].0,
+                            end_rt: ref_xic[ei].0,
+                            start_index: si,
+                            end_index: ei,
+                            area,
+                            signal_to_noise: snr,
+                        }
+                    } else {
+                        // Select best peak by mean pairwise fragment correlation
+                        let best = candidates
+                            .iter()
+                            .map(|bp| {
+                                let si = bp.start_index;
+                                let ei = bp.end_index;
+                                let peak_len = ei - si + 1;
+
+                                let coelution_score = if peak_len >= 3 {
+                                    let vals: Vec<Vec<f64>> = xics
+                                        .iter()
+                                        .map(|(_, xic_data)| {
+                                            xic_data[si..=ei].iter().map(|(_, v)| *v).collect()
+                                        })
+                                        .collect();
+                                    let mut sum = 0.0f64;
+                                    let mut count = 0u32;
+                                    for ii in 0..vals.len() {
+                                        for jj in (ii + 1)..vals.len() {
+                                            sum += pearson_correlation_raw(&vals[ii], &vals[jj]);
+                                            count += 1;
+                                        }
+                                    }
+                                    if count > 0 {
+                                        sum / count as f64
+                                    } else {
+                                        0.0
+                                    }
+                                } else {
+                                    0.0
+                                };
+
+                                (bp, coelution_score)
+                            })
+                            .max_by(|a, b| a.1.total_cmp(&b.1))
+                            .unwrap();
+
+                        let bp = best.0;
+                        let si = bp.start_index;
+                        let ei = bp.end_index;
+                        let (apex_idx, apex_val) = ref_xic[si..=ei]
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                            .map(|(i, &(_, v))| (si + i, v))
+                            .unwrap_or((bp.apex_index, 0.0));
+                        let area = trapezoidal_area(&ref_xic[si..=ei]);
+                        let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+                        let snr = compute_snr(&raw_ints, apex_idx, si, ei);
+                        XICPeakBounds {
+                            apex_rt: ref_xic[apex_idx].0,
+                            apex_intensity: apex_val,
+                            apex_index: apex_idx,
+                            start_rt: ref_xic[si].0,
+                            end_rt: ref_xic[ei].0,
+                            start_index: si,
+                            end_index: ei,
+                            area,
+                            signal_to_noise: snr,
+                        }
+                    };
+
+                    // Refine boundaries via EMG fit to median polish consensus profile.
+                    // The EMG (Exponentially Modified Gaussian) captures LC peak asymmetry
+                    // and gives 95% CDF boundaries that are much tighter than intensity-based
+                    // valley detection. Falls back to original boundaries if fit fails.
+                    //
+                    // CRITICAL: crop the profile to the single peak around the apex before
+                    // fitting. The full profile may contain multiple peaks across the
+                    // extraction window; the EMG is a single-peak model and would produce
+                    // overly broad boundaries if fit to the entire multi-peak profile.
+                    let peak = {
+                        let full_profile = full_polish
+                            .as_ref()
+                            .map(|mp| &mp.elution_profile[..])
+                            .unwrap_or(ref_xic);
+                        let (crop_start, crop_end) =
+                            isolate_peak_region(full_profile, peak.apex_index);
+                        let emg_profile = &full_profile[crop_start..=crop_end];
+                        let fitter = EmgFitter::new();
+                        match fitter.fit(emg_profile) {
+                            Ok(params) if params.r_squared > 0.5 => {
+                                if let Some((left_rt, right_rt)) =
+                                    EmgFitter::boundaries(&params, 0.99)
+                                {
+                                    let apex_rt = ref_xic[peak.apex_index].0;
+                                    // Validate: EMG boundaries must contain the apex
+                                    if left_rt < apex_rt && right_rt > apex_rt {
+                                        // Map EMG CDF boundaries to XIC indices.
+                                        // Don't constrain to original peak boundaries —
+                                        // let the EMG determine its own boundaries.
+                                        let n_xic = ref_xic.len();
+                                        let si = ref_xic
+                                            .partition_point(|(rt, _)| *rt < left_rt)
+                                            .min(peak.apex_index); // safety: si <= apex
+                                        let ei = ref_xic
+                                            .partition_point(|(rt, _)| *rt <= right_rt)
+                                            .saturating_sub(1)
+                                            .min(n_xic - 1)
+                                            .max(peak.apex_index); // safety: ei >= apex
+                                        if ei - si >= 2 {
+                                            let raw_ints: Vec<f64> =
+                                                ref_xic.iter().map(|(_, v)| *v).collect();
+                                            let snr =
+                                                compute_snr(&raw_ints, peak.apex_index, si, ei);
+                                            XICPeakBounds {
+                                                start_index: si,
+                                                end_index: ei,
+                                                start_rt: ref_xic[si].0,
+                                                end_rt: ref_xic[ei].0,
+                                                area: trapezoidal_area(&ref_xic[si..=ei]),
+                                                signal_to_noise: snr,
+                                                ..peak
+                                            }
+                                        } else {
+                                            peak // too narrow
+                                        }
+                                    } else {
+                                        peak // EMG boundaries don't contain apex
+                                    }
+                                } else {
+                                    peak
+                                }
+                            }
+                            _ => peak,
+                        }
+                    };
+
+                    if peak.end_index <= peak.start_index + 1 {
+                        pb.inc(1);
+                        return None;
+                    }
+
+                    // 4. Compute pairwise fragment correlations within peak boundaries
+                    let n_xics = xics.len();
+                    let peak_len = peak.end_index - peak.start_index + 1;
+
+                    // Extract XIC values within peak boundaries
+                    let xic_peak_values: Vec<Vec<f64>> = xics
+                        .iter()
+                        .map(|(_, xic)| {
+                            xic[peak.start_index..=peak.end_index]
+                                .iter()
+                                .map(|(_, v)| *v)
+                                .collect()
+                        })
+                        .collect();
+
+                    // Pairwise correlations
+                    let mut corr_sum = 0.0f64;
+                    let mut corr_min = f64::INFINITY;
+                    let mut corr_max = f64::NEG_INFINITY;
+                    let mut n_pairs = 0u32;
+                    let mut per_frag_corr_sum = vec![0.0f64; n_xics];
+                    let mut per_frag_corr_count = vec![0u32; n_xics];
+
+                    for i in 0..n_xics {
+                        for j in (i + 1)..n_xics {
+                            let r =
+                                pearson_correlation_raw(&xic_peak_values[i], &xic_peak_values[j]);
+                            corr_sum += r;
+                            if r < corr_min {
+                                corr_min = r;
+                            }
+                            if r > corr_max {
+                                corr_max = r;
+                            }
+                            n_pairs += 1;
+                            per_frag_corr_sum[i] += r;
+                            per_frag_corr_count[i] += 1;
+                            per_frag_corr_sum[j] += r;
+                            per_frag_corr_count[j] += 1;
+                        }
+                    }
+
+                    if n_pairs == 0 {
+                        pb.inc(1);
+                        return None;
+                    }
+
+                    let mut fragment_corr = [0.0f64; 6];
+                    let mut n_coeluting = 0u8;
+                    for i in 0..n_xics.min(6) {
+                        if per_frag_corr_count[i] > 0 {
+                            fragment_corr[i] = per_frag_corr_sum[i] / per_frag_corr_count[i] as f64;
+                            if fragment_corr[i] > 0.0 {
+                                n_coeluting += 1;
+                            }
+                        }
+                    }
+
+                    // 5. Find the spectrum closest to apex RT for spectral scoring
+                    let apex_local_idx = cand_spectra
+                        .iter()
+                        .enumerate()
+                        .min_by(|a, b| {
+                            (a.1.retention_time - peak.apex_rt)
+                                .abs()
+                                .total_cmp(&(b.1.retention_time - peak.apex_rt).abs())
+                        })
+                        .map(|(i, _)| i)?;
+                    let _apex_global_idx = cand_global[apex_local_idx];
+                    let apex_spectrum = cand_spectra[apex_local_idx];
+
+                    let spectral_score = scorer.xcorr(apex_spectrum, entry);
+
+                    // 5b. SG-weighted spectral scores at apex ±2 scans
+                    // Savitzky-Golay 5-point quadratic smoothing coefficients
+                    let sg_weights: [f64; 5] = [
+                        -3.0 / 35.0,
+                        12.0 / 35.0,
+                        17.0 / 35.0,
+                        12.0 / 35.0,
+                        -3.0 / 35.0,
+                    ];
+                    let mut sg_xcorr = 0.0;
+                    let mut sg_cosine = 0.0;
+                    for (offset, &weight) in [-2i32, -1, 0, 1, 2].iter().zip(&sg_weights) {
+                        let idx = apex_local_idx as i32 + offset;
+                        if idx >= 0 && (idx as usize) < cand_spectra.len() {
+                            let spec = cand_spectra[idx as usize];
+                            sg_xcorr += scorer.xcorr_at_scan(spec, entry) * weight;
+                            sg_cosine +=
+                                compute_cosine_at_scan(&entry.fragments, spec, tol_da, tol_ppm)
+                                    * weight;
+                        }
+                    }
+
+                    // 6. Elution-weighted cosine (LibCosine at each scan,
+                    //    weighted by reference XIC intensity²)
+                    let elution_weighted_cosine = compute_elution_weighted_cosine(
+                        &entry.fragments,
+                        ref_xic,
+                        &cand_spectra,
+                        tol_da,
+                        tol_ppm,
+                        peak.start_rt,
+                        peak.end_rt,
+                    );
+
+                    // 7. Mass accuracy at apex
+                    let frag_matches = scorer.match_fragments(apex_spectrum, entry);
+                    let (mass_mean, mass_abs_mean, mass_std) =
+                        compute_mass_accuracy(&frag_matches, fragment_tolerance.unit);
+
+                    // 7. RT deviation
+                    let rt_dev = peak.apex_rt - expected_rt;
+
+                    // 8. MS1 features (HRAM only)
+                    let (ms1_coelution, ms1_isotope_cos) = if is_hram && !ms1_index.is_empty() {
+                        let ms1_tol_ppm = calibration
+                            .map(|cal| calibrated_tolerance_ppm(&cal.ms1_calibration, 10.0))
+                            .unwrap_or(10.0);
+                        let search_mz = calibration
+                            .map(|cal| {
+                                reverse_calibrate_mz(entry.precursor_mz, &cal.ms1_calibration)
+                            })
+                            .unwrap_or(entry.precursor_mz);
+
+                        // MS1 precursor coelution: correlate MS1 M+0 XIC with reference fragment XIC
+                        let mut ms1_coelution_val = 0.0;
+                        let peak_rts: Vec<(f64, f64)> =
+                            ref_xic[peak.start_index..=peak.end_index].to_vec();
+                        if peak_rts.len() >= 3 {
+                            let mut ms1_intensities = Vec::with_capacity(peak_rts.len());
+                            let mut ref_intensities = Vec::with_capacity(peak_rts.len());
+                            for &(rt, ref_val) in &peak_rts {
+                                if let Some(ms1) = ms1_index.find_nearest(rt) {
+                                    let intensity = ms1
+                                        .find_peak_ppm(search_mz, ms1_tol_ppm)
+                                        .map(|(_, int)| int as f64)
+                                        .unwrap_or(0.0);
+                                    ms1_intensities.push(intensity);
+                                    ref_intensities.push(ref_val);
+                                }
+                            }
+                            if ms1_intensities.len() >= 3 {
+                                ms1_coelution_val =
+                                    pearson_correlation_raw(&ms1_intensities, &ref_intensities);
+                            }
+                        }
+
+                        // MS1 isotope cosine at apex RT
+                        let mut iso_cos = 0.0;
+                        if let Some(apex_ms1) = ms1_index.find_nearest(peak.apex_rt) {
+                            let envelope = osprey_core::IsotopeEnvelope::extract(
+                                apex_ms1,
+                                search_mz,
+                                entry.charge,
+                                ms1_tol_ppm,
+                            );
+                            if envelope.has_m0() {
+                                iso_cos = osprey_core::peptide_isotope_cosine(
+                                    &entry.sequence,
+                                    &envelope.intensities,
+                                )
+                                .unwrap_or(0.0);
+                            }
+                        }
+
+                        (ms1_coelution_val, iso_cos)
+                    } else {
+                        (0.0, 0.0)
+                    };
+
+                    // 9. Peak shape features
+                    let peak_width = peak.end_rt - peak.start_rt;
+                    let peak_symmetry = {
+                        let left_slice = &ref_xic[peak.start_index..=peak.apex_index];
+                        let right_slice = &ref_xic[peak.apex_index..=peak.end_index];
+                        let left_area = trapezoidal_area(left_slice);
+                        let right_area = trapezoidal_area(right_slice);
+                        if right_area > 1e-10 {
+                            (left_area / right_area).min(10.0)
+                        } else {
+                            1.0
+                        }
+                    };
+                    let peak_sharpness = {
+                        // Average edge steepness (intensity change per minute)
+                        let left_edge = if peak.apex_index > peak.start_index {
+                            let dt = peak.apex_rt - peak.start_rt;
+                            if dt > 1e-10 {
+                                (peak.apex_intensity - ref_xic[peak.start_index].1) / dt
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        };
+                        let right_edge = if peak.end_index > peak.apex_index {
+                            let dt = peak.end_rt - peak.apex_rt;
+                            if dt > 1e-10 {
+                                (peak.apex_intensity - ref_xic[peak.end_index].1) / dt
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        };
+                        (left_edge + right_edge) / 2.0
+                    };
+
+                    // 10. Median polish features
+                    let (mp_cosine, mp_rsquared, mp_residual, mp_min_r2, mp_resid_corr) = {
+                        // Build XIC matrix within peak boundaries
+                        let peak_xics: Vec<(usize, Vec<(f64, f64)>)> = xics
+                            .iter()
+                            .map(|(frag_idx, xic)| {
+                                let peak_slice: Vec<(f64, f64)> =
+                                    xic[peak.start_index..=peak.end_index].to_vec();
+                                (*frag_idx, peak_slice)
+                            })
+                            .collect();
+
+                        if let Some(ref mp) = tukey_median_polish(&peak_xics, 10, 0.01) {
+                            let cos = median_polish_libcosine(mp, &entry.fragments);
+                            let rsq = median_polish_rsquared(mp);
+                            let res = median_polish_residual_ratio(mp);
+                            let min_r2 = median_polish_min_fragment_r2(mp);
+                            let resid_corr = median_polish_residual_correlation(mp);
+                            (cos, rsq, res, min_r2, resid_corr)
+                        } else {
+                            (0.0, 0.0, 1.0, 0.0, 0.0)
+                        }
+                    };
+
+                    // 11. Peptide properties
+                    let mod_count = entry.modifications.len() as u8;
+                    let pep_len = entry.sequence.len() as u8;
+                    let missed_cleav = entry
+                        .sequence
+                        .chars()
+                        .take(entry.sequence.len().saturating_sub(1))
+                        .filter(|&c| c == 'K' || c == 'R')
+                        .count() as u8;
+
+                    // Fragment m/z and intensities from library for blib output
+                    // Use library theoretical values (not observed peaks) so Skyline
+                    // can build XICs for the correct b/y ions
+                    let frag_mzs: Vec<f64> = entry.fragments.iter().map(|f| f.mz).collect();
+                    let frag_intensities: Vec<f32> = entry
+                        .fragments
+                        .iter()
+                        .map(|f| f.relative_intensity)
+                        .collect();
+
+                    // Reference XIC within peak bounds for blib coefficient series
+                    let ref_xic_peak: Vec<(f64, f64)> =
+                        ref_xic[peak.start_index..=peak.end_index].to_vec();
+
+                    let features = CoelutionFeatureSet {
+                        // Pairwise coelution
+                        coelution_sum: corr_sum,
+                        coelution_min: if corr_min.is_finite() { corr_min } else { 0.0 },
+                        coelution_max: if corr_max.is_finite() { corr_max } else { 0.0 },
+                        n_coeluting_fragments: n_coeluting,
+                        n_fragment_pairs: n_pairs.min(255) as u8,
+                        fragment_corr,
+
+                        // Peak shape
+                        peak_apex: peak.apex_intensity,
+                        peak_area: peak.area,
+                        peak_width,
+                        peak_symmetry,
+                        signal_to_noise: peak.signal_to_noise,
+                        n_scans: peak_len as u16,
+                        peak_sharpness,
+
+                        // Spectral at apex
+                        hyperscore: spectral_score.hyperscore,
+                        xcorr: spectral_score.xcorr,
+                        dot_product: spectral_score.lib_cosine,
+                        dot_product_smz: spectral_score.lib_cosine_smz,
+                        dot_product_top6: spectral_score.dot_product_top6,
+                        dot_product_top5: spectral_score.dot_product_top5,
+                        dot_product_top4: spectral_score.dot_product_top4,
+                        dot_product_smz_top6: spectral_score.dot_product_smz_top6,
+                        dot_product_smz_top5: spectral_score.dot_product_smz_top5,
+                        dot_product_smz_top4: spectral_score.dot_product_smz_top4,
+                        fragment_coverage: spectral_score.fragment_coverage,
+                        sequence_coverage: spectral_score.sequence_coverage,
+                        consecutive_ions: spectral_score.consecutive_ions as u8,
+                        base_peak_rank: spectral_score.base_peak_rank as u8,
+                        top6_matches: spectral_score.top6_matches as u8,
+                        explained_intensity: spectral_score.explained_intensity,
+                        elution_weighted_cosine,
+
+                        // Mass accuracy
+                        mass_accuracy_mean: mass_mean,
+                        abs_mass_accuracy_mean: mass_abs_mean,
+                        mass_accuracy_std: mass_std,
+
+                        // RT deviation
+                        rt_deviation: rt_dev,
+                        abs_rt_deviation: rt_dev.abs(),
+
+                        // MS1
+                        ms1_precursor_coelution: ms1_coelution,
+                        ms1_isotope_cosine: ms1_isotope_cos,
+
+                        // Peptide properties
+                        modification_count: mod_count,
+                        peptide_length: pep_len,
+                        missed_cleavages: missed_cleav,
+
+                        // Median polish
+                        median_polish_cosine: mp_cosine,
+                        median_polish_rsquared: mp_rsquared,
+                        median_polish_residual_ratio: mp_residual,
+
+                        // SG-weighted multi-scan scores
+                        sg_weighted_xcorr: sg_xcorr,
+                        sg_weighted_cosine: sg_cosine,
+                        median_polish_min_fragment_r2: mp_min_r2,
+                        median_polish_residual_correlation: mp_resid_corr,
+                    };
+
+                    pb.inc(1);
+
+                    Some(CoelutionScoredEntry {
+                        entry_id: entry.id,
+                        is_decoy: entry.is_decoy,
+                        sequence: entry.sequence.clone(),
+                        modified_sequence: entry.modified_sequence.clone(),
+                        charge: entry.charge,
+                        precursor_mz: entry.precursor_mz,
+                        protein_ids: entry.protein_ids.clone(),
+                        scan_number: apex_spectrum.scan_number,
+                        apex_rt: peak.apex_rt,
+                        peak_bounds: peak,
+                        features,
+                        fragment_mzs: frag_mzs,
+                        fragment_intensities: frag_intensities,
+                        reference_xic: ref_xic_peak,
+                        file_name: file_name.to_string(),
+                        run_qvalue: 1.0,
+                        experiment_qvalue: 1.0,
+                        score: 0.0,
+                        pep: 1.0,
+                    })
+                })
+                .collect();
+
+            pb.inc(candidate_indices.len().saturating_sub(window_entries.len()) as u64);
+            window_entries
         })
         .collect();
 
-    // Write PIN file
-    mokapot_runner.write_pin(&psm_features, pin_path)?;
+    pb.finish_with_message("Done");
 
     log::info!(
-        "Wrote PIN file with {} precursors ({} targets, {} decoys)",
-        psm_features.len(),
-        psm_features.iter().filter(|p| !p.is_decoy).count(),
-        psm_features.iter().filter(|p| p.is_decoy).count()
+        "Coelution search complete: {} scored entries ({} targets, {} decoys)",
+        all_entries.len(),
+        all_entries.iter().filter(|e| !e.is_decoy).count(),
+        all_entries.iter().filter(|e| e.is_decoy).count(),
     );
 
-    Ok(())
-}
-
-/// Write results to blib format for Skyline (legacy, without FDR)
-#[allow(dead_code)]
-fn write_blib_output(
-    config: &OspreyConfig,
-    library: &[LibraryEntry],
-    results: &[RegressionResult],
-    input_files: &[std::path::PathBuf],
-) -> Result<()> {
-    let mut writer = BlibWriter::create(&config.output_blib)?;
-
-    // Add metadata
-    writer.add_metadata("osprey_version", env!("CARGO_PKG_VERSION"))?;
-    writer.add_metadata(
-        "rt_calibration_enabled",
-        &config.rt_calibration.enabled.to_string(),
-    )?;
-    writer.add_metadata(
-        "rt_tolerance_factor",
-        &config.rt_calibration.rt_tolerance_factor.to_string(),
-    )?;
-    writer.add_metadata(
-        "fallback_rt_tolerance",
-        &config.rt_calibration.fallback_rt_tolerance.to_string(),
-    )?;
-    writer.add_metadata("run_fdr", &config.run_fdr.to_string())?;
-
-    // Add source files - use relative path for cross-platform compatibility (WSL2 → Windows)
-    let blib_dir = config.output_blib.parent();
-    let mut file_ids = std::collections::HashMap::new();
-    for input_file in input_files {
-        let file_name = input_file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-        // Compute relative path from blib directory to mzML file
-        let source_path = if let Some(blib_parent) = blib_dir {
-            pathdiff::diff_paths(input_file, blib_parent)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| file_name.to_string())
-        } else {
-            file_name.to_string()
-        };
-        let file_id = writer.add_source_file(&source_path, &source_path, 0.0)?;
-        file_ids.insert(input_file.clone(), file_id);
-    }
-
-    // Begin batch transaction for much faster writes
-    writer.begin_batch()?;
-
-    // Build ID-to-index map for looking up library entries
-    let id_to_index: HashMap<u32, usize> = library
-        .iter()
-        .enumerate()
-        .map(|(idx, entry)| (entry.id, idx))
-        .collect();
-
-    // Aggregate results by library entry ID
-    // For each library entry that has non-zero coefficients, create a spectrum entry
-    let mut entry_coefficients: HashMap<u32, Vec<(f64, f64)>> = HashMap::new();
-
-    for result in results {
-        for (lib_id, coef) in result.library_ids.iter().zip(result.coefficients.iter()) {
-            entry_coefficients
-                .entry(*lib_id)
-                .or_default()
-                .push((result.retention_time, *coef));
+    // Keep best score per precursor (a precursor can be scored in multiple
+    // overlapping DIA windows; keep the one with highest coelution_sum)
+    let pre_count = all_entries.len();
+    let mut best_by_id: HashMap<u32, CoelutionScoredEntry> = HashMap::new();
+    for entry in all_entries {
+        let is_better = best_by_id
+            .get(&entry.entry_id)
+            .map(|existing| entry.features.coelution_sum > existing.features.coelution_sum)
+            .unwrap_or(true);
+        if is_better {
+            best_by_id.insert(entry.entry_id, entry);
         }
     }
 
-    // Write spectra for entries with detections
-    for (lib_id, rt_coef_pairs) in entry_coefficients.iter() {
-        if rt_coef_pairs.is_empty() {
-            continue;
-        }
+    let mut deduped: Vec<CoelutionScoredEntry> = best_by_id.into_values().collect();
 
-        // Look up the library entry by ID
-        let lib_idx = match id_to_index.get(lib_id) {
-            Some(&idx) => idx,
-            None => continue,
-        };
+    // Sort by (entry_id, scan_number) for deterministic output regardless of
+    // Rayon thread scheduling or HashMap iteration order
+    deduped.sort_by(|a, b| {
+        a.entry_id
+            .cmp(&b.entry_id)
+            .then(a.scan_number.cmp(&b.scan_number))
+    });
 
-        let entry = &library[lib_idx];
-
-        // Find peak boundaries from coefficient time series
-        // Simple approach: find region where coefficient is above threshold
-        let mut sorted_pairs = rt_coef_pairs.clone();
-        sorted_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-        let max_coef = sorted_pairs.iter().map(|(_, c)| *c).fold(0.0f64, f64::max);
-        let threshold = max_coef * 0.1; // 10% of max
-
-        // Find start, apex, end
-        let above_threshold: Vec<_> = sorted_pairs
-            .iter()
-            .filter(|(_, c)| *c >= threshold)
-            .collect();
-
-        if above_threshold.is_empty() {
-            continue;
-        }
-
-        let start_rt = above_threshold.first().map(|(rt, _)| *rt).unwrap_or(0.0);
-        let end_rt = above_threshold.last().map(|(rt, _)| *rt).unwrap_or(0.0);
-        let (apex_rt, apex_coef) = sorted_pairs
-            .iter()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(rt, c)| (*rt, *c))
-            .unwrap_or((0.0, 0.0));
-
-        // Use the first input file's ID (in a real implementation, track per-file)
-        let file_id = *file_ids.values().next().unwrap_or(&1);
-
-        // Get fragment peaks from library entry
-        let mzs: Vec<f64> = entry.fragments.iter().map(|f| f.mz).collect();
-        let intensities: Vec<f32> = entry
-            .fragments
-            .iter()
-            .map(|f| f.relative_intensity)
-            .collect();
-
-        // Compute simple score (will be replaced with proper FDR-controlled scoring)
-        let score = apex_coef.min(1.0); // Placeholder score
-
-        // Add spectrum
-        let ref_id = writer.add_spectrum(
-            &entry.sequence,
-            &entry.modified_sequence,
-            entry.precursor_mz,
-            entry.charge as i32,
-            apex_rt,
-            start_rt,
-            end_rt,
-            &mzs,
-            &intensities,
-            score,
-            file_id,
-            1,   // copies
-            0.0, // total_ion_current
-        )?;
-
-        // Add modifications if present
-        if !entry.modifications.is_empty() {
-            writer.add_modifications(ref_id, &entry.modifications)?;
-        }
-
-        // Add protein mappings if present
-        if !entry.protein_ids.is_empty() {
-            writer.add_protein_mapping(ref_id, &entry.protein_ids)?;
-        }
-
-        // Add peak boundaries
-        let boundaries = osprey_core::PeakBoundaries {
-            start_rt,
-            end_rt,
-            apex_rt,
-            apex_coefficient: apex_coef,
-            integrated_area: sorted_pairs.iter().map(|(_, c)| c).sum(),
-            peak_quality: osprey_core::PeakQuality::default(),
-        };
-
-        let file_name = input_files
-            .first()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-
-        writer.add_peak_boundaries(ref_id, file_name, &boundaries)?;
-
-        // Add run scores (placeholder - will be replaced with proper FDR)
-        writer.add_run_scores(ref_id, file_name, score, apex_coef, 1.0 - score)?;
+    if deduped.len() < pre_count {
+        log::info!(
+            "Best per precursor: {} entries (removed {} duplicate window hits)",
+            deduped.len(),
+            pre_count - deduped.len()
+        );
     }
 
-    // Commit the batch transaction
-    writer.commit()?;
-    writer.finalize()?;
-
-    log::info!("Wrote {} spectra to blib", entry_coefficients.len());
-
-    Ok(())
+    Ok(deduped)
 }
 
 /// RT-sorted index for fast candidate selection via binary search.
@@ -3950,6 +3696,7 @@ fn build_mz_index(library: &[LibraryEntry]) -> MzRTIndex {
 ///
 /// The MzRTIndex stores entries sorted by expected_rt (calibrated if available),
 /// enabling O(log n + k) candidate selection instead of O(n) per m/z bin.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn select_candidates_with_calibration(
     spectrum: &Spectrum,
@@ -4017,7 +3764,7 @@ fn select_candidates_with_calibration(
 
                 // Apply top-N fragment pre-filter if enabled
                 if let Some(ref frag_tol) = fragment_tolerance {
-                    if !has_topn_fragment_match(
+                    if !osprey_scoring::has_topn_fragment_match(
                         &entry.fragments,
                         &spectrum.mzs,
                         frag_tol.tolerance,
@@ -4223,42 +3970,6 @@ mod tests {
 
     fn make_test_entry(id: u32, mz: f64, rt: f64) -> LibraryEntry {
         LibraryEntry::new(id, "PEPTIDE".into(), "PEPTIDE".into(), 2, mz, rt)
-    }
-
-    /// Creates a library entry with explicit fragment ions at given m/z values.
-    fn make_entry_with_fragments(id: u32, mz: f64, rt: f64, frag_mzs: &[f64]) -> LibraryEntry {
-        let mut entry = LibraryEntry::new(
-            id,
-            format!("PEPTIDE{}", id),
-            format!("PEPTIDE{}", id),
-            2,
-            mz,
-            rt,
-        );
-        entry.fragments = frag_mzs
-            .iter()
-            .enumerate()
-            .map(|(i, &fmz)| LibraryFragment {
-                mz: fmz,
-                relative_intensity: 100.0 - (i as f32 * 10.0), // decreasing intensity
-                annotation: FragmentAnnotation::default(),
-            })
-            .collect();
-        entry
-    }
-
-    /// Creates a set of DIA-like spectra with the given isolation window center and width.
-    fn make_dia_spectra(center: f64, width: f64, n_scans: usize) -> Vec<Spectrum> {
-        (0..n_scans)
-            .map(|i| Spectrum {
-                scan_number: i as u32 + 1,
-                retention_time: 10.0 + (i as f64 * 0.05), // 3-second cycle time
-                precursor_mz: center,
-                isolation_window: IsolationWindow::symmetric(center, width / 2.0),
-                mzs: vec![300.0, 400.0, 500.0],
-                intensities: vec![100.0, 200.0, 300.0],
-            })
-            .collect()
     }
 
     /// Verifies candidate selection includes entries within the isolation window and RT tolerance.
@@ -4478,337 +4189,92 @@ mod tests {
         assert!(extract_isolation_scheme(&[]).is_none());
     }
 
-    /// Verifies deduplication removes the lower-scoring entry when two entries
-    /// share ≥50% of top-6 fragments, are in the same isolation window,
-    /// and have similar apex RTs.
+    /// Verifies deduplicate_pairs() returns deterministic order regardless of HashMap internals.
+    ///
+    /// Non-deterministic HashMap iteration used to cause different row ordering in the
+    /// SVM feature matrix, leading to different gradient updates and model weights.
+    /// The fix sorts output by entry_id. This test verifies that guarantee.
     #[test]
-    fn test_deduplicate_removes_overlapping_entry() {
-        // Two entries with identical fragments in the same isolation window
-        let entry_a =
-            make_entry_with_fragments(0, 500.0, 10.0, &[300.0, 400.0, 500.0, 600.0, 700.0, 800.0]);
-        let entry_b =
-            make_entry_with_fragments(1, 501.0, 10.0, &[300.0, 400.0, 500.0, 600.0, 700.0, 800.0]);
-        let library = vec![entry_a, entry_b];
+    fn test_deduplicate_pairs_deterministic() {
+        use osprey_core::types::{CoelutionFeatureSet, CoelutionScoredEntry, XICPeakBounds};
 
-        // Create DIA spectra with a window covering both entries
-        let spectra = make_dia_spectra(500.0, 25.0, 20);
-
-        // Scored entries: A has higher peak_apex (survives), B has lower (removed)
-        let scored = vec![
-            ScoredEntry {
-                lib_idx: 0,
-                psm_id: "file_0".into(),
-                file_name: "file".into(),
-                apex_scan_number: 10,
-                rt_coef_pairs: vec![(10.5, 100.0)],
-                features: FeatureSet {
-                    peak_apex: 100.0,
-                    ..FeatureSet::default()
-                },
-                score: 0.9,
-                run_qvalue: 0.01,
-                experiment_qvalue: 0.01,
-                pep: 0.01,
-                is_decoy: false,
-                fragment_peak_bounds: None,
+        // Helper to create a scored entry with a given entry_id and coelution_sum
+        let make_entry = |entry_id: u32, is_decoy: bool, coelution_sum: f64| CoelutionScoredEntry {
+            entry_id,
+            is_decoy,
+            sequence: format!("SEQ{}", entry_id & 0x7FFFFFFF),
+            modified_sequence: format!("SEQ{}", entry_id & 0x7FFFFFFF),
+            charge: 2,
+            precursor_mz: 500.0,
+            protein_ids: vec![],
+            scan_number: 100,
+            apex_rt: 10.0,
+            peak_bounds: XICPeakBounds {
+                apex_rt: 10.0,
+                apex_intensity: 100.0,
+                apex_index: 5,
+                start_rt: 9.0,
+                end_rt: 11.0,
+                start_index: 0,
+                end_index: 10,
+                area: 500.0,
+                signal_to_noise: 10.0,
             },
-            ScoredEntry {
-                lib_idx: 1,
-                psm_id: "file_1".into(),
-                file_name: "file".into(),
-                apex_scan_number: 10,
-                rt_coef_pairs: vec![(10.5, 50.0)],
-                features: FeatureSet {
-                    peak_apex: 50.0,
-                    ..FeatureSet::default()
-                },
-                score: 0.7,
-                run_qvalue: 0.01,
-                experiment_qvalue: 0.01,
-                pep: 0.01,
-                is_decoy: false,
-                fragment_peak_bounds: None,
+            features: CoelutionFeatureSet {
+                coelution_sum,
+                ..CoelutionFeatureSet::default()
             },
-        ];
-
-        let config = OspreyConfig::default();
-        let result = deduplicate_double_counting(scored, &library, &spectra, None, &config);
-
-        assert_eq!(
-            result.len(),
-            1,
-            "One entry should be removed (shared fragments)"
-        );
-        assert_eq!(
-            result[0].lib_idx, 0,
-            "Higher-scoring entry A should survive"
-        );
-    }
-
-    /// Verifies deduplication keeps both entries when fragments are disjoint.
-    #[test]
-    fn test_deduplicate_keeps_disjoint_entries() {
-        // Two entries with completely different fragments
-        let entry_a =
-            make_entry_with_fragments(0, 500.0, 10.0, &[300.0, 400.0, 500.0, 600.0, 700.0, 800.0]);
-        let entry_b =
-            make_entry_with_fragments(1, 501.0, 10.0, &[310.0, 410.0, 510.0, 610.0, 710.0, 810.0]);
-        let library = vec![entry_a, entry_b];
-
-        let spectra = make_dia_spectra(500.0, 25.0, 20);
-
-        let scored = vec![
-            ScoredEntry {
-                lib_idx: 0,
-                psm_id: "file_0".into(),
-                file_name: "file".into(),
-                apex_scan_number: 10,
-                rt_coef_pairs: vec![(10.5, 100.0)],
-                features: FeatureSet {
-                    peak_apex: 100.0,
-                    ..FeatureSet::default()
-                },
-                score: 0.9,
-                run_qvalue: 0.01,
-                experiment_qvalue: 0.01,
-                pep: 0.01,
-                is_decoy: false,
-                fragment_peak_bounds: None,
-            },
-            ScoredEntry {
-                lib_idx: 1,
-                psm_id: "file_1".into(),
-                file_name: "file".into(),
-                apex_scan_number: 10,
-                rt_coef_pairs: vec![(10.5, 50.0)],
-                features: FeatureSet {
-                    peak_apex: 50.0,
-                    ..FeatureSet::default()
-                },
-                score: 0.7,
-                run_qvalue: 0.01,
-                experiment_qvalue: 0.01,
-                pep: 0.01,
-                is_decoy: false,
-                fragment_peak_bounds: None,
-            },
-        ];
-
-        let config = OspreyConfig::default();
-        let result = deduplicate_double_counting(scored, &library, &spectra, None, &config);
-
-        assert_eq!(
-            result.len(),
-            2,
-            "Both entries should survive (different fragments)"
-        );
-    }
-
-    /// Verifies deduplication keeps entries that are distant in RT even with shared fragments.
-    #[test]
-    fn test_deduplicate_keeps_rt_distant_entries() {
-        // Two entries with identical fragments but very different apex RTs
-        let entry_a =
-            make_entry_with_fragments(0, 500.0, 5.0, &[300.0, 400.0, 500.0, 600.0, 700.0, 800.0]);
-        let entry_b =
-            make_entry_with_fragments(1, 501.0, 25.0, &[300.0, 400.0, 500.0, 600.0, 700.0, 800.0]);
-        let library = vec![entry_a, entry_b];
-
-        let spectra = make_dia_spectra(500.0, 25.0, 20);
-
-        // Entry A has apex near RT=10.5, entry B has apex near RT=11.5
-        // With 20 spectra at 0.05 min intervals, 5*median_interval = 5*0.05 = 0.25 min
-        // So entries >0.25 min apart should NOT be deduplicated
-        let scored = vec![
-            ScoredEntry {
-                lib_idx: 0,
-                psm_id: "file_0".into(),
-                file_name: "file".into(),
-                apex_scan_number: 1,
-                rt_coef_pairs: vec![(10.0, 100.0)], // apex at RT=10.0
-                features: FeatureSet {
-                    peak_apex: 100.0,
-                    ..FeatureSet::default()
-                },
-                score: 0.9,
-                run_qvalue: 0.01,
-                experiment_qvalue: 0.01,
-                pep: 0.01,
-                is_decoy: false,
-                fragment_peak_bounds: None,
-            },
-            ScoredEntry {
-                lib_idx: 1,
-                psm_id: "file_1".into(),
-                file_name: "file".into(),
-                apex_scan_number: 20,
-                rt_coef_pairs: vec![(11.0, 50.0)], // apex at RT=11.0 (1 min away)
-                features: FeatureSet {
-                    peak_apex: 50.0,
-                    ..FeatureSet::default()
-                },
-                score: 0.7,
-                run_qvalue: 0.01,
-                experiment_qvalue: 0.01,
-                pep: 0.01,
-                is_decoy: false,
-                fragment_peak_bounds: None,
-            },
-        ];
-
-        let config = OspreyConfig::default();
-        let result = deduplicate_double_counting(scored, &library, &spectra, None, &config);
-
-        assert_eq!(
-            result.len(),
-            2,
-            "Entries with distant apex RTs should both survive"
-        );
-    }
-
-    /// Verifies deduplication with empty input returns empty output.
-    #[test]
-    fn test_deduplicate_empty() {
-        let spectra = make_dia_spectra(500.0, 25.0, 10);
-        let config = OspreyConfig::default();
-        let result = deduplicate_double_counting(Vec::new(), &[], &spectra, None, &config);
-        assert!(result.is_empty());
-    }
-
-    // ============================================
-    // Tests for target-decoy competition
-    // ============================================
-
-    fn make_scored_entry(lib_idx: usize, is_decoy: bool, peak_apex: f64) -> ScoredEntry {
-        ScoredEntry {
-            lib_idx,
-            psm_id: format!("psm_{}", lib_idx),
+            fragment_mzs: vec![],
+            fragment_intensities: vec![],
+            reference_xic: vec![],
             file_name: "test".into(),
-            apex_scan_number: 1,
-            rt_coef_pairs: vec![(10.0, peak_apex)],
-            features: FeatureSet {
-                peak_apex,
-                ..FeatureSet::default()
-            },
-            score: peak_apex,
             run_qvalue: 1.0,
             experiment_qvalue: 1.0,
+            score: 0.0,
             pep: 1.0,
-            is_decoy,
-            fragment_peak_bounds: None,
+        };
+
+        // Create entries: 5 target-decoy pairs with tied coelution_sum scores.
+        // The HashMap iteration order will vary, but the output must be sorted by entry_id.
+        let entries = vec![
+            make_entry(5, false, 0.8),
+            make_entry(3, false, 0.8),
+            make_entry(1, false, 0.8),
+            make_entry(4, false, 0.8),
+            make_entry(2, false, 0.8),
+            make_entry(5 | 0x80000000, true, 0.3),
+            make_entry(3 | 0x80000000, true, 0.3),
+            make_entry(1 | 0x80000000, true, 0.3),
+            make_entry(4 | 0x80000000, true, 0.3),
+            make_entry(2 | 0x80000000, true, 0.3),
+        ];
+
+        let first_result: Vec<u32> = deduplicate_pairs(entries.clone())
+            .iter()
+            .map(|e| e.entry_id)
+            .collect();
+
+        // Run multiple times — must always produce the same order
+        for _ in 0..20 {
+            let result: Vec<u32> = deduplicate_pairs(entries.clone())
+                .iter()
+                .map(|e| e.entry_id)
+                .collect();
+            assert_eq!(
+                result, first_result,
+                "deduplicate_pairs must return deterministic order"
+            );
         }
-    }
 
-    fn make_library_pair(target_id: u32) -> (LibraryEntry, LibraryEntry) {
-        let mut target = LibraryEntry::new(
-            target_id,
-            "PEPTIDE".into(),
-            "PEPTIDE".into(),
-            2,
-            500.0,
-            10.0,
-        );
-        target.is_decoy = false;
-        let mut decoy = LibraryEntry::new(
-            target_id | 0x80000000,
-            "EDITPEP".into(),
-            "EDITPEP".into(),
-            2,
-            500.0,
-            10.0,
-        );
-        decoy.is_decoy = true;
-        (target, decoy)
-    }
-
-    /// Target wins when it has a better feature value.
-    #[test]
-    fn test_compete_target_wins() {
-        let (target_lib, decoy_lib) = make_library_pair(1);
-        let library = vec![target_lib, decoy_lib];
-
-        // Target (lib_idx=0) has peak_apex=0.9, decoy (lib_idx=1) has peak_apex=0.3
-        let entries = vec![
-            make_scored_entry(0, false, 0.9),
-            make_scored_entry(1, true, 0.3),
-        ];
-
-        let result = compete_target_decoy_pairs(entries, &library);
-        assert_eq!(result.len(), 1);
-        assert!(!result[0].is_decoy, "Target should win");
-    }
-
-    /// Decoy wins when it has a better feature value.
-    #[test]
-    fn test_compete_decoy_wins() {
-        let (target_lib, decoy_lib) = make_library_pair(1);
-        let library = vec![target_lib, decoy_lib];
-
-        // Target has peak_apex=0.3, decoy has peak_apex=0.9
-        let entries = vec![
-            make_scored_entry(0, false, 0.3),
-            make_scored_entry(1, true, 0.9),
-        ];
-
-        let result = compete_target_decoy_pairs(entries, &library);
-        assert_eq!(result.len(), 1);
-        assert!(result[0].is_decoy, "Decoy should win");
-    }
-
-    /// Unpaired entries (singletons) win automatically.
-    #[test]
-    fn test_compete_singleton_auto_wins() {
-        let (target_lib, _decoy_lib) = make_library_pair(1);
-        // Only put target in library, no decoy scored
-        let library = vec![target_lib];
-
-        let entries = vec![make_scored_entry(0, false, 0.5)];
-
-        let result = compete_target_decoy_pairs(entries, &library);
-        assert_eq!(result.len(), 1);
-        assert!(!result[0].is_decoy, "Singleton target should auto-win");
-    }
-
-    /// Ties go to the decoy (conservative for FDR estimation).
-    #[test]
-    fn test_compete_tie_goes_to_decoy() {
-        let (target_lib, decoy_lib) = make_library_pair(1);
-        let library = vec![target_lib, decoy_lib];
-
-        // Both have identical peak_apex=0.5
-        let entries = vec![
-            make_scored_entry(0, false, 0.5),
-            make_scored_entry(1, true, 0.5),
-        ];
-
-        let result = compete_target_decoy_pairs(entries, &library);
-        assert_eq!(result.len(), 1);
-        assert!(result[0].is_decoy, "Tie should go to decoy");
-    }
-
-    /// Competition with multiple pairs returns correct number of winners.
-    #[test]
-    fn test_compete_multiple_pairs() {
-        let (t1, d1) = make_library_pair(1);
-        let (t2, d2) = make_library_pair(2);
-        let (t3, d3) = make_library_pair(3);
-        let library = vec![t1, d1, t2, d2, t3, d3];
-
-        let entries = vec![
-            make_scored_entry(0, false, 0.9), // target 1 wins
-            make_scored_entry(1, true, 0.3),  // decoy 1 loses
-            make_scored_entry(2, false, 0.2), // target 2 loses
-            make_scored_entry(3, true, 0.8),  // decoy 2 wins
-            make_scored_entry(4, false, 0.6), // target 3 wins
-            make_scored_entry(5, true, 0.4),  // decoy 3 loses
-        ];
-
-        let result = compete_target_decoy_pairs(entries, &library);
-        assert_eq!(result.len(), 3, "Should have one winner per pair");
-
-        let n_targets = result.iter().filter(|e| !e.is_decoy).count();
-        let n_decoys = result.iter().filter(|e| e.is_decoy).count();
-        assert_eq!(n_targets, 2);
-        assert_eq!(n_decoys, 1);
+        // Verify sorted by entry_id (targets first since their IDs are smaller)
+        assert_eq!(first_result.len(), 10);
+        for i in 1..first_result.len() {
+            assert!(
+                first_result[i - 1] < first_result[i],
+                "Output must be sorted by entry_id: {} >= {}",
+                first_result[i - 1],
+                first_result[i]
+            );
+        }
     }
 }

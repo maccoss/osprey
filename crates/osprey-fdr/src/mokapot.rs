@@ -16,34 +16,11 @@
 //! 2. **Experiment-level FDR**: Run mokapot WITH `--aggregate` + WITH `--load_models`
 //!    Reuses the model from Step 1, reports experiment-wide q-values.
 
-use osprey_core::{FeatureSet, OspreyError, Result};
+use osprey_core::{CoelutionFeatureSet, CoelutionScoredEntry, OspreyError, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-
-/// PSM (Peptide-Spectrum Match) with features for mokapot
-#[derive(Debug, Clone)]
-pub struct PsmFeatures {
-    /// Unique PSM identifier
-    pub psm_id: String,
-    /// Peptide sequence (modified)
-    pub peptide: String,
-    /// Protein accessions
-    pub proteins: Vec<String>,
-    /// Scan number
-    pub scan_number: u32,
-    /// Run/file name
-    pub file_name: String,
-    /// Precursor charge
-    pub charge: u8,
-    /// Is this a decoy?
-    pub is_decoy: bool,
-    /// Feature set
-    pub features: FeatureSet,
-    /// Optional pre-computed score (for initial ranking)
-    pub initial_score: Option<f64>,
-}
 
 /// Mokapot results for a PSM
 #[derive(Debug, Clone)]
@@ -204,133 +181,6 @@ impl MokapotRunner {
             .stderr(Stdio::null())
             .status()
             .is_ok()
-    }
-
-    /// Write PSMs to a PIN file
-    pub fn write_pin<P: AsRef<Path>>(&self, psms: &[PsmFeatures], path: P) -> Result<()> {
-        use std::io::BufWriter;
-
-        let file = std::fs::File::create(path.as_ref())
-            .map_err(|e| OspreyError::OutputError(format!("Failed to create PIN file: {}", e)))?;
-
-        // Use buffered writer for much faster I/O (avoids syscall per line)
-        let mut writer = BufWriter::with_capacity(1024 * 1024, file); // 1MB buffer
-
-        // Write header
-        writeln!(
-            writer,
-            "SpecId\tLabel\tScanNr\tCharge1\tCharge2\tCharge3\tCharge4\tCharge5\t{}\tPeptide\tProteins",
-            get_feature_header()
-        )
-        .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
-
-        // Write PSMs
-        for psm in psms {
-            let label = if psm.is_decoy { -1 } else { 1 };
-            let proteins = if psm.proteins.is_empty() {
-                "UNKNOWN".to_string()
-            } else {
-                psm.proteins.join(",")
-            };
-
-            writeln!(
-                writer,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                psm.psm_id,
-                label,
-                psm.scan_number,
-                format_charge_features(psm.charge),
-                format_features(&psm.features),
-                format_peptide(&psm.peptide),
-                proteins
-            )
-            .map_err(|e| OspreyError::OutputError(format!("Failed to write PSM: {}", e)))?;
-        }
-
-        // Ensure all data is flushed to disk
-        writer
-            .flush()
-            .map_err(|e| OspreyError::OutputError(format!("Failed to flush PIN file: {}", e)))?;
-
-        Ok(())
-    }
-
-    /// Write a single file's PSMs to a PIN file
-    ///
-    /// This is used for memory-efficient processing where each file's PIN
-    /// is written immediately after scoring, rather than accumulating all data.
-    ///
-    /// # Arguments
-    /// * `file_name` - Name of the source file (used for PIN file naming)
-    /// * `psms` - PSM features to write
-    /// * `output_dir` - Directory to write the PIN file
-    ///
-    /// # Returns
-    /// Path to the written PIN file
-    pub fn write_single_pin_file<P: AsRef<Path>>(
-        &self,
-        file_name: &str,
-        psms: &[PsmFeatures],
-        output_dir: P,
-    ) -> Result<PathBuf> {
-        use std::io::BufWriter;
-
-        let out_dir = output_dir.as_ref();
-        std::fs::create_dir_all(out_dir).map_err(|e| {
-            OspreyError::OutputError(format!("Failed to create output directory: {}", e))
-        })?;
-
-        // Sanitize file name for use as PIN file name
-        let safe_name = file_name.replace(['/', '\\', ' '], "_");
-        let pin_path = out_dir.join(format!("{}.pin", safe_name));
-
-        let file = std::fs::File::create(&pin_path)
-            .map_err(|e| OspreyError::OutputError(format!("Failed to create PIN file: {}", e)))?;
-
-        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
-
-        // Write header
-        writeln!(
-            writer,
-            "SpecId\tLabel\tScanNr\tCharge1\tCharge2\tCharge3\tCharge4\tCharge5\t{}\tPeptide\tProteins",
-            get_feature_header()
-        )
-        .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
-
-        // Write PSMs
-        for psm in psms {
-            let label = if psm.is_decoy { -1 } else { 1 };
-            let proteins = if psm.proteins.is_empty() {
-                "UNKNOWN".to_string()
-            } else {
-                psm.proteins.join(",")
-            };
-
-            writeln!(
-                writer,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                psm.psm_id,
-                label,
-                psm.scan_number,
-                format_charge_features(psm.charge),
-                format_features(&psm.features),
-                format_peptide(&psm.peptide),
-                proteins
-            )
-            .map_err(|e| OspreyError::OutputError(format!("Failed to write PSM: {}", e)))?;
-        }
-
-        writer
-            .flush()
-            .map_err(|e| OspreyError::OutputError(format!("Failed to flush PIN file: {}", e)))?;
-
-        log::info!(
-            "Wrote {} PSMs to PIN file: {}",
-            psms.len(),
-            pin_path.display()
-        );
-
-        Ok(pin_path)
     }
 
     /// Run mokapot on a PIN file
@@ -574,81 +424,6 @@ print("SUCCESS")
         self.parse_results(&results_file)
     }
 
-    /// Write separate PIN files for each file in the input
-    ///
-    /// Returns a HashMap mapping file_name to the PIN file path.
-    pub fn write_pin_files<P: AsRef<Path>>(
-        &self,
-        psms_by_file: &HashMap<String, Vec<PsmFeatures>>,
-        output_dir: P,
-    ) -> Result<HashMap<String, PathBuf>> {
-        use std::io::BufWriter;
-
-        let out_dir = output_dir.as_ref();
-        std::fs::create_dir_all(out_dir).map_err(|e| {
-            OspreyError::OutputError(format!("Failed to create output directory: {}", e))
-        })?;
-
-        let mut pin_files = HashMap::new();
-
-        for (file_name, psms) in psms_by_file {
-            // Sanitize file name for use as PIN file name
-            let safe_name = file_name.replace(['/', '\\', ' '], "_");
-            let pin_path = out_dir.join(format!("{}.pin", safe_name));
-
-            let file = std::fs::File::create(&pin_path).map_err(|e| {
-                OspreyError::OutputError(format!("Failed to create PIN file: {}", e))
-            })?;
-
-            let mut writer = BufWriter::with_capacity(1024 * 1024, file);
-
-            // Write header
-            writeln!(
-                writer,
-                "SpecId\tLabel\tScanNr\tCharge1\tCharge2\tCharge3\tCharge4\tCharge5\t{}\tPeptide\tProteins",
-                get_feature_header()
-            )
-            .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
-
-            // Write PSMs
-            for psm in psms {
-                let label = if psm.is_decoy { -1 } else { 1 };
-                let proteins = if psm.proteins.is_empty() {
-                    "UNKNOWN".to_string()
-                } else {
-                    psm.proteins.join(",")
-                };
-
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    psm.psm_id,
-                    label,
-                    psm.scan_number,
-                    psm.charge,
-                    format_features(&psm.features),
-                    format_peptide(&psm.peptide),
-                    proteins
-                )
-                .map_err(|e| OspreyError::OutputError(format!("Failed to write PSM: {}", e)))?;
-            }
-
-            writer.flush().map_err(|e| {
-                OspreyError::OutputError(format!("Failed to flush PIN file: {}", e))
-            })?;
-
-            log::info!(
-                "Wrote {} PSMs to PIN file: {}",
-                psms.len(),
-                pin_path.display()
-            );
-
-            pin_files.insert(file_name.clone(), pin_path);
-        }
-
-        Ok(pin_files)
-    }
-
     /// Run two-step mokapot analysis using CLI
     ///
     /// For a single file: just runs mokapot once with --save_models
@@ -824,7 +599,7 @@ print("SUCCESS")
 
             log::info!("");
             log::info!(
-                "Step 1 total: {} precursors, {} unique peptides across {} files",
+                "Step 1 total: {} unique precursors, {} unique peptides across {} files",
                 total_precursors,
                 total_peptides_set.len(),
                 per_file_results.len()
@@ -1077,71 +852,6 @@ fn find_mokapot_models(dir: &Path) -> Result<Vec<PathBuf>> {
     )))
 }
 
-/// Get the feature header for PIN format (37 features)
-///
-/// Features are grouped by source:
-/// - Ridge regression (chromatographic): peak_apex, peak_area, peak_width,
-///   coefficient_stability, relative_coefficient, explained_intensity, signal_to_noise,
-///   xic_signal_to_noise
-/// - Spectral matching (mixed, at apex): xcorr, consecutive_ions
-/// - Spectral matching (deconvoluted, apex ± 2): *_deconv versions
-/// - Derived: rt_deviation, fragment co-elution, mass accuracy
-/// - Percolator-style: abs_rt_deviation, peptide_length, missed_cleavages,
-///   ln_num_candidates, coef_zscore, coef_zscore_mean
-fn get_feature_header() -> String {
-    [
-        // Ridge regression features (chromatographic profile)
-        "peak_apex",
-        "peak_area",
-        "peak_width",
-        "coefficient_stability",
-        "relative_coefficient",
-        "explained_intensity",
-        "signal_to_noise",
-        "xic_signal_to_noise",
-        // Spectral matching features (mixed/observed at apex spectrum)
-        "xcorr",
-        "consecutive_ions",
-        // Spectral matching features (deconvoluted, coefficient-weighted apex ± 2 scans)
-        "xcorr_deconv",
-        "consecutive_ions_deconv",
-        // Derived features
-        "rt_deviation",
-        // Fragment co-elution features (bounded to peak integration boundaries)
-        "fragment_coelution_sum",
-        "fragment_coelution_min",
-        "n_coeluting_fragments",
-        // Per-fragment correlations (top 6 by library intensity, 0-padded)
-        "fragment_corr_0",
-        "fragment_corr_1",
-        "fragment_corr_2",
-        "fragment_corr_3",
-        "fragment_corr_4",
-        "fragment_corr_5",
-        // Elution-weighted spectral similarity
-        "elution_weighted_cosine",
-        // Per-fragment mass accuracy
-        "mass_accuracy_deviation_mean",
-        "abs_mass_accuracy_deviation_mean",
-        "mass_accuracy_std",
-        // Percolator-style features
-        "abs_rt_deviation",
-        "peptide_length",
-        "missed_cleavages",
-        "ln_num_candidates",
-        "coef_zscore",
-        "coef_zscore_mean",
-        // MS1-based features (HRAM only, 0.0 for unit resolution or missing MS1)
-        "ms1_precursor_coelution",
-        "ms1_isotope_cosine",
-        // Tukey median polish features (fragment XIC decomposition)
-        "median_polish_cosine",
-        "median_polish_rsquared",
-        "median_polish_residual_ratio",
-    ]
-    .join("\t")
-}
-
 /// Format charge state as 5 binary one-hot features (Charge1..Charge5)
 /// Charge 6+ produces all zeros.
 fn format_charge_features(charge: u8) -> String {
@@ -1154,153 +864,6 @@ fn format_charge_features(charge: u8) -> String {
         if charge == 5 { 1 } else { 0 },
     )
 }
-
-/// Format features for PIN output (37 features)
-fn format_features(features: &FeatureSet) -> String {
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        // Ridge regression features (chromatographic profile)
-        features.peak_apex,
-        features.peak_area,
-        features.peak_width,
-        features.coefficient_stability,
-        features.relative_coefficient,
-        features.explained_intensity,
-        features.signal_to_noise,
-        features.xic_signal_to_noise,
-        // Spectral matching features (mixed/observed at apex spectrum)
-        features.xcorr,
-        features.consecutive_ions,
-        // Spectral matching features (deconvoluted, coefficient-weighted apex ± 2 scans)
-        features.xcorr_deconv,
-        features.consecutive_ions_deconv,
-        // Derived features
-        features.rt_deviation,
-        // Fragment co-elution features (bounded to peak integration boundaries)
-        features.fragment_coelution_sum,
-        features.fragment_coelution_min,
-        features.n_coeluting_fragments,
-        // Per-fragment correlations (top 6 by library intensity, 0-padded)
-        features.fragment_corr_0,
-        features.fragment_corr_1,
-        features.fragment_corr_2,
-        features.fragment_corr_3,
-        features.fragment_corr_4,
-        features.fragment_corr_5,
-        // Elution-weighted spectral similarity
-        features.elution_weighted_cosine,
-        // Per-fragment mass accuracy
-        features.mass_accuracy_deviation_mean,
-        features.abs_mass_accuracy_deviation_mean,
-        features.mass_accuracy_std,
-        // Percolator-style features
-        features.abs_rt_deviation,
-        features.peptide_length,
-        features.missed_cleavages,
-        features.ln_num_candidates,
-        features.coef_zscore,
-        features.coef_zscore_mean,
-        // MS1-based features (HRAM only, 0.0 for unit resolution or missing MS1)
-        features.ms1_precursor_coelution,
-        features.ms1_isotope_cosine,
-        // Tukey median polish features (fragment XIC decomposition)
-        features.median_polish_cosine,
-        features.median_polish_rsquared,
-        features.median_polish_residual_ratio,
-    )
-}
-
-/// Returns the 37 PIN feature names in the same order as get_feature_header() and format_features().
-pub fn get_pin_feature_names() -> Vec<&'static str> {
-    vec![
-        "peak_apex",
-        "peak_area",
-        "peak_width",
-        "coefficient_stability",
-        "relative_coefficient",
-        "explained_intensity",
-        "signal_to_noise",
-        "xic_signal_to_noise",
-        "xcorr",
-        "consecutive_ions",
-        "xcorr_deconv",
-        "consecutive_ions_deconv",
-        "rt_deviation",
-        "fragment_coelution_sum",
-        "fragment_coelution_min",
-        "n_coeluting_fragments",
-        "fragment_corr_0",
-        "fragment_corr_1",
-        "fragment_corr_2",
-        "fragment_corr_3",
-        "fragment_corr_4",
-        "fragment_corr_5",
-        "elution_weighted_cosine",
-        "mass_accuracy_deviation_mean",
-        "abs_mass_accuracy_deviation_mean",
-        "mass_accuracy_std",
-        "abs_rt_deviation",
-        "peptide_length",
-        "missed_cleavages",
-        "ln_num_candidates",
-        "coef_zscore",
-        "coef_zscore_mean",
-        "ms1_precursor_coelution",
-        "ms1_isotope_cosine",
-        "median_polish_cosine",
-        "median_polish_rsquared",
-        "median_polish_residual_ratio",
-    ]
-}
-
-/// Returns a single PIN feature value by index (0-36).
-///
-/// Index order matches get_feature_header(), format_features(), and get_pin_feature_names().
-pub fn pin_feature_value(features: &FeatureSet, index: usize) -> f64 {
-    match index {
-        0 => features.peak_apex,
-        1 => features.peak_area,
-        2 => features.peak_width,
-        3 => features.coefficient_stability,
-        4 => features.relative_coefficient,
-        5 => features.explained_intensity,
-        6 => features.signal_to_noise,
-        7 => features.xic_signal_to_noise,
-        8 => features.xcorr,
-        9 => features.consecutive_ions as f64,
-        10 => features.xcorr_deconv,
-        11 => features.consecutive_ions_deconv as f64,
-        12 => features.rt_deviation,
-        13 => features.fragment_coelution_sum,
-        14 => features.fragment_coelution_min,
-        15 => features.n_coeluting_fragments as f64,
-        16 => features.fragment_corr_0,
-        17 => features.fragment_corr_1,
-        18 => features.fragment_corr_2,
-        19 => features.fragment_corr_3,
-        20 => features.fragment_corr_4,
-        21 => features.fragment_corr_5,
-        22 => features.elution_weighted_cosine,
-        23 => features.mass_accuracy_deviation_mean,
-        24 => features.abs_mass_accuracy_deviation_mean,
-        25 => features.mass_accuracy_std,
-        26 => features.abs_rt_deviation,
-        27 => features.peptide_length as f64,
-        28 => features.missed_cleavages as f64,
-        29 => features.ln_num_candidates,
-        30 => features.coef_zscore,
-        31 => features.coef_zscore_mean,
-        32 => features.ms1_precursor_coelution,
-        33 => features.ms1_isotope_cosine,
-        34 => features.median_polish_cosine,
-        35 => features.median_polish_rsquared,
-        36 => features.median_polish_residual_ratio,
-        _ => 0.0,
-    }
-}
-
-/// Number of PIN features (37).
-pub const NUM_PIN_FEATURES: usize = 37;
 
 /// Format peptide for PIN output
 /// Percolator/mokapot expects format: FLANKING.SEQUENCE.FLANKING
@@ -1318,7 +881,7 @@ fn format_peptide(peptide: &str) -> String {
 /// - `_PEPTIDE_` → `PEPTIDE`
 /// - `K.PEPTIDE.R` → `PEPTIDE`
 /// - `-PEPTIDE-` → `PEPTIDE`
-fn strip_flanking_chars(seq: &str) -> String {
+pub fn strip_flanking_chars(seq: &str) -> String {
     let trimmed = seq.trim_matches(|c| c == '_' || c == '.' || c == '-');
 
     // Also handle internal patterns like "K.PEPTIDE.R" -> "PEPTIDE"
@@ -1354,6 +917,201 @@ pub fn write_mokapot_report<P: AsRef<Path>>(results: &[MokapotResult], path: P) 
     Ok(())
 }
 
+/// Number of PIN features (18).
+pub const NUM_PIN_FEATURES: usize = 21;
+
+/// Returns the PIN feature header as a tab-separated string.
+fn get_feature_header() -> String {
+    get_pin_feature_names().join("\t")
+}
+
+/// Returns the 22 PIN feature names.
+///
+/// PIN feature names for the scoring feature set.
+/// Note: 26 features temporarily removed (fragment_corr_0..5, fragment_coelution_min,
+/// n_fragment_pairs, dot_product, dot_product_smz, dot_product_top4..6,
+/// dot_product_smz_top4..6, signal_to_noise, peak_symmetry, elution_weighted_cosine,
+/// peptide_length, missed_cleavages, peak_width, n_scans, fragment_coverage,
+/// hyperscore, sequence_coverage).
+pub fn get_pin_feature_names() -> Vec<&'static str> {
+    vec![
+        // Pairwise coelution (3)
+        "fragment_coelution_sum",
+        "fragment_coelution_max",
+        "n_coeluting_fragments",
+        // Peak shape (3)
+        "peak_apex",
+        "peak_area",
+        "peak_sharpness",
+        // Spectral at apex (3)
+        "xcorr",
+        "consecutive_ions",
+        "explained_intensity",
+        // Mass accuracy (2)
+        "mass_accuracy_deviation_mean",
+        "abs_mass_accuracy_deviation_mean",
+        // RT deviation (2)
+        "rt_deviation",
+        "abs_rt_deviation",
+        // MS1 (2)
+        "ms1_precursor_coelution",
+        "ms1_isotope_cosine",
+        // Median polish (2)
+        "median_polish_cosine",
+        "median_polish_residual_ratio",
+        // SG-weighted multi-scan (4)
+        "sg_weighted_xcorr",
+        "sg_weighted_cosine",
+        "median_polish_min_fragment_r2",
+        "median_polish_residual_correlation",
+    ]
+}
+
+/// Format features as a tab-separated string for PIN output.
+fn format_features(f: &CoelutionFeatureSet) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        // Pairwise coelution
+        f.coelution_sum,
+        f.coelution_max,
+        f.n_coeluting_fragments,
+        // Peak shape
+        f.peak_apex,
+        f.peak_area,
+        f.peak_sharpness,
+        // Spectral at apex
+        f.xcorr,
+        f.consecutive_ions,
+        f.explained_intensity,
+        // Mass accuracy
+        f.mass_accuracy_mean,
+        f.abs_mass_accuracy_mean,
+        // RT deviation
+        f.rt_deviation,
+        f.abs_rt_deviation,
+        // MS1
+        f.ms1_precursor_coelution,
+        f.ms1_isotope_cosine,
+        // Median polish
+        f.median_polish_cosine,
+        f.median_polish_residual_ratio,
+        // SG-weighted multi-scan
+        f.sg_weighted_xcorr,
+        f.sg_weighted_cosine,
+        f.median_polish_min_fragment_r2,
+        f.median_polish_residual_correlation,
+    )
+}
+
+/// Returns a PIN feature value by index (0-16).
+pub fn pin_feature_value(f: &CoelutionFeatureSet, index: usize) -> f64 {
+    match index {
+        // Pairwise coelution
+        0 => f.coelution_sum,
+        1 => f.coelution_max,
+        2 => f.n_coeluting_fragments as f64,
+        // Peak shape
+        3 => f.peak_apex,
+        4 => f.peak_area,
+        5 => f.peak_sharpness,
+        // Spectral at apex
+        6 => f.xcorr,
+        7 => f.consecutive_ions as f64,
+        8 => f.explained_intensity,
+        // Mass accuracy
+        9 => f.mass_accuracy_mean,
+        10 => f.abs_mass_accuracy_mean,
+        // RT deviation
+        11 => f.rt_deviation,
+        12 => f.abs_rt_deviation,
+        // MS1
+        13 => f.ms1_precursor_coelution,
+        14 => f.ms1_isotope_cosine,
+        // Median polish
+        15 => f.median_polish_cosine,
+        16 => f.median_polish_residual_ratio,
+        // SG-weighted multi-scan
+        17 => f.sg_weighted_xcorr,
+        18 => f.sg_weighted_cosine,
+        19 => f.median_polish_min_fragment_r2,
+        20 => f.median_polish_residual_correlation,
+        _ => 0.0,
+    }
+}
+
+impl MokapotRunner {
+    /// Write a PIN file for a single file's scored entries.
+    pub fn write_pin_file<P: AsRef<Path>>(
+        &self,
+        file_name: &str,
+        entries: &[CoelutionScoredEntry],
+        output_dir: P,
+    ) -> Result<PathBuf> {
+        use std::io::BufWriter;
+
+        let out_dir = output_dir.as_ref();
+        std::fs::create_dir_all(out_dir).map_err(|e| {
+            OspreyError::OutputError(format!("Failed to create output directory: {}", e))
+        })?;
+
+        let safe_name = file_name.replace(['/', '\\', ' '], "_");
+        let pin_path = out_dir.join(format!("{}.pin", safe_name));
+
+        let file = std::fs::File::create(&pin_path)
+            .map_err(|e| OspreyError::OutputError(format!("Failed to create PIN file: {}", e)))?;
+
+        let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+
+        // Write header
+        writeln!(
+            writer,
+            "SpecId\tLabel\tScanNr\tCharge1\tCharge2\tCharge3\tCharge4\tCharge5\t{}\tPeptide\tProteins",
+            get_feature_header()
+        )
+        .map_err(|e| OspreyError::OutputError(format!("Failed to write PIN header: {}", e)))?;
+
+        // Write entries
+        for entry in entries {
+            let label = if entry.is_decoy { -1 } else { 1 };
+            let proteins = if entry.protein_ids.is_empty() {
+                "UNKNOWN".to_string()
+            } else {
+                entry.protein_ids.join(",")
+            };
+
+            let psm_id = format!(
+                "{}_{}_{}_{}",
+                file_name, entry.modified_sequence, entry.charge, entry.scan_number
+            );
+
+            writeln!(
+                writer,
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                psm_id,
+                label,
+                entry.scan_number,
+                format_charge_features(entry.charge),
+                format_features(&entry.features),
+                format_peptide(&entry.modified_sequence),
+                proteins
+            )
+            .map_err(|e| OspreyError::OutputError(format!("Failed to write entry: {}", e)))?;
+        }
+
+        writer
+            .flush()
+            .map_err(|e| OspreyError::OutputError(format!("Failed to flush PIN file: {}", e)))?;
+
+        log::info!(
+            "Wrote {} entries to PIN file: {}",
+            entries.len(),
+            pin_path.display()
+        );
+
+        Ok(pin_path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,25 +1124,26 @@ mod tests {
         assert_eq!(format_peptide("K.PEPTIDE.R"), "-.PEPTIDE.-");
     }
 
-    /// Verifies that the PIN feature header contains expected feature names and excludes optional fields.
+    /// Verifies that the PIN feature header contains expected feature names.
     #[test]
     fn test_feature_header() {
         let header = get_feature_header();
         assert!(header.contains("peak_apex"));
         assert!(header.contains("xcorr"));
-        assert!(header.contains("coef_zscore"));
-        assert!(header.contains("xic_signal_to_noise"));
         assert!(header.contains("ms1_precursor_coelution"));
         assert!(header.contains("ms1_isotope_cosine"));
         assert!(header.contains("median_polish_cosine"));
-        assert!(header.contains("median_polish_rsquared"));
         assert!(header.contains("median_polish_residual_ratio"));
-        // Removed features should not be present
-        assert!(!header.contains("dot_product"));
+        assert!(!header.contains("median_polish_rsquared"));
+        // Verify removed features are NOT present
+        assert!(!header.contains("dot_product\t"));
+        assert!(!header.contains("fragment_corr_"));
+        assert!(!header.contains("signal_to_noise"));
+        assert!(!header.contains("peptide_length"));
+        assert!(!header.contains("missed_cleavages"));
         assert!(!header.contains("hyperscore"));
         assert!(!header.contains("fragment_coverage"));
-        assert!(!header.contains("top6_matches"));
-        assert!(!header.contains("n_contributing_scans"));
+        assert!(!header.contains("sequence_coverage"));
     }
 
     /// Verifies that charge states 1-5 produce correct one-hot encodings and out-of-range charges produce all zeros.
@@ -1407,7 +1166,7 @@ mod tests {
         let _available = runner.is_available();
     }
 
-    /// Verifies that get_pin_feature_names() returns exactly 37 names matching the header.
+    /// Verifies that get_pin_feature_names() returns exactly NUM_PIN_FEATURES names matching the header.
     #[test]
     fn test_get_pin_feature_names_count() {
         let names = get_pin_feature_names();
@@ -1425,7 +1184,7 @@ mod tests {
     /// Verifies that pin_feature_value returns consistent values matching format_features order.
     #[test]
     fn test_pin_feature_value_matches_format() {
-        let features = FeatureSet::default();
+        let features = CoelutionFeatureSet::default();
         // All default values should be 0.0, so pin_feature_value should return 0.0 for all indices
         for i in 0..NUM_PIN_FEATURES {
             let val = pin_feature_value(&features, i);

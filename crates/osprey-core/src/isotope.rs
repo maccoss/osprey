@@ -363,23 +363,35 @@ fn multinomial_prob(n: usize, counts: &[usize], probs: &[f64]) -> f64 {
 /// # Returns
 /// Cosine similarity (0.0 to 1.0), or None if vectors are invalid
 ///
-/// Note: The observed array has M-1 first (from pyXcorrDIA convention),
-/// while theoretical starts at M+0. This function aligns them appropriately.
+/// Uses all 5 isotope positions [M-1, M+0, M+1, M+2, M+3] for the cosine.
+/// Zeros are critical for discrimination:
+/// - Theoretical M-1 = 0: observed signal there indicates a wrong match
+/// - For small peptides, theoretical M+3 ≈ 0: observed signal also penalizes
+///
+/// Including zeros means the cosine is lower when unexpected isotope peaks appear.
+///
+/// The observed array follows [M-1, M+0, M+1, M+2, M+3] convention.
+/// The theoretical array from calculate_isotope_distribution is [M+0, M+1, M+2, M+3, M+4],
+/// so we remap to [0, M+0, M+1, M+2, M+3] for alignment.
 pub fn isotope_cosine_score(observed: &[f64; 5], theoretical: &[f64; 5]) -> Option<f64> {
-    // Align: observed[1..5] corresponds to M+0 to M+3
-    // theoretical[0..4] corresponds to M+0 to M+3
-    let obs = &observed[1..5]; // Skip M-1
-    let theo = &theoretical[0..4]; // M+0 to M+3
+    // Build theoretical vector aligned with observed: [M-1=0, M+0, M+1, M+2, M+3]
+    let theo_aligned = [
+        0.0,            // M-1: no theoretical contribution
+        theoretical[0], // M+0
+        theoretical[1], // M+1
+        theoretical[2], // M+2
+        theoretical[3], // M+3
+    ];
 
-    // Calculate dot product and norms
+    // Cosine similarity over all 5 positions
     let mut dot = 0.0;
     let mut obs_norm_sq = 0.0;
     let mut theo_norm_sq = 0.0;
 
-    for i in 0..4 {
-        dot += obs[i] * theo[i];
-        obs_norm_sq += obs[i] * obs[i];
-        theo_norm_sq += theo[i] * theo[i];
+    for i in 0..5 {
+        dot += observed[i] * theo_aligned[i];
+        obs_norm_sq += observed[i] * observed[i];
+        theo_norm_sq += theo_aligned[i] * theo_aligned[i];
     }
 
     let obs_norm = obs_norm_sq.sqrt();

@@ -44,8 +44,8 @@ pub mod calibration_ml;
 pub mod pipeline;
 
 use osprey_core::{
-    BinConfig, FeatureSet, FragmentAnnotation, IonType, LibraryEntry, LibraryFragment,
-    Modification, Result, Spectrum, ToleranceUnit,
+    BinConfig, FragmentAnnotation, IonType, LibraryEntry, LibraryFragment, Modification, Result,
+    Spectrum, ToleranceUnit,
 };
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -250,241 +250,6 @@ pub fn topn_fragment_match_with_errors(
     (has_match, mass_errors)
 }
 
-/// Result of fragment co-elution analysis.
-pub struct FragmentCoelutionResult {
-    /// Sum of Pearson correlations across scored fragments
-    pub coelution_sum: f64,
-    /// Minimum per-fragment correlation
-    pub coelution_min: f64,
-    /// Number of fragments with positive correlation
-    pub n_positive: u32,
-    /// Per-fragment correlations for top 6 fragments (0-padded if fewer)
-    pub per_fragment_corr: [f64; 6],
-    /// Best-correlated fragment XIC as (RT, intensity) pairs for SNR computation
-    pub best_xic: Option<Vec<(f64, f64)>>,
-}
-
-/// Compute fragment co-elution correlation (DIA-NN pTimeCorr-inspired).
-///
-/// For each of the top 6 library fragments, extracts a raw XIC from the peak region
-/// spectra and computes Pearson correlation against the regression coefficient time series.
-/// The coefficient series serves as the deconvolved elution profile reference.
-///
-/// Only data points within `[peak_start_rt, peak_end_rt]` are used for correlation,
-/// ensuring that scoring reflects the detected peak rather than flanking interference.
-///
-/// Uses plain Pearson correlation on raw intensities (no sqrt transform), matching DIA-NN.
-pub fn compute_fragment_coelution(
-    library_fragments: &[LibraryFragment],
-    coefficient_series: &[(f64, f64)], // (RT, coefficient) pairs
-    spectra: &[&Spectrum],             // peak region spectra (sorted by RT)
-    tolerance_da: f64,
-    tolerance_ppm: f64,
-    peak_start_rt: f64,
-    peak_end_rt: f64,
-) -> FragmentCoelutionResult {
-    let empty = FragmentCoelutionResult {
-        coelution_sum: 0.0,
-        coelution_min: 0.0,
-        n_positive: 0,
-        per_fragment_corr: [0.0; 6],
-        best_xic: None,
-    };
-
-    if library_fragments.is_empty() || coefficient_series.len() < 3 || spectra.is_empty() {
-        return empty;
-    }
-
-    // Filter coefficient series to peak boundaries
-    let bounded_series: Vec<&(f64, f64)> = coefficient_series
-        .iter()
-        .filter(|(rt, _)| *rt >= peak_start_rt && *rt <= peak_end_rt)
-        .collect();
-
-    if bounded_series.len() < 3 {
-        return empty;
-    }
-
-    // Select top 6 fragments by relative intensity
-    let top_indices: Vec<usize> = if library_fragments.len() <= 6 {
-        (0..library_fragments.len()).collect()
-    } else {
-        let mut indexed: Vec<(usize, f32)> = library_fragments
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (i, f.relative_intensity))
-            .collect();
-        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-        indexed.iter().take(6).map(|(i, _)| *i).collect()
-    };
-
-    // Build spectrum RT index for fast nearest-RT lookup
-    let spec_rts: Vec<f64> = spectra.iter().map(|s| s.retention_time).collect();
-
-    let mut coelution_sum = 0.0;
-    let mut coelution_min = f64::MAX;
-    let mut n_positive: u32 = 0;
-    let mut n_scored: u32 = 0;
-    let mut per_fragment_corr = [0.0f64; 6];
-    let mut best_corr = f64::NEG_INFINITY;
-    let mut best_xic: Option<Vec<(f64, f64)>> = None;
-
-    for (rank, &frag_idx) in top_indices.iter().enumerate() {
-        let frag_mz = library_fragments[frag_idx].mz;
-        let tol = tolerance_da.max(frag_mz * tolerance_ppm / 1e6);
-
-        // Extract raw XIC only within peak boundaries
-        let mut xic: Vec<f64> = Vec::with_capacity(bounded_series.len());
-        let mut coefs: Vec<f64> = Vec::with_capacity(bounded_series.len());
-
-        for &&(rt, coef) in &bounded_series {
-            // Find the spectrum closest to this RT
-            let spec_idx = match spec_rts
-                .binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal))
-            {
-                Ok(i) => i,
-                Err(i) => {
-                    if i == 0 {
-                        0
-                    } else if i >= spec_rts.len() {
-                        spec_rts.len() - 1
-                    } else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() {
-                        i
-                    } else {
-                        i - 1
-                    }
-                }
-            };
-
-            // Binary search for the fragment m/z in the spectrum
-            let spectrum = &spectra[spec_idx];
-            let lower = frag_mz - tol;
-            let upper = frag_mz + tol;
-            let start = spectrum.mzs.partition_point(|&mz| mz < lower);
-
-            let intensity = if start < spectrum.mzs.len() && spectrum.mzs[start] <= upper {
-                // Find closest peak within tolerance
-                let mut best_intensity = spectrum.intensities[start] as f64;
-                let mut best_diff = (spectrum.mzs[start] - frag_mz).abs();
-                let mut j = start + 1;
-                while j < spectrum.mzs.len() && spectrum.mzs[j] <= upper {
-                    let diff = (spectrum.mzs[j] - frag_mz).abs();
-                    if diff < best_diff {
-                        best_diff = diff;
-                        best_intensity = spectrum.intensities[j] as f64;
-                    }
-                    j += 1;
-                }
-                best_intensity
-            } else {
-                0.0
-            };
-
-            xic.push(intensity);
-            coefs.push(coef);
-        }
-
-        // Compute Pearson correlation between XIC and coefficient series
-        if xic.len() >= 3 {
-            let corr = pearson_correlation_raw(&xic, &coefs);
-            coelution_sum += corr;
-            if corr < coelution_min {
-                coelution_min = corr;
-            }
-            if corr > 0.0 {
-                n_positive += 1;
-            }
-            n_scored += 1;
-
-            // Store per-fragment correlation (rank-ordered by library intensity)
-            if rank < 6 {
-                per_fragment_corr[rank] = corr;
-            }
-
-            // Track the best-correlated fragment XIC for SNR computation
-            // (use full coefficient series for XIC to get proper SNR baseline)
-            if corr > best_corr {
-                best_corr = corr;
-                best_xic = Some(extract_fragment_xic(
-                    frag_mz,
-                    tol,
-                    coefficient_series,
-                    spectra,
-                    &spec_rts,
-                ));
-            }
-        }
-    }
-
-    if n_scored == 0 {
-        return empty;
-    }
-    if coelution_min == f64::MAX {
-        coelution_min = 0.0;
-    }
-
-    FragmentCoelutionResult {
-        coelution_sum,
-        coelution_min,
-        n_positive,
-        per_fragment_corr,
-        best_xic,
-    }
-}
-
-/// Extract a fragment XIC across the full coefficient series (for SNR computation).
-fn extract_fragment_xic(
-    frag_mz: f64,
-    tol: f64,
-    coefficient_series: &[(f64, f64)],
-    spectra: &[&Spectrum],
-    spec_rts: &[f64],
-) -> Vec<(f64, f64)> {
-    let lower = frag_mz - tol;
-    let upper = frag_mz + tol;
-
-    coefficient_series
-        .iter()
-        .map(|&(rt, _)| {
-            let spec_idx = match spec_rts
-                .binary_search_by(|srt| srt.partial_cmp(&rt).unwrap_or(std::cmp::Ordering::Equal))
-            {
-                Ok(i) => i,
-                Err(i) => {
-                    if i == 0 {
-                        0
-                    } else if i >= spec_rts.len() {
-                        spec_rts.len() - 1
-                    } else if (spec_rts[i] - rt).abs() < (spec_rts[i - 1] - rt).abs() {
-                        i
-                    } else {
-                        i - 1
-                    }
-                }
-            };
-            let spectrum = &spectra[spec_idx];
-            let start = spectrum.mzs.partition_point(|&mz| mz < lower);
-            let intensity = if start < spectrum.mzs.len() && spectrum.mzs[start] <= upper {
-                let mut best_intensity = spectrum.intensities[start] as f64;
-                let mut best_diff = (spectrum.mzs[start] - frag_mz).abs();
-                let mut j = start + 1;
-                while j < spectrum.mzs.len() && spectrum.mzs[j] <= upper {
-                    let diff = (spectrum.mzs[j] - frag_mz).abs();
-                    if diff < best_diff {
-                        best_diff = diff;
-                        best_intensity = spectrum.intensities[j] as f64;
-                    }
-                    j += 1;
-                }
-                best_intensity
-            } else {
-                0.0
-            };
-            (rt, intensity)
-        })
-        .collect()
-}
-
 /// Compute elution-weighted cosine similarity across peak boundaries.
 ///
 /// At each scan within `[peak_start_rt, peak_end_rt]`, computes the cosine similarity
@@ -568,7 +333,7 @@ pub fn compute_elution_weighted_cosine(
 /// Unmatched fragments use observed intensity of 0, which penalizes the
 /// cosine — a missing fragment that should be present is strong evidence
 /// against a match.
-fn compute_cosine_at_scan(
+pub fn compute_cosine_at_scan(
     library_fragments: &[LibraryFragment],
     spectrum: &Spectrum,
     tolerance_da: f64,
@@ -1146,7 +911,10 @@ pub fn median_polish_residual_ratio(polish: &TukeyMedianPolishResult) -> f64 {
                     + polish.residuals[f][s])
                     .exp()
             } else {
-                0.0
+                // Zero intensity is a real measurement (fragment had no signal),
+                // not missing data. Use pseudocount to prevent |0 - predicted|
+                // from dominating the ratio.
+                0.0001
             };
 
             sum_abs_residual += (observed - predicted).abs();
@@ -1159,6 +927,123 @@ pub fn median_polish_residual_ratio(polish: &TukeyMedianPolishResult) -> f64 {
     }
 
     sum_abs_residual / sum_observed
+}
+
+/// Minimum per-fragment R² with the shared elution profile.
+///
+/// For each fragment row: compute R² of sqrt(observed) vs sqrt(predicted) across scans.
+/// `predicted(f,s) = exp(overall + row_effects[f] + col_effects[s])`
+/// `observed(f,s) = exp(overall + row_effects[f] + col_effects[s] + residuals[f][s])`
+/// Returns the minimum R² across fragments (weakest link).
+/// If a fragment has < 3 finite scans, R² = 0.0 for that fragment.
+pub fn median_polish_min_fragment_r2(polish: &TukeyMedianPolishResult) -> f64 {
+    let n_frags = polish.row_effects.len();
+    let n_scans = polish.col_effects.len();
+    if n_frags < 1 || n_scans < 3 {
+        return 0.0;
+    }
+
+    let mut min_r2 = f64::MAX;
+
+    for f in 0..n_frags {
+        let mut pred_vals = Vec::with_capacity(n_scans);
+        let mut obs_vals = Vec::with_capacity(n_scans);
+
+        for s in 0..n_scans {
+            if !polish.residuals[f][s].is_finite() {
+                continue;
+            }
+            let predicted = (polish.overall + polish.row_effects[f] + polish.col_effects[s]).exp();
+            let observed = (polish.overall
+                + polish.row_effects[f]
+                + polish.col_effects[s]
+                + polish.residuals[f][s])
+                .exp();
+            pred_vals.push(predicted.sqrt());
+            obs_vals.push(observed.sqrt());
+        }
+
+        let r2 = if pred_vals.len() < 3 {
+            0.0
+        } else {
+            compute_r2(&pred_vals, &obs_vals)
+        };
+
+        if r2 < min_r2 {
+            min_r2 = r2;
+        }
+    }
+
+    if min_r2 == f64::MAX {
+        0.0
+    } else {
+        min_r2.max(0.0)
+    }
+}
+
+/// Mean pairwise Pearson correlation of median polish residuals across fragments.
+///
+/// For a clean target, residuals should be uncorrelated noise → correlations ≈ 0.
+/// Correlated residuals suggest a co-eluting interferer affecting multiple fragment channels.
+/// Returns 0.0 if < 2 fragments with sufficient data.
+pub fn median_polish_residual_correlation(polish: &TukeyMedianPolishResult) -> f64 {
+    let n_frags = polish.row_effects.len();
+    let n_scans = polish.col_effects.len();
+    if n_frags < 2 || n_scans < 3 {
+        return 0.0;
+    }
+
+    // Pairwise Pearson correlations using only scans where BOTH fragments
+    // have finite residuals. NaN cells (zero observed intensity) would create
+    // artificial correlation structure if replaced with 0.0.
+    let mut corr_sum = 0.0;
+    let mut n_pairs = 0;
+
+    for i in 0..n_frags {
+        for j in (i + 1)..n_frags {
+            // Collect residuals at scans where both fragments are finite
+            let mut ri = Vec::with_capacity(n_scans);
+            let mut rj = Vec::with_capacity(n_scans);
+            for s in 0..n_scans {
+                if polish.residuals[i][s].is_finite() && polish.residuals[j][s].is_finite() {
+                    ri.push(polish.residuals[i][s]);
+                    rj.push(polish.residuals[j][s]);
+                }
+            }
+            if ri.len() >= 3 {
+                let r = pearson_correlation_raw(&ri, &rj);
+                if r.is_finite() {
+                    corr_sum += r;
+                    n_pairs += 1;
+                }
+            }
+        }
+    }
+
+    if n_pairs == 0 {
+        0.0
+    } else {
+        corr_sum / n_pairs as f64
+    }
+}
+
+/// Compute R² (coefficient of determination) between predicted and observed values.
+fn compute_r2(predicted: &[f64], observed: &[f64]) -> f64 {
+    let n = predicted.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let obs_mean = observed.iter().sum::<f64>() / n as f64;
+    let ss_tot: f64 = observed.iter().map(|&o| (o - obs_mean).powi(2)).sum();
+    let ss_res: f64 = predicted
+        .iter()
+        .zip(observed.iter())
+        .map(|(&p, &o)| (o - p).powi(2))
+        .sum();
+    if ss_tot < 1e-30 {
+        return 0.0;
+    }
+    (1.0 - ss_res / ss_tot).max(0.0)
 }
 
 /// Compute fragment-based FWHM and peak boundaries using Tukey median polish.
@@ -1376,35 +1261,6 @@ pub fn compute_fwhm_interpolated(series: &[(f64, f64)]) -> Option<(f64, f64, f64
     } else {
         None
     }
-}
-
-/// Calculate signal-to-noise ratio from a time series.
-///
-/// Uses FWHM-based peak boundaries (±1.96σ) to define the peak region.
-/// Background is measured from 3-5 points on each side outside these boundaries.
-/// SNR = (apex - background_mean) / background_sd.
-///
-/// Works on any (RT, value) series — coefficient series or fragment XICs.
-pub fn compute_signal_to_noise(
-    series: &[(f64, f64)],
-    apex_idx: usize,
-    apex_value: f64,
-) -> Option<f64> {
-    if series.len() < 10 || apex_value <= 0.0 {
-        return None;
-    }
-
-    let bg = compute_background_stats(series, apex_idx)?;
-
-    if bg.sd <= 1e-10 {
-        return None;
-    }
-
-    // S/N = (signal - background) / noise
-    let signal = apex_value - bg.mean;
-    let snr = signal / bg.sd;
-
-    Some(snr.max(0.0))
 }
 
 /// Background statistics from flanking points outside the peak region.
@@ -1756,11 +1612,13 @@ impl SpectralScorer {
                 j += 1;
             }
 
-            // Raw intensities for Pearson/Spearman (0 for unmatched)
+            // Raw intensities for base_peak_rank (0 for unmatched)
             lib_intensities.push(frag.relative_intensity as f64);
             obs_intensities.push(best_intensity);
 
-            // Sqrt-preprocessed for cosine (0 for unmatched)
+            // Sqrt-preprocessed for cosine, Pearson, and Spearman (0 for unmatched).
+            // Sqrt compresses the dynamic range so all fragments contribute more
+            // equally, rather than being dominated by a single high-intensity peak.
             lib_preprocessed.push((frag.relative_intensity as f64).sqrt());
             obs_preprocessed.push(best_intensity.sqrt());
         }
@@ -1783,9 +1641,12 @@ impl SpectralScorer {
             .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
             .sum();
 
-        // Pearson and Spearman use all fragments (0 for unmatched is informative)
-        let pearson_correlation = Self::pearson_correlation(&lib_intensities, &obs_intensities);
-        let spearman_correlation = Self::spearman_correlation(&lib_intensities, &obs_intensities);
+        // Pearson and Spearman use sqrt-preprocessed intensities including zeros
+        // for unmatched fragments. The zeros are essential — they penalize missing
+        // matches. Without them, a decoy with 2 random matches would score higher
+        // than a target with 6 matches but some noise.
+        let pearson_correlation = Self::pearson_correlation(&lib_preprocessed, &obs_preprocessed);
+        let spearman_correlation = Self::spearman_correlation(&lib_preprocessed, &obs_preprocessed);
 
         // Counting metrics use matched fragments only (presence-based)
         let n_matched = matches.len() as u32;
@@ -1812,6 +1673,29 @@ impl SpectralScorer {
         // Compute X!Tandem hyperscore
         let (hyperscore_val, n_matched_b, n_matched_y) = self.hyperscore(observed, library);
 
+        // Compute top-N cosine variants (top 6, 5, 4 library fragments by intensity).
+        // Sort fragment pairs by library intensity descending, then compute cosine
+        // on the top N. Peptides with fewer than N fragments use all available.
+        let mut frag_data: Vec<(f64, f64, f64)> = lib_intensities
+            .iter()
+            .zip(obs_intensities.iter())
+            .zip(
+                library
+                    .fragments
+                    .iter()
+                    .filter(|f| f.mz >= spec_mz_min && f.mz <= spec_mz_max),
+            )
+            .map(|((lib, obs), frag)| (*lib, *obs, frag.mz))
+            .collect();
+        frag_data.sort_by(|a, b| b.0.total_cmp(&a.0)); // descending by lib intensity
+
+        let dot_product_top6 = Self::cosine_topn_sqrt(&frag_data, 6);
+        let dot_product_top5 = Self::cosine_topn_sqrt(&frag_data, 5);
+        let dot_product_top4 = Self::cosine_topn_sqrt(&frag_data, 4);
+        let dot_product_smz_top6 = Self::cosine_topn_smz(&frag_data, 6);
+        let dot_product_smz_top5 = Self::cosine_topn_smz(&frag_data, 5);
+        let dot_product_smz_top4 = Self::cosine_topn_smz(&frag_data, 4);
+
         SpectralScore {
             lib_cosine: dot_product,
             lib_cosine_smz,
@@ -1830,7 +1714,62 @@ impl SpectralScorer {
             top6_matches,
             n_matched_b,
             n_matched_y,
+            dot_product_top6,
+            dot_product_top5,
+            dot_product_top4,
+            dot_product_smz_top6,
+            dot_product_smz_top5,
+            dot_product_smz_top4,
         }
+    }
+
+    /// Compute cosine similarity on the top N fragments (by library intensity)
+    /// using sqrt preprocessing. `frag_data` must be sorted by library intensity
+    /// descending. Each entry is (lib_intensity_raw, obs_intensity_raw, mz).
+    fn cosine_topn_sqrt(frag_data: &[(f64, f64, f64)], n: usize) -> f64 {
+        let subset = &frag_data[..frag_data.len().min(n)];
+        if subset.len() < 2 {
+            return 0.0;
+        }
+        let lib_sqrt: Vec<f64> = subset.iter().map(|(lib, _, _)| lib.sqrt()).collect();
+        let obs_sqrt: Vec<f64> = subset.iter().map(|(_, obs, _)| obs.sqrt()).collect();
+        let lib_norm = lib_sqrt.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let obs_norm = obs_sqrt.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if lib_norm < 1e-10 || obs_norm < 1e-10 {
+            return 0.0;
+        }
+        lib_sqrt
+            .iter()
+            .zip(obs_sqrt.iter())
+            .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
+            .sum()
+    }
+
+    /// Compute cosine similarity on the top N fragments (by library intensity)
+    /// using SMZ preprocessing (sqrt(intensity) * mz²).
+    fn cosine_topn_smz(frag_data: &[(f64, f64, f64)], n: usize) -> f64 {
+        let subset = &frag_data[..frag_data.len().min(n)];
+        if subset.len() < 2 {
+            return 0.0;
+        }
+        let lib_smz: Vec<f64> = subset
+            .iter()
+            .map(|(lib, _, mz)| lib.sqrt() * mz * mz)
+            .collect();
+        let obs_smz: Vec<f64> = subset
+            .iter()
+            .map(|(_, obs, mz)| obs.sqrt() * mz * mz)
+            .collect();
+        let lib_norm = lib_smz.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let obs_norm = obs_smz.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if lib_norm < 1e-10 || obs_norm < 1e-10 {
+            return 0.0;
+        }
+        lib_smz
+            .iter()
+            .zip(obs_smz.iter())
+            .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
+            .sum()
     }
 
     /// Compute Pearson correlation coefficient
@@ -2100,23 +2039,8 @@ impl SpectralScorer {
         let xcorr_scaled = xcorr_raw * 0.005f32;
 
         SpectralScore {
-            lib_cosine: lib_cosine_score.lib_cosine,
-            lib_cosine_smz: lib_cosine_score.lib_cosine_smz,
             xcorr: xcorr_scaled as f64,
-            hyperscore: lib_cosine_score.hyperscore,
-            dot_product: lib_cosine_score.dot_product,
-            n_matched: lib_cosine_score.n_matched,
-            n_library: lib_cosine_score.n_library,
-            fragment_coverage: lib_cosine_score.fragment_coverage,
-            explained_intensity: lib_cosine_score.explained_intensity,
-            pearson_correlation: lib_cosine_score.pearson_correlation,
-            spearman_correlation: lib_cosine_score.spearman_correlation,
-            consecutive_ions: lib_cosine_score.consecutive_ions,
-            sequence_coverage: lib_cosine_score.sequence_coverage,
-            base_peak_rank: lib_cosine_score.base_peak_rank,
-            top6_matches: lib_cosine_score.top6_matches,
-            n_matched_b: lib_cosine_score.n_matched_b,
-            n_matched_y: lib_cosine_score.n_matched_y,
+            ..lib_cosine_score
         }
     }
 
@@ -2371,6 +2295,24 @@ impl SpectralScorer {
         self.apply_sliding_window(&windowed)
     }
 
+    /// Lightweight XCorr for a single spectrum — no LibCosine overhead.
+    ///
+    /// Preprocesses the spectrum (bin + window + sliding window subtraction),
+    /// then sums the preprocessed values at library fragment bin positions × 0.005.
+    pub fn xcorr_at_scan(&self, spectrum: &Spectrum, library: &LibraryEntry) -> f64 {
+        if library.fragments.is_empty() || spectrum.mzs.is_empty() {
+            return 0.0;
+        }
+        let preprocessed = self.preprocess_spectrum_for_xcorr(spectrum);
+        let xcorr_raw: f32 = library
+            .fragments
+            .iter()
+            .filter_map(|frag| self.bin_config.mz_to_bin(frag.mz))
+            .map(|bin| preprocessed[bin])
+            .sum();
+        (xcorr_raw * 0.005) as f64
+    }
+
     /// Preprocess a library entry for XCorr (Comet-style)
     ///
     /// Returns a preprocessed vector ready for dot product with spectrum vectors.
@@ -2463,6 +2405,18 @@ pub struct SpectralScore {
     pub n_matched_b: u32,
     /// Number of matched y-ions (for hyperscore)
     pub n_matched_y: u32,
+    /// LibCosine using only top 6 library fragments by intensity
+    pub dot_product_top6: f64,
+    /// LibCosine using only top 5 library fragments by intensity
+    pub dot_product_top5: f64,
+    /// LibCosine using only top 4 library fragments by intensity
+    pub dot_product_top4: f64,
+    /// SMZ cosine using only top 6 library fragments by intensity
+    pub dot_product_smz_top6: f64,
+    /// SMZ cosine using only top 5 library fragments by intensity
+    pub dot_product_smz_top5: f64,
+    /// SMZ cosine using only top 4 library fragments by intensity
+    pub dot_product_smz_top4: f64,
 }
 
 /// Fragment matching result with observed m/z for mass accuracy computation
@@ -2601,7 +2555,7 @@ impl SpectrumAggregator {
 
     /// Aggregate spectra weighted by coefficient values
     ///
-    /// Uses ridge regression coefficients to weight the contribution
+    /// Uses coefficient values to weight the contribution
     /// of each scan to the aggregated spectrum.
     pub fn aggregate_weighted(
         &self,
@@ -2713,597 +2667,6 @@ impl SpectrumAggregator {
             isolation_window: apex_spectrum.isolation_window,
             mzs: merged_mzs,
             intensities: merged_intensities,
-        }
-    }
-}
-
-/// Contextual information from regression results for a peptide
-///
-/// This aggregates information from multiple regression results (across spectra)
-/// to compute contextual features like n_competitors and relative_coefficient.
-#[derive(Debug, Clone, Default)]
-pub struct RegressionContext {
-    /// Average number of competitors per spectrum
-    pub avg_n_competitors: f64,
-    /// Maximum number of competitors seen
-    pub max_n_competitors: u32,
-    /// Average relative coefficient (this peptide / sum of all in spectrum)
-    pub avg_relative_coefficient: f64,
-    /// Maximum relative coefficient
-    pub max_relative_coefficient: f64,
-    /// Average regression residual
-    pub avg_residual: f64,
-    /// Average explained variance (1 - residual / ||b||²)
-    pub avg_explained_variance: f64,
-    /// Number of spectra this peptide appeared in
-    pub n_spectra: u32,
-    /// Spectral complexity estimate (average number of peaks)
-    pub avg_spectral_complexity: f64,
-}
-
-impl RegressionContext {
-    /// Build regression context from regression results for a specific peptide
-    pub fn from_results(results: &[&osprey_core::RegressionResult], lib_id: u32) -> Self {
-        if results.is_empty() {
-            return Self::default();
-        }
-
-        let n = results.len() as f64;
-        let mut total_competitors = 0.0;
-        let mut max_competitors = 0u32;
-        let mut total_relative_coef = 0.0;
-        let mut max_relative_coef = 0.0f64;
-        let mut total_residual = 0.0;
-        let mut total_explained_var = 0.0;
-
-        for result in results {
-            total_competitors += result.n_candidates as f64;
-            max_competitors = max_competitors.max(result.n_candidates);
-
-            let rel_coef = result.relative_coefficient(lib_id);
-            total_relative_coef += rel_coef;
-            max_relative_coef = max_relative_coef.max(rel_coef);
-
-            total_residual += result.residual;
-            total_explained_var += result.explained_variance();
-        }
-
-        Self {
-            avg_n_competitors: total_competitors / n,
-            max_n_competitors: max_competitors,
-            avg_relative_coefficient: total_relative_coef / n,
-            max_relative_coefficient: max_relative_coef,
-            avg_residual: total_residual / n,
-            avg_explained_variance: total_explained_var / n,
-            n_spectra: results.len() as u32,
-            avg_spectral_complexity: 0.0, // Computed separately if needed
-        }
-    }
-}
-
-/// Feature extractor for peptide candidates
-#[derive(Debug, Default)]
-pub struct FeatureExtractor {
-    /// Spectral scorer for computing similarity metrics
-    spectral_scorer: SpectralScorer,
-    /// Spectrum aggregator for combining scans
-    spectrum_aggregator: SpectrumAggregator,
-}
-
-impl FeatureExtractor {
-    /// Create a new feature extractor
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create a feature extractor with custom spectral scorer
-    pub fn with_scorer(spectral_scorer: SpectralScorer) -> Self {
-        Self {
-            spectral_scorer,
-            spectrum_aggregator: SpectrumAggregator::default(),
-        }
-    }
-
-    /// Create a feature extractor with custom scorer and aggregator
-    pub fn with_scorer_and_aggregator(
-        spectral_scorer: SpectralScorer,
-        spectrum_aggregator: SpectrumAggregator,
-    ) -> Self {
-        Self {
-            spectral_scorer,
-            spectrum_aggregator,
-        }
-    }
-
-    /// Get the spectrum aggregator
-    pub fn aggregator(&self) -> &SpectrumAggregator {
-        &self.spectrum_aggregator
-    }
-
-    /// Extract features using spectrum aggregation across peak apex region
-    ///
-    /// FR-5.2.1: This method aggregates spectra around the peak apex before
-    /// computing spectral features, providing more robust scoring.
-    ///
-    /// Parameters:
-    /// - `entry`: The library entry being scored
-    /// - `coefficient_series`: Vec of (retention_time, coefficient) pairs
-    /// - `spectra`: All spectra in the peak region
-    /// - `expected_rt`: Optional expected retention time
-    pub fn extract_with_aggregation(
-        &self,
-        entry: &LibraryEntry,
-        coefficient_series: &[(f64, f64)],
-        spectra: &[&Spectrum],
-        expected_rt: Option<f64>,
-    ) -> FeatureSet {
-        // Find apex RT from coefficient series
-        let apex_rt = coefficient_series
-            .iter()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(rt, _)| *rt)
-            .unwrap_or(entry.retention_time);
-
-        // Aggregate spectra around apex (FR-5.2.1)
-        let aggregated =
-            self.spectrum_aggregator
-                .aggregate_weighted(spectra, coefficient_series, apex_rt);
-
-        // Extract features using the aggregated spectrum
-        self.extract_with_expected_rt(entry, coefficient_series, Some(&aggregated), expected_rt)
-    }
-
-    /// Extract features for a peptide candidate
-    ///
-    /// Computes both chromatographic features (from coefficient series) and
-    /// spectral features (from apex spectrum comparison to library).
-    ///
-    /// Parameters:
-    /// - `entry`: The library entry being scored
-    /// - `coefficient_series`: Vec of (retention_time, coefficient) pairs
-    /// - `apex_spectrum`: Optional spectrum at peak apex for spectral scoring
-    /// - `expected_rt`: Optional expected retention time for RT deviation calculation
-    pub fn extract(
-        &self,
-        entry: &LibraryEntry,
-        coefficient_series: &[(f64, f64)],
-        apex_spectrum: Option<&Spectrum>,
-    ) -> FeatureSet {
-        self.extract_with_expected_rt(entry, coefficient_series, apex_spectrum, None)
-    }
-
-    /// Extract features with expected RT for deviation calculation
-    pub fn extract_with_expected_rt(
-        &self,
-        entry: &LibraryEntry,
-        coefficient_series: &[(f64, f64)],
-        apex_spectrum: Option<&Spectrum>,
-        expected_rt: Option<f64>,
-    ) -> FeatureSet {
-        // Percolator-style sequence features
-        let seq_bytes = entry.sequence.as_bytes();
-        let missed_cleavages = seq_bytes
-            .iter()
-            .take(seq_bytes.len().saturating_sub(1)) // exclude C-terminal
-            .filter(|&&b| b == b'K' || b == b'R')
-            .count() as u32;
-
-        let mut features = FeatureSet {
-            peptide_length: entry.sequence.len() as u32,
-            missed_cleavages,
-            ..Default::default()
-        };
-
-        // Chromatographic features from coefficient series (FR-5.1.*)
-        if !coefficient_series.is_empty() {
-            // FR-5.1.1: Peak apex coefficient (maximum value)
-            let (apex_idx, apex_value) = coefficient_series
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                .map(|(i, (_, c))| (i, *c))
-                .unwrap_or((0, 0.0));
-
-            let apex_rt = coefficient_series
-                .get(apex_idx)
-                .map(|(rt, _)| *rt)
-                .unwrap_or(0.0);
-
-            // Compute FWHM-based peak boundaries for background subtraction
-            let fwhm_info = compute_fwhm_interpolated(coefficient_series);
-            let bg_stats = compute_background_stats(coefficient_series, apex_idx);
-            let bg_mean = bg_stats.as_ref().map(|bg| bg.mean).unwrap_or(0.0);
-
-            // Peak apex: background-subtracted (signal above baseline)
-            features.peak_apex = (apex_value - bg_mean).max(0.0);
-
-            // FR-5.1.2: Integrated peak area (trapezoidal, background-subtracted)
-            // Use FWHM-based boundaries (±1.96σ) for integration region
-            if let Some((fwhm, _, _)) = fwhm_info {
-                let sigma = fwhm / 2.355;
-                let boundary_width = 1.96 * sigma;
-                let left_boundary = apex_rt - boundary_width;
-                let right_boundary = apex_rt + boundary_width;
-
-                // Trapezoidal area of signal within peak boundaries
-                let signal_area =
-                    compute_trapezoidal_area(coefficient_series, left_boundary, right_boundary);
-                // Baseline area = bg_mean × peak width
-                let baseline_area = bg_mean * (right_boundary - left_boundary);
-                features.peak_area = (signal_area - baseline_area).max(0.0);
-
-                // FR-5.1.4: Peak width (FWHM with linear interpolation)
-                features.peak_width = fwhm;
-            } else {
-                // Fallback: trapezoidal area over full series, no background subtraction
-                features.peak_area = compute_trapezoidal_area(
-                    coefficient_series,
-                    coefficient_series.first().map(|(rt, _)| *rt).unwrap_or(0.0),
-                    coefficient_series.last().map(|(rt, _)| *rt).unwrap_or(0.0),
-                );
-            }
-
-            // FR-5.1.8: Number of contributing scans
-            features.n_contributing_scans =
-                coefficient_series.iter().filter(|(_, c)| *c > 0.0).count() as u32;
-
-            // FR-5.1.5: Peak symmetry (leading/trailing ratio)
-            features.peak_symmetry = self.compute_peak_symmetry(coefficient_series, apex_idx);
-
-            // FR-5.1.6 & FR-5.1.7: RT deviation
-            if let Some(expected) = expected_rt.or(Some(entry.retention_time)) {
-                features.rt_deviation = apex_rt - expected;
-                features.abs_rt_deviation = features.rt_deviation.abs();
-                // Normalized deviation (use FWHM as uncertainty proxy)
-                if features.peak_width > 0.0 {
-                    features.rt_deviation_normalized = features.rt_deviation / features.peak_width;
-                }
-            }
-
-            // FR-5.1.9: Coefficient stability (variance near apex)
-            features.coefficient_stability =
-                self.compute_coefficient_stability(coefficient_series, apex_idx);
-
-            // FR-5.1.10: Peak boundary sharpness
-            features.peak_sharpness = self.compute_peak_sharpness(coefficient_series, apex_idx);
-
-            // FR-5.1.11: Peak prominence (apex / baseline)
-            features.peak_prominence = self.compute_peak_prominence(coefficient_series, apex_value);
-
-            // FR-5.1.12: Signal-to-noise ratio
-            if let Some(snr) =
-                self.compute_signal_to_noise(coefficient_series, apex_idx, apex_value)
-            {
-                features.signal_to_noise = snr;
-            }
-
-            // FR-5.1.3: EMG fit quality (simplified - use symmetry as proxy)
-            // Full EMG fitting would go here, but for now use a heuristic
-            features.emg_fit_quality = self.estimate_emg_quality(coefficient_series, apex_idx);
-        }
-
-        // Spectral features from apex spectrum (FR-5.2.*)
-        if let Some(spectrum) = apex_spectrum {
-            // Compute both LibCosine and XCorr scores
-            let spectral_score = self.spectral_scorer.xcorr(spectrum, entry);
-
-            // FR-5.2.4: Dot product (LibCosine with sqrt preprocessing)
-            features.dot_product = spectral_score.lib_cosine;
-
-            // LibCosine with sqrt(intensity)*mz² (SMZ) preprocessing
-            features.dot_product_smz = spectral_score.lib_cosine_smz;
-
-            // FR-5.2.3: Normalized spectral contrast angle
-            features.spectral_contrast_angle = (spectral_score.lib_cosine.clamp(-1.0, 1.0))
-                .acos()
-                .to_degrees();
-
-            // FR-5.2.7: Fragment coverage (fraction detected)
-            features.fragment_coverage = spectral_score.fragment_coverage;
-
-            // FR-5.2.12: Explained intensity fraction
-            features.explained_intensity = spectral_score.explained_intensity;
-
-            // FR-5.2.2: X!Tandem Hyperscore: log(n_b!) + log(n_y!) + Σlog(I_f+1)
-            features.hyperscore = spectral_score.hyperscore;
-
-            // XCorr (Comet-style cross-correlation)
-            features.xcorr = spectral_score.xcorr;
-
-            // FR-5.2.5: Pearson intensity correlation
-            features.pearson_correlation = spectral_score.pearson_correlation;
-
-            // FR-5.2.6: Spearman rank correlation
-            features.spearman_correlation = spectral_score.spearman_correlation;
-
-            // FR-5.2.8: Sequence coverage (backbone coverage)
-            features.sequence_coverage = spectral_score.sequence_coverage;
-
-            // FR-5.2.9: Consecutive ion count (longest b/y run)
-            features.consecutive_ions = spectral_score.consecutive_ions;
-
-            // FR-5.2.10: Base peak match rank
-            features.base_peak_rank = spectral_score.base_peak_rank;
-
-            // FR-5.2.11: Top-N match count
-            features.top6_matches = spectral_score.top6_matches;
-        }
-
-        // Count modifications
-        features.modification_count = entry.modifications.len() as u32;
-
-        features
-    }
-
-    /// Extract features with both mixed (apex) and deconvoluted (aggregated) scoring
-    ///
-    /// This computes spectral features twice:
-    /// - Mixed: from the raw observed spectrum at apex (includes interference)
-    /// - Deconvoluted: from coefficient-weighted aggregated spectrum (apex ± 2 scans)
-    ///
-    /// The deconvoluted features weight each scan's contribution by its regression
-    /// coefficient, emphasizing where this peptide is actually contributing.
-    ///
-    /// Parameters:
-    /// - `entry`: The library entry being scored
-    /// - `coefficient_series`: Vec of (retention_time, coefficient) pairs
-    /// - `spectra`: Full set of spectra for aggregation
-    /// - `expected_rt`: Optional expected retention time
-    pub fn extract_with_deconvolution(
-        &self,
-        entry: &LibraryEntry,
-        coefficient_series: &[(f64, f64)],
-        spectra: &[&Spectrum],
-        expected_rt: Option<f64>,
-    ) -> FeatureSet {
-        // Find apex RT and spectrum
-        let apex_rt = coefficient_series
-            .iter()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(rt, _)| *rt)
-            .unwrap_or(entry.retention_time);
-
-        // Find apex spectrum index
-        let apex_spectrum = spectra
-            .iter()
-            .min_by(|a, b| {
-                (a.retention_time - apex_rt)
-                    .abs()
-                    .partial_cmp(&(b.retention_time - apex_rt).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .copied();
-
-        // First, extract features with mixed (apex) spectrum
-        let mut features =
-            self.extract_with_expected_rt(entry, coefficient_series, apex_spectrum, expected_rt);
-
-        // Now compute deconvoluted features from coefficient-weighted aggregated spectrum
-        if !spectra.is_empty() && !coefficient_series.is_empty() {
-            // Aggregate spectra weighted by coefficients (apex ± 2 scans)
-            let deconv_spectrum =
-                self.spectrum_aggregator
-                    .aggregate_weighted(spectra, coefficient_series, apex_rt);
-
-            // Compute spectral scores on the deconvoluted spectrum
-            let deconv_score = self.spectral_scorer.xcorr(&deconv_spectrum, entry);
-
-            // Populate deconvoluted features
-            features.hyperscore_deconv = deconv_score.hyperscore;
-            features.xcorr_deconv = deconv_score.xcorr;
-            features.dot_product_deconv = deconv_score.lib_cosine;
-            features.dot_product_smz_deconv = deconv_score.lib_cosine_smz;
-            features.fragment_coverage_deconv = deconv_score.fragment_coverage;
-            features.sequence_coverage_deconv = deconv_score.sequence_coverage;
-            features.consecutive_ions_deconv = deconv_score.consecutive_ions;
-            features.top6_matches_deconv = deconv_score.top6_matches;
-        }
-
-        features
-    }
-
-    /// Apply contextual features from regression context
-    ///
-    /// Call this after extract() or extract_with_expected_rt() to add
-    /// contextual features computed from regression results.
-    pub fn apply_regression_context(features: &mut FeatureSet, context: &RegressionContext) {
-        // FR-5.3.1: Number of competing candidates
-        features.n_competitors = context.max_n_competitors;
-
-        // FR-5.3.2: Relative coefficient (our coefficient / sum of all)
-        features.relative_coefficient = context.max_relative_coefficient;
-
-        // FR-5.3.3: Local peptide density (using avg competitors as proxy)
-        features.local_peptide_density = context.avg_n_competitors;
-
-        // FR-5.3.4: Spectral complexity
-        features.spectral_complexity = context.avg_spectral_complexity;
-
-        // FR-5.3.5: Regression residual (average across contributing spectra)
-        features.regression_residual = context.avg_residual;
-
-        // Percolator-style: ln(number of candidates) — lnNumSP analog
-        features.ln_num_candidates = (context.max_n_competitors.max(1) as f64).ln();
-    }
-
-    /// Extract features with full context (chromatographic, spectral, and contextual)
-    ///
-    /// This is the recommended method when regression context is available.
-    pub fn extract_full(
-        &self,
-        entry: &LibraryEntry,
-        coefficient_series: &[(f64, f64)],
-        apex_spectrum: Option<&Spectrum>,
-        expected_rt: Option<f64>,
-        context: Option<&RegressionContext>,
-    ) -> FeatureSet {
-        let mut features =
-            self.extract_with_expected_rt(entry, coefficient_series, apex_spectrum, expected_rt);
-
-        if let Some(ctx) = context {
-            Self::apply_regression_context(&mut features, ctx);
-        }
-
-        features
-    }
-
-    /// Compute peak symmetry (leading half area / trailing half area)
-    fn compute_peak_symmetry(&self, series: &[(f64, f64)], apex_idx: usize) -> f64 {
-        if series.len() < 3 || apex_idx == 0 || apex_idx >= series.len() - 1 {
-            return 1.0; // Default to symmetric
-        }
-
-        // Sum coefficients before and after apex
-        let leading_area: f64 = series[..apex_idx].iter().map(|(_, c)| c).sum();
-        let trailing_area: f64 = series[apex_idx + 1..].iter().map(|(_, c)| c).sum();
-
-        if trailing_area > 1e-10 {
-            leading_area / trailing_area
-        } else if leading_area > 1e-10 {
-            f64::MAX // Infinitely asymmetric
-        } else {
-            1.0
-        }
-    }
-
-    /// Compute coefficient stability (inverse of variance near apex)
-    fn compute_coefficient_stability(&self, series: &[(f64, f64)], apex_idx: usize) -> f64 {
-        // Take 5 points centered on apex
-        let start = apex_idx.saturating_sub(2);
-        let end = (apex_idx + 3).min(series.len());
-
-        if end <= start + 1 {
-            return 0.0;
-        }
-
-        let window: Vec<f64> = series[start..end].iter().map(|(_, c)| *c).collect();
-        let mean: f64 = window.iter().sum::<f64>() / window.len() as f64;
-        let variance: f64 =
-            window.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / window.len() as f64;
-
-        // Return inverse of coefficient of variation (higher = more stable)
-        if mean > 1e-10 {
-            mean / (variance.sqrt() + 1e-10)
-        } else {
-            0.0
-        }
-    }
-
-    /// Compute peak sharpness (slope at boundaries)
-    fn compute_peak_sharpness(&self, series: &[(f64, f64)], apex_idx: usize) -> f64 {
-        if series.len() < 3 {
-            return 0.0;
-        }
-
-        let apex_coef = series[apex_idx].1;
-
-        // Compute average slope from apex to boundaries
-        let mut total_slope = 0.0;
-        let mut count = 0;
-
-        // Slope going left from apex
-        if apex_idx > 0 {
-            let dt = series[apex_idx].0 - series[0].0;
-            if dt > 0.0 {
-                total_slope += (apex_coef - series[0].1) / dt;
-                count += 1;
-            }
-        }
-
-        // Slope going right from apex
-        if apex_idx < series.len() - 1 {
-            let dt = series[series.len() - 1].0 - series[apex_idx].0;
-            if dt > 0.0 {
-                total_slope += (apex_coef - series[series.len() - 1].1) / dt;
-                count += 1;
-            }
-        }
-
-        if count > 0 {
-            total_slope / count as f64
-        } else {
-            0.0
-        }
-    }
-
-    /// Compute peak prominence (apex / local baseline)
-    fn compute_peak_prominence(&self, series: &[(f64, f64)], apex_value: f64) -> f64 {
-        if series.is_empty() {
-            return 0.0;
-        }
-
-        // Estimate baseline from minimum values at edges
-        let edge_values: Vec<f64> = series
-            .iter()
-            .take(3)
-            .chain(series.iter().rev().take(3))
-            .map(|(_, c)| *c)
-            .collect();
-
-        let baseline = edge_values
-            .iter()
-            .cloned()
-            .fold(f64::MAX, f64::min)
-            .max(0.0);
-
-        if baseline > 1e-10 {
-            apex_value / baseline
-        } else if apex_value > 0.0 {
-            apex_value / 1e-10 // Very high prominence
-        } else {
-            0.0
-        }
-    }
-
-    /// Calculate signal-to-noise ratio from coefficient series
-    fn compute_signal_to_noise(
-        &self,
-        series: &[(f64, f64)],
-        apex_idx: usize,
-        apex_value: f64,
-    ) -> Option<f64> {
-        compute_signal_to_noise(series, apex_idx, apex_value)
-    }
-
-    /// Estimate EMG fit quality (heuristic based on peak shape)
-    fn estimate_emg_quality(&self, series: &[(f64, f64)], apex_idx: usize) -> f64 {
-        if series.len() < 5 {
-            return 0.0;
-        }
-
-        // Simple heuristic: measure how Gaussian-like the peak is
-        // by comparing expected and actual half-width points
-        let apex_coef = series[apex_idx].1;
-        let half_max = apex_coef / 2.0;
-
-        // Find actual half-width points
-        let mut left_half_idx = apex_idx;
-        let mut right_half_idx = apex_idx;
-
-        for i in (0..apex_idx).rev() {
-            if series[i].1 < half_max {
-                left_half_idx = i;
-                break;
-            }
-        }
-
-        for (i, entry) in series.iter().enumerate().skip(apex_idx + 1) {
-            if entry.1 < half_max {
-                right_half_idx = i;
-                break;
-            }
-        }
-
-        // For a Gaussian, we expect roughly symmetric FWHM
-        let left_half = apex_idx - left_half_idx;
-        let right_half = right_half_idx - apex_idx;
-
-        if left_half > 0 && right_half > 0 {
-            // Ratio closer to 1.0 = more symmetric = better fit
-            // Value between 0 and 1
-            left_half.min(right_half) as f64 / left_half.max(right_half) as f64
-        } else {
-            0.5 // Default if we can't measure
         }
     }
 }
@@ -4027,23 +3390,6 @@ mod tests {
     use super::*;
     use osprey_core::IsolationWindow;
 
-    /// Verifies that FeatureExtractor computes correct peak apex, area, and scan count from a coefficient time series.
-    #[test]
-    fn test_feature_extractor() {
-        let extractor = FeatureExtractor::new();
-        let entry = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
-
-        let series = vec![(9.0, 0.1), (10.0, 1.0), (11.0, 0.5)];
-        let features = extractor.extract(&entry, &series, None);
-
-        // peak_apex: bg-subtracted, but only 3 points so bg_mean = 0.0 (fallback)
-        assert!((features.peak_apex - 1.0).abs() < 1e-6);
-        // peak_area: trapezoidal integration within FWHM-based boundaries
-        // With 3 points: trap area = (0.1+1.0)/2*1 + (1.0+0.5)/2*1 = 0.55 + 0.75 = 1.3
-        assert!((features.peak_area - 1.3).abs() < 1e-6);
-        assert_eq!(features.n_contributing_scans, 3);
-    }
-
     /// Verifies that LibCosine scorer returns a score near 1.0 when the observed spectrum perfectly matches the library entry.
     #[test]
     fn test_spectral_scorer_lib_cosine() {
@@ -4213,53 +3559,6 @@ mod tests {
         assert!(
             score.xcorr != 0.0 || score.lib_cosine > 0.9,
             "Should have some score"
-        );
-    }
-
-    /// Verifies that FeatureExtractor computes both chromatographic and spectral features when given an apex spectrum.
-    #[test]
-    fn test_feature_extractor_with_spectrum() {
-        let extractor = FeatureExtractor::new();
-
-        // Create library entry with fragments
-        let mut entry = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
-        entry.fragments = vec![
-            LibraryFragment {
-                mz: 300.0,
-                relative_intensity: 100.0,
-                annotation: FragmentAnnotation::default(),
-            },
-            LibraryFragment {
-                mz: 400.0,
-                relative_intensity: 50.0,
-                annotation: FragmentAnnotation::default(),
-            },
-        ];
-
-        // Create apex spectrum
-        let spectrum = Spectrum {
-            scan_number: 1,
-            retention_time: 10.0,
-            precursor_mz: 500.0,
-            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
-            mzs: vec![300.0, 400.0],
-            intensities: vec![100.0, 50.0],
-        };
-
-        let series = vec![(9.0, 0.1), (10.0, 1.0), (11.0, 0.5)];
-        let features = extractor.extract(&entry, &series, Some(&spectrum));
-
-        // Chromatographic features should be computed
-        assert!((features.peak_apex - 1.0).abs() < 1e-6);
-
-        // Spectral features should be computed
-        assert!(
-            features.dot_product > 0.9,
-            "Dot product should be high for matching spectrum"
-        );
-        assert!(
-            (features.fragment_coverage - 1.0).abs() < 1e-6,
-            "All fragments should match"
         );
     }
 
