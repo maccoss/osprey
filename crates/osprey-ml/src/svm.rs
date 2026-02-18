@@ -293,31 +293,32 @@ fn count_passing_targets_svm(
     }
 
     // Compete each pair: winner enters ranked list
-    let mut winners: Vec<(f64, bool)> = Vec::with_capacity(targets.len());
-    for (base_id, &(_idx, target_score)) in &targets {
-        let decoy_score = decoys.get(base_id).copied().unwrap_or(f64::NEG_INFINITY);
+    // Include base_id for deterministic tiebreaking in sort
+    let mut winners: Vec<(f64, bool, u32)> = Vec::with_capacity(targets.len());
+    for (&base_id, &(_idx, target_score)) in &targets {
+        let decoy_score = decoys.get(&base_id).copied().unwrap_or(f64::NEG_INFINITY);
         if target_score > decoy_score {
-            winners.push((target_score, false)); // target wins
+            winners.push((target_score, false, base_id)); // target wins
         } else {
-            winners.push((decoy_score, true)); // decoy wins (including ties)
+            winners.push((decoy_score, true, base_id)); // decoy wins (including ties)
         }
     }
     // Add unpaired decoys
-    for (base_id, &decoy_score) in &decoys {
-        if !targets.contains_key(base_id) {
-            winners.push((decoy_score, true));
+    for (&base_id, &decoy_score) in &decoys {
+        if !targets.contains_key(&base_id) {
+            winners.push((decoy_score, true, base_id));
         }
     }
 
-    // Sort by score descending
-    winners.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // Sort by score descending, then base_id ascending for deterministic tiebreaking
+    winners.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2.cmp(&b.2)));
 
     // Walk and compute FDR = (n_decoy + 1) / n_target
     let mut n_target = 0usize;
     let mut n_decoy = 0usize;
     let mut max_passing = 0usize;
 
-    for &(_, is_decoy) in &winners {
+    for &(_, is_decoy, _) in &winners {
         if is_decoy {
             n_decoy += 1;
         } else {
@@ -780,5 +781,58 @@ mod tests {
         // Weights should be similar magnitude (both features equally important)
         let ratio = model.weights()[0] / model.weights()[1];
         assert!(ratio > 0.3 && ratio < 3.0, "weight ratio={:.3}", ratio);
+    }
+
+    /// Verifies count_passing_targets_svm() returns deterministic results with tied scores.
+    ///
+    /// Previously, HashMap iteration order caused different sort orderings for entries
+    /// with tied scores, producing different FDR walk results. The fix adds base_id
+    /// as a secondary sort key. This test creates tied scores and verifies consistency.
+    #[test]
+    fn test_count_passing_targets_svm_deterministic() {
+        // Create 10 targets and 10 decoys where some targets have tied scores.
+        // Targets 1-5 score 0.9 (tied), targets 6-10 score 0.6.
+        // Decoys all score 0.1 (all targets win competition).
+        let mut scores = Vec::new();
+        let mut labels = Vec::new();
+        let mut entry_ids = Vec::new();
+
+        // Targets with tied scores
+        for id in 1..=5u32 {
+            scores.push(0.9);
+            labels.push(false);
+            entry_ids.push(id);
+        }
+        for id in 6..=10u32 {
+            scores.push(0.6);
+            labels.push(false);
+            entry_ids.push(id);
+        }
+        // Decoys
+        for id in 1..=10u32 {
+            scores.push(0.1);
+            labels.push(true);
+            entry_ids.push(id | 0x80000000);
+        }
+
+        let first_result = count_passing_targets_svm(&scores, &labels, &entry_ids, 0.50);
+
+        // Run multiple times — must always produce the same count
+        for _ in 0..20 {
+            let result = count_passing_targets_svm(&scores, &labels, &entry_ids, 0.50);
+            assert_eq!(
+                result, first_result,
+                "count_passing_targets_svm must be deterministic with tied scores"
+            );
+        }
+
+        // With 10 targets winning, 0 decoys in winners, FDR = (0+1)/n_target:
+        // After 1 target: (0+1)/1=100%, after 2: 50%, after 3: 33%, ..., after 10: 10%
+        // At 50% FDR, max_passing where FDR ≤ 50% → n_target=2 gives 50%, so passes
+        assert!(
+            first_result >= 2,
+            "Expected at least 2 passing, got {}",
+            first_result
+        );
     }
 }

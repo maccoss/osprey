@@ -367,7 +367,7 @@ fn default_max_rt_tolerance() -> f64 {
 }
 
 fn default_use_percentile_tolerance() -> bool {
-    true
+    false
 }
 
 impl Default for RTCalibrationConfig {
@@ -382,8 +382,8 @@ impl Default for RTCalibrationConfig {
             initial_tolerance_fraction: 1.0, // 100% of RT range (no RT filtering, like pyXcorrDIA)
             calibration_sample_size: 100000,
             calibration_retry_factor: 2.0,
-            max_rt_tolerance: 3.0,          // Hard cap at 3 minutes
-            use_percentile_tolerance: true, // DIA-NN-style percentile tolerance
+            max_rt_tolerance: 3.0,           // Hard cap at 3 minutes
+            use_percentile_tolerance: false, // Use 3×SD tolerance (covers >99% of peptides)
         }
     }
 }

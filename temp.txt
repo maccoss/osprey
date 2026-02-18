@@ -173,3 +173,4 @@ fragment_coverage
 hyperscore
 sequence_coverage
 median_polish_rsquared
+mass_accuracy_std

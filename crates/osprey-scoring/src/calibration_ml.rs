@@ -585,8 +585,16 @@ fn compete_calibration_pairs(
         }
     }
 
-    // Sort winners by score descending
-    winners.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+    // Sort winners by score descending, then base_id ascending for deterministic tiebreaking.
+    // IMPORTANT: Use base_id (not array index) as tiebreaker. Array indices depend on input
+    // order (HashMap iteration), and if the input is sorted by entry_id, all targets get low
+    // indices → systematic target-before-decoy bias → artificially inflated FDR estimates.
+    // base_id is intrinsic to the entry and doesn't correlate with target/decoy status.
+    winners.sort_by(|&a, &b| {
+        scores[b]
+            .total_cmp(&scores[a])
+            .then((entry_ids[a] & 0x7FFFFFFF).cmp(&(entry_ids[b] & 0x7FFFFFFF)))
+    });
     winners
 }
 
@@ -996,5 +1004,47 @@ mod tests {
         let winners = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
         assert_eq!(winners.len(), 1);
         assert_eq!(winners[0], 3); // decoy wins (0.7 > 0.3)
+    }
+
+    /// Verify that compete_calibration_pairs produces deterministic results with tied scores.
+    ///
+    /// Winners are built from HashMap iteration (non-deterministic order), then sorted
+    /// by score with index as tiebreaker. This test verifies tied-score entries always
+    /// appear in the same order across multiple calls.
+    #[test]
+    fn test_compete_calibration_pairs_deterministic_with_ties() {
+        // 4 pairs, targets all score 0.5 (tied), decoys all score 0.1
+        let scores = vec![
+            0.5, 0.5, 0.5, 0.5, // targets (indices 0-3)
+            0.1, 0.1, 0.1, 0.1, // decoys (indices 4-7)
+        ];
+        let entry_ids: Vec<u32> = vec![
+            10,
+            20,
+            30,
+            40, // targets
+            10 | 0x80000000,
+            20 | 0x80000000,
+            30 | 0x80000000,
+            40 | 0x80000000, // decoys
+        ];
+        let is_decoy = vec![false, false, false, false, true, true, true, true];
+        let indices: Vec<usize> = (0..8).collect();
+
+        let first_result = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+
+        // Run multiple times — HashMap iteration order varies, but output must be stable
+        for _ in 0..20 {
+            let result = compete_calibration_pairs(&scores, &entry_ids, &is_decoy, &indices);
+            assert_eq!(
+                result, first_result,
+                "compete_calibration_pairs must be deterministic with tied scores"
+            );
+        }
+
+        // All targets win (0.5 > 0.1), so winners are target indices
+        assert_eq!(first_result.len(), 4);
+        // With tied scores, winners must be sorted by base_id ascending
+        assert_eq!(first_result, vec![0, 1, 2, 3]);
     }
 }

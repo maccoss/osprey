@@ -80,12 +80,23 @@ impl CalibrationParams {
             self.ms2_calibration.unit,
             self.ms2_calibration.count
         );
-        log::info!(
-            "RT calibration: method={:?}, residual_SD={:.2} min, R²={:.4}",
-            self.rt_calibration.method,
-            self.rt_calibration.residual_sd,
-            self.rt_calibration.r_squared
-        );
+        if let Some(mad) = self.rt_calibration.mad {
+            log::info!(
+                "RT calibration: method={:?}, MAD={:.3} min, robust_SD={:.3} min, residual_SD={:.3} min, R²={:.4}",
+                self.rt_calibration.method,
+                mad,
+                mad * 1.4826,
+                self.rt_calibration.residual_sd,
+                self.rt_calibration.r_squared
+            );
+        } else {
+            log::info!(
+                "RT calibration: method={:?}, residual_SD={:.2} min, R²={:.4}",
+                self.rt_calibration.method,
+                self.rt_calibration.residual_sd,
+                self.rt_calibration.r_squared
+            );
+        }
     }
 }
 
@@ -265,6 +276,10 @@ pub struct RTCalibrationParams {
     /// 20th percentile of absolute residuals (for percentile-based tolerance)
     #[serde(default)]
     pub p20_abs_residual: Option<f64>,
+    /// Median absolute deviation of residuals (robust spread measure)
+    /// Tolerance = 2 × MAD × 1.4826 covers ~95% of peptides
+    #[serde(default)]
+    pub mad: Option<f64>,
 }
 
 /// LOESS model parameters for serialization
@@ -293,6 +308,7 @@ impl RTCalibrationParams {
             r_squared: 0.0,
             model_params: None,
             p20_abs_residual: None,
+            mad: None,
         }
     }
 
@@ -416,6 +432,7 @@ mod tests {
                     abs_residuals: vec![0.1, 0.2, 0.3, 0.4],
                 }),
                 p20_abs_residual: Some(0.15),
+                mad: Some(0.12),
             },
         };
 

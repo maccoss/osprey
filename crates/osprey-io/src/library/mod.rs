@@ -112,6 +112,15 @@ fn deduplicate_library(entries: Vec<LibraryEntry>) -> Vec<LibraryEntry> {
         }
     }
 
+    // Sort deterministically before assigning IDs: HashMap iteration order is random,
+    // so without sorting, entries get different IDs across runs — causing non-deterministic
+    // calibration sampling, tiebreakers, and FDR results.
+    deduped.sort_by(|a, b| {
+        a.modified_sequence
+            .cmp(&b.modified_sequence)
+            .then(a.charge.cmp(&b.charge))
+    });
+
     // Re-assign sequential IDs
     for (i, entry) in deduped.iter_mut().enumerate() {
         entry.id = i as u32;

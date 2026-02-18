@@ -918,14 +918,14 @@ pub fn write_mokapot_report<P: AsRef<Path>>(results: &[MokapotResult], path: P) 
 }
 
 /// Number of PIN features (18).
-pub const NUM_PIN_FEATURES: usize = 18;
+pub const NUM_PIN_FEATURES: usize = 21;
 
 /// Returns the PIN feature header as a tab-separated string.
 fn get_feature_header() -> String {
     get_pin_feature_names().join("\t")
 }
 
-/// Returns the 19 PIN feature names.
+/// Returns the 22 PIN feature names.
 ///
 /// PIN feature names for the scoring feature set.
 /// Note: 26 features temporarily removed (fragment_corr_0..5, fragment_coelution_min,
@@ -947,10 +947,9 @@ pub fn get_pin_feature_names() -> Vec<&'static str> {
         "xcorr",
         "consecutive_ions",
         "explained_intensity",
-        // Mass accuracy (3)
+        // Mass accuracy (2)
         "mass_accuracy_deviation_mean",
         "abs_mass_accuracy_deviation_mean",
-        "mass_accuracy_std",
         // RT deviation (2)
         "rt_deviation",
         "abs_rt_deviation",
@@ -960,13 +959,18 @@ pub fn get_pin_feature_names() -> Vec<&'static str> {
         // Median polish (2)
         "median_polish_cosine",
         "median_polish_residual_ratio",
+        // SG-weighted multi-scan (4)
+        "sg_weighted_xcorr",
+        "sg_weighted_cosine",
+        "median_polish_min_fragment_r2",
+        "median_polish_residual_correlation",
     ]
 }
 
 /// Format features as a tab-separated string for PIN output.
 fn format_features(f: &CoelutionFeatureSet) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         // Pairwise coelution
         f.coelution_sum,
         f.coelution_max,
@@ -982,7 +986,6 @@ fn format_features(f: &CoelutionFeatureSet) -> String {
         // Mass accuracy
         f.mass_accuracy_mean,
         f.abs_mass_accuracy_mean,
-        f.mass_accuracy_std,
         // RT deviation
         f.rt_deviation,
         f.abs_rt_deviation,
@@ -992,10 +995,15 @@ fn format_features(f: &CoelutionFeatureSet) -> String {
         // Median polish
         f.median_polish_cosine,
         f.median_polish_residual_ratio,
+        // SG-weighted multi-scan
+        f.sg_weighted_xcorr,
+        f.sg_weighted_cosine,
+        f.median_polish_min_fragment_r2,
+        f.median_polish_residual_correlation,
     )
 }
 
-/// Returns a PIN feature value by index (0-17).
+/// Returns a PIN feature value by index (0-16).
 pub fn pin_feature_value(f: &CoelutionFeatureSet, index: usize) -> f64 {
     match index {
         // Pairwise coelution
@@ -1013,16 +1021,20 @@ pub fn pin_feature_value(f: &CoelutionFeatureSet, index: usize) -> f64 {
         // Mass accuracy
         9 => f.mass_accuracy_mean,
         10 => f.abs_mass_accuracy_mean,
-        11 => f.mass_accuracy_std,
         // RT deviation
-        12 => f.rt_deviation,
-        13 => f.abs_rt_deviation,
+        11 => f.rt_deviation,
+        12 => f.abs_rt_deviation,
         // MS1
-        14 => f.ms1_precursor_coelution,
-        15 => f.ms1_isotope_cosine,
+        13 => f.ms1_precursor_coelution,
+        14 => f.ms1_isotope_cosine,
         // Median polish
-        16 => f.median_polish_cosine,
-        17 => f.median_polish_residual_ratio,
+        15 => f.median_polish_cosine,
+        16 => f.median_polish_residual_ratio,
+        // SG-weighted multi-scan
+        17 => f.sg_weighted_xcorr,
+        18 => f.sg_weighted_cosine,
+        19 => f.median_polish_min_fragment_r2,
+        20 => f.median_polish_residual_correlation,
         _ => 0.0,
     }
 }

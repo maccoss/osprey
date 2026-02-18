@@ -1615,11 +1615,14 @@ pub fn group_spectra_by_isolation_window(spectra: &[Spectrum]) -> Vec<((f64, f64
         windows.entry((lower_key, upper_key)).or_default().push(idx);
     }
 
-    // Convert back to f64 windows with spectrum indices
-    windows
+    // Convert back to f64 windows with spectrum indices, sorted by lower bound
+    // for deterministic ordering regardless of HashMap iteration order.
+    let mut result: Vec<((f64, f64), Vec<usize>)> = windows
         .into_iter()
         .map(|((lower, upper), indices)| ((lower as f64 / 10.0, upper as f64 / 10.0), indices))
-        .collect()
+        .collect();
+    result.sort_by(|a, b| a.0 .0.total_cmp(&b.0 .0).then(a.0 .1.total_cmp(&b.0 .1)));
+    result
 }
 
 /// Run windowed batch calibration scoring
@@ -1796,9 +1799,13 @@ pub fn run_windowed_calibration_scoring(
         }
     }
 
-    // Sort by score descending
+    // Sort by score descending, entry_id ascending for deterministic tiebreaking
     let mut results: Vec<CalibrationMatch> = best_matches.into_values().collect();
-    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    results.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.entry_id.cmp(&b.entry_id))
+    });
 
     log::info!(
         "Windowed batch scoring complete: {} unique matches from {} windows",
@@ -2370,9 +2377,13 @@ pub fn run_xcorr_calibration_scoring<M: MS1SpectrumLookup>(
             .or_insert(m);
     }
 
-    // Sort by XCorr descending (since XCorr is used for RT selection)
+    // Sort by XCorr descending, entry_id ascending for deterministic tiebreaking
     let mut results: Vec<CalibrationMatch> = best_matches.into_values().collect();
-    results.sort_by(|a, b| b.xcorr_score.total_cmp(&a.xcorr_score));
+    results.sort_by(|a, b| {
+        b.xcorr_score
+            .total_cmp(&a.xcorr_score)
+            .then(a.entry_id.cmp(&b.entry_id))
+    });
 
     // Log scoring statistics
     let targets = results.iter().filter(|m| !m.is_decoy).count();
@@ -2803,9 +2814,13 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             .or_insert(m);
     }
 
-    // Sort by score descending
+    // Sort by score descending, entry_id ascending for deterministic tiebreaking
     let mut results: Vec<CalibrationMatch> = best_matches.into_values().collect();
-    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    results.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.entry_id.cmp(&b.entry_id))
+    });
 
     // Log scoring statistics
     let targets = results.iter().filter(|m| !m.is_decoy).count();
@@ -3268,5 +3283,51 @@ mod tests {
         let few_spectrum = vec![100.0, 200.0];
         let count = count_top6_matched_at_apex(&few_fragments, &few_spectrum, tolerance_config);
         assert_eq!(count, 2); // All 2 fragments matched
+    }
+
+    /// Verify that group_spectra_by_isolation_window returns windows in deterministic
+    /// sorted order regardless of HashMap iteration order.
+    #[test]
+    fn test_group_spectra_by_isolation_window_sorted() {
+        use osprey_core::types::{IsolationWindow, Spectrum};
+
+        // Create spectra across 3 different isolation windows, inserted in non-sorted order
+        let spectra = vec![
+            // Window 600-602 (added first, but should sort last)
+            Spectrum::new(1, 10.0, IsolationWindow::symmetric(601.0, 1.0)),
+            Spectrum::new(2, 10.5, IsolationWindow::symmetric(601.0, 1.0)),
+            // Window 400-402 (should sort first)
+            Spectrum::new(3, 11.0, IsolationWindow::symmetric(401.0, 1.0)),
+            Spectrum::new(4, 11.5, IsolationWindow::symmetric(401.0, 1.0)),
+            // Window 500-502 (should sort second)
+            Spectrum::new(5, 12.0, IsolationWindow::symmetric(501.0, 1.0)),
+        ];
+
+        let groups = group_spectra_by_isolation_window(&spectra);
+        assert_eq!(groups.len(), 3);
+
+        // Windows must be sorted by lower bound ascending
+        assert!(
+            groups[0].0 .0 < groups[1].0 .0,
+            "First window ({}) must have lower bound < second ({})",
+            groups[0].0 .0,
+            groups[1].0 .0
+        );
+        assert!(
+            groups[1].0 .0 < groups[2].0 .0,
+            "Second window ({}) must have lower bound < third ({})",
+            groups[1].0 .0,
+            groups[2].0 .0
+        );
+
+        // Verify window order: 400, 500, 600
+        assert!((groups[0].0 .0 - 400.0).abs() < 0.2);
+        assert!((groups[1].0 .0 - 500.0).abs() < 0.2);
+        assert!((groups[2].0 .0 - 600.0).abs() < 0.2);
+
+        // Verify spectrum counts per window
+        assert_eq!(groups[0].1.len(), 2); // 400-402: spectra 3,4
+        assert_eq!(groups[1].1.len(), 1); // 500-502: spectrum 5
+        assert_eq!(groups[2].1.len(), 2); // 600-602: spectra 1,2
     }
 }

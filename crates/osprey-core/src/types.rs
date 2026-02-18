@@ -596,6 +596,16 @@ pub struct CoelutionFeatureSet {
     pub median_polish_rsquared: f64,
     /// Fraction of signal unexplained by additive model
     pub median_polish_residual_ratio: f64,
+
+    // --- SG-weighted multi-scan spectral scores ---
+    /// XCorr on raw DIA spectra at apex ±2 scans, Savitzky-Golay weighted
+    pub sg_weighted_xcorr: f64,
+    /// Cosine similarity on raw DIA spectra at apex ±2 scans, SG weighted
+    pub sg_weighted_cosine: f64,
+    /// Minimum per-fragment R² with the shared elution profile (weakest link)
+    pub median_polish_min_fragment_r2: f64,
+    /// Mean pairwise correlation of median polish residuals across fragments
+    pub median_polish_residual_correlation: f64,
 }
 
 /// Scored entry from coelution-based search.

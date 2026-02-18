@@ -596,6 +596,10 @@ impl RTCalibration {
         let p20_abs_residual = percentile_value(&self.abs_residuals, 0.20);
         let p80_abs_residual = percentile_value(&self.abs_residuals, 0.80);
 
+        // MAD = median(|residual_i|) — robust measure of spread
+        // Since median of residuals ≈ 0 for LOESS, MAD ≈ P50 of absolute residuals
+        let mad = percentile_value(&self.abs_residuals, 0.50);
+
         RTCalibrationStats {
             n_points: n,
             residual_std: self.residual_std,
@@ -604,6 +608,7 @@ impl RTCalibration {
             r_squared,
             p20_abs_residual,
             p80_abs_residual,
+            mad,
         }
     }
 
@@ -716,6 +721,9 @@ pub struct RTCalibrationStats {
     pub p20_abs_residual: f64,
     /// 80th percentile of absolute residuals
     pub p80_abs_residual: f64,
+    /// Median absolute deviation (MAD) of residuals — robust measure of spread
+    /// For normal distribution: SD ≈ MAD × 1.4826
+    pub mad: f64,
 }
 
 /// Stratified sampler for RT calibration discovery

@@ -409,9 +409,14 @@ fn run_calibration_discovery_windowed(
         // Isotope features are used in the full scoring step after calibration.
         let calibration_fdr = 0.01;
 
-        // Convert to Vec for LDA training
+        // Convert to Vec for LDA training.
+        // Sort by base_id for deterministic LDA input: LinearDiscriminantAnalysis::fit()
+        // computes class means by iterating matrix rows, and floating-point addition is
+        // non-associative — different row order → different sums → different eigenvectors.
+        // Sort by (base_id, entry_id) to group target-decoy pairs together.
         let mut all_matches: Vec<CalibrationMatch> =
             accumulated_matches.values().cloned().collect();
+        all_matches.sort_by_key(|m| (m.entry_id & 0x7FFFFFFF, m.entry_id));
 
         // Train LDA and score (4 features: correlation, libcosine, top6, snr)
         let _n_passing =
@@ -568,22 +573,29 @@ fn run_calibration_discovery_windowed(
             degree: 1,
             min_points: effective_min_points,
             robustness_iter: 2,
-            outlier_retention: 0.8, // Remove worst 20% of calibration points
+            outlier_retention: 1.0, // Use all calibration points — LDA + S/N already filtered
         };
         let calibrator = RTCalibrator::with_config(calibrator_config);
         let mut rt_calibration = calibrator.fit(&library_rts_detected, &measured_rts_detected)?;
         let mut rt_stats = rt_calibration.stats();
 
-        // === Iterative calibration refinement (2-pass, DIA-NN-style) ===
-        // Compute first-pass tolerance and check if refinement is worthwhile
-        let pass1_tolerance = if config.rt_calibration.use_percentile_tolerance {
-            rt_calibration.percentile_tolerance(0.20)
-        } else {
-            rt_stats.residual_std * config.rt_calibration.rt_tolerance_factor
-        };
-        let pass1_tolerance = pass1_tolerance
+        // === Iterative calibration refinement (2-pass) ===
+        // Compute first-pass tolerance using MAD-based robust estimate
+        // MAD × 1.4826 ≈ SD for normal distribution; 3× that covers ~99.7% of peptides
+        let mad_tolerance = rt_stats.mad * 1.4826 * 3.0;
+        let pass1_tolerance = mad_tolerance
             .max(config.rt_calibration.min_rt_tolerance)
             .min(config.rt_calibration.max_rt_tolerance);
+
+        log::info!(
+            "First-pass RT tolerance: {:.2} min (MAD={:.3}, robust_SD={:.3}, residual_SD={:.3}, {} points, R²={:.4})",
+            pass1_tolerance,
+            rt_stats.mad,
+            rt_stats.mad * 1.4826,
+            rt_stats.residual_std,
+            rt_stats.n_points,
+            rt_stats.r_squared
+        );
 
         // Only refine if tolerance narrowed significantly (at least 2× tighter)
         if pass1_tolerance < initial_tolerance * 0.5 {
@@ -713,6 +725,7 @@ fn run_calibration_discovery_windowed(
                 r_squared: rt_stats.r_squared,
                 model_params: Some(rt_calibration.export_model_params()),
                 p20_abs_residual: Some(rt_stats.p20_abs_residual),
+                mad: Some(rt_stats.mad),
             },
         };
 
@@ -1038,11 +1051,23 @@ fn load_scores_parquet(path: &std::path::Path) -> Result<Vec<CoelutionScoredEntr
     let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
         OspreyError::OutputError(format!("Failed to read parquet {}: {}", path.display(), e))
     })?;
+
+    // Validate schema: reject stale scores files from older versions with different features
+    let feature_names = get_pin_feature_names();
+    let parquet_schema = builder.schema();
+    for name in &feature_names {
+        if parquet_schema.column_with_name(name).is_none() {
+            return Err(OspreyError::OutputError(format!(
+                "Stale scores cache {}: missing column '{}'. Delete and re-run.",
+                path.display(),
+                name
+            )));
+        }
+    }
+
     let reader = builder.build().map_err(|e| {
         OspreyError::OutputError(format!("Failed to build reader {}: {}", path.display(), e))
     })?;
-
-    let feature_names = get_pin_feature_names();
     let mut entries = Vec::new();
 
     for batch_result in reader {
@@ -1248,71 +1273,51 @@ fn load_scores_parquet(path: &std::path::Path) -> Result<Vec<CoelutionScoredEntr
 
 /// Set CoelutionFeatureSet fields from parquet feature columns.
 ///
-/// This maps the 45 PIN feature columns back to the struct fields.
+/// This maps the 17 PIN feature columns back to the struct fields.
+/// Order must match get_pin_feature_names() and pin_feature_value().
 fn set_features_from_pin_values(
     features: &mut CoelutionFeatureSet,
     feat_cols: &[&arrow::array::Float64Array],
     row: usize,
 ) {
-    // The PIN feature order matches the order in get_pin_feature_names()
-    // and pin_feature_value(). We reconstruct by index.
     let v = |i: usize| -> f64 { feat_cols[i].value(row) };
 
-    // Pairwise coelution (indices 0-10)
+    // Pairwise coelution (indices 0-2)
     features.coelution_sum = v(0);
-    features.coelution_min = v(1);
-    features.coelution_max = v(2);
-    features.n_coeluting_fragments = v(3) as u8;
-    features.n_fragment_pairs = v(4) as u8;
-    features.fragment_corr = [v(5), v(6), v(7), v(8), v(9), v(10)];
+    features.coelution_max = v(1);
+    features.n_coeluting_fragments = v(2) as u8;
 
-    // Peak shape (indices 11-17)
-    features.peak_apex = v(11);
-    features.peak_area = v(12);
-    features.peak_width = v(13);
-    features.peak_symmetry = v(14);
-    features.signal_to_noise = v(15);
-    features.n_scans = v(16) as u16;
-    features.peak_sharpness = v(17);
+    // Peak shape (indices 3-5)
+    features.peak_apex = v(3);
+    features.peak_area = v(4);
+    features.peak_sharpness = v(5);
 
-    // Spectral at apex (indices 18-33)
-    features.hyperscore = v(18);
-    features.xcorr = v(19);
-    features.dot_product = v(20);
-    features.dot_product_smz = v(21);
-    features.dot_product_top6 = v(22);
-    features.dot_product_top5 = v(23);
-    features.dot_product_top4 = v(24);
-    features.dot_product_smz_top6 = v(25);
-    features.dot_product_smz_top5 = v(26);
-    features.dot_product_smz_top4 = v(27);
-    features.fragment_coverage = v(28);
-    features.sequence_coverage = v(29);
-    features.consecutive_ions = v(30) as u8;
-    features.explained_intensity = v(31);
-    features.elution_weighted_cosine = v(32);
+    // Spectral at apex (indices 6-8)
+    features.xcorr = v(6);
+    features.consecutive_ions = v(7) as u8;
+    features.explained_intensity = v(8);
 
-    // Mass accuracy (indices 33-35)
-    features.mass_accuracy_mean = v(33);
-    features.abs_mass_accuracy_mean = v(34);
-    features.mass_accuracy_std = v(35);
+    // Mass accuracy (indices 9-10)
+    features.mass_accuracy_mean = v(9);
+    features.abs_mass_accuracy_mean = v(10);
 
-    // RT deviation (indices 36-37)
-    features.rt_deviation = v(36);
-    features.abs_rt_deviation = v(37);
+    // RT deviation (indices 11-12)
+    features.rt_deviation = v(11);
+    features.abs_rt_deviation = v(12);
 
-    // MS1 features (indices 38-39)
-    features.ms1_precursor_coelution = v(38);
-    features.ms1_isotope_cosine = v(39);
+    // MS1 (indices 13-14)
+    features.ms1_precursor_coelution = v(13);
+    features.ms1_isotope_cosine = v(14);
 
-    // Peptide properties (indices 40-42)
-    features.peptide_length = v(40) as u8;
-    features.missed_cleavages = v(41) as u8;
+    // Median polish (indices 15-16)
+    features.median_polish_cosine = v(15);
+    features.median_polish_residual_ratio = v(16);
 
-    // Median polish (indices 42-44)
-    features.median_polish_cosine = v(42);
-    features.median_polish_rsquared = v(43);
-    features.median_polish_residual_ratio = v(44);
+    // SG-weighted multi-scan (indices 17-20)
+    features.sg_weighted_xcorr = v(17);
+    features.sg_weighted_cosine = v(18);
+    features.median_polish_min_fragment_r2 = v(19);
+    features.median_polish_residual_correlation = v(20);
 }
 
 /// Write coelution scored entries to Parquet report (one row per precursor per run)
@@ -1729,6 +1734,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     }
 
     // Dispatch FDR control based on method
+    log::info!("");
     log::info!(
         "Running {} FDR control on coelution results...",
         config.fdr_method
@@ -2068,6 +2074,11 @@ fn deduplicate_pairs(entries: Vec<CoelutionScoredEntry>) -> Vec<CoelutionScoredE
     all_entries.extend(target_best.into_values());
     all_entries.extend(decoy_best.into_values());
 
+    // Sort by entry_id for deterministic order regardless of HashMap iteration.
+    // Without this, the random HashMap order propagates to SVM feature matrix
+    // row ordering, causing non-deterministic gradient updates and model weights.
+    all_entries.sort_by_key(|e| e.entry_id);
+
     log::info!(
         "Deduplicated to {} targets + {} decoys ({} paired, {} total)",
         n_targets,
@@ -2303,14 +2314,18 @@ fn deduplicate_double_counting(
         .map(|&i| entries[i].precursor_mz)
         .collect();
 
-    // For each window, binary search for the range of entries that fall within it
+    // For each window, binary search for the range of entries that fall within it.
+    // Use exclusive upper bound [lower, upper) so each entry is in at most one window.
+    // Without this, entries at exact window boundaries (e.g., precursor_mz = 500.0 for
+    // adjacent windows [498,500] and [500,502]) would be in two windows, causing race
+    // conditions in the par_iter with AtomicBool below.
     let window_entry_indices: Vec<Vec<usize>> = windows
         .iter()
         .map(|&(center, width)| {
             let win_lower = center - width / 2.0;
             let win_upper = center + width / 2.0;
             let lo = mz_sorted_vals.partition_point(|&mz| mz < win_lower);
-            let hi = mz_sorted_vals.partition_point(|&mz| mz <= win_upper);
+            let hi = mz_sorted_vals.partition_point(|&mz| mz < win_upper);
             mz_sorted_indices[lo..hi].to_vec()
         })
         .collect();
@@ -2331,7 +2346,13 @@ fn deduplicate_double_counting(
             .copied()
             .filter(|&i| !removed[i].load(Ordering::Relaxed))
             .collect();
-        rt_sorted.sort_by(|&a, &b| entries[a].apex_rt.total_cmp(&entries[b].apex_rt));
+        rt_sorted.sort_by(|&a, &b| {
+            entries[a]
+                .apex_rt
+                .total_cmp(&entries[b].apex_rt)
+                .then((entries[a].entry_id & 0x7FFFFFFF).cmp(&(entries[b].entry_id & 0x7FFFFFFF)))
+                .then(entries[a].entry_id.cmp(&entries[b].entry_id))
+        });
 
         for i_pos in 0..rt_sorted.len() {
             let idx_a = rt_sorted[i_pos];
@@ -2378,7 +2399,10 @@ fn deduplicate_double_counting(
                 let threshold = (min_a.min(min_b) as f64 * 0.5).ceil() as usize;
 
                 if overlap >= threshold {
-                    // Remove the entry with lower coelution_sum (keep the better one)
+                    // Remove the entry with lower coelution_sum (keep the better one).
+                    // Use standard f64 comparison (NaN loses, matching original behavior).
+                    // The iteration order is deterministic (entries sorted by apex_rt + entry_id),
+                    // so the >= tiebreaker (outer loop wins ties) is also deterministic.
                     if entries[idx_a].features.coelution_sum
                         >= entries[idx_b].features.coelution_sum
                     {
@@ -2732,8 +2756,9 @@ fn run_search(
     };
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
     use osprey_scoring::{
-        compute_elution_weighted_cosine, compute_mass_accuracy, extract_fragment_xics,
-        median_polish_libcosine, median_polish_residual_ratio, median_polish_rsquared,
+        compute_cosine_at_scan, compute_elution_weighted_cosine, compute_mass_accuracy,
+        extract_fragment_xics, median_polish_libcosine, median_polish_min_fragment_r2,
+        median_polish_residual_correlation, median_polish_residual_ratio, median_polish_rsquared,
         pearson_correlation_raw, tukey_median_polish, SpectralScorer,
     };
 
@@ -2799,55 +2824,22 @@ fn run_search(
     let spectra_ref = calibrated_spectra.as_deref().unwrap_or(spectra);
 
     // RT tolerance for candidate selection
+    // Use MAD-based robust tolerance: 3 × MAD × 1.4826 covers ~99.7% of peptides
     let rt_tolerance = if let Some(cal) = calibration {
-        let (raw_tol, method_desc) = if config.rt_calibration.use_percentile_tolerance {
-            // DIA-NN-style: max(2 × P20_abs_error, RT_range / 40)
-            if let Some(p20) = cal.rt_calibration.p20_abs_residual {
-                let rt_range = rt_calibration
-                    .as_ref()
-                    .map(|c| {
-                        let (rmin, rmax) = c.measured_rt_range();
-                        rmax - rmin
-                    })
-                    .unwrap_or_else(|| {
-                        spectra
-                            .iter()
-                            .map(|s| s.retention_time)
-                            .fold(f64::NEG_INFINITY, f64::max)
-                            - spectra
-                                .iter()
-                                .map(|s| s.retention_time)
-                                .fold(f64::INFINITY, f64::min)
-                    });
-                let from_percentile = 2.0 * p20;
-                let from_range = rt_range / 40.0;
-                let tol = from_percentile.max(from_range);
-                (
-                    tol,
-                    format!(
-                        "percentile: max(2×P20={:.2}, range/40={:.2})",
-                        from_percentile, from_range
-                    ),
-                )
-            } else {
-                // Fallback for old calibration files without p20
-                let tol =
-                    cal.rt_calibration.residual_sd * config.rt_calibration.rt_tolerance_factor;
-                (
-                    tol,
-                    format!(
-                        "{}× residual SD {:.2} min (p20 unavailable)",
-                        config.rt_calibration.rt_tolerance_factor, cal.rt_calibration.residual_sd
-                    ),
-                )
-            }
+        let (raw_tol, method_desc) = if let Some(mad) = cal.rt_calibration.mad {
+            let robust_sd = mad * 1.4826;
+            let tol = 3.0 * robust_sd;
+            (
+                tol,
+                format!("3×MAD×1.4826: MAD={:.3}, robust_SD={:.3}", mad, robust_sd),
+            )
         } else {
-            // Classic SD-based tolerance
+            // Fallback for old calibration files without MAD
             let tol = cal.rt_calibration.residual_sd * config.rt_calibration.rt_tolerance_factor;
             (
                 tol,
                 format!(
-                    "{}× residual SD {:.2} min",
+                    "{}× residual SD {:.2} min (MAD unavailable)",
                     config.rt_calibration.rt_tolerance_factor, cal.rt_calibration.residual_sd
                 ),
             )
@@ -3090,7 +3082,7 @@ fn run_search(
                             signal_to_noise: snr,
                         }
                     } else {
-                        // Evaluate each candidate by coelution score
+                        // Select best peak by mean pairwise fragment correlation
                         let best = candidates
                             .iter()
                             .map(|bp| {
@@ -3296,6 +3288,28 @@ fn run_search(
 
                     let spectral_score = scorer.xcorr(apex_spectrum, entry);
 
+                    // 5b. SG-weighted spectral scores at apex ±2 scans
+                    // Savitzky-Golay 5-point quadratic smoothing coefficients
+                    let sg_weights: [f64; 5] = [
+                        -3.0 / 35.0,
+                        12.0 / 35.0,
+                        17.0 / 35.0,
+                        12.0 / 35.0,
+                        -3.0 / 35.0,
+                    ];
+                    let mut sg_xcorr = 0.0;
+                    let mut sg_cosine = 0.0;
+                    for (offset, &weight) in [-2i32, -1, 0, 1, 2].iter().zip(&sg_weights) {
+                        let idx = apex_local_idx as i32 + offset;
+                        if idx >= 0 && (idx as usize) < cand_spectra.len() {
+                            let spec = cand_spectra[idx as usize];
+                            sg_xcorr += scorer.xcorr_at_scan(spec, entry) * weight;
+                            sg_cosine +=
+                                compute_cosine_at_scan(&entry.fragments, spec, tol_da, tol_ppm)
+                                    * weight;
+                        }
+                    }
+
                     // 6. Elution-weighted cosine (LibCosine at each scan,
                     //    weighted by reference XIC intensity²)
                     let elution_weighted_cosine = compute_elution_weighted_cosine(
@@ -3412,7 +3426,7 @@ fn run_search(
                     };
 
                     // 10. Median polish features
-                    let (mp_cosine, mp_rsquared, mp_residual) = {
+                    let (mp_cosine, mp_rsquared, mp_residual, mp_min_r2, mp_resid_corr) = {
                         // Build XIC matrix within peak boundaries
                         let peak_xics: Vec<(usize, Vec<(f64, f64)>)> = xics
                             .iter()
@@ -3427,9 +3441,11 @@ fn run_search(
                             let cos = median_polish_libcosine(mp, &entry.fragments);
                             let rsq = median_polish_rsquared(mp);
                             let res = median_polish_residual_ratio(mp);
-                            (cos, rsq, res)
+                            let min_r2 = median_polish_min_fragment_r2(mp);
+                            let resid_corr = median_polish_residual_correlation(mp);
+                            (cos, rsq, res, min_r2, resid_corr)
                         } else {
-                            (0.0, 0.0, 1.0)
+                            (0.0, 0.0, 1.0, 0.0, 0.0)
                         }
                     };
 
@@ -3516,6 +3532,12 @@ fn run_search(
                         median_polish_cosine: mp_cosine,
                         median_polish_rsquared: mp_rsquared,
                         median_polish_residual_ratio: mp_residual,
+
+                        // SG-weighted multi-scan scores
+                        sg_weighted_xcorr: sg_xcorr,
+                        sg_weighted_cosine: sg_cosine,
+                        median_polish_min_fragment_r2: mp_min_r2,
+                        median_polish_residual_correlation: mp_resid_corr,
                     };
 
                     pb.inc(1);
@@ -4165,5 +4187,94 @@ mod tests {
     #[test]
     fn test_extract_isolation_scheme_empty() {
         assert!(extract_isolation_scheme(&[]).is_none());
+    }
+
+    /// Verifies deduplicate_pairs() returns deterministic order regardless of HashMap internals.
+    ///
+    /// Non-deterministic HashMap iteration used to cause different row ordering in the
+    /// SVM feature matrix, leading to different gradient updates and model weights.
+    /// The fix sorts output by entry_id. This test verifies that guarantee.
+    #[test]
+    fn test_deduplicate_pairs_deterministic() {
+        use osprey_core::types::{CoelutionFeatureSet, CoelutionScoredEntry, XICPeakBounds};
+
+        // Helper to create a scored entry with a given entry_id and coelution_sum
+        let make_entry = |entry_id: u32, is_decoy: bool, coelution_sum: f64| CoelutionScoredEntry {
+            entry_id,
+            is_decoy,
+            sequence: format!("SEQ{}", entry_id & 0x7FFFFFFF),
+            modified_sequence: format!("SEQ{}", entry_id & 0x7FFFFFFF),
+            charge: 2,
+            precursor_mz: 500.0,
+            protein_ids: vec![],
+            scan_number: 100,
+            apex_rt: 10.0,
+            peak_bounds: XICPeakBounds {
+                apex_rt: 10.0,
+                apex_intensity: 100.0,
+                apex_index: 5,
+                start_rt: 9.0,
+                end_rt: 11.0,
+                start_index: 0,
+                end_index: 10,
+                area: 500.0,
+                signal_to_noise: 10.0,
+            },
+            features: CoelutionFeatureSet {
+                coelution_sum,
+                ..CoelutionFeatureSet::default()
+            },
+            fragment_mzs: vec![],
+            fragment_intensities: vec![],
+            reference_xic: vec![],
+            file_name: "test".into(),
+            run_qvalue: 1.0,
+            experiment_qvalue: 1.0,
+            score: 0.0,
+            pep: 1.0,
+        };
+
+        // Create entries: 5 target-decoy pairs with tied coelution_sum scores.
+        // The HashMap iteration order will vary, but the output must be sorted by entry_id.
+        let entries = vec![
+            make_entry(5, false, 0.8),
+            make_entry(3, false, 0.8),
+            make_entry(1, false, 0.8),
+            make_entry(4, false, 0.8),
+            make_entry(2, false, 0.8),
+            make_entry(5 | 0x80000000, true, 0.3),
+            make_entry(3 | 0x80000000, true, 0.3),
+            make_entry(1 | 0x80000000, true, 0.3),
+            make_entry(4 | 0x80000000, true, 0.3),
+            make_entry(2 | 0x80000000, true, 0.3),
+        ];
+
+        let first_result: Vec<u32> = deduplicate_pairs(entries.clone())
+            .iter()
+            .map(|e| e.entry_id)
+            .collect();
+
+        // Run multiple times — must always produce the same order
+        for _ in 0..20 {
+            let result: Vec<u32> = deduplicate_pairs(entries.clone())
+                .iter()
+                .map(|e| e.entry_id)
+                .collect();
+            assert_eq!(
+                result, first_result,
+                "deduplicate_pairs must return deterministic order"
+            );
+        }
+
+        // Verify sorted by entry_id (targets first since their IDs are smaller)
+        assert_eq!(first_result.len(), 10);
+        for i in 1..first_result.len() {
+            assert!(
+                first_result[i - 1] < first_result[i],
+                "Output must be sorted by entry_id: {} >= {}",
+                first_result[i - 1],
+                first_result[i]
+            );
+        }
     }
 }

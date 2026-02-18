@@ -802,27 +802,31 @@ fn compete_from_indices(
     }
 
     // Compete pairs: higher score wins, ties → decoy
-    let mut winners: Vec<(usize, f64, bool)> = Vec::with_capacity(targets.len());
-    for (base_id, &(t_idx, t_score)) in &targets {
-        if let Some(&(d_idx, d_score)) = decoys.get(base_id) {
+    // Store (index, score, is_decoy, base_id) — base_id for deterministic tiebreaking.
+    let mut winners: Vec<(usize, f64, bool, u32)> = Vec::with_capacity(targets.len());
+    for (&base_id, &(t_idx, t_score)) in &targets {
+        if let Some(&(d_idx, d_score)) = decoys.get(&base_id) {
             if t_score > d_score {
-                winners.push((t_idx, t_score, false));
+                winners.push((t_idx, t_score, false, base_id));
             } else {
-                winners.push((d_idx, d_score, true)); // tie → decoy
+                winners.push((d_idx, d_score, true, base_id)); // tie → decoy
             }
         } else {
-            winners.push((t_idx, t_score, false)); // unpaired target wins
+            winners.push((t_idx, t_score, false, base_id)); // unpaired target wins
         }
     }
     // Unpaired decoys
-    for (base_id, &(d_idx, d_score)) in &decoys {
-        if !targets.contains_key(base_id) {
-            winners.push((d_idx, d_score, true));
+    for (&base_id, &(d_idx, d_score)) in &decoys {
+        if !targets.contains_key(&base_id) {
+            winners.push((d_idx, d_score, true, base_id));
         }
     }
 
-    // Sort by score descending
-    winners.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // Sort by score descending, then by base_id ascending for deterministic tiebreaking.
+    // IMPORTANT: Use base_id (not array index) as tiebreaker. Array indices depend on input
+    // order, and sorting by index can create systematic target/decoy bias if targets
+    // systematically have lower indices. base_id is intrinsic and unbiased.
+    winners.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.3.cmp(&b.3)));
 
     let winner_indices: Vec<usize> = winners.iter().map(|w| w.0).collect();
     let winner_scores: Vec<f64> = winners.iter().map(|w| w.1).collect();
@@ -1633,5 +1637,63 @@ mod tests {
         let config = PercolatorConfig::default();
         let results = run_percolator(&[], &config).unwrap();
         assert!(results.entries.is_empty());
+    }
+
+    /// Verify that compete_from_indices produces deterministic results with tied scores.
+    ///
+    /// HashMap iteration order is non-deterministic (Rust's RandomState), so entries
+    /// with tied scores could appear in any order. The secondary sort key (index)
+    /// must break ties deterministically. This test runs competition multiple times
+    /// and asserts identical output each time.
+    #[test]
+    fn test_compete_from_indices_deterministic_with_ties() {
+        // Create entries where multiple winners have the same score (tied)
+        let scores = vec![
+            0.8, // target base_id=1
+            0.5, // target base_id=2
+            0.5, // target base_id=3 (tied with base_id=2)
+            0.5, // target base_id=4 (tied with base_id=2,3)
+            0.1, // decoy base_id=1
+            0.1, // decoy base_id=2 (tied with decoy base_id=1)
+            0.1, // decoy base_id=3
+            0.1, // decoy base_id=4
+        ];
+        let labels = vec![false, false, false, false, true, true, true, true];
+        let entry_ids: Vec<u32> = vec![
+            1,
+            2,
+            3,
+            4,
+            1 | 0x80000000,
+            2 | 0x80000000,
+            3 | 0x80000000,
+            4 | 0x80000000,
+        ];
+        let indices: Vec<usize> = (0..scores.len()).collect();
+
+        // Run competition multiple times — must always produce identical results
+        let (idx_first, scores_first, decoy_first) =
+            compete_from_indices(&scores, &labels, &entry_ids, &indices);
+
+        for _ in 0..20 {
+            let (idx, sc, dec) = compete_from_indices(&scores, &labels, &entry_ids, &indices);
+            assert_eq!(idx, idx_first, "Winner indices must be deterministic");
+            assert_eq!(dec, decoy_first, "Winner decoy flags must be deterministic");
+            for (a, b) in sc.iter().zip(scores_first.iter()) {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "Winner scores must be deterministic"
+                );
+            }
+        }
+
+        // Verify the secondary sort: among tied-score winners, lower base_id comes first
+        // Winners sorted by score desc: 0.8 (base_id=1), then 0.5 (base_ids 2,3,4)
+        assert_eq!(scores_first[0], 0.8);
+        // The three tied entries at 0.5 should be in base_id order (2,3,4 → indices 1,2,3)
+        assert_eq!(idx_first[1], 1);
+        assert_eq!(idx_first[2], 2);
+        assert_eq!(idx_first[3], 3);
     }
 }

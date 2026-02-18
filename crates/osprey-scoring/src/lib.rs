@@ -333,7 +333,7 @@ pub fn compute_elution_weighted_cosine(
 /// Unmatched fragments use observed intensity of 0, which penalizes the
 /// cosine — a missing fragment that should be present is strong evidence
 /// against a match.
-fn compute_cosine_at_scan(
+pub fn compute_cosine_at_scan(
     library_fragments: &[LibraryFragment],
     spectrum: &Spectrum,
     tolerance_da: f64,
@@ -911,7 +911,10 @@ pub fn median_polish_residual_ratio(polish: &TukeyMedianPolishResult) -> f64 {
                     + polish.residuals[f][s])
                     .exp()
             } else {
-                0.0
+                // Zero intensity is a real measurement (fragment had no signal),
+                // not missing data. Use pseudocount to prevent |0 - predicted|
+                // from dominating the ratio.
+                0.0001
             };
 
             sum_abs_residual += (observed - predicted).abs();
@@ -924,6 +927,123 @@ pub fn median_polish_residual_ratio(polish: &TukeyMedianPolishResult) -> f64 {
     }
 
     sum_abs_residual / sum_observed
+}
+
+/// Minimum per-fragment R² with the shared elution profile.
+///
+/// For each fragment row: compute R² of sqrt(observed) vs sqrt(predicted) across scans.
+/// `predicted(f,s) = exp(overall + row_effects[f] + col_effects[s])`
+/// `observed(f,s) = exp(overall + row_effects[f] + col_effects[s] + residuals[f][s])`
+/// Returns the minimum R² across fragments (weakest link).
+/// If a fragment has < 3 finite scans, R² = 0.0 for that fragment.
+pub fn median_polish_min_fragment_r2(polish: &TukeyMedianPolishResult) -> f64 {
+    let n_frags = polish.row_effects.len();
+    let n_scans = polish.col_effects.len();
+    if n_frags < 1 || n_scans < 3 {
+        return 0.0;
+    }
+
+    let mut min_r2 = f64::MAX;
+
+    for f in 0..n_frags {
+        let mut pred_vals = Vec::with_capacity(n_scans);
+        let mut obs_vals = Vec::with_capacity(n_scans);
+
+        for s in 0..n_scans {
+            if !polish.residuals[f][s].is_finite() {
+                continue;
+            }
+            let predicted = (polish.overall + polish.row_effects[f] + polish.col_effects[s]).exp();
+            let observed = (polish.overall
+                + polish.row_effects[f]
+                + polish.col_effects[s]
+                + polish.residuals[f][s])
+                .exp();
+            pred_vals.push(predicted.sqrt());
+            obs_vals.push(observed.sqrt());
+        }
+
+        let r2 = if pred_vals.len() < 3 {
+            0.0
+        } else {
+            compute_r2(&pred_vals, &obs_vals)
+        };
+
+        if r2 < min_r2 {
+            min_r2 = r2;
+        }
+    }
+
+    if min_r2 == f64::MAX {
+        0.0
+    } else {
+        min_r2.max(0.0)
+    }
+}
+
+/// Mean pairwise Pearson correlation of median polish residuals across fragments.
+///
+/// For a clean target, residuals should be uncorrelated noise → correlations ≈ 0.
+/// Correlated residuals suggest a co-eluting interferer affecting multiple fragment channels.
+/// Returns 0.0 if < 2 fragments with sufficient data.
+pub fn median_polish_residual_correlation(polish: &TukeyMedianPolishResult) -> f64 {
+    let n_frags = polish.row_effects.len();
+    let n_scans = polish.col_effects.len();
+    if n_frags < 2 || n_scans < 3 {
+        return 0.0;
+    }
+
+    // Pairwise Pearson correlations using only scans where BOTH fragments
+    // have finite residuals. NaN cells (zero observed intensity) would create
+    // artificial correlation structure if replaced with 0.0.
+    let mut corr_sum = 0.0;
+    let mut n_pairs = 0;
+
+    for i in 0..n_frags {
+        for j in (i + 1)..n_frags {
+            // Collect residuals at scans where both fragments are finite
+            let mut ri = Vec::with_capacity(n_scans);
+            let mut rj = Vec::with_capacity(n_scans);
+            for s in 0..n_scans {
+                if polish.residuals[i][s].is_finite() && polish.residuals[j][s].is_finite() {
+                    ri.push(polish.residuals[i][s]);
+                    rj.push(polish.residuals[j][s]);
+                }
+            }
+            if ri.len() >= 3 {
+                let r = pearson_correlation_raw(&ri, &rj);
+                if r.is_finite() {
+                    corr_sum += r;
+                    n_pairs += 1;
+                }
+            }
+        }
+    }
+
+    if n_pairs == 0 {
+        0.0
+    } else {
+        corr_sum / n_pairs as f64
+    }
+}
+
+/// Compute R² (coefficient of determination) between predicted and observed values.
+fn compute_r2(predicted: &[f64], observed: &[f64]) -> f64 {
+    let n = predicted.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let obs_mean = observed.iter().sum::<f64>() / n as f64;
+    let ss_tot: f64 = observed.iter().map(|&o| (o - obs_mean).powi(2)).sum();
+    let ss_res: f64 = predicted
+        .iter()
+        .zip(observed.iter())
+        .map(|(&p, &o)| (o - p).powi(2))
+        .sum();
+    if ss_tot < 1e-30 {
+        return 0.0;
+    }
+    (1.0 - ss_res / ss_tot).max(0.0)
 }
 
 /// Compute fragment-based FWHM and peak boundaries using Tukey median polish.
@@ -2173,6 +2293,24 @@ impl SpectralScorer {
 
         // Apply flanking bin subtraction
         self.apply_sliding_window(&windowed)
+    }
+
+    /// Lightweight XCorr for a single spectrum — no LibCosine overhead.
+    ///
+    /// Preprocesses the spectrum (bin + window + sliding window subtraction),
+    /// then sums the preprocessed values at library fragment bin positions × 0.005.
+    pub fn xcorr_at_scan(&self, spectrum: &Spectrum, library: &LibraryEntry) -> f64 {
+        if library.fragments.is_empty() || spectrum.mzs.is_empty() {
+            return 0.0;
+        }
+        let preprocessed = self.preprocess_spectrum_for_xcorr(spectrum);
+        let xcorr_raw: f32 = library
+            .fragments
+            .iter()
+            .filter_map(|frag| self.bin_config.mz_to_bin(frag.mz))
+            .map(|bin| preprocessed[bin])
+            .sum();
+        (xcorr_raw * 0.005) as f64
     }
 
     /// Preprocess a library entry for XCorr (Comet-style)
