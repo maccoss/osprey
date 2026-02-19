@@ -200,6 +200,7 @@ mod tests {
                 p20_abs_residual: Some(0.15),
                 mad: Some(0.12),
             },
+            second_pass_rt: None,
         }
     }
 

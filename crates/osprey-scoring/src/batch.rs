@@ -1600,19 +1600,42 @@ pub fn sample_library_for_calibration(
     sampled
 }
 
+/// Maximum isolation window width (Da) for DIA analytical spectra.
+/// Wider windows (e.g., 25-75 Da zoom/alignment scans in dynamic DIA) are excluded.
+const MAX_DIA_WINDOW_WIDTH: f64 = 25.0;
+
 /// Group spectra by isolation window bounds
+///
+/// Skips spectra with isolation windows wider than [`MAX_DIA_WINDOW_WIDTH`] Da,
+/// which filters out alignment/zoom scans used in dynamic DIA methods.
 ///
 /// Returns: Vec of ((lower_bound, upper_bound), spectrum_indices)
 pub fn group_spectra_by_isolation_window(spectra: &[Spectrum]) -> Vec<((f64, f64), Vec<usize>)> {
     let mut windows: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    let mut n_wide_skipped = 0usize;
 
     for (idx, spec) in spectra.iter().enumerate() {
         let iso = &spec.isolation_window;
+
+        // Skip wide alignment/zoom scans (e.g., dynamic DIA uses 25-75 Da windows for RT alignment)
+        if iso.width() > MAX_DIA_WINDOW_WIDTH {
+            n_wide_skipped += 1;
+            continue;
+        }
+
         // Round window bounds to avoid floating point issues (0.1 m/z precision)
         let lower_key = (iso.lower_bound() * 10.0) as i64;
         let upper_key = (iso.upper_bound() * 10.0) as i64;
 
         windows.entry((lower_key, upper_key)).or_default().push(idx);
+    }
+
+    if n_wide_skipped > 0 {
+        log::info!(
+            "Skipped {} wide isolation window spectra (>{:.0} Da, likely alignment/zoom scans)",
+            n_wide_skipped,
+            MAX_DIA_WINDOW_WIDTH
+        );
     }
 
     // Convert back to f64 windows with spectrum indices, sorted by lower bound

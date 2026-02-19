@@ -403,12 +403,19 @@ pub fn compute_cosine_at_scan(
 /// # Arguments
 /// * `matches` - Fragment matches from the apex spectrum
 /// * `unit` - Tolerance unit determining error computation (ppm for HRAM, Th for unit resolution)
+/// * `tolerance` - The fragment matching tolerance (in the same unit). Used as penalty value
+///   when no fragments match, so entries with no evidence get "bad" mass accuracy instead of
+///   a misleading 0.0 ("perfect" accuracy).
 ///
 /// # Returns
 /// `(signed_mean, abs_mean, std)` in the configured unit
-pub fn compute_mass_accuracy(matches: &[FragmentMatch], unit: ToleranceUnit) -> (f64, f64, f64) {
+pub fn compute_mass_accuracy(
+    matches: &[FragmentMatch],
+    unit: ToleranceUnit,
+    tolerance: f64,
+) -> (f64, f64, f64) {
     if matches.is_empty() {
-        return (0.0, 0.0, 0.0);
+        return (0.0, tolerance, tolerance);
     }
 
     let errors: Vec<f64> = matches

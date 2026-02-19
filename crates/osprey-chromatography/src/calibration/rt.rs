@@ -225,69 +225,64 @@ impl RTCalibrator {
         for i in 0..n {
             let xi = x[i];
 
-            // Find k nearest neighbors
-            let mut distances: Vec<(usize, f64)> = x
-                .iter()
-                .enumerate()
-                .map(|(j, &xj)| (j, (xj - xi).abs()))
-                .collect();
-            distances.sort_by(|a, b| a.1.total_cmp(&b.1));
+            // Find k nearest neighbors as contiguous range [lo, hi).
+            // x is sorted, so the k nearest neighbors are always a contiguous subrange.
+            // Two-pointer expansion from index i: O(k) instead of O(n log n) sort.
+            let (lo, hi) = find_k_nearest_sorted(x, i, k);
+            let max_dist = (x[lo] - xi).abs().max((x[hi - 1] - xi).abs());
 
-            let neighbors: Vec<usize> = distances.iter().take(k).map(|(j, _)| *j).collect();
-            let max_dist = distances[k - 1].1;
+            // Accumulate weighted sums in a single pass (zero allocation)
+            let mut sum_w = 0.0f64;
+            let mut sum_wx = 0.0f64;
+            let mut sum_wy = 0.0f64;
+            let mut sum_wxx = 0.0f64;
+            let mut sum_wxy = 0.0f64;
 
-            // Compute tricube weights
-            let tricube_weights: Vec<f64> = neighbors
-                .iter()
-                .map(|&j| {
-                    let dist = (x[j] - xi).abs();
-                    let u = if max_dist > 1e-10 {
-                        dist / max_dist
-                    } else {
-                        0.0
-                    };
-                    if u < 1.0 {
-                        (1.0 - u.powi(3)).powi(3)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
+            for j in lo..hi {
+                let dist = (x[j] - xi).abs();
+                let u = if max_dist > 1e-10 {
+                    dist / max_dist
+                } else {
+                    0.0
+                };
+                let tw = if u < 1.0 {
+                    (1.0 - u.powi(3)).powi(3)
+                } else {
+                    0.0
+                };
+                let w = if let Some(wts) = weights {
+                    tw * wts[j]
+                } else {
+                    tw
+                };
 
-            // Combine with robustness weights if provided
-            let final_weights: Vec<f64> = if let Some(w) = weights {
-                tricube_weights
-                    .iter()
-                    .zip(neighbors.iter())
-                    .map(|(&tw, &j)| tw * w[j])
-                    .collect()
+                sum_w += w;
+                sum_wx += w * x[j];
+                sum_wy += w * y[j];
+                sum_wxx += w * x[j] * x[j];
+                sum_wxy += w * x[j] * y[j];
+            }
+
+            // Fit local polynomial (degree 0 = weighted mean, else weighted linear)
+            let yi = if self.config.degree == 0 {
+                if sum_w > 1e-10 {
+                    sum_wy / sum_w
+                } else {
+                    y[i]
+                }
             } else {
-                tricube_weights
-            };
-
-            // Fit local polynomial (degree 0, 1, or 2)
-            let yi = match self.config.degree {
-                0 => {
-                    // Weighted mean
-                    let sum_w: f64 = final_weights.iter().sum();
+                // Weighted linear regression (degree 1 or 2, quadratic falls back to linear)
+                let det = sum_w * sum_wxx - sum_wx * sum_wx;
+                if det.abs() < 1e-10 {
                     if sum_w > 1e-10 {
-                        neighbors
-                            .iter()
-                            .zip(final_weights.iter())
-                            .map(|(&j, &w)| w * y[j])
-                            .sum::<f64>()
-                            / sum_w
+                        sum_wy / sum_w
                     } else {
                         y[i]
                     }
-                }
-                1 => {
-                    // Weighted linear regression
-                    self.weighted_linear_fit(&neighbors, x, y, &final_weights, xi)
-                }
-                _ => {
-                    // Weighted quadratic regression
-                    self.weighted_quadratic_fit(&neighbors, x, y, &final_weights, xi)
+                } else {
+                    let b0 = (sum_wxx * sum_wy - sum_wx * sum_wxy) / det;
+                    let b1 = (sum_w * sum_wxy - sum_wx * sum_wy) / det;
+                    b0 + b1 * xi
                 }
             };
 
@@ -296,67 +291,46 @@ impl RTCalibrator {
 
         Ok(fitted)
     }
-
-    /// Fit weighted linear regression and predict at xi
-    fn weighted_linear_fit(
-        &self,
-        neighbors: &[usize],
-        x: &[f64],
-        y: &[f64],
-        weights: &[f64],
-        xi: f64,
-    ) -> f64 {
-        let mut sum_w = 0.0;
-        let mut sum_wx = 0.0;
-        let mut sum_wy = 0.0;
-        let mut sum_wxx = 0.0;
-        let mut sum_wxy = 0.0;
-
-        for (&j, &w) in neighbors.iter().zip(weights.iter()) {
-            sum_w += w;
-            sum_wx += w * x[j];
-            sum_wy += w * y[j];
-            sum_wxx += w * x[j] * x[j];
-            sum_wxy += w * x[j] * y[j];
-        }
-
-        // Solve: [sum_w    sum_wx ] [b0]   [sum_wy ]
-        //        [sum_wx   sum_wxx] [b1] = [sum_wxy]
-        let det = sum_w * sum_wxx - sum_wx * sum_wx;
-        if det.abs() < 1e-10 {
-            // Fallback to weighted mean
-            if sum_w > 1e-10 {
-                return sum_wy / sum_w;
-            } else {
-                return y[neighbors[0]];
-            }
-        }
-
-        let b0 = (sum_wxx * sum_wy - sum_wx * sum_wxy) / det;
-        let b1 = (sum_w * sum_wxy - sum_wx * sum_wy) / det;
-
-        b0 + b1 * xi
-    }
-
-    /// Fit weighted quadratic regression and predict at xi
-    fn weighted_quadratic_fit(
-        &self,
-        neighbors: &[usize],
-        x: &[f64],
-        y: &[f64],
-        weights: &[f64],
-        xi: f64,
-    ) -> f64 {
-        // For simplicity, use linear fit as fallback if quadratic is unstable
-        // Full quadratic would require solving 3x3 system
-        self.weighted_linear_fit(neighbors, x, y, weights, xi)
-    }
 }
 
 impl Default for RTCalibrator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Find the contiguous range [lo, hi) of k nearest neighbors of x[center]
+/// in a sorted array. Returns (lo, hi) where hi - lo == k.
+///
+/// Since x is sorted, the k nearest neighbors are always a contiguous subrange.
+/// Uses two-pointer expansion from center: O(k) instead of O(n log n) sort.
+fn find_k_nearest_sorted(x: &[f64], center: usize, k: usize) -> (usize, usize) {
+    let n = x.len();
+    debug_assert!(k <= n);
+    debug_assert!(center < n);
+
+    let mut lo = center;
+    let mut hi = center + 1;
+
+    while hi - lo < k {
+        let can_go_left = lo > 0;
+        let can_go_right = hi < n;
+
+        if can_go_left && can_go_right {
+            // Expand toward the closer neighbor (ties go left for stability)
+            if (x[center] - x[lo - 1]) <= (x[hi] - x[center]) {
+                lo -= 1;
+            } else {
+                hi += 1;
+            }
+        } else if can_go_left {
+            lo -= 1;
+        } else {
+            hi += 1;
+        }
+    }
+
+    (lo, hi)
 }
 
 /// Fitted RT calibration curve
@@ -420,6 +394,100 @@ impl RTCalibration {
                 y0 + t * (y1 - y0)
             }
         }
+    }
+
+    /// Inverse predict: convert measured RT back to library RT space.
+    ///
+    /// Searches the `fitted_values` array and interpolates back to `library_rts`.
+    /// This is the exact inverse of `predict()` when the LOESS fit is monotonic
+    /// (which it virtually always is for LC-MS RT calibration).
+    ///
+    /// For non-monotonic fits (rare), finds the nearest fitted value and returns
+    /// the corresponding library RT.
+    pub fn inverse_predict(&self, measured_rt: f64) -> f64 {
+        let n = self.fitted_values.len();
+        if n == 0 {
+            return measured_rt;
+        }
+
+        // Check monotonicity of fitted_values (almost always true for RT calibration)
+        let is_monotonic = self.fitted_values.windows(2).all(|w| w[1] >= w[0] - 1e-12);
+
+        if is_monotonic {
+            // Binary search on fitted_values (they're sorted if monotonic)
+            let idx = self
+                .fitted_values
+                .binary_search_by(|&y| y.total_cmp(&measured_rt))
+                .unwrap_or_else(|i| i);
+
+            if idx == 0 {
+                // Extrapolate below range
+                self.inverse_extrapolate_below(measured_rt)
+            } else if idx >= n {
+                // Extrapolate above range
+                self.inverse_extrapolate_above(measured_rt)
+            } else {
+                // Interpolate between idx-1 and idx
+                let y0 = self.fitted_values[idx - 1];
+                let y1 = self.fitted_values[idx];
+
+                if (y1 - y0).abs() < 1e-12 {
+                    // Duplicate fitted_values — average the library_rts
+                    (self.library_rts[idx - 1] + self.library_rts[idx]) / 2.0
+                } else {
+                    let x0 = self.library_rts[idx - 1];
+                    let x1 = self.library_rts[idx];
+                    let t = (measured_rt - y0) / (y1 - y0);
+                    x0 + t * (x1 - x0)
+                }
+            }
+        } else {
+            // Non-monotonic fallback: find nearest fitted value
+            let nearest_idx = self
+                .fitted_values
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    (measured_rt - *a)
+                        .abs()
+                        .total_cmp(&(measured_rt - *b).abs())
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.library_rts[nearest_idx]
+        }
+    }
+
+    /// Extrapolate below fitted range for inverse prediction
+    fn inverse_extrapolate_below(&self, measured_rt: f64) -> f64 {
+        let n = self.fitted_values.len();
+        if n < 2 {
+            return self.library_rts[0];
+        }
+        for i in 0..n - 1 {
+            let dy = self.fitted_values[i + 1] - self.fitted_values[i];
+            if dy.abs() > 1e-12 {
+                let slope = (self.library_rts[i + 1] - self.library_rts[i]) / dy;
+                return self.library_rts[i] + slope * (measured_rt - self.fitted_values[i]);
+            }
+        }
+        self.library_rts[0]
+    }
+
+    /// Extrapolate above fitted range for inverse prediction
+    fn inverse_extrapolate_above(&self, measured_rt: f64) -> f64 {
+        let n = self.fitted_values.len();
+        if n < 2 {
+            return self.library_rts[n - 1];
+        }
+        for i in (0..n - 1).rev() {
+            let dy = self.fitted_values[i + 1] - self.fitted_values[i];
+            if dy.abs() > 1e-12 {
+                let slope = (self.library_rts[i + 1] - self.library_rts[i]) / dy;
+                return self.library_rts[i + 1] + slope * (measured_rt - self.fitted_values[i + 1]);
+            }
+        }
+        self.library_rts[n - 1]
     }
 
     /// Extrapolate below the calibration range, skipping duplicate points
@@ -1209,6 +1277,89 @@ mod tests {
         assert!(
             !pred_above.is_nan(),
             "Extrapolation above range with duplicate last points must not return NaN"
+        );
+    }
+
+    /// Verifies inverse_predict roundtrips with predict for a linear calibration.
+    #[test]
+    fn test_inverse_predict_roundtrip_linear() {
+        let library_rts: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        let measured_rts: Vec<f64> = library_rts.iter().map(|&x| 2.0 * x + 5.0).collect();
+
+        let calibrator = RTCalibrator::new().with_bandwidth(0.3);
+        let calibration = calibrator.fit(&library_rts, &measured_rts).unwrap();
+
+        // Test roundtrip at several points within range
+        for &lib_rt in &[5.0, 15.0, 25.0, 35.0, 45.0] {
+            let measured = calibration.predict(lib_rt);
+            let recovered = calibration.inverse_predict(measured);
+            assert!(
+                (recovered - lib_rt).abs() < 0.5,
+                "inverse_predict(predict({})) = {}, expected ~{}",
+                lib_rt,
+                recovered,
+                lib_rt
+            );
+        }
+
+        // Test extrapolation roundtrip
+        let measured_extrap = calibration.predict(55.0);
+        let recovered_extrap = calibration.inverse_predict(measured_extrap);
+        assert!(
+            (recovered_extrap - 55.0).abs() < 2.0,
+            "Extrapolation roundtrip: inverse_predict(predict(55)) = {}, expected ~55",
+            recovered_extrap
+        );
+    }
+
+    /// Verifies inverse_predict roundtrips for a nonlinear (sinusoidal) calibration.
+    #[test]
+    fn test_inverse_predict_roundtrip_nonlinear() {
+        let library_rts: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
+        let measured_rts: Vec<f64> = library_rts
+            .iter()
+            .map(|&x| x + 2.0 * (x / 20.0).sin())
+            .collect();
+
+        let calibrator = RTCalibrator::new().with_bandwidth(0.2);
+        let calibration = calibrator.fit(&library_rts, &measured_rts).unwrap();
+
+        for &lib_rt in &[5.0, 15.0, 25.0, 35.0, 45.0] {
+            let measured = calibration.predict(lib_rt);
+            let recovered = calibration.inverse_predict(measured);
+            assert!(
+                (recovered - lib_rt).abs() < 1.0,
+                "Nonlinear roundtrip: inverse_predict(predict({})) = {}, expected ~{}",
+                lib_rt,
+                recovered,
+                lib_rt
+            );
+        }
+    }
+
+    /// Verifies inverse_predict handles duplicate fitted values without NaN.
+    #[test]
+    fn test_inverse_predict_duplicate_fitted() {
+        let cal = RTCalibration {
+            library_rts: vec![5.0, 10.0, 15.0, 20.0],
+            measured_rts: vec![5.5, 10.5, 10.5, 20.5],
+            fitted_values: vec![5.5, 10.5, 10.5, 20.5],
+            abs_residuals: vec![0.1, 0.1, 0.1, 0.1],
+            residual_std: 0.5,
+            bandwidth: 0.3,
+            degree: 1,
+        };
+
+        let result = cal.inverse_predict(10.5);
+        assert!(
+            !result.is_nan(),
+            "inverse_predict must not return NaN for duplicate fitted_values"
+        );
+        // Should average the library_rts: (10 + 15) / 2 = 12.5
+        assert!(
+            (result - 12.5).abs() < 0.01,
+            "Expected ~12.5 for duplicate fitted_values, got {}",
+            result
         );
     }
 }

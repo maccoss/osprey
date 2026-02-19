@@ -43,9 +43,9 @@ use osprey_chromatography::{
     RTCalibration, RTCalibrationMethod, RTCalibrationParams, RTCalibrator, RTCalibratorConfig,
 };
 use osprey_core::{
-    CoelutionFeatureSet, CoelutionScoredEntry, DecoyMethod as CoreDecoyMethod, FdrMethod,
-    FragmentToleranceConfig, LibraryEntry, LibraryFragment, MS1Spectrum, OspreyConfig, OspreyError,
-    Result, Spectrum, ToleranceUnit, XICPeakBounds,
+    CoelutionFeatureSet, CoelutionScoredEntry, CwtCandidate, DecoyMethod as CoreDecoyMethod,
+    FdrMethod, FragmentToleranceConfig, LibraryEntry, LibraryFragment, MS1Spectrum, OspreyConfig,
+    OspreyError, Result, Spectrum, ToleranceUnit, XICPeakBounds,
 };
 use osprey_fdr::{
     get_pin_feature_names, percolator, pin_feature_value, MokapotRunner, NUM_PIN_FEATURES,
@@ -727,6 +727,7 @@ fn run_calibration_discovery_windowed(
                 p20_abs_residual: Some(rt_stats.p20_abs_residual),
                 mad: Some(rt_stats.mad),
             },
+            second_pass_rt: None,
         };
 
         return Ok((rt_calibration, calibration_params));
@@ -898,6 +899,7 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         Field::new("bounds_snr", DataType::Float64, false),
         Field::new("file_name", DataType::Utf8, false),
         // Variable-length arrays as binary (LE bytes)
+        Field::new("cwt_candidates", DataType::Binary, true),
         Field::new("fragment_mzs", DataType::Binary, true),
         Field::new("fragment_intensities", DataType::Binary, true),
         Field::new("reference_xic_rts", DataType::Binary, true),
@@ -923,6 +925,7 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
     let mut area_b = Float64Builder::with_capacity(n);
     let mut snr_b = Float64Builder::with_capacity(n);
     let mut fname_b = StringBuilder::with_capacity(n, n * 20);
+    let mut cwt_cand_b = BinaryBuilder::with_capacity(n, n * 244); // 4 + 5*48 = 244
     let mut frag_mz_b = BinaryBuilder::with_capacity(n, n * 48);
     let mut frag_int_b = BinaryBuilder::with_capacity(n, n * 24);
     let mut xic_rt_b = BinaryBuilder::with_capacity(n, n * 80);
@@ -946,6 +949,19 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         area_b.append_value(entry.peak_bounds.area);
         snr_b.append_value(entry.peak_bounds.signal_to_noise);
         fname_b.append_value(&entry.file_name);
+
+        // Serialize CWT candidates as packed LE bytes: [u32 count][48 bytes per candidate]
+        let mut cwt_bytes = Vec::with_capacity(4 + entry.cwt_candidates.len() * 48);
+        cwt_bytes.extend_from_slice(&(entry.cwt_candidates.len() as u32).to_le_bytes());
+        for cand in &entry.cwt_candidates {
+            cwt_bytes.extend_from_slice(&cand.apex_rt.to_le_bytes());
+            cwt_bytes.extend_from_slice(&cand.start_rt.to_le_bytes());
+            cwt_bytes.extend_from_slice(&cand.end_rt.to_le_bytes());
+            cwt_bytes.extend_from_slice(&cand.area.to_le_bytes());
+            cwt_bytes.extend_from_slice(&cand.snr.to_le_bytes());
+            cwt_bytes.extend_from_slice(&cand.coelution_score.to_le_bytes());
+        }
+        cwt_cand_b.append_value(&cwt_bytes);
 
         // Serialize variable-length arrays as contiguous LE bytes
         let mz_bytes: Vec<u8> = entry
@@ -998,6 +1014,7 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         std::sync::Arc::new(area_b.finish()),
         std::sync::Arc::new(snr_b.finish()),
         std::sync::Arc::new(fname_b.finish()),
+        std::sync::Arc::new(cwt_cand_b.finish()),
         std::sync::Arc::new(frag_mz_b.finish()),
         std::sync::Arc::new(frag_int_b.finish()),
         std::sync::Arc::new(xic_rt_b.finish()),
@@ -1183,6 +1200,11 @@ fn load_scores_parquet(path: &std::path::Path) -> Result<Vec<CoelutionScoredEntr
             .downcast_ref::<BinaryArray>()
             .unwrap();
 
+        // Read CWT candidates column (optional, backwards-compatible)
+        let cwt_cand_col = batch
+            .column_by_name("cwt_candidates")
+            .and_then(|c| c.as_any().downcast_ref::<BinaryArray>());
+
         // Read feature columns
         let feat_cols: Vec<&Float64Array> = feature_names
             .iter()
@@ -1234,6 +1256,36 @@ fn load_scores_parquet(path: &std::path::Path) -> Result<Vec<CoelutionScoredEntr
 
             let apex_rt_val = apex_rts.value(row);
 
+            // Deserialize CWT candidates from packed binary
+            let cwt_candidates = if let Some(col) = cwt_cand_col {
+                let bytes = col.value(row);
+                if bytes.len() >= 4 {
+                    let count = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+                    let data = &bytes[4..];
+                    // Each CwtCandidate is 6 × f64 = 48 bytes
+                    data.chunks_exact(48)
+                        .take(count)
+                        .map(|chunk| {
+                            let f = |offset: usize| -> f64 {
+                                f64::from_le_bytes(chunk[offset..offset + 8].try_into().unwrap())
+                            };
+                            CwtCandidate {
+                                apex_rt: f(0),
+                                start_rt: f(8),
+                                end_rt: f(16),
+                                area: f(24),
+                                snr: f(32),
+                                coelution_score: f(40),
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
             entries.push(CoelutionScoredEntry {
                 entry_id: entry_ids.value(row),
                 is_decoy: is_decoys.value(row),
@@ -1264,6 +1316,7 @@ fn load_scores_parquet(path: &std::path::Path) -> Result<Vec<CoelutionScoredEntr
                 experiment_qvalue: 1.0,
                 score: 0.0,
                 pep: 1.0,
+                cwt_candidates,
             });
         }
     }
@@ -1560,6 +1613,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Process each file
     let mut per_file_entries: Vec<(String, Vec<CoelutionScoredEntry>)> = Vec::new();
     let mut pin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
+    // Retain per-file RT calibrations for cross-run reconciliation
+    let mut per_file_calibrations: HashMap<String, RTCalibration> = HashMap::new();
 
     for (file_idx, input_file) in config.input_files.iter().enumerate() {
         log::info!("");
@@ -1586,6 +1641,24 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         entries.len(),
                         scores_path.display()
                     );
+                    // Load cached calibration for cross-run reconciliation
+                    if let Some(input_dir) = input_file.parent() {
+                        let cal_path = calibration_path_for_input(input_file, input_dir);
+                        if cal_path.exists() {
+                            if let Ok(cal_params) = load_calibration(&cal_path) {
+                                if let Some(ref model_params) =
+                                    cal_params.rt_calibration.model_params
+                                {
+                                    if let Ok(rt_cal) = RTCalibration::from_model_params(
+                                        model_params,
+                                        cal_params.rt_calibration.residual_sd,
+                                    ) {
+                                        per_file_calibrations.insert(file_name.clone(), rt_cal);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     entries
                 }
                 Err(e) => {
@@ -1665,6 +1738,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             } else {
                 (None, None)
             };
+
+            // Retain RT calibration for cross-run reconciliation
+            if let Some(ref cal) = rt_cal {
+                per_file_calibrations.insert(file_name.clone(), cal.clone());
+            }
 
             // Run coelution search
             let entries = run_search(
@@ -1756,6 +1834,261 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         FdrMethod::Simple => {
             for (_, entries) in per_file_entries.iter_mut() {
                 apply_simple_fdr(entries, config.run_fdr)?;
+            }
+        }
+    }
+
+    // Cross-run peak reconciliation
+    // After first-pass FDR, use detections across all runs to build consensus RTs,
+    // then re-score entries at consistent peak boundaries across replicates.
+    if config.reconciliation.enabled && config.input_files.len() > 1 {
+        use crate::reconciliation::{
+            compute_consensus_rts, plan_reconciliation, refit_calibration_with_consensus,
+            ReconcileAction,
+        };
+        use osprey_scoring::batch::group_spectra_by_isolation_window;
+
+        log::info!("");
+        log::info!("=== Cross-Run Peak Reconciliation ===");
+
+        // 1. Compute consensus RTs from first-pass detections
+        let consensus = compute_consensus_rts(
+            &per_file_entries,
+            &per_file_calibrations,
+            config.reconciliation.consensus_fdr,
+        );
+
+        if !consensus.is_empty() {
+            // 2. Refit RT calibrations per file using consensus peptides (parallel)
+            let refined_calibrations: HashMap<String, RTCalibration> = per_file_entries
+                .par_iter()
+                .filter_map(|(file_name, entries)| {
+                    refit_calibration_with_consensus(
+                        &consensus,
+                        entries,
+                        config.reconciliation.consensus_fdr,
+                    )
+                    .map(|cal| (file_name.clone(), cal))
+                })
+                .collect();
+
+            // 3. Plan reconciliation actions for all entries
+            let actions = plan_reconciliation(
+                &consensus,
+                &per_file_entries,
+                &refined_calibrations,
+                &per_file_calibrations,
+            );
+
+            if !actions.is_empty() {
+                // 4. Re-score entries at reconciled peak boundaries
+                // Build file_name → input_file index mapping
+                let file_name_to_idx: HashMap<String, usize> = config
+                    .input_files
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, p)| {
+                        let stem = p
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        (stem, idx)
+                    })
+                    .collect();
+
+                let mut total_rescored = 0usize;
+
+                // Process each file sequentially (loads spectra per file to manage memory)
+                for (file_name, entries) in per_file_entries.iter_mut() {
+                    // Collect actions for this file, converting to (idx, apex, start, end)
+                    let file_rescore_targets: Vec<(usize, f64, f64, f64)> = actions
+                        .iter()
+                        .filter(|((f, _), _)| f == file_name)
+                        .filter_map(|((_, idx), action)| {
+                            let (start, apex, end) = match action {
+                                ReconcileAction::Keep => return None,
+                                ReconcileAction::UseCwtPeak { candidate_idx } => {
+                                    let cand = &entries[*idx].cwt_candidates[*candidate_idx];
+                                    (cand.start_rt, cand.apex_rt, cand.end_rt)
+                                }
+                                ReconcileAction::ForcedIntegration {
+                                    expected_rt,
+                                    half_width,
+                                } => (
+                                    expected_rt - half_width,
+                                    *expected_rt,
+                                    expected_rt + half_width,
+                                ),
+                            };
+                            Some((*idx, apex, start, end))
+                        })
+                        .collect();
+
+                    if file_rescore_targets.is_empty() {
+                        continue;
+                    }
+
+                    let input_idx = match file_name_to_idx.get(file_name.as_str()) {
+                        Some(idx) => *idx,
+                        None => continue,
+                    };
+                    let input_file = &config.input_files[input_idx];
+
+                    log::info!(
+                        "Re-scoring {} reconciled entries in {}",
+                        file_rescore_targets.len(),
+                        file_name
+                    );
+
+                    // Load spectra for re-scoring
+                    let (spectra, ms1_index) = load_all_spectra(input_file)?;
+                    if spectra.is_empty() {
+                        continue;
+                    }
+
+                    // Load calibration from cached JSON
+                    let cal_params: Option<CalibrationParams> =
+                        input_file.parent().and_then(|input_dir| {
+                            let cal_path = calibration_path_for_input(input_file, input_dir);
+                            if cal_path.exists() {
+                                load_calibration(&cal_path).ok()
+                            } else {
+                                None
+                            }
+                        });
+
+                    // Use refined calibration if available, fall back to original
+                    let rt_cal = refined_calibrations
+                        .get(file_name.as_str())
+                        .or_else(|| per_file_calibrations.get(file_name.as_str()));
+
+                    // Apply MS2 calibration to spectra (same as run_search)
+                    let calibrated_spectra: Option<Vec<Spectrum>> =
+                        cal_params.as_ref().and_then(|cal| {
+                            if cal.ms2_calibration.calibrated {
+                                Some(
+                                    spectra
+                                        .iter()
+                                        .map(|s| {
+                                            osprey_chromatography::apply_spectrum_calibration(
+                                                s,
+                                                &cal.ms2_calibration,
+                                            )
+                                        })
+                                        .collect(),
+                                )
+                            } else {
+                                None
+                            }
+                        });
+                    let spectra_ref = calibrated_spectra.as_deref().unwrap_or(&spectra);
+
+                    // Set up fragment tolerance (calibrated if available)
+                    let fragment_tolerance = if let Some(ref cal) = cal_params {
+                        let (tol_val, tol_unit) = osprey_chromatography::calibrated_tolerance(
+                            &cal.ms2_calibration,
+                            config.fragment_tolerance.tolerance,
+                            config.fragment_tolerance.unit,
+                        );
+                        FragmentToleranceConfig {
+                            tolerance: tol_val,
+                            unit: tol_unit,
+                        }
+                    } else {
+                        config.fragment_tolerance
+                    };
+
+                    let tol_da = match fragment_tolerance.unit {
+                        ToleranceUnit::Mz => fragment_tolerance.tolerance,
+                        ToleranceUnit::Ppm => 0.0,
+                    };
+                    let tol_ppm = match fragment_tolerance.unit {
+                        ToleranceUnit::Ppm => fragment_tolerance.tolerance,
+                        ToleranceUnit::Mz => 0.0,
+                    };
+
+                    let is_hram =
+                        matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
+                    let scorer = if is_hram {
+                        SpectralScorer::hram().with_tolerance_ppm(fragment_tolerance.tolerance)
+                    } else {
+                        SpectralScorer::new().with_tolerance_da(fragment_tolerance.tolerance)
+                    };
+
+                    // RT tolerance from calibration
+                    let rt_tolerance = cal_params
+                        .as_ref()
+                        .map(|cal| {
+                            let raw_tol = if let Some(mad) = cal.rt_calibration.mad {
+                                3.0 * mad * 1.4826
+                            } else {
+                                cal.rt_calibration.residual_sd
+                                    * config.rt_calibration.rt_tolerance_factor
+                            };
+                            raw_tol
+                                .max(config.rt_calibration.min_rt_tolerance)
+                                .min(config.rt_calibration.max_rt_tolerance)
+                        })
+                        .unwrap_or(config.rt_calibration.max_rt_tolerance);
+
+                    // Group spectra by isolation window
+                    let window_groups = group_spectra_by_isolation_window(spectra_ref);
+
+                    let n_rescored = rescore_for_reconciliation(
+                        entries,
+                        &file_rescore_targets,
+                        &library,
+                        spectra_ref,
+                        &window_groups,
+                        &ms1_index,
+                        cal_params.as_ref(),
+                        rt_cal,
+                        &scorer,
+                        tol_da,
+                        tol_ppm,
+                        rt_tolerance,
+                        is_hram,
+                        file_name,
+                    );
+
+                    total_rescored += n_rescored;
+                    log::info!(
+                        "  {} of {} entries successfully re-scored",
+                        n_rescored,
+                        file_rescore_targets.len()
+                    );
+                }
+
+                log::info!(
+                    "Cross-run reconciliation: {} entries re-scored across all files",
+                    total_rescored
+                );
+
+                // 5. Second FDR pass on reconciled entries
+                if total_rescored > 0 {
+                    log::info!("");
+                    log::info!("Running second-pass FDR on reconciled entries...");
+                    match config.fdr_method {
+                        FdrMethod::Percolator => {
+                            run_percolator_fdr(&mut per_file_entries, &config)?;
+                        }
+                        FdrMethod::Mokapot => {
+                            run_mokapot_fdr(
+                                &mut per_file_entries,
+                                &mokapot,
+                                &pin_files,
+                                &mokapot_dir,
+                                &config,
+                            )?;
+                        }
+                        FdrMethod::Simple => {
+                            for (_, entries) in per_file_entries.iter_mut() {
+                                apply_simple_fdr(entries, config.run_fdr)?;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2887,8 +3220,16 @@ fn compute_features_at_peak(
     } else {
         ToleranceUnit::Mz
     };
-    let (mass_mean, mass_abs_mean, mass_std) =
-        compute_mass_accuracy(&frag_matches, fragment_tolerance_unit);
+    let fragment_tolerance_val = if ctx.tol_ppm > 0.0 {
+        ctx.tol_ppm
+    } else {
+        ctx.tol_da
+    };
+    let (mass_mean, mass_abs_mean, mass_std) = compute_mass_accuracy(
+        &frag_matches,
+        fragment_tolerance_unit,
+        fragment_tolerance_val,
+    );
 
     // 5. RT deviation
     let rt_dev = peak.apex_rt - ctx.expected_rt;
@@ -3094,6 +3435,7 @@ fn compute_features_at_peak(
         experiment_qvalue: 1.0,
         score: 0.0,
         pep: 1.0,
+        cwt_candidates: Vec::new(), // populated by caller after peak selection
     })
 }
 
@@ -3188,7 +3530,7 @@ fn rescore_at_consensus(
     use osprey_scoring::extract_fragment_xics;
 
     rescore_targets
-        .iter()
+        .par_iter()
         .map(
             |&(orig_idx, consensus_apex, consensus_start, consensus_end)| {
                 let orig_entry = &entries[orig_idx];
@@ -3368,6 +3710,211 @@ fn rescore_at_consensus(
         .collect()
 }
 
+/// Re-score entries at cross-run reconciled peak boundaries.
+///
+/// For each entry with a reconciliation action (`UseCwtPeak` or `ForcedIntegration`),
+/// extracts XICs from the appropriate isolation window and computes all features
+/// at the specified reconciled boundaries. Updates entries in-place.
+///
+/// Uses rayon parallel iteration over actions, then merges results sequentially.
+/// Returns the number of successfully re-scored entries.
+#[allow(clippy::too_many_arguments)]
+fn rescore_for_reconciliation(
+    entries: &mut [CoelutionScoredEntry],
+    actions: &[(usize, f64, f64, f64)], // (entry_idx, target_apex, target_start, target_end)
+    library: &[LibraryEntry],
+    spectra: &[Spectrum],
+    window_groups: &[((f64, f64), Vec<usize>)],
+    ms1_index: &MS1Index,
+    calibration: Option<&CalibrationParams>,
+    rt_calibration: Option<&RTCalibration>,
+    scorer: &SpectralScorer,
+    tol_da: f64,
+    tol_ppm: f64,
+    rt_tolerance: f64,
+    is_hram: bool,
+    file_name: &str,
+) -> usize {
+    use osprey_chromatography::compute_snr;
+    use osprey_scoring::extract_fragment_xics;
+
+    // Parallel phase: compute new scored entries for each action
+    let results: Vec<(usize, Option<CoelutionScoredEntry>)> = actions
+        .par_iter()
+        .map(|&(entry_idx, target_apex, target_start, target_end)| {
+            let orig_entry = &entries[entry_idx];
+
+            // Look up the library entry
+            let lib_entry = if (orig_entry.entry_id as usize) < library.len()
+                && library[orig_entry.entry_id as usize].id == orig_entry.entry_id
+            {
+                &library[orig_entry.entry_id as usize]
+            } else {
+                match library.iter().find(|e| e.id == orig_entry.entry_id) {
+                    Some(e) => e,
+                    None => return (entry_idx, None),
+                }
+            };
+
+            let expected_rt = rt_calibration
+                .map(|cal| cal.predict(lib_entry.retention_time))
+                .unwrap_or(lib_entry.retention_time);
+
+            let mut best_result: Option<CoelutionScoredEntry> = None;
+
+            for &((lower, upper), ref spec_indices) in window_groups {
+                if lib_entry.precursor_mz < lower || lib_entry.precursor_mz > upper {
+                    continue;
+                }
+
+                let mut window_pairs: Vec<(usize, &Spectrum)> = spec_indices
+                    .iter()
+                    .filter_map(|&idx| {
+                        let spec = &spectra[idx];
+                        if (spec.retention_time - target_apex).abs() <= rt_tolerance {
+                            Some((idx, spec))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                window_pairs.sort_by(|a, b| {
+                    a.1.retention_time
+                        .partial_cmp(&b.1.retention_time)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                if window_pairs.len() < 3 {
+                    continue;
+                }
+
+                let cand_spectra: Vec<&Spectrum> = window_pairs.iter().map(|(_, s)| *s).collect();
+                let cand_global: Vec<usize> = window_pairs.iter().map(|(idx, _)| *idx).collect();
+
+                let xics =
+                    extract_fragment_xics(&lib_entry.fragments, &cand_spectra, tol_da, tol_ppm, 6);
+
+                if xics.len() < 2 {
+                    continue;
+                }
+
+                let ref_idx = xics
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| {
+                        let sum_a: f64 = a.1 .1.iter().map(|(_, v)| *v).sum();
+                        let sum_b: f64 = b.1 .1.iter().map(|(_, v)| *v).sum();
+                        sum_a.total_cmp(&sum_b)
+                    })
+                    .map(|(i, _)| i);
+
+                let ref_idx = match ref_idx {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let ref_xic = &xics[ref_idx].1;
+
+                if ref_xic.len() < 3 {
+                    continue;
+                }
+
+                let start_index = ref_xic
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (a.0 - target_start)
+                            .abs()
+                            .total_cmp(&(b.0 - target_start).abs())
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+
+                let end_index = ref_xic
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (a.0 - target_end)
+                            .abs()
+                            .total_cmp(&(b.0 - target_end).abs())
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(ref_xic.len() - 1);
+
+                let apex_index = ref_xic
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (a.0 - target_apex)
+                            .abs()
+                            .total_cmp(&(b.0 - target_apex).abs())
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(start_index);
+
+                if end_index <= start_index + 1 {
+                    continue;
+                }
+
+                let area =
+                    osprey_chromatography::trapezoidal_area(&ref_xic[start_index..=end_index]);
+                let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+                let snr = compute_snr(&raw_ints, apex_index, start_index, end_index);
+
+                let peak = XICPeakBounds {
+                    apex_rt: ref_xic[apex_index].0,
+                    apex_intensity: ref_xic[apex_index].1,
+                    apex_index,
+                    start_rt: ref_xic[start_index].0,
+                    end_rt: ref_xic[end_index].0,
+                    start_index,
+                    end_index,
+                    area,
+                    signal_to_noise: snr,
+                };
+
+                let ctx = FeatureComputeContext {
+                    entry: lib_entry,
+                    xics: &xics,
+                    ref_xic,
+                    cand_spectra: &cand_spectra,
+                    cand_global: &cand_global,
+                    scorer,
+                    ms1_index,
+                    calibration,
+                    tol_da,
+                    tol_ppm,
+                    expected_rt,
+                    is_hram,
+                    file_name,
+                };
+
+                if let Some(scored_entry) = compute_features_at_peak(&ctx, peak) {
+                    let dominated = best_result.as_ref().is_some_and(|existing| {
+                        existing.features.coelution_sum >= scored_entry.features.coelution_sum
+                    });
+                    if !dominated {
+                        best_result = Some(scored_entry);
+                    }
+                }
+            }
+
+            (entry_idx, best_result)
+        })
+        .collect();
+
+    // Sequential merge: update entries in-place from parallel results
+    let mut rescored_count = 0;
+    for (entry_idx, new_entry) in results {
+        if let Some(mut e) = new_entry {
+            e.cwt_candidates = entries[entry_idx].cwt_candidates.clone();
+            entries[entry_idx] = e;
+            rescored_count += 1;
+        }
+    }
+
+    rescored_count
+}
+
 /// For each precursor candidate in each isolation window:
 /// 1. Extract top-6 fragment XICs
 /// 2. Detect peak on reference XIC (DIA-NN-style valley detection)
@@ -3386,10 +3933,7 @@ fn run_search(
     config: &OspreyConfig,
     file_name: &str,
 ) -> Result<Vec<CoelutionScoredEntry>> {
-    use osprey_chromatography::{
-        compute_snr, detect_all_xic_peaks, detect_cwt_consensus_peaks,
-        detect_cwt_consensus_peaks_diagnostic,
-    };
+    use osprey_chromatography::{compute_snr, detect_all_xic_peaks, detect_cwt_consensus_peaks};
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
     use osprey_scoring::{
         extract_fragment_xics, pearson_correlation_raw, tukey_median_polish, SpectralScorer,
@@ -3671,17 +4215,8 @@ fn run_search(
                     // the majority of transitions exhibit peak-like shapes simultaneously.
                     // Falls back to median polish profile or reference XIC if CWT finds nothing.
                     let full_polish = tukey_median_polish(&xics, 10, 0.01);
-                    let is_diag_target = entry.modified_sequence.contains("SYELPDGQVITIGNER");
                     let candidates = {
-                        let cwt_candidates = if is_diag_target {
-                            let label = format!(
-                                "{}+{} win=[{:.1},{:.1}]",
-                                &entry.modified_sequence, entry.charge, lower, upper
-                            );
-                            detect_cwt_consensus_peaks_diagnostic(&xics, 0.0, &label)
-                        } else {
-                            detect_cwt_consensus_peaks(&xics, 0.0)
-                        };
+                        let cwt_candidates = detect_cwt_consensus_peaks(&xics, 0.0);
                         if cwt_candidates.is_empty() {
                             // Fallback: median polish elution profile, then reference XIC
                             let mp_candidates = full_polish
@@ -3704,91 +4239,92 @@ fn run_search(
                     }
 
                     // Score each candidate by mean pairwise fragment correlation
-                    let peak = if candidates.len() == 1 {
-                        let bp = &candidates[0];
-                        let si = bp.start_index;
-                        let ei = bp.end_index;
-                        let (apex_idx, apex_val) = ref_xic[si..=ei]
-                            .iter()
-                            .enumerate()
-                            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                            .map(|(i, &(_, v))| (si + i, v))
-                            .unwrap_or((bp.apex_index, 0.0));
-                        let area = trapezoidal_area(&ref_xic[si..=ei]);
-                        let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
-                        let snr = compute_snr(&raw_ints, apex_idx, si, ei);
-                        XICPeakBounds {
-                            apex_rt: ref_xic[apex_idx].0,
-                            apex_intensity: apex_val,
-                            apex_index: apex_idx,
-                            start_rt: ref_xic[si].0,
-                            end_rt: ref_xic[ei].0,
-                            start_index: si,
-                            end_index: ei,
-                            area,
-                            signal_to_noise: snr,
-                        }
-                    } else {
-                        // Select best peak by mean pairwise fragment correlation
-                        let best = candidates
-                            .iter()
-                            .map(|bp| {
-                                let si = bp.start_index;
-                                let ei = bp.end_index;
-                                let peak_len = ei - si + 1;
+                    let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+                    let mut scored_candidates: Vec<(&XICPeakBounds, f64)> = candidates
+                        .iter()
+                        .map(|bp| {
+                            let si = bp.start_index;
+                            let ei = bp.end_index;
+                            let peak_len = ei - si + 1;
 
-                                let coelution_score = if peak_len >= 3 {
-                                    let vals: Vec<Vec<f64>> = xics
-                                        .iter()
-                                        .map(|(_, xic_data)| {
-                                            xic_data[si..=ei].iter().map(|(_, v)| *v).collect()
-                                        })
-                                        .collect();
-                                    let mut sum = 0.0f64;
-                                    let mut count = 0u32;
-                                    for ii in 0..vals.len() {
-                                        for jj in (ii + 1)..vals.len() {
-                                            sum += pearson_correlation_raw(&vals[ii], &vals[jj]);
-                                            count += 1;
-                                        }
+                            let coelution_score = if peak_len >= 3 {
+                                let vals: Vec<Vec<f64>> = xics
+                                    .iter()
+                                    .map(|(_, xic_data)| {
+                                        xic_data[si..=ei].iter().map(|(_, v)| *v).collect()
+                                    })
+                                    .collect();
+                                let mut sum = 0.0f64;
+                                let mut count = 0u32;
+                                for ii in 0..vals.len() {
+                                    for jj in (ii + 1)..vals.len() {
+                                        sum += pearson_correlation_raw(&vals[ii], &vals[jj]);
+                                        count += 1;
                                     }
-                                    if count > 0 {
-                                        sum / count as f64
-                                    } else {
-                                        0.0
-                                    }
+                                }
+                                if count > 0 {
+                                    sum / count as f64
                                 } else {
                                     0.0
-                                };
+                                }
+                            } else {
+                                0.0
+                            };
 
-                                (bp, coelution_score)
-                            })
-                            .max_by(|a, b| a.1.total_cmp(&b.1))
-                            .unwrap();
+                            (bp, coelution_score)
+                        })
+                        .collect();
+                    scored_candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-                        let bp = best.0;
-                        let si = bp.start_index;
-                        let ei = bp.end_index;
-                        let (apex_idx, apex_val) = ref_xic[si..=ei]
-                            .iter()
-                            .enumerate()
-                            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                            .map(|(i, &(_, v))| (si + i, v))
-                            .unwrap_or((bp.apex_index, 0.0));
-                        let area = trapezoidal_area(&ref_xic[si..=ei]);
-                        let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
-                        let snr = compute_snr(&raw_ints, apex_idx, si, ei);
-                        XICPeakBounds {
-                            apex_rt: ref_xic[apex_idx].0,
-                            apex_intensity: apex_val,
-                            apex_index: apex_idx,
-                            start_rt: ref_xic[si].0,
-                            end_rt: ref_xic[ei].0,
-                            start_index: si,
-                            end_index: ei,
-                            area,
-                            signal_to_noise: snr,
-                        }
+                    // Store top-N CWT candidates for cross-run reconciliation
+                    let top_n = config.reconciliation.top_n_peaks;
+                    let cwt_top_n: Vec<CwtCandidate> = scored_candidates
+                        .iter()
+                        .take(top_n)
+                        .map(|(bp, score)| {
+                            let si = bp.start_index;
+                            let ei = bp.end_index;
+                            let area = trapezoidal_area(&ref_xic[si..=ei]);
+                            let (apex_idx, _) = ref_xic[si..=ei]
+                                .iter()
+                                .enumerate()
+                                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                                .map(|(i, &(_, v))| (si + i, v))
+                                .unwrap_or((bp.apex_index, 0.0));
+                            let snr = compute_snr(&raw_ints, apex_idx, si, ei);
+                            CwtCandidate {
+                                apex_rt: ref_xic[apex_idx].0,
+                                start_rt: ref_xic[si].0,
+                                end_rt: ref_xic[ei].0,
+                                area,
+                                snr,
+                                coelution_score: *score,
+                            }
+                        })
+                        .collect();
+
+                    // Build peak from best candidate
+                    let (best_bp, _) = scored_candidates[0];
+                    let si = best_bp.start_index;
+                    let ei = best_bp.end_index;
+                    let (apex_idx, apex_val) = ref_xic[si..=ei]
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                        .map(|(i, &(_, v))| (si + i, v))
+                        .unwrap_or((best_bp.apex_index, 0.0));
+                    let area = trapezoidal_area(&ref_xic[si..=ei]);
+                    let snr = compute_snr(&raw_ints, apex_idx, si, ei);
+                    let peak = XICPeakBounds {
+                        apex_rt: ref_xic[apex_idx].0,
+                        apex_intensity: apex_val,
+                        apex_index: apex_idx,
+                        start_rt: ref_xic[si].0,
+                        end_rt: ref_xic[ei].0,
+                        start_index: si,
+                        end_index: ei,
+                        area,
+                        signal_to_noise: snr,
                     };
 
                     // CWT zero-crossing boundaries are the final boundaries.
@@ -3810,7 +4346,11 @@ fn run_search(
                     };
 
                     pb.inc(1);
-                    compute_features_at_peak(&ctx, peak)
+                    let mut result = compute_features_at_peak(&ctx, peak);
+                    if let Some(ref mut entry) = result {
+                        entry.cwt_candidates = cwt_top_n;
+                    }
+                    result
                 })
                 .collect();
 
@@ -4536,6 +5076,7 @@ mod tests {
             experiment_qvalue: 1.0,
             score: 0.0,
             pep: 1.0,
+            cwt_candidates: vec![],
         };
 
         // Create entries: 5 target-decoy pairs with tied coelution_sum scores.
@@ -4628,6 +5169,7 @@ mod tests {
             experiment_qvalue: 1.0,
             score: 0.0,
             pep: 1.0,
+            cwt_candidates: vec![],
         }
     }
 

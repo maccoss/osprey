@@ -70,8 +70,8 @@ CI runs `cargo fmt --check` and `cargo clippy -D warnings` (including test targe
 ## Key Files
 
 - `docs/README.md` - Pipeline overview and algorithm documentation
-- `docs/fdr-control.md` - Two-level FDR with Mokapot
-- `docs/blib-output-schema.md` - BiblioSpec output format and Skyline integration
+- `docs/07-fdr-control.md` - Two-level FDR with Mokapot
+- `docs/08-blib-output-schema.md` - BiblioSpec output format and Skyline integration
 - `crates/osprey/src/pipeline.rs` - Main analysis pipeline
 - `crates/osprey/src/main.rs` - CLI entry point
 - `crates/osprey-fdr/src/mokapot.rs` - Mokapot integration

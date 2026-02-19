@@ -214,7 +214,7 @@ The primary output is a SQLite database in BiblioSpec format, compatible with Sk
 - **OspreyRunScores**: Run-level q-values and scores
 - **OspreyExperimentScores**: Experiment-level q-values
 
-Import directly into Skyline for quantification. See [BiblioSpec Output Schema](docs/blib-output-schema.md) for complete schema documentation.
+Import directly into Skyline for quantification. See [BiblioSpec Output Schema](docs/08-blib-output-schema.md) for complete schema documentation.
 
 ### TSV Report
 
