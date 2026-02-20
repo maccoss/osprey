@@ -225,7 +225,11 @@ pub fn refit_calibration_with_consensus(
         return None;
     }
 
-    let calibrator = RTCalibrator::new().with_bandwidth(0.3);
+    // Disable outlier removal (retention=1.0) — these are FDR-controlled detections,
+    // not noisy initial matches. Robustness iterations still downweight any bad points.
+    let calibrator = RTCalibrator::new()
+        .with_bandwidth(0.3)
+        .with_outlier_retention(1.0);
     match calibrator.fit(&library_rts, &measured_rts) {
         Ok(cal) => {
             let stats = cal.stats();

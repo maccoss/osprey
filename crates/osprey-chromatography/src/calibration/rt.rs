@@ -71,6 +71,12 @@ impl RTCalibrator {
         self
     }
 
+    /// Set the outlier retention fraction (0.0-1.0). Set to 1.0 to disable outlier removal.
+    pub fn with_outlier_retention(mut self, outlier_retention: f64) -> Self {
+        self.config.outlier_retention = outlier_retention;
+        self
+    }
+
     /// Fit a calibration curve from (library_rt, measured_rt) pairs
     ///
     /// # Arguments
