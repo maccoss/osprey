@@ -186,7 +186,7 @@ impl NeutralLoss {
 ///
 /// Used for precursor isotope envelope extraction and MS1 mass calibration.
 /// pyXcorrDIA extracts M+0 peak from MS1 spectra for accurate mass calibration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MS1Spectrum {
     /// Scan number in the file
     pub scan_number: u32,
@@ -328,7 +328,7 @@ impl IsotopeEnvelope {
 }
 
 /// MS/MS spectrum from data file
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Spectrum {
     /// Scan number in the file
     pub scan_number: u32,
@@ -374,7 +374,7 @@ impl Spectrum {
 }
 
 /// DIA isolation window
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct IsolationWindow {
     /// Center m/z
     pub center: f64,

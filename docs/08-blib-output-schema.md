@@ -182,6 +182,31 @@ Ion mobility type definitions (standard BiblioSpec).
 
 Types: 0=none, 1=driftTime(msec), 2=inverseK0(Vsec/cm^2), 3=compensation(V)
 
+### RetentionTimes
+
+Per-run retention times and peak boundaries for multi-file experiments. Each precursor (RefSpectra row) gets one RetentionTimes row per source file where it was detected.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| RefSpectraID | INTEGER | FK to RefSpectra.id |
+| RedundantRefSpectraID | INTEGER | Redundant spectrum ID (0) |
+| SpectrumSourceID | INTEGER | FK to SpectrumSourceFiles.id |
+| ionMobility | REAL | Ion mobility value (0.0) |
+| collisionalCrossSectionSqA | REAL | CCS (0.0) |
+| ionMobilityHighEnergyOffset | REAL | High energy offset (0.0) |
+| ionMobilityType | INTEGER | Ion mobility type (0 = none) |
+| retentionTime | REAL | Apex RT (minutes), **or NULL** |
+| startTime | REAL | Peak start time (minutes) |
+| endTime | REAL | Peak end time (minutes) |
+| score | REAL | Run-level q-value |
+| bestSpectrum | INTEGER | 1 if this is the best run, 0 otherwise |
+
+**Nullable retentionTime for Skyline ID lines**: The `retentionTime` column controls whether Skyline shows an ID line (vertical marker) for the precursor in that run:
+- **`retentionTime` = apex RT**: The precursor passed run-level FDR (`run_qvalue <= 0.01`) in this file. Skyline shows an ID line at the apex and uses `startTime`/`endTime` for peak integration boundaries.
+- **`retentionTime` = NULL**: The precursor did NOT pass run-level FDR in this file, but passed experiment-level FDR (it was confidently detected in another replicate). Skyline uses `startTime`/`endTime` for quantification boundaries **without** showing an ID line. This correctly indicates "we have boundaries for quantification, but this is not an independent identification."
+
+This distinction matters for multi-file experiments where a precursor may pass FDR in some replicates but not others. Peak boundaries are still provided for all files (from cross-run reconciliation) to enable consistent quantification across replicates.
+
 ---
 
 ## Osprey Extension Tables
@@ -396,5 +421,5 @@ How data flows from library through search to blib output:
    - **RefSpectraPeaks**: Library theoretical fragment m/z and intensities (not observed DIA peaks)
    - **Modifications**: From library entry (UniMod converted to mass notation)
    - **Proteins**: From library entry protein accessions
-   - **RetentionTimes**: Per-run peak boundaries for multi-file experiments
+   - **RetentionTimes**: Per-run peak boundaries for multi-file experiments. `retentionTime` is set for runs passing FDR (Skyline ID line), NULL otherwise (boundaries only, no ID line).
    - **Osprey tables**: Run/experiment q-values, peak boundaries

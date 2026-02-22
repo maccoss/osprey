@@ -181,7 +181,7 @@ impl SpectrumSource for MzmlReader {
 ///
 /// Used for finding the nearest MS1 scan to extract isotope envelopes
 /// for MS1 mass calibration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MS1Index {
     /// MS1 spectra sorted by retention time
     spectra: Vec<MS1Spectrum>,

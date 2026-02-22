@@ -18,6 +18,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 base64 = { workspace = true }
+bincode = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

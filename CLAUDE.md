@@ -247,6 +247,14 @@ After experiment-level FDR determines which precursors pass, **all per-file targ
 - The best experiment_qvalue is propagated to all observations of that precursor
 - Skyline can use per-file peak boundaries for quantification across replicates/GPF files
 
+### Blib RetentionTimes: Nullable retentionTime for Skyline ID Lines
+
+In the RetentionTimes table, `retentionTime` controls Skyline's ID line display:
+- **Set to apex RT**: When the precursor passes run-level FDR in that file → Skyline shows an ID line
+- **Set to NULL**: When the precursor did NOT pass run-level FDR in that file (but passed experiment-level FDR via another replicate) → Skyline uses `startTime`/`endTime` for quantification boundaries without showing an ID line
+
+This distinction is important: a NULL `retentionTime` with populated `startTime`/`endTime` tells Skyline "integrate here for quantification, but this is not an independent identification." See `docs/08-blib-output-schema.md` for full details.
+
 ### FDR Pipeline Flow (Multi-File)
 
 1. Train model on all data (all files combined)
@@ -282,3 +290,7 @@ After experiment-level FDR determines which precursors pass, **all per-file targ
 - Enforced dual precursor + peptide level FDR via max(precursor_qvalue, peptide_qvalue)
 - Added mokapot.peptides.txt parsing for peptide-level FDR in Mokapot paths
 - Added multi-file observation propagation: all per-file observations for passing precursors included in output
+- Nullable retentionTime in blib RetentionTimes: NULL (no ID line) for runs not passing FDR, populated for runs passing FDR
+- Added binary spectra cache (.spectra.bin) for faster second-pass mzML loading
+- Merged multi-charge consensus + cross-run reconciliation into single post-FDR phase (one spectra load per file)
+- Skip consensus re-scoring for peptide groups where no charge state passes FDR
