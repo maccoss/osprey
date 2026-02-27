@@ -63,6 +63,52 @@ use std::collections::HashMap;
 ///
 /// # Returns
 /// `true` if at least 2 of the top 6 library peaks have matching observed peaks
+/// Check if at least one of the top-6 library fragments matches in a spectrum.
+///
+/// More permissive than [`has_topn_fragment_match`] (which requires 2 matches).
+/// Used as a fast apex-scan pre-filter in the coelution search: if not even one
+/// top-6 fragment has any signal in the scan closest to the expected RT, the
+/// candidate is very unlikely to be a real detection.
+pub fn has_any_top_fragment_match(
+    library_fragments: &[LibraryFragment],
+    spectrum_mzs: &[f64],
+    tolerance: f64,
+    unit: ToleranceUnit,
+) -> bool {
+    if library_fragments.is_empty() || spectrum_mzs.is_empty() {
+        return true; // Be conservative - don't filter if no data
+    }
+
+    // Consider only the top 6 fragments by intensity
+    let top_indices: Vec<usize> = if library_fragments.len() <= 6 {
+        (0..library_fragments.len()).collect()
+    } else {
+        let mut indexed: Vec<(usize, f32)> = library_fragments
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i, f.relative_intensity))
+            .collect();
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+        indexed.iter().take(6).map(|(i, _)| *i).collect()
+    };
+
+    for &idx in &top_indices {
+        let lib_mz = library_fragments[idx].mz;
+        let tol_da = match unit {
+            ToleranceUnit::Ppm => lib_mz * tolerance / 1e6,
+            ToleranceUnit::Mz => tolerance,
+        };
+        let lower = lib_mz - tol_da;
+        let upper = lib_mz + tol_da;
+        let start_idx = spectrum_mzs.partition_point(|&mz| mz < lower);
+        if start_idx < spectrum_mzs.len() && spectrum_mzs[start_idx] <= upper {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub fn has_topn_fragment_match(
     library_fragments: &[LibraryFragment],
     spectrum_mzs: &[f64],

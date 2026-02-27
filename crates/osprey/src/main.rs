@@ -161,6 +161,11 @@ struct Args {
     #[arg(long)]
     write_pin: bool,
 
+    /// Disable the coelution signal pre-filter (3-of-4 consecutive scans with ≥2 top-6
+    /// fragments). The pre-filter speeds up HRAM searches ~30% with minimal sensitivity loss.
+    #[arg(long)]
+    no_prefilter: bool,
+
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -278,6 +283,11 @@ fn main() -> Result<()> {
         _ => config.resolution_mode,
     };
     config.resolution_mode = resolution_mode;
+
+    // Pre-filter: on by default for all modes; --no-prefilter disables it.
+    if args.no_prefilter {
+        config.prefilter_enabled = false;
+    }
 
     // Apply unit resolution defaults (Th units, 1.0 Th precursor, 0.5 Th fragment)
     // Explicit CLI args override these defaults

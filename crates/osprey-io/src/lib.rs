@@ -10,12 +10,10 @@
 //! - `load_ms1_spectra()` - Load only MS1 spectra
 //! - `MS1Index` - Index for efficient nearest-neighbor lookup by RT
 
-pub mod cache;
 pub mod library;
 pub mod mzml;
 pub mod output;
 
-pub use cache::{load_spectra_cache, save_spectra_cache};
 pub use library::{load_library, BlibLoader, DiannTsvLoader, ElibLoader};
 pub use mzml::{load_all_spectra, load_ms1_spectra, MS1Index, MzmlReader};
 pub use output::BlibWriter;

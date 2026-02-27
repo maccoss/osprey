@@ -50,12 +50,10 @@ use osprey_core::{
 use osprey_fdr::{
     get_pin_feature_names, percolator, pin_feature_value, MokapotRunner, NUM_PIN_FEATURES,
 };
-use osprey_io::{
-    load_all_spectra, load_library, load_spectra_cache, save_spectra_cache, BlibWriter, MS1Index,
-};
+use osprey_io::{load_all_spectra, load_library, BlibWriter, MS1Index};
 use osprey_scoring::{
     batch::{run_coelution_calibration_scoring, sample_library_for_calibration, MS1SpectrumLookup},
-    DecoyGenerator, DecoyMethod, Enzyme, SpectralScorer,
+    has_topn_fragment_match, DecoyGenerator, DecoyMethod, Enzyme, SpectralScorer,
 };
 
 /// Wrapper to implement MS1SpectrumLookup for MS1Index
@@ -1686,18 +1684,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         let entries = if !entries.is_empty() {
             entries
         } else {
-            // Load spectra (try cache first, then parse mzML)
-            let (spectra, ms1_index) = if let Some(cached) = load_spectra_cache(input_file) {
-                log::info!("Loaded spectra from cache for {}", input_file.display());
-                cached
-            } else {
-                let result = load_all_spectra(input_file)?;
-                // Save cache for later re-use (post-FDR re-scoring)
-                if let Err(e) = save_spectra_cache(input_file, &result.0, &result.1) {
-                    log::debug!("Failed to save spectra cache: {}", e);
-                }
-                result
-            };
+            // Load spectra
+            let (spectra, ms1_index) = load_all_spectra(input_file)?;
             if spectra.is_empty() {
                 log::warn!("No spectra found in {}", input_file.display());
                 continue;
@@ -3537,13 +3525,7 @@ impl FileRescoreContext {
     fn load(input_file: &std::path::Path, config: &OspreyConfig) -> Result<Self> {
         use osprey_scoring::batch::group_spectra_by_isolation_window;
 
-        // Try loading from cache first (saved during initial search phase)
-        let (spectra, ms1_index) = if let Some(cached) = load_spectra_cache(input_file) {
-            log::info!("Loaded spectra from cache for {}", input_file.display());
-            cached
-        } else {
-            load_all_spectra(input_file)?
-        };
+        let (spectra, ms1_index) = load_all_spectra(input_file)?;
         if spectra.is_empty() {
             return Err(OspreyError::MzmlParseError("No spectra found".into()));
         }
@@ -4046,13 +4028,13 @@ fn run_search(
         SpectralScorer::new().with_tolerance_da(fragment_tolerance.tolerance)
     };
 
-    // Progress bar
-    let total_candidates = library.len() as u64;
-    let pb = ProgressBar::new(total_candidates);
+    // Progress bar — each library entry belongs to exactly one window (half-open
+    // [lower, upper) convention), so total candidates == library.len().
+    let pb = ProgressBar::new(library.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} precursors ({per_sec})",
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} candidates",
             )
             .unwrap()
             .progress_chars("#>-"),
@@ -4105,9 +4087,11 @@ fn run_search(
                         if seen.contains(&idx) {
                             continue;
                         }
-                        // Check m/z falls within isolation window
+                        // Check m/z falls within isolation window.
+                        // Use half-open [lower, upper) so entries at the boundary
+                        // belong to exactly one window, preventing double-counting.
                         let entry = &library[idx];
-                        if entry.precursor_mz < *lower || entry.precursor_mz > *upper {
+                        if entry.precursor_mz < *lower || entry.precursor_mz >= *upper {
                             continue;
                         }
                         // Check RT is within a reasonable range of window spectra
@@ -4145,6 +4129,44 @@ fn run_search(
                     if rt_spec_pairs.len() < MIN_COELUTION_SPECTRA {
                         pb.inc(1);
                         return None;
+                    }
+
+                    // Signal pre-filter: sliding window of 4 consecutive scans
+                    // (in RT order), requiring ≥3 of the 4 to have ≥2 of the
+                    // top-6 fragments matching. Disabled for unit-resolution data
+                    // (lower fragment specificity) or via --no-prefilter.
+                    if config.prefilter_enabled {
+                        let tol = if tol_ppm > 0.0 { tol_ppm } else { tol_da };
+                        let tol_unit = if tol_ppm > 0.0 {
+                            ToleranceUnit::Ppm
+                        } else {
+                            ToleranceUnit::Mz
+                        };
+                        const WIN: usize = 4;
+                        const MIN_PASS: u32 = 3;
+                        let mut window = [false; WIN];
+                        let mut win_sum = 0u32;
+                        let mut has_signal = false;
+                        for (i, (_, spec)) in rt_spec_pairs.iter().enumerate() {
+                            let passes =
+                                has_topn_fragment_match(&entry.fragments, &spec.mzs, tol, tol_unit);
+                            let slot = i % WIN;
+                            if window[slot] {
+                                win_sum -= 1;
+                            }
+                            window[slot] = passes;
+                            if passes {
+                                win_sum += 1;
+                            }
+                            if i + 1 >= WIN && win_sum >= MIN_PASS {
+                                has_signal = true;
+                                break;
+                            }
+                        }
+                        if !has_signal {
+                            pb.inc(1);
+                            return None;
+                        }
                     }
 
                     let cand_spectra: Vec<&Spectrum> =

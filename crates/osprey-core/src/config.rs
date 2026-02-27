@@ -65,6 +65,12 @@ pub struct OspreyConfig {
     #[serde(default)]
     pub reconciliation: ReconciliationConfig,
 
+    // Search pre-filter
+    /// Enable the coelution signal pre-filter (3-of-4 consecutive scans with ≥2 top-6 fragments).
+    /// Speeds up searches ~30% with minimal sensitivity loss. Disable with --no-prefilter.
+    #[serde(default = "default_true")]
+    pub prefilter_enabled: bool,
+
     // Performance
     /// Number of threads to use
     pub n_threads: usize,
@@ -92,10 +98,15 @@ impl Default for OspreyConfig {
             decoy_method: DecoyMethod::Reverse,
             decoys_in_library: false,
             reconciliation: ReconciliationConfig::default(),
+            prefilter_enabled: true,
             n_threads: num_cpus(),
             memory_limit_gb: None,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Get the number of CPUs available

@@ -186,7 +186,7 @@ impl NeutralLoss {
 ///
 /// Used for precursor isotope envelope extraction and MS1 mass calibration.
 /// pyXcorrDIA extracts M+0 peak from MS1 spectra for accurate mass calibration.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct MS1Spectrum {
     /// Scan number in the file
     pub scan_number: u32,
@@ -328,7 +328,7 @@ impl IsotopeEnvelope {
 }
 
 /// MS/MS spectrum from data file
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Spectrum {
     /// Scan number in the file
     pub scan_number: u32,
@@ -374,7 +374,7 @@ impl Spectrum {
 }
 
 /// DIA isolation window
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub struct IsolationWindow {
     /// Center m/z
     pub center: f64,
@@ -418,9 +418,12 @@ impl IsolationWindow {
         self.lower_offset + self.upper_offset
     }
 
-    /// Check if an m/z value falls within this window
+    /// Check if an m/z value falls within this window (half-open: [lower, upper))
+    ///
+    /// Half-open convention ensures entries at shared boundaries between adjacent
+    /// windows belong to exactly one window, preventing double-counting.
     pub fn contains(&self, mz: f64) -> bool {
-        mz >= self.lower_bound() && mz <= self.upper_bound()
+        mz >= self.lower_bound() && mz < self.upper_bound()
     }
 }
 
@@ -681,15 +684,19 @@ pub struct CoelutionScoredEntry {
 mod tests {
     use super::*;
 
-    /// Verifies that IsolationWindow correctly includes/excludes m/z values at boundaries.
+    /// Verifies that IsolationWindow uses half-open [lower, upper) convention.
+    ///
+    /// The upper bound is exclusive so entries at shared boundaries between
+    /// adjacent windows belong to exactly one window.
     #[test]
     fn test_isolation_window_contains() {
         let window = IsolationWindow::symmetric(500.0, 12.5);
-        assert!(window.contains(500.0));
-        assert!(window.contains(487.5));
-        assert!(window.contains(512.5));
-        assert!(!window.contains(487.4));
-        assert!(!window.contains(512.6));
+        // lower = 487.5, upper = 512.5
+        assert!(window.contains(500.0)); // interior
+        assert!(window.contains(487.5)); // lower bound inclusive
+        assert!(!window.contains(512.5)); // upper bound exclusive
+        assert!(!window.contains(487.4)); // below lower
+        assert!(!window.contains(512.6)); // above upper
     }
 
     /// Verifies that NeutralLoss::H2O and NH3 return correct monoisotopic masses.
