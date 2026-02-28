@@ -60,6 +60,17 @@ pub struct OspreyConfig {
     #[serde(default)]
     pub write_pin: bool,
 
+    // Cross-run reconciliation
+    /// Cross-run peak reconciliation settings
+    #[serde(default)]
+    pub reconciliation: ReconciliationConfig,
+
+    // Search pre-filter
+    /// Enable the coelution signal pre-filter (3-of-4 consecutive scans with ≥2 top-6 fragments).
+    /// Speeds up searches ~30% with minimal sensitivity loss. Disable with --no-prefilter.
+    #[serde(default = "default_true")]
+    pub prefilter_enabled: bool,
+
     // Performance
     /// Number of threads to use
     pub n_threads: usize,
@@ -86,10 +97,16 @@ impl Default for OspreyConfig {
             experiment_fdr: 0.01,
             decoy_method: DecoyMethod::Reverse,
             decoys_in_library: false,
+            reconciliation: ReconciliationConfig::default(),
+            prefilter_enabled: true,
             n_threads: num_cpus(),
             memory_limit_gb: None,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Get the number of CPUs available
@@ -451,6 +468,27 @@ impl std::fmt::Display for FdrMethod {
             FdrMethod::Percolator => write!(f, "percolator"),
             FdrMethod::Mokapot => write!(f, "mokapot"),
             FdrMethod::Simple => write!(f, "simple"),
+        }
+    }
+}
+
+/// Cross-run peak reconciliation configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationConfig {
+    /// Enable cross-run peak reconciliation (default: true for multi-file)
+    pub enabled: bool,
+    /// Number of CWT candidate peaks to store per precursor (default: 5)
+    pub top_n_peaks: usize,
+    /// FDR threshold for selecting consensus peptides (default: 0.01)
+    pub consensus_fdr: f64,
+}
+
+impl Default for ReconciliationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            top_n_peaks: 5,
+            consensus_fdr: 0.01,
         }
     }
 }

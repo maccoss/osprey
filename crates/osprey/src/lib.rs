@@ -43,6 +43,9 @@ pub use osprey_scoring::{DecoyGenerator, DecoyMethod, Enzyme};
 // Re-export FDR
 pub use osprey_fdr::{FdrController, FdrCounts, MokapotResult, MokapotRunner};
 
+// Cross-run peak reconciliation
+pub mod reconciliation;
+
 // Pipeline
 mod pipeline;
 pub use pipeline::run_analysis;

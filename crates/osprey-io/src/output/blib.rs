@@ -589,12 +589,16 @@ impl BlibWriter {
     ///
     /// Each precursor gets one RetentionTimes row per source file where it was detected.
     /// The `best_spectrum` flag marks which run's data was used for the RefSpectra entry.
+    ///
+    /// `retention_time` should be `Some(apex_rt)` for runs where the precursor passed
+    /// run-level FDR (Skyline shows an ID line), or `None` for runs where it did not
+    /// (Skyline uses startTime/endTime for quantification without showing an ID line).
     #[allow(clippy::too_many_arguments)]
     pub fn add_retention_time(
         &self,
         ref_id: i64,
         source_file_id: i64,
-        retention_time: f64,
+        retention_time: Option<f64>,
         start_time: f64,
         end_time: f64,
         score: f64,
@@ -960,7 +964,7 @@ mod tests {
 
         // Add retention time entry
         writer
-            .add_retention_time(ref_id, file_id, 10.0, 9.0, 11.0, 0.01, true)
+            .add_retention_time(ref_id, file_id, Some(10.0), 9.0, 11.0, 0.01, true)
             .unwrap();
 
         // Add peak boundaries
@@ -1369,43 +1373,52 @@ mod tests {
             )
             .unwrap();
 
-        // Add retention times for 3 runs — run 2 is best
+        // Add retention times for 3 runs — run 2 is best, run 3 has null RT (didn't pass FDR)
         writer
-            .add_retention_time(ref_id, file_id_1, 10.5, 9.5, 11.5, 0.008, false)
+            .add_retention_time(ref_id, file_id_1, Some(10.5), 9.5, 11.5, 0.008, false)
             .unwrap();
         writer
-            .add_retention_time(ref_id, file_id_2, 10.3, 9.3, 11.3, 0.005, true)
+            .add_retention_time(ref_id, file_id_2, Some(10.3), 9.3, 11.3, 0.005, true)
             .unwrap();
         writer
-            .add_retention_time(ref_id, file_id_3, 10.7, 9.7, 11.7, 0.012, false)
+            .add_retention_time(ref_id, file_id_3, None, 9.7, 11.7, 0.012, false)
             .unwrap();
 
-        // Read back RetentionTimes
+        // Read back RetentionTimes (retentionTime can be NULL)
         let mut stmt = writer
             .conn
             .prepare(
-                "SELECT SpectrumSourceID, retentionTime, bestSpectrum \
+                "SELECT SpectrumSourceID, retentionTime, startTime, endTime, bestSpectrum \
                  FROM RetentionTimes WHERE RefSpectraID = ? \
                  ORDER BY SpectrumSourceID",
             )
             .unwrap();
-        let rows: Vec<(i64, f64, i32)> = stmt
+        let rows: Vec<(i64, Option<f64>, f64, f64, i32)> = stmt
             .query_map(params![ref_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
 
         assert_eq!(rows.len(), 3);
-        // Run 1: not best
-        assert_eq!(rows[0].2, 0);
-        assert!((rows[0].1 - 10.5).abs() < 0.01);
-        // Run 2: best
-        assert_eq!(rows[1].2, 1);
-        assert!((rows[1].1 - 10.3).abs() < 0.01);
-        // Run 3: not best
-        assert_eq!(rows[2].2, 0);
-        assert!((rows[2].1 - 10.7).abs() < 0.01);
+        // Run 1: has ID (retentionTime set), not best
+        assert_eq!(rows[0].4, 0);
+        assert!((rows[0].1.unwrap() - 10.5).abs() < 0.01);
+        assert!((rows[0].2 - 9.5).abs() < 0.01);
+        // Run 2: has ID, best
+        assert_eq!(rows[1].4, 1);
+        assert!((rows[1].1.unwrap() - 10.3).abs() < 0.01);
+        // Run 3: no ID (retentionTime NULL), but has boundaries
+        assert_eq!(rows[2].4, 0);
+        assert!(rows[2].1.is_none(), "Run 3 should have NULL retentionTime");
+        assert!((rows[2].2 - 9.7).abs() < 0.01);
+        assert!((rows[2].3 - 11.7).abs() < 0.01);
     }
 }

@@ -418,9 +418,12 @@ impl IsolationWindow {
         self.lower_offset + self.upper_offset
     }
 
-    /// Check if an m/z value falls within this window
+    /// Check if an m/z value falls within this window (half-open: [lower, upper))
+    ///
+    /// Half-open convention ensures entries at shared boundaries between adjacent
+    /// windows belong to exactly one window, preventing double-counting.
     pub fn contains(&self, mz: f64) -> bool {
-        mz >= self.lower_bound() && mz <= self.upper_bound()
+        mz >= self.lower_bound() && mz < self.upper_bound()
     }
 }
 
@@ -608,6 +611,26 @@ pub struct CoelutionFeatureSet {
     pub median_polish_residual_correlation: f64,
 }
 
+/// A CWT candidate peak with boundaries and coelution score.
+///
+/// Stored in parquet as packed LE bytes for top-N peak storage,
+/// enabling cross-run peak reconciliation without re-running CWT.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CwtCandidate {
+    /// Peak apex RT (minutes)
+    pub apex_rt: f64,
+    /// Start RT of peak (minutes)
+    pub start_rt: f64,
+    /// End RT of peak (minutes)
+    pub end_rt: f64,
+    /// Integrated area within boundaries
+    pub area: f64,
+    /// Signal-to-noise ratio
+    pub snr: f64,
+    /// Mean pairwise fragment correlation within peak
+    pub coelution_score: f64,
+}
+
 /// Scored entry from coelution-based search.
 ///
 /// Holds all information needed for Mokapot FDR (via PIN file) and
@@ -652,21 +675,28 @@ pub struct CoelutionScoredEntry {
     pub score: f64,
     /// Posterior error probability (computed on the final SVM score)
     pub pep: f64,
+    /// Top-N CWT candidate peaks (sorted by coelution_score descending).
+    /// Used for cross-run peak reconciliation.
+    pub cwt_candidates: Vec<CwtCandidate>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Verifies that IsolationWindow correctly includes/excludes m/z values at boundaries.
+    /// Verifies that IsolationWindow uses half-open [lower, upper) convention.
+    ///
+    /// The upper bound is exclusive so entries at shared boundaries between
+    /// adjacent windows belong to exactly one window.
     #[test]
     fn test_isolation_window_contains() {
         let window = IsolationWindow::symmetric(500.0, 12.5);
-        assert!(window.contains(500.0));
-        assert!(window.contains(487.5));
-        assert!(window.contains(512.5));
-        assert!(!window.contains(487.4));
-        assert!(!window.contains(512.6));
+        // lower = 487.5, upper = 512.5
+        assert!(window.contains(500.0)); // interior
+        assert!(window.contains(487.5)); // lower bound inclusive
+        assert!(!window.contains(512.5)); // upper bound exclusive
+        assert!(!window.contains(487.4)); // below lower
+        assert!(!window.contains(512.6)); // above upper
     }
 
     /// Verifies that NeutralLoss::H2O and NH3 return correct monoisotopic masses.

@@ -112,7 +112,10 @@
       "WebFetch(domain:misc.legendu.net)",
       "Bash(cargo tree:*)",
       "Bash(xxd:*)",
-      "WebFetch(domain:pubs.acs.org)"
+      "WebFetch(domain:pubs.acs.org)",
+      "Bash(git merge:*)",
+      "Bash(gh auth status:*)",
+      "Bash(git mv:*)"
     ],
     "additionalDirectories": [
       "/mnt/c/Users/macco/Documents/github/maccoss/osprey/example_test_data/astral"

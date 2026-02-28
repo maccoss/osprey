@@ -28,6 +28,9 @@ pub struct CalibrationParams {
     pub ms2_calibration: MzCalibration,
     /// Retention time calibration
     pub rt_calibration: RTCalibrationParams,
+    /// Second-pass RT calibration from cross-run consensus (optional)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub second_pass_rt: Option<RTCalibrationParams>,
 }
 
 impl CalibrationParams {
@@ -44,6 +47,7 @@ impl CalibrationParams {
             ms1_calibration: MzCalibration::uncalibrated(),
             ms2_calibration: MzCalibration::uncalibrated(),
             rt_calibration: RTCalibrationParams::uncalibrated(),
+            second_pass_rt: None,
         }
     }
 
@@ -434,6 +438,7 @@ mod tests {
                 p20_abs_residual: Some(0.15),
                 mad: Some(0.12),
             },
+            second_pass_rt: None,
         };
 
         // Serialize to JSON
