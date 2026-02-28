@@ -140,7 +140,7 @@ For large datasets (millions of entries), SVM training can be very slow (O(n²) 
 4. Train the SVM on the subsampled folds
 5. Score ALL original entries with the trained model
 
-The default training cap is 250,000 total entries. Subsampling operates on peptide groups to preserve target-decoy pairs and charge state groupings.
+The default training cap is 300,000 total entries. Subsampling operates on peptide groups to preserve target-decoy pairs and charge state groupings.
 
 ### Initial Feature Selection
 

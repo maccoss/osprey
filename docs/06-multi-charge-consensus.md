@@ -19,7 +19,11 @@ Cross-charge consensus **cannot** happen within the per-window parallel loop bec
 4. Re-scoring at consensus boundaries → replaces entries with corrected features
 5. Return final results
    ↓
-6. FDR control (caller)
+6. First-pass FDR control (caller) → run-level q-values
+   ↓
+7. Cross-run reconciliation (caller, multi-file only)
+   → consensus RT computation, calibration refit, second-pass FDR
+   See: Cross-Run Reconciliation (10-cross-run-reconciliation.md)
 ```
 
 ---

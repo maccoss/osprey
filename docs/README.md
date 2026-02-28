@@ -26,6 +26,7 @@ Osprey has a **working prototype** that can:
 | [07 - FDR Control](07-fdr-control.md) | Two-level FDR: native Percolator, Mokapot, and simple TDC |
 | [08 - BiblioSpec Output Schema](08-blib-output-schema.md) | blib output format and Skyline integration |
 | [09 - Determinism](09-determinism.md) | Deterministic analysis: patterns, invariants, and maintenance |
+| [10 - Cross-Run Reconciliation](10-cross-run-reconciliation.md) | Consensus RT computation and peak alignment across replicates |
 
 ---
 
@@ -58,20 +59,30 @@ PHASE 2: CALIBRATION DISCOVERY (first file only)
   +- Set tight RT tolerance for main search (3x residual SD)
   |
   v
-PHASE 3: COELUTION SEARCH
+PHASE 3: COELUTION SEARCH (per file)
+  +- Pre-filter: 3-of-4 consecutive scans must have ≥2 top-6 fragment matches
+  |    (~30% speedup, minimal sensitivity loss; disable with --no-prefilter)
   +- Extract fragment XICs per precursor within RT window
   +- CWT consensus peak detection (Mexican Hat wavelet, median across transitions)
   +- Fallback: median polish profile or reference XIC peak detection
   +- Peak boundaries: zero-crossings ±2σ (valley guard)
+  +- 45-feature extraction (coelution, spectral, peak shape, mass accuracy, MS1)
+  +- Multi-charge consensus: all charge states of same peptide share peak boundaries
   |
   v
-PHASE 4: COELUTION SCORING (45 features)
-  +- Pairwise coelution features (correlations between fragment XICs)
-  +- Peak shape features (apex, area, width, symmetry, S/N)
-  +- Spectral matching at apex (hyperscore, xcorr, dot products)
-  +- Tukey median polish on fragment XICs
-  +- Multi-charge consensus: all charge states of same peptide share peak boundaries
-  +- FDR control (Percolator SVM or Mokapot) -> q-values
+PHASE 4: FIRST-PASS FDR
+  +- FDR control (Percolator SVM or Mokapot) -> run-level q-values
+  |
+  v
+PHASE 5: CROSS-RUN RECONCILIATION (multi-file only)
+  +- Collect peptides passing FDR in any run (at consensus_fdr threshold)
+  +- Compute consensus library RTs: weighted median of per-run detections
+  |    (weight = coelution_sum; mapped back to library RT space via inverse calibration)
+  +- Refit per-run LOESS calibration using consensus peptides
+  +- Plan reconciliation for each entry:
+  |    Keep | UseCwtPeak (alternate stored candidate) | ForcedIntegration
+  +- Re-score reconciled entries at updated peak boundaries
+  +- Second-pass FDR -> final q-values
   |
   v
 OUTPUT
@@ -270,7 +281,9 @@ See: [Calibration](02-calibration.md)
 
 The coelution search extracts fragment XICs directly from the DIA data and scores precursors based on how well their fragment ion chromatograms co-elute.
 
-For each precursor within the RT window:
+Before per-precursor scoring, a **pre-filter** eliminates candidates with no spectral evidence: at least 3 of 4 consecutive scans must contain ≥2 of the top-6 library fragment matches. This reduces scoring work by ~30% with negligible sensitivity loss. Disable with `--no-prefilter`.
+
+For each precursor passing the pre-filter:
 
 1. **Fragment XIC extraction**: Extract chromatograms for each library fragment ion at the expected m/z (ppm tolerance)
 2. **CWT consensus peak detection**: Convolve each fragment XIC with a Mexican Hat wavelet, compute pointwise median across transitions, find peaks in consensus signal. Boundaries via zero-crossings extended to ±2σ with valley guard. See [Peak Detection](05-peak-detection.md).
@@ -309,11 +322,28 @@ All 45 features are computed within or at the peak boundaries:
 - **MS1 features**: Precursor co-elution and isotope cosine (HRAM only)
 - **Peptide properties**: Peptide length, missed cleavages, RT deviation
 
-### Step 4: FDR Control
+### Step 4: First-Pass FDR
 
 All 45 features are combined into an optimal discriminant score via semi-supervised learning (linear SVM). The default native Percolator receives both targets and decoys and performs internal paired competition. For external Mokapot, targets and decoys are pre-competed using the best feature (selected by ROC AUC) and only winners are written to PIN files.
 
-**Two-level FDR with dual precursor+peptide control**:
+This produces **run-level q-values** for each file, used as input to cross-run reconciliation.
+
+See: [FDR Control](07-fdr-control.md)
+
+### Step 5: Cross-Run Reconciliation (multi-file only)
+
+For multi-file experiments, cross-run reconciliation aligns peak boundaries across replicates before the final FDR pass:
+
+1. **Consensus RTs**: Peptides passing FDR in any run contribute (apex_rt → library_rt) pairs. The consensus library RT is computed as the weighted median across runs (weight = coelution_sum).
+2. **Calibration refit**: Each run's LOESS calibration is refit using consensus peptides, improving RT prediction accuracy for the second pass.
+3. **Reconciliation plan**: For each entry, the expected measured RT is predicted from the refined calibration. Three outcomes: **Keep** (current peak contains expected RT), **UseCwtPeak** (alternate stored CWT candidate overlaps), or **ForcedIntegration** (no overlapping candidate — integrate at expected RT ± half of median peak width).
+4. **Second-pass FDR**: Reconciled entries are re-scored and FDR is recomputed, producing final experiment-level q-values.
+
+**Why this matters**: In low-signal runs or windows with interference, the peak selector may choose a completely wrong chromatographic peak for a peptide. Reconciliation uses the high-confidence runs to establish where the peptide truly elutes, then corrects the other runs — either by switching to an alternate stored CWT candidate or by imputing boundaries at the expected RT.
+
+See: [Cross-Run Reconciliation](10-cross-run-reconciliation.md)
+
+**Final two-level FDR with dual precursor+peptide control**:
 1. **Run-level**: Per-file FDR at both precursor and peptide level
 2. **Experiment-level**: Best observation per precursor across all files, FDR at both levels
 3. **Effective q-value**: `max(precursor_qvalue, peptide_qvalue)` at each level
@@ -365,7 +395,7 @@ Library retention times may be predicted by deep learning models (Prosit, DeepLC
 ```
 osprey/
 +-- osprey-core/              # Core types, config, errors, traits
-|   +-- config.rs             # YAML configuration structures
+|   +-- config.rs             # YAML configuration structures (incl. ReconciliationConfig)
 |   +-- isotope.rs            # Isotope distribution calculations
 |   +-- types.rs              # LibraryEntry, Spectrum, CoelutionFeatureSet
 |   +-- traits.rs             # MS1SpectrumLookup, etc.
@@ -379,7 +409,7 @@ osprey/
 |   +-- lib.rs                # SpectralScorer, FeatureExtractor, DecoyGenerator,
 |   |                         # Tukey median polish, fragment co-elution
 |   +-- batch.rs              # BLAS-accelerated batch scoring (calibration)
-|   +-- calibration_ml.rs     # LDA calibration scoring
+|   +-- calibration_ml.rs     # LDA calibration scoring (classical LDA, 3-fold CV)
 |   +-- pipeline/             # Streaming pipeline components
 |
 +-- osprey-chromatography/    # Chromatographic analysis
@@ -387,13 +417,23 @@ osprey/
 |   +-- cwt.rs                # CWT consensus peak detection (Mexican Hat wavelet)
 |   +-- calibration/          # LOESS RT calibration, mass calibration, I/O
 |
++-- osprey-ml/                # Machine learning primitives
+|   +-- svm.rs                # Linear SVM (dual coordinate descent, Percolator training)
+|   +-- linear_discriminant.rs# Classical LDA (scatter matrices + eigenvector, for calibration)
+|   +-- pep.rs                # PEP estimation via KDE + isotonic regression
+|   +-- kde.rs                # Kernel density estimation
+|   +-- qvalue.rs             # Q-value computation
+|   +-- matrix.rs             # Linear algebra operations
+|
 +-- osprey-fdr/               # FDR control
 |   +-- lib.rs                # Target-decoy competition, q-values
+|   +-- percolator.rs         # Native Percolator (SVM, fold assignment, score calibration)
 |   +-- mokapot.rs            # PIN file output, Mokapot integration
 |
 +-- osprey/                   # Main library + CLI binary
     +-- main.rs               # CLI entry point
     +-- pipeline.rs           # Analysis pipeline orchestration
+    +-- reconciliation.rs     # Cross-run consensus RT and peak alignment
 ```
 
 ## Utility Scripts
@@ -464,6 +504,14 @@ run_fdr: 0.01
 
 # Decoy Generation
 decoy_method: Reverse
+
+# Search pre-filter (speeds up ~30%, disable only if investigating sensitivity)
+prefilter_enabled: true
+
+# Cross-run peak reconciliation (multi-file only)
+reconciliation:
+  enabled: true
+  consensus_fdr: 0.01   # FDR threshold for selecting consensus peptides
 ```
 
 ## References

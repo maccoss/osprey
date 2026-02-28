@@ -1,8 +1,8 @@
 # Osprey
 
-**Open-Source Peptide Recognition and Elution Yield**
+[![GitHub Downloads](https://img.shields.io/github/downloads/maccoss/osprey/total)](https://github.com/maccoss/osprey/releases)
 
-Peptide-centric DIA analysis with Skyline integration.
+**Open-Source Peptide-Centric Search Tool Designed for Skyline Integration**
 
 Osprey is an open-source tool for peptide detection and quantification in data-independent acquisition (DIA) mass spectrometry data. It uses fragment XIC co-elution analysis to detect peptides in DIA data, with machine learning scoring and rigorous FDR control.
 
@@ -14,7 +14,7 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 - **RT calibration**: LOESS-based retention time calibration with stratified sampling
 - **Decoy generation**: Enzyme-aware sequence reversal with fragment m/z recalculation
 - **Skyline integration**: Outputs BiblioSpec (.blib) format for seamless quantification in Skyline
-- **FDR control**: Target-decoy competition with mokapot integration for semi-supervised learning
+- **FDR control**: Built-in Percolator-style semi-supervised SVM with target-decoy competition; optional Mokapot integration for an alternative semi-supervised approach
 - **Flexible input**: Supports DIA-NN TSV, EncyclopeDIA elib, and BiblioSpec blib libraries
 - **Configurable**: YAML configuration files for reproducible analyses
 
@@ -23,8 +23,6 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 ### Prerequisites
 
 - Rust 1.75 or later
-- Python 3.8 or later (for mokapot)
-- Mokapot (for FDR control)
 - OpenBLAS development libraries
 - OpenSSL development libraries
 - CMake
@@ -32,24 +30,20 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 On Ubuntu/Debian:
 ```bash
 sudo apt-get update
-sudo apt-get install libopenblas-dev libssl-dev cmake pkg-config python3-pip
+sudo apt-get install libopenblas-dev libssl-dev cmake pkg-config
 ```
 
-Install mokapot:
+### Optional: Mokapot
+
+Osprey includes a built-in Percolator-style semi-supervised SVM — no Python required. Mokapot is an optional alternative FDR engine that can be enabled with `--fdr-engine mokapot`.
+
 ```bash
+# Requires Python 3.8+ and pip
 # Note: mokapot 0.10.0 requires pandas 2.x and numpy <2.0
 pip install mokapot 'pandas>=2.0,<3.0' 'numpy<2.0'
-
-# Or install for your user only (recommended)
-pip install --user mokapot 'pandas>=2.0,<3.0' 'numpy<2.0'
 ```
 
-Verify mokapot installation:
-```bash
-mokapot --version
-```
-
-**Note:** If the `mokapot` command is not found after installation, add `~/.local/bin` to your PATH:
+If the `mokapot` command is not found after installation, add `~/.local/bin` to your PATH:
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 source ~/.bashrc
@@ -280,7 +274,7 @@ For each candidate precursor:
 2. Compute pairwise fragment co-elution correlations
 3. Detect peaks in the co-elution signal
 4. Score using spectral matching (dot product, XCorr, hyperscore) at the apex
-5. Extract 45 features per precursor for machine learning scoring via Mokapot
+5. Extract 45 features per precursor for machine learning scoring via built-in Percolator SVM (or optionally Mokapot)
 
 ## Development
 
@@ -293,7 +287,7 @@ osprey/
 │   ├── osprey-io/            # File I/O (mzML, blib, libraries)
 │   ├── osprey-chromatography/# Peak detection, RT calibration
 │   ├── osprey-scoring/       # Feature extraction, decoy generation
-│   ├── osprey-fdr/           # FDR control, mokapot integration
+│   ├── osprey-fdr/           # FDR control (Percolator SVM + optional Mokapot)
 │   ├── osprey-ml/            # Machine learning (SVM, PEP estimation)
 │   └── osprey/               # CLI and pipeline
 ```
@@ -332,8 +326,9 @@ cargo doc --open
 - RT calibration with LOESS regression and stratified sampling
 - MS1/MS2 mass calibration
 - Enzyme-aware decoy generation with fragment recalculation
-- 45-feature extraction per precursor for Mokapot
-- Two-level FDR control (run + experiment level) via Mokapot
+- 45-feature extraction per precursor for machine learning scoring
+- Built-in Percolator-style semi-supervised SVM for FDR control (no Python required)
+- Two-level FDR control (run + experiment level) with optional Mokapot integration
 - Tukey median polish for robust elution profiles and fragment scoring
 - Fragment co-elution scoring, elution-weighted cosine
 - Mass accuracy features (ppm-level)
