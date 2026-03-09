@@ -3,10 +3,12 @@
 //! Parses spectral libraries in BiblioSpec's SQLite-based blib format.
 //! This format is commonly used by Skyline and other proteomics tools.
 
+use flate2::read::ZlibDecoder;
 use osprey_core::{
     FragmentAnnotation, IonType, LibraryEntry, LibraryFragment, Modification, OspreyError, Result,
 };
 use rusqlite::{Connection, OpenFlags};
+use std::io::Read;
 use std::path::Path;
 
 /// BiblioSpec blib format loader
@@ -70,7 +72,7 @@ impl BlibLoader {
                 let precursor_mz: f64 = row.get(3)?;
                 let precursor_charge: i32 = row.get(4)?;
                 let retention_time: Option<f64> = row.get(5)?;
-                let _num_peaks: Option<i32> = row.get(6)?;
+                let num_peaks: Option<i32> = row.get(6)?;
                 let peak_mz_blob: Option<Vec<u8>> = row.get(7)?;
                 let peak_int_blob: Option<Vec<u8>> = row.get(8)?;
 
@@ -81,6 +83,7 @@ impl BlibLoader {
                     precursor_mz,
                     precursor_charge,
                     retention_time,
+                    num_peaks,
                     peak_mz_blob,
                     peak_int_blob,
                 ))
@@ -95,6 +98,7 @@ impl BlibLoader {
                 precursor_mz,
                 precursor_charge,
                 retention_time,
+                num_peaks,
                 peak_mz_blob,
                 peak_int_blob,
             ) = row_result
@@ -110,10 +114,11 @@ impl BlibLoader {
                 // Parse modifications from modified sequence
                 let modifications = parse_blib_modifications(&peptide_mod_seq);
 
-                // Decode peaks
+                // Decode peaks (may be zlib-compressed in Skyline blib files)
                 let fragments =
                     if let (Some(mz_blob), Some(int_blob)) = (&peak_mz_blob, &peak_int_blob) {
-                        decode_blib_peaks(mz_blob, int_blob)?
+                        let n = num_peaks.unwrap_or(0) as usize;
+                        decode_blib_peaks(mz_blob, int_blob, n)?
                     } else {
                         Vec::new()
                     };
@@ -302,43 +307,125 @@ fn identify_modification(mass: f64, is_nterm: bool) -> (f64, Option<u32>, Option
     }
 }
 
-/// Decode peak blobs from blib format
-/// BiblioSpec stores peaks as little-endian doubles
-fn decode_blib_peaks(mz_blob: &[u8], intensity_blob: &[u8]) -> Result<Vec<LibraryFragment>> {
-    // BiblioSpec typically stores as doubles (f64)
-    if mz_blob.len() % 8 != 0 {
-        return Err(OspreyError::LibraryLoadError(
-            "Invalid peak m/z blob size".to_string(),
-        ));
+/// Try to zlib-decompress a blob. Returns the decompressed data on success,
+/// or None if this doesn't look like valid zlib data.
+fn try_zlib_decompress(data: &[u8], expected_size: usize) -> Option<Vec<u8>> {
+    let mut decoder = ZlibDecoder::new(data);
+    let mut decompressed = Vec::with_capacity(expected_size);
+    decoder.read_to_end(&mut decompressed).ok()?;
+    Some(decompressed)
+}
+
+/// Determine whether blobs need decompression and return decompressed copies if so.
+/// Returns (Option<mz_decompressed>, Option<intensity_decompressed>).
+/// None means the original blob is already in the right format.
+#[allow(clippy::type_complexity)]
+fn decompress_peak_blobs(
+    mz_blob: &[u8],
+    intensity_blob: &[u8],
+    num_peaks: usize,
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    let expected_mz_size = num_peaks * 8; // f64
+
+    // If raw m/z blob is already the right size, assume uncompressed
+    if mz_blob.len() == expected_mz_size && mz_blob.len() % 8 == 0 {
+        // Still check intensity — it might be compressed even if m/z isn't
+        let expected_int_f32 = num_peaks * 4;
+        let expected_int_f64 = num_peaks * 8;
+        if intensity_blob.len() == expected_int_f32 || intensity_blob.len() == expected_int_f64 {
+            return Ok((None, None));
+        }
+        // Try decompressing intensity only
+        if let Some(dec) = try_zlib_decompress(intensity_blob, expected_int_f32) {
+            if dec.len() == expected_int_f32 || dec.len() == expected_int_f64 {
+                return Ok((None, Some(dec)));
+            }
+        }
+        return Ok((None, None));
     }
 
-    let n_peaks = mz_blob.len() / 8;
+    // m/z blob doesn't match expected raw size — try zlib decompression
+    if num_peaks > 0 {
+        if let Some(mz_dec) = try_zlib_decompress(mz_blob, expected_mz_size) {
+            let int_dec =
+                if intensity_blob.len() == num_peaks * 4 || intensity_blob.len() == num_peaks * 8 {
+                    // Intensity already uncompressed
+                    None
+                } else {
+                    // Try decompressing intensity too
+                    try_zlib_decompress(intensity_blob, num_peaks * 4)
+                };
+            return Ok((Some(mz_dec), int_dec));
+        }
+    }
+
+    // num_peaks is 0 or unknown — try decompressing m/z and infer n_peaks from result
+    if mz_blob.len() % 8 != 0 {
+        if let Some(mz_dec) = try_zlib_decompress(mz_blob, mz_blob.len() * 4) {
+            let inferred_n = mz_dec.len() / 8;
+            let int_dec = if intensity_blob.len() == inferred_n * 4
+                || intensity_blob.len() == inferred_n * 8
+            {
+                None
+            } else {
+                try_zlib_decompress(intensity_blob, inferred_n * 4)
+            };
+            return Ok((Some(mz_dec), int_dec));
+        }
+    }
+
+    // Fall through — let the caller produce a proper error with the raw sizes
+    Ok((None, None))
+}
+
+/// Decode peak blobs from blib format.
+/// BiblioSpec stores peaks as little-endian doubles, optionally zlib-compressed.
+/// `num_peaks` from the RefSpectra table is used to determine expected decompressed size.
+fn decode_blib_peaks(
+    mz_blob: &[u8],
+    intensity_blob: &[u8],
+    num_peaks: usize,
+) -> Result<Vec<LibraryFragment>> {
+    // Try raw first; if sizes don't match expected layout, attempt zlib decompression.
+    let (mz_data, int_data) = decompress_peak_blobs(mz_blob, intensity_blob, num_peaks)?;
+
+    let mz_ref = mz_data.as_deref().unwrap_or(mz_blob);
+    let int_ref = int_data.as_deref().unwrap_or(intensity_blob);
+
+    if mz_ref.len() % 8 != 0 {
+        return Err(OspreyError::LibraryLoadError(format!(
+            "Invalid peak m/z blob size: {} bytes (not a multiple of 8)",
+            mz_ref.len()
+        )));
+    }
+
+    let n_peaks = mz_ref.len() / 8;
 
     // Intensity can be float (4 bytes) or double (8 bytes)
-    let intensity_size = if intensity_blob.len() == n_peaks * 4 {
+    let intensity_size = if int_ref.len() == n_peaks * 4 {
         4
-    } else if intensity_blob.len() == n_peaks * 8 {
+    } else if int_ref.len() == n_peaks * 8 {
         8
     } else {
         return Err(OspreyError::LibraryLoadError(format!(
             "Invalid peak intensity blob size: expected {} or {} bytes, got {}",
             n_peaks * 4,
             n_peaks * 8,
-            intensity_blob.len()
+            int_ref.len()
         )));
     };
 
     let mut fragments = Vec::with_capacity(n_peaks);
 
     for i in 0..n_peaks {
-        let mz_bytes: [u8; 8] = mz_blob[i * 8..(i + 1) * 8].try_into().unwrap();
+        let mz_bytes: [u8; 8] = mz_ref[i * 8..(i + 1) * 8].try_into().unwrap();
         let mz = f64::from_le_bytes(mz_bytes);
 
         let intensity = if intensity_size == 4 {
-            let int_bytes: [u8; 4] = intensity_blob[i * 4..(i + 1) * 4].try_into().unwrap();
+            let int_bytes: [u8; 4] = int_ref[i * 4..(i + 1) * 4].try_into().unwrap();
             f32::from_le_bytes(int_bytes)
         } else {
-            let int_bytes: [u8; 8] = intensity_blob[i * 8..(i + 1) * 8].try_into().unwrap();
+            let int_bytes: [u8; 8] = int_ref[i * 8..(i + 1) * 8].try_into().unwrap();
             f64::from_le_bytes(int_bytes) as f32
         };
 

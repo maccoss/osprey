@@ -1618,7 +1618,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Process each file
     let mut per_file_entries: Vec<(String, Vec<CoelutionScoredEntry>)> = Vec::new();
     let mut pin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
-    // Retain per-file RT calibrations for cross-run reconciliation
+    // Retain per-file RT calibrations for inter-replicate reconciliation
     let mut per_file_calibrations: HashMap<String, RTCalibration> = HashMap::new();
 
     for (file_idx, input_file) in config.input_files.iter().enumerate() {
@@ -1646,7 +1646,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         entries.len(),
                         scores_path.display()
                     );
-                    // Load cached calibration for cross-run reconciliation
+                    // Load cached calibration for inter-replicate reconciliation
                     if let Some(input_dir) = input_file.parent() {
                         let cal_path = calibration_path_for_input(input_file, input_dir);
                         if cal_path.exists() {
@@ -1744,7 +1744,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 (None, None)
             };
 
-            // Retain RT calibration for cross-run reconciliation
+            // Retain RT calibration for inter-replicate reconciliation
             if let Some(ref cal) = rt_cal {
                 per_file_calibrations.insert(file_name.clone(), cal.clone());
             }
@@ -1843,7 +1843,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // Post-FDR re-scoring: multi-charge consensus + cross-run reconciliation.
+    // Post-FDR re-scoring: multi-charge consensus + inter-replicate reconciliation.
     // Both phases need to load spectra and re-score entries, so we merge them
     // into a single spectra-load pass per file to avoid redundant I/O.
     {
@@ -1890,7 +1890,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             );
         }
 
-        // 2. Cross-run reconciliation: compute per-file rescore targets
+        // 2. Inter-replicate reconciliation: compute per-file rescore targets
         //    Uses first-pass FDR results to build consensus RTs across runs,
         //    then plans which entries need re-scoring at reconciled boundaries.
         let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
@@ -1900,7 +1900,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         if reconciliation_enabled {
             log::info!("");
-            log::info!("=== Cross-Run Peak Reconciliation ===");
+            log::info!("=== Inter-Replicate Peak Reconciliation ===");
 
             let consensus = compute_consensus_rts(
                 &per_file_entries,
@@ -1977,7 +1977,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
             // Merge both target sets, deduplicating by entry index
             // (if an entry appears in both consensus and reconciliation,
-            // prefer the reconciliation target since it's cross-run informed)
+            // prefer the reconciliation target since it's inter-replicate informed)
             let mut combined_targets: HashMap<usize, (f64, f64, f64)> = HashMap::new();
             for (idx, apex, start, end) in &consensus_targets {
                 combined_targets.insert(*idx, (*apex, *start, *end));
@@ -2119,10 +2119,33 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // Write blib output
+    // Write blib output — write to a local temp file first, then move to the
+    // final destination. This avoids SQLite locking issues on network filesystems.
     if !passing_entries.is_empty() {
         log::info!("Writing blib to {}", config.output_blib.display());
-        write_blib_output(&config, &library, &passing_entries)?;
+
+        let final_path = &config.output_blib;
+        let temp_path = std::env::temp_dir().join(format!(
+            "osprey_{}.blib",
+            std::process::id()
+        ));
+
+        // Write to local temp file
+        let mut temp_config = config.clone();
+        temp_config.output_blib = temp_path.clone();
+        write_blib_output(&temp_config, &library, &passing_entries)?;
+
+        // Move to final destination (try rename first, fall back to copy+delete)
+        if std::fs::rename(&temp_path, final_path).is_err() {
+            std::fs::copy(&temp_path, final_path).map_err(|e| {
+                std::io::Error::other(format!(
+                    "Failed to copy blib to {}: {}",
+                    final_path.display(),
+                    e
+                ))
+            })?;
+            let _ = std::fs::remove_file(&temp_path);
+        }
     } else {
         log::warn!("No peptides passed FDR threshold, skipping blib output");
     }
@@ -2696,6 +2719,13 @@ fn deduplicate_double_counting(
                     continue;
                 }
 
+                // Never deduplicate across target/decoy types: removing a decoy because
+                // it shares fragments with a winning target destroys FDR estimation.
+                // Only deduplicate within the same class (target-target or decoy-decoy).
+                if entries[idx_a].is_decoy != entries[idx_b].is_decoy {
+                    continue;
+                }
+
                 // Check top-6 fragment overlap (look up library entries by ID)
                 let lib_idx_a = match lib_id_map.get(&entries[idx_a].entry_id) {
                     Some(&idx) => idx,
@@ -2740,9 +2770,17 @@ fn deduplicate_double_counting(
 
     let removed_count = removed.iter().filter(|r| r.load(Ordering::Relaxed)).count();
     if removed_count > 0 {
+        let removed_targets = removed
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| r.load(Ordering::Relaxed) && !entries[*i].is_decoy)
+            .count();
+        let removed_decoys = removed_count - removed_targets;
         log::info!(
-            "Double-counting deduplication: removed {} entries ({} remaining)",
+            "Double-counting deduplication: removed {} entries ({} targets, {} decoys; {} remaining)",
             removed_count,
+            removed_targets,
+            removed_decoys,
             original_count - removed_count
         );
     }
@@ -2987,10 +3025,19 @@ fn write_blib_output(
                     scored.peak_bounds.end_rt,
                 ));
 
-            // Only set retentionTime (ID line) if this run passes FDR;
-            // otherwise NULL retentionTime with startTime/endTime gives Skyline
-            // peak boundaries for quantification without an ID line.
-            let rt_for_id = if scored.run_qvalue <= config.run_fdr {
+            // Show an ID line (non-NULL retentionTime) if this observation passes
+            // EITHER run-level or experiment-level FDR. In GPF experiments, a precursor
+            // exists in only one file, so its run q-value may be slightly above the
+            // threshold while the experiment q-value (which benefits from global
+            // competition) passes. Since this entry is already in the output (it passed
+            // experiment FDR), it should get an ID line in the file where it was found.
+            //
+            // For multi-replicate DIA, observations propagated from other replicates
+            // (where the precursor wasn't independently identified) still get NULL
+            // retentionTime — their run_qvalue stays at 1.0 and experiment_qvalue
+            // reflects the best replicate, not this one.
+            let effective_qvalue = scored.run_qvalue.min(scored.experiment_qvalue);
+            let rt_for_id = if effective_qvalue <= config.run_fdr {
                 Some(run_apex)
             } else {
                 None
@@ -3506,7 +3553,7 @@ fn select_post_fdr_consensus(
 /// Context for re-scoring entries in a file.
 ///
 /// Loads spectra, calibration, sets up fragment tolerance and scorer —
-/// shared setup needed by both multi-charge consensus and cross-run reconciliation.
+/// shared setup needed by both multi-charge consensus and inter-replicate reconciliation.
 struct FileRescoreContext {
     spectra: Vec<Spectrum>,
     calibrated_spectra: Option<Vec<Spectrum>>,
@@ -3631,7 +3678,7 @@ impl FileRescoreContext {
 
 /// Re-score a single entry at specified RT boundaries.
 ///
-/// Used by both multi-charge consensus and cross-run reconciliation.
+/// Used by both multi-charge consensus and inter-replicate reconciliation.
 /// Uses binary search on pre-sorted spec_indices for efficient spectra selection.
 #[allow(clippy::too_many_arguments)]
 fn rescore_entry_at_boundaries(
@@ -3730,6 +3777,9 @@ fn rescore_entry_at_boundaries(
         } else {
             apex_index
         };
+        // Clamp apex to within peak boundaries so ID line is always inside
+        // the integration window written to blib
+        let apex_index = apex_index.clamp(start_index, end_index);
 
         if end_index <= start_index + 1 {
             continue;
@@ -3781,7 +3831,7 @@ fn rescore_entry_at_boundaries(
     best_result
 }
 
-/// Re-score entries at cross-run reconciled peak boundaries.
+/// Re-score entries at inter-replicate reconciled peak boundaries.
 ///
 /// For each entry with a reconciliation action (`UseCwtPeak` or `ForcedIntegration`),
 /// extracts XICs from the appropriate isolation window and computes all features
@@ -4263,7 +4313,7 @@ fn run_search(
                         .collect();
                     scored_candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-                    // Store top-N CWT candidates for cross-run reconciliation
+                    // Store top-N CWT candidates for inter-replicate reconciliation
                     let top_n = config.reconciliation.top_n_peaks;
                     let cwt_top_n: Vec<CwtCandidate> = scored_candidates
                         .iter()

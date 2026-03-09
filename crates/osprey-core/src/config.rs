@@ -60,8 +60,8 @@ pub struct OspreyConfig {
     #[serde(default)]
     pub write_pin: bool,
 
-    // Cross-run reconciliation
-    /// Cross-run peak reconciliation settings
+    // Inter-replicate reconciliation
+    /// Inter-replicate peak reconciliation settings
     #[serde(default)]
     pub reconciliation: ReconciliationConfig,
 
@@ -472,14 +472,16 @@ impl std::fmt::Display for FdrMethod {
     }
 }
 
-/// Cross-run peak reconciliation configuration
+/// Inter-replicate peak reconciliation configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationConfig {
-    /// Enable cross-run peak reconciliation (default: true for multi-file)
+    /// Enable inter-replicate peak reconciliation (default: true for multi-file)
     pub enabled: bool,
     /// Number of CWT candidate peaks to store per precursor (default: 5)
     pub top_n_peaks: usize,
-    /// FDR threshold for selecting consensus peptides (default: 0.01)
+    /// FDR threshold for selecting consensus peptides (default: 0.05)
+    /// More liberal than final FDR to cast a wider net and rescue peptides
+    /// with supporting evidence across replicates.
     pub consensus_fdr: f64,
 }
 
@@ -488,7 +490,7 @@ impl Default for ReconciliationConfig {
         Self {
             enabled: true,
             top_n_peaks: 5,
-            consensus_fdr: 0.01,
+            consensus_fdr: 0.05,
         }
     }
 }

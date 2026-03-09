@@ -885,16 +885,45 @@ pub fn strip_flanking_chars(seq: &str) -> String {
     let trimmed = seq.trim_matches(|c| c == '_' || c == '.' || c == '-');
 
     // Also handle internal patterns like "K.PEPTIDE.R" -> "PEPTIDE"
-    if let Some(start) = trimmed.find('.') {
-        if let Some(end) = trimmed.rfind('.') {
-            if start < end {
-                // Extract the middle part between the first and last dots
-                return trimmed[start + 1..end].to_string();
-            }
+    // But ignore dots inside modification brackets like [+57.02146]
+    let first_dot = find_dot_outside_brackets(trimmed, false);
+    let last_dot = find_dot_outside_brackets(trimmed, true);
+    if let (Some(start), Some(end)) = (first_dot, last_dot) {
+        if start < end {
+            return trimmed[start + 1..end].to_string();
         }
     }
 
     trimmed.to_string()
+}
+
+/// Find the first (or last) dot that is NOT inside square brackets.
+fn find_dot_outside_brackets(s: &str, reverse: bool) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if reverse {
+        let mut depth: i32 = 0;
+        for i in (0..bytes.len()).rev() {
+            if bytes[i] == b']' {
+                depth += 1;
+            } else if bytes[i] == b'[' {
+                depth -= 1;
+            } else if bytes[i] == b'.' && depth == 0 {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+    let mut depth: i32 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'[' {
+            depth += 1;
+        } else if b == b']' {
+            depth -= 1;
+        } else if b == b'.' && depth == 0 {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Write a simple TSV report of mokapot results
@@ -1122,6 +1151,40 @@ mod tests {
         assert_eq!(format_peptide("PEPTIDE"), "-.PEPTIDE.-");
         // Flanking residues are stripped and re-wrapped with standard format
         assert_eq!(format_peptide("K.PEPTIDE.R"), "-.PEPTIDE.-");
+    }
+
+    /// Verifies that dots inside modification brackets are NOT treated as flanking separators.
+    #[test]
+    fn test_strip_flanking_chars_preserves_modification_dots() {
+        // No flanking chars — modification dots must be preserved
+        assert_eq!(
+            strip_flanking_chars("C[+57.02146]GPSPC[+57.02146]GLLK"),
+            "C[+57.02146]GPSPC[+57.02146]GLLK"
+        );
+
+        // Multiple modifications with decimal dots
+        assert_eq!(
+            strip_flanking_chars("AC[+57.02146]AC[+57.02146]AHGMLAEDGASC[+57.02146]R"),
+            "AC[+57.02146]AC[+57.02146]AHGMLAEDGASC[+57.02146]R"
+        );
+
+        // Flanking chars with modification dots — flanking stripped, mod dots preserved
+        assert_eq!(
+            strip_flanking_chars("K.C[+57.02146]PEPTIDE.R"),
+            "C[+57.02146]PEPTIDE"
+        );
+
+        // N-terminal modification
+        assert_eq!(
+            strip_flanking_chars("[+42.011]PEPTC[+57.02146]IDE"),
+            "[+42.011]PEPTC[+57.02146]IDE"
+        );
+
+        // format_peptide should also work correctly with modification dots
+        assert_eq!(
+            format_peptide("C[+57.02146]GPSPC[+57.02146]GLLK"),
+            "-.C[+57.02146]GPSPC[+57.02146]GLLK.-"
+        );
     }
 
     /// Verifies that the PIN feature header contains expected feature names.
