@@ -222,6 +222,33 @@ pub fn run_percolator(
     // 5. Find best initial feature (on subsampled set)
     let (best_feat_idx, best_feat_passing) =
         find_best_initial_feature(&sub_features, &sub_labels, &sub_entry_ids, config.train_fdr);
+
+    // If no targets pass at the configured FDR, loosen to 5% so training can proceed
+    let mut config = config.clone();
+    let (best_feat_idx, best_feat_passing) = if best_feat_passing == 0 {
+        let relaxed_fdr = 0.05;
+        let (idx, passing) =
+            find_best_initial_feature(&sub_features, &sub_labels, &sub_entry_ids, relaxed_fdr);
+        if passing > 0 {
+            log::warn!(
+                "  No targets at {:.0}% FDR — loosening train FDR to {:.0}%",
+                config.train_fdr * 100.0,
+                relaxed_fdr * 100.0
+            );
+            config.train_fdr = relaxed_fdr;
+        } else {
+            log::warn!(
+                "  No targets at {:.0}% or {:.0}% FDR — features cannot discriminate targets from decoys",
+                config.train_fdr * 100.0,
+                relaxed_fdr * 100.0
+            );
+        }
+        (idx, passing)
+    } else {
+        (best_feat_idx, best_feat_passing)
+    };
+    let config = &config;
+
     let initial_scores: Vec<f64> = (0..sub_n)
         .map(|i| sub_features[(i, best_feat_idx)])
         .collect();

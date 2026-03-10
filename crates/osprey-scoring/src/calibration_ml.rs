@@ -244,7 +244,7 @@ fn train_lda_with_nonnegative_cv(
 ) -> Result<Vec<f64>, OspreyError> {
     const N_FOLDS: usize = 3;
     const MAX_ITERATIONS: usize = 3;
-    const TRAIN_FDR: f64 = 0.01;
+    let mut train_fdr: f64 = 0.01;
     const MIN_POSITIVE_EXAMPLES: usize = 50;
 
     let n_samples = features.rows;
@@ -259,15 +259,47 @@ fn train_lda_with_nonnegative_cv(
     let mut best_feat_passing = 0;
     for feat_idx in 0..n_features {
         let feat_scores: Vec<f64> = (0..n_samples).map(|i| features[(i, feat_idx)]).collect();
-        let n_pass = count_passing_targets(&feat_scores, decoy_labels, entry_ids, 0.01);
+        let n_pass = count_passing_targets(&feat_scores, decoy_labels, entry_ids, train_fdr);
         log::info!(
-            "  Initial feature '{}': {} pass 1% FDR",
+            "  Initial feature '{}': {} pass {:.0}% FDR",
             feature_names[feat_idx],
-            n_pass
+            n_pass,
+            train_fdr * 100.0
         );
         if n_pass > best_feat_passing {
             best_feat_passing = n_pass;
             best_feat_idx = feat_idx;
+        }
+    }
+
+    // If no targets pass at configured FDR, loosen to 5% so training can proceed
+    if best_feat_passing == 0 {
+        let relaxed_fdr = 0.05;
+        let mut relaxed_best_idx = 0;
+        let mut relaxed_best_passing = 0;
+        for feat_idx in 0..n_features {
+            let feat_scores: Vec<f64> = (0..n_samples).map(|i| features[(i, feat_idx)]).collect();
+            let n_pass = count_passing_targets(&feat_scores, decoy_labels, entry_ids, relaxed_fdr);
+            if n_pass > relaxed_best_passing {
+                relaxed_best_passing = n_pass;
+                relaxed_best_idx = feat_idx;
+            }
+        }
+        if relaxed_best_passing > 0 {
+            log::warn!(
+                "  No targets at {:.0}% FDR — loosening train FDR to {:.0}%",
+                train_fdr * 100.0,
+                relaxed_fdr * 100.0
+            );
+            train_fdr = relaxed_fdr;
+            best_feat_idx = relaxed_best_idx;
+            best_feat_passing = relaxed_best_passing;
+        } else {
+            log::warn!(
+                "  No targets at {:.0}% or {:.0}% FDR — features cannot discriminate targets from decoys",
+                train_fdr * 100.0,
+                relaxed_fdr * 100.0
+            );
         }
     }
 
@@ -277,9 +309,10 @@ fn train_lda_with_nonnegative_cv(
         .collect();
 
     log::info!(
-        "  Baseline: '{}' = {} pass 1% FDR",
+        "  Baseline: '{}' = {} pass {:.0}% FDR",
         feature_names[best_feat_idx],
-        best_feat_passing
+        best_feat_passing,
+        train_fdr * 100.0
     );
 
     // Best-so-far tracking: always revert to the iteration with the most passing targets
@@ -310,7 +343,7 @@ fn train_lda_with_nonnegative_cv(
                 decoy_labels,
                 entry_ids,
                 &train_indices,
-                TRAIN_FDR,
+                train_fdr,
                 MIN_POSITIVE_EXAMPLES,
             );
 
@@ -417,10 +450,10 @@ fn train_lda_with_nonnegative_cv(
             .map_err(OspreyError::config)?;
         let new_scores = lda_consensus.predict(features);
 
-        let n_passing = count_passing_targets(&new_scores, decoy_labels, entry_ids, 0.01);
+        let n_passing = count_passing_targets(&new_scores, decoy_labels, entry_ids, train_fdr);
 
         log::info!(
-            "  Iteration {}: weights=[{}], selected {} train targets, {} pass 1% FDR",
+            "  Iteration {}: weights=[{}], selected {} train targets, {} pass {:.0}% FDR",
             iteration + 1,
             feature_names
                 .iter()
@@ -430,6 +463,7 @@ fn train_lda_with_nonnegative_cv(
                 .join(", "),
             total_selected_targets / N_FOLDS,
             n_passing,
+            train_fdr * 100.0,
         );
 
         iteration_passing.push(n_passing);
@@ -441,8 +475,9 @@ fn train_lda_with_nonnegative_cv(
             best_iteration = iteration + 1;
             consecutive_no_improve = 0;
             log::info!(
-                "    -> New best: {} pass 1% FDR (iteration {})",
+                "    -> New best: {} pass {:.0}% FDR (iteration {})",
                 best_passing,
+                train_fdr * 100.0,
                 best_iteration
             );
         } else {
@@ -467,11 +502,16 @@ fn train_lda_with_nonnegative_cv(
     }
 
     // Log final result
-    log::info!("  Iteration history (pass 1% FDR): {:?}", iteration_passing);
     log::info!(
-        "  Using iteration {} ({} pass 1% FDR)",
+        "  Iteration history (pass {:.0}% FDR): {:?}",
+        train_fdr * 100.0,
+        iteration_passing
+    );
+    log::info!(
+        "  Using iteration {} ({} pass {:.0}% FDR)",
         best_iteration,
-        best_passing
+        best_passing,
+        train_fdr * 100.0
     );
 
     Ok(best_scores)
