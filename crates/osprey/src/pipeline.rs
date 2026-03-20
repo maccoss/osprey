@@ -4378,7 +4378,6 @@ fn run_search(
                 })
                 .collect();
 
-            pb.inc(candidate_indices.len().saturating_sub(window_entries.len()) as u64);
             window_entries
         })
         .collect();

@@ -1843,8 +1843,7 @@ mod tests {
         .map(String::from)
         .collect();
 
-        let qvalues =
-            compute_experiment_peptide_qvalues(&scores, &labels, &entry_ids, &peptides);
+        let qvalues = compute_experiment_peptide_qvalues(&scores, &labels, &entry_ids, &peptides);
 
         // Both charge states of PEPTIDEK should get the same peptide-level q-value
         assert!(
@@ -1915,13 +1914,8 @@ mod tests {
             .map(String::from)
             .collect();
 
-        let qvalues = compute_per_run_peptide_qvalues(
-            &scores,
-            &labels,
-            &entry_ids,
-            &file_names,
-            &peptides,
-        );
+        let qvalues =
+            compute_per_run_peptide_qvalues(&scores, &labels, &entry_ids, &file_names, &peptides);
 
         // Both charge states should get the same peptide-level q-value
         assert!(
@@ -2033,13 +2027,15 @@ mod tests {
             false, // ANOTHERONE z2
             false, false, // THIRDPEP z2, z3
             true, true, // decoys for PEPTIDEK
-            true,  // decoy for ANOTHERONE
+            true, // decoy for ANOTHERONE
             true, true, // decoys for THIRDPEP
         ];
         let entry_ids: Vec<u32> = vec![
-            1, 2, // PEPTIDEK z2 (base=1), z3 (base=2)
+            1,
+            2, // PEPTIDEK z2 (base=1), z3 (base=2)
             3, // ANOTHERONE z2 (base=3)
-            4, 5, // THIRDPEP z2 (base=4), z3 (base=5)
+            4,
+            5, // THIRDPEP z2 (base=4), z3 (base=5)
             1 | 0x80000000,
             2 | 0x80000000, // decoys for PEPTIDEK
             3 | 0x80000000, // decoy for ANOTHERONE
@@ -2065,17 +2061,38 @@ mod tests {
         let folds = create_stratified_folds_by_peptide(&labels, &peptides, &entry_ids, 3);
 
         // PEPTIDEK targets (0,1) and their decoys (5,6) must share a fold
-        assert_eq!(folds[0], folds[1], "PEPTIDEK z2 and z3 targets must share fold");
-        assert_eq!(folds[0], folds[5], "PEPTIDEK z2 and its decoy must share fold");
-        assert_eq!(folds[1], folds[6], "PEPTIDEK z3 and its decoy must share fold");
+        assert_eq!(
+            folds[0], folds[1],
+            "PEPTIDEK z2 and z3 targets must share fold"
+        );
+        assert_eq!(
+            folds[0], folds[5],
+            "PEPTIDEK z2 and its decoy must share fold"
+        );
+        assert_eq!(
+            folds[1], folds[6],
+            "PEPTIDEK z3 and its decoy must share fold"
+        );
 
         // THIRDPEP targets (3,4) and their decoys (8,9) must share a fold
-        assert_eq!(folds[3], folds[4], "THIRDPEP z2 and z3 targets must share fold");
-        assert_eq!(folds[3], folds[8], "THIRDPEP z2 and its decoy must share fold");
-        assert_eq!(folds[4], folds[9], "THIRDPEP z3 and its decoy must share fold");
+        assert_eq!(
+            folds[3], folds[4],
+            "THIRDPEP z2 and z3 targets must share fold"
+        );
+        assert_eq!(
+            folds[3], folds[8],
+            "THIRDPEP z2 and its decoy must share fold"
+        );
+        assert_eq!(
+            folds[4], folds[9],
+            "THIRDPEP z3 and its decoy must share fold"
+        );
 
         // ANOTHERONE target (2) and its decoy (7) must share a fold
-        assert_eq!(folds[2], folds[7], "ANOTHERONE and its decoy must share fold");
+        assert_eq!(
+            folds[2], folds[7],
+            "ANOTHERONE and its decoy must share fold"
+        );
     }
 
     /// Verifies that subsampling with max_entries >= total returns all entries unchanged.
@@ -2090,7 +2107,11 @@ mod tests {
 
         let selected = subsample_by_peptide_group(&labels, &entry_ids, &peptides, 100, 42);
 
-        assert_eq!(selected.len(), 4, "Should return all entries when under limit");
+        assert_eq!(
+            selected.len(),
+            4,
+            "Should return all entries when under limit"
+        );
         assert_eq!(selected, vec![0, 1, 2, 3]);
     }
 }

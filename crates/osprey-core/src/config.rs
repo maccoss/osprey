@@ -265,6 +265,9 @@ n_threads: 0  # 0 = auto-detect
         if let Some(fdr) = args.run_fdr {
             self.run_fdr = fdr;
         }
+        if let Some(fdr) = args.experiment_fdr {
+            self.experiment_fdr = fdr;
+        }
         if let Some(threads) = args.n_threads {
             self.n_threads = threads;
         }
@@ -301,6 +304,7 @@ pub struct ConfigOverrides {
     pub report: Option<PathBuf>,
     pub rt_tolerance: Option<f64>,
     pub run_fdr: Option<f64>,
+    pub experiment_fdr: Option<f64>,
     pub n_threads: Option<usize>,
     pub verbose: bool,
     pub disable_rt_calibration: bool,

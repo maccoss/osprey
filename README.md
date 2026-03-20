@@ -24,13 +24,114 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 
 - Rust 1.75 or later
 - OpenBLAS development libraries
-- OpenSSL development libraries
 - CMake
 
-On Ubuntu/Debian:
+### Linux (Ubuntu/Debian)
+
+#### 1. Install Rust
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+Follow the on-screen prompts (the defaults are fine). After installation, `cargo` and `rustc` will be available in your terminal.
+
+#### 2. Install build dependencies
+
 ```bash
 sudo apt-get update
-sudo apt-get install libopenblas-dev libssl-dev cmake pkg-config
+sudo apt-get install build-essential libopenblas-dev cmake pkg-config
+```
+
+#### 3. Build and install
+
+```bash
+git clone https://github.com/maccoss/osprey.git
+cd osprey
+cargo build --release
+cargo install --path crates/osprey
+```
+
+### Windows
+
+#### 1. Install Rust
+
+Download and run [rustup-init.exe](https://rustup.rs/). The default installation (MSVC toolchain) is recommended.
+
+#### 2. Install Visual Studio Build Tools
+
+Rust on Windows requires the MSVC C/C++ build tools. If you don't have Visual Studio installed, download [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and install the **"Desktop development with C++"** workload.
+
+#### 3. Install CMake
+
+Download and install [CMake](https://cmake.org/download/). During installation, select **"Add CMake to the system PATH"**.
+
+Alternatively, install via winget:
+```powershell
+winget install Kitware.CMake
+```
+
+#### 4. Install OpenBLAS
+
+Osprey requires OpenBLAS for linear algebra operations. Download pre-built binaries from the [OpenBLAS releases](https://github.com/OpenMathLib/OpenBLAS/releases) page (choose the latest `OpenBLAS-*-x64.zip`).
+
+Extract the archive and set the environment variable so the build system can find it:
+
+```powershell
+# Example: extracted to C:\OpenBLAS
+[System.Environment]::SetEnvironmentVariable("OPENBLAS_PATH", "C:\OpenBLAS", "User")
+```
+
+Alternatively, install OpenBLAS via [vcpkg](https://vcpkg.io/):
+```powershell
+git clone https://github.com/microsoft/vcpkg.git
+cd vcpkg
+.\bootstrap-vcpkg.bat
+.\vcpkg install openblas:x64-windows
+
+# Set the environment variable to the installed path
+[System.Environment]::SetEnvironmentVariable("OPENBLAS_PATH", "$PWD\installed\x64-windows", "User")
+```
+
+After setting environment variables, **restart your terminal** for changes to take effect.
+
+#### 5. Build and install
+
+```powershell
+git clone https://github.com/maccoss/osprey.git
+cd osprey
+cargo build --release
+cargo install --path crates/osprey
+```
+
+The built binary will be at `target\release\osprey.exe`, and `cargo install` places it in `%USERPROFILE%\.cargo\bin\` (which rustup adds to PATH automatically).
+
+### macOS
+
+#### 1. Install Rust
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+#### 2. Install build dependencies
+
+```bash
+brew install openblas cmake
+export OPENBLAS_PATH="$(brew --prefix openblas)"
+```
+
+Add the `OPENBLAS_PATH` export to your `~/.zshrc` (or `~/.bash_profile`) so it persists across sessions.
+
+#### 3. Build and install
+
+```bash
+git clone https://github.com/maccoss/osprey.git
+cd osprey
+cargo build --release
+cargo install --path crates/osprey
 ```
 
 ### Optional: Mokapot
@@ -43,32 +144,17 @@ Osprey includes a built-in Percolator-style semi-supervised SVM — no Python re
 pip install mokapot 'pandas>=2.0,<3.0' 'numpy<2.0'
 ```
 
-If the `mokapot` command is not found after installation, add `~/.local/bin` to your PATH:
-```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-### Building from source
-
-```bash
-git clone https://github.com/maccoss/osprey.git
-cd osprey
-cargo build --release
-```
-
-### Installing
-
-```bash
-cargo install --path crates/osprey
-```
+If the `mokapot` command is not found after installation, add the scripts directory to your PATH:
+- **Linux**: Add `~/.local/bin` to PATH in `~/.bashrc`
+- **Windows**: `pip install --user` places scripts in `%APPDATA%\Python\PythonXX\Scripts` — add this to your system PATH, or use `pip install` (without `--user`) in an activated virtual environment
+- **macOS**: Add `~/Library/Python/X.Y/bin` to PATH
 
 ## Quick Start
 
 ### Basic usage
 
 ```bash
-# Analyze DIA data with a spectral library
+# Analyze DIA data with a spectral library (default: 10 ppm fragment tolerance)
 osprey -i sample.mzML -l library.tsv -o results.blib
 
 # Multiple input files
@@ -77,8 +163,11 @@ osprey -i *.mzML -l library.tsv -o results.blib
 # With TSV report
 osprey -i sample.mzML -l library.tsv -o results.blib --report results.tsv
 
-# High-resolution mode (HRAM) - uses ppm-based fragment matching
-osprey -i sample.mzML -l library.tsv -o results.blib --resolution hram --hram-tolerance 20
+# Custom fragment tolerance (e.g., 20 ppm)
+osprey -i sample.mzML -l library.tsv -o results.blib --fragment-tolerance 20
+
+# Unit resolution mode (uses Th/Dalton tolerances instead of ppm)
+osprey -i sample.mzML -l library.tsv -o results.blib --resolution unit
 ```
 
 ### Using configuration files
@@ -178,6 +267,19 @@ Options:
       --run-fdr <THRESHOLD>
           Run-level FDR threshold [default: 0.01]
 
+      --experiment-fdr <THRESHOLD>
+          Experiment-level FDR threshold (for multi-file analyses) [default: 0.01]
+
+      --fdr-method <METHOD>
+          FDR method: percolator (built-in SVM, default), mokapot (external Python),
+          or simple (no ML) [default: percolator]
+
+      --write-pin
+          Write PIN files for external tools
+
+      --no-prefilter
+          Disable the coelution signal pre-filter
+
       --threads <N>
           Number of threads (default: all available)
 
@@ -274,7 +376,7 @@ For each candidate precursor:
 2. Compute pairwise fragment co-elution correlations
 3. Detect peaks in the co-elution signal
 4. Score using spectral matching (dot product, XCorr, hyperscore) at the apex
-5. Extract 45 features per precursor for machine learning scoring via built-in Percolator SVM (or optionally Mokapot)
+5. Extract 21 features per precursor for machine learning scoring via built-in Percolator SVM (or optionally Mokapot)
 
 ## Development
 
@@ -326,7 +428,7 @@ cargo doc --open
 - RT calibration with LOESS regression and stratified sampling
 - MS1/MS2 mass calibration
 - Enzyme-aware decoy generation with fragment recalculation
-- 45-feature extraction per precursor for machine learning scoring
+- 21-feature extraction per precursor for machine learning scoring
 - Built-in Percolator-style semi-supervised SVM for FDR control (no Python required)
 - Two-level FDR control (run + experiment level) with optional Mokapot integration
 - Tukey median polish for robust elution profiles and fragment scoring
