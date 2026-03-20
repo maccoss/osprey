@@ -1,4 +1,4 @@
-//! Cross-run peak reconciliation for consistent peak integration across replicates.
+//! Inter-replicate peak reconciliation for consistent peak integration across replicates.
 //!
 //! After initial per-run FDR, this module:
 //! 1. Computes consensus library RTs for peptides detected across multiple runs
@@ -35,7 +35,7 @@ pub struct PeptideConsensusRT {
 /// of per-run detections mapped back to library RT space.
 ///
 /// Targets and decoys get independent consensus RTs to maintain fair
-/// competition — both sides benefit equally from cross-run consensus.
+/// competition — both sides benefit equally from inter-replicate consensus.
 ///
 /// # Arguments
 /// * `per_file_entries` - Per-file scored entries (after first-pass FDR)
@@ -46,11 +46,11 @@ pub fn compute_consensus_rts(
     per_file_calibrations: &HashMap<String, RTCalibration>,
     consensus_fdr: f64,
 ) -> Vec<PeptideConsensusRT> {
-    // 1. Collect target peptides passing FDR in any run
+    // 1. Collect target peptides passing FDR in any run (run-level OR experiment-level)
     let mut target_peptides: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.run_qvalue <= consensus_fdr {
+            if !entry.is_decoy && entry.run_qvalue.min(entry.experiment_qvalue) <= consensus_fdr {
                 target_peptides.insert(entry.modified_sequence.clone());
             }
         }
@@ -61,7 +61,7 @@ pub fn compute_consensus_rts(
     }
 
     log::info!(
-        "Cross-run reconciliation: {} target peptides pass {:.1}% FDR in at least one run",
+        "Inter-replicate reconciliation: {} target peptides pass {:.1}% FDR in at least one run",
         target_peptides.len(),
         consensus_fdr * 100.0
     );
@@ -92,7 +92,7 @@ pub fn compute_consensus_rts(
     }
 
     log::info!(
-        "Cross-run reconciliation: {} paired decoy peptides included",
+        "Inter-replicate reconciliation: {} paired decoy peptides included",
         decoy_peptides.len()
     );
 
@@ -170,7 +170,7 @@ pub fn compute_consensus_rts(
     let n_decoys = consensus.iter().filter(|c| c.is_decoy).count();
     let multi_run = consensus.iter().filter(|c| c.n_runs_detected > 1).count();
     log::info!(
-        "Cross-run consensus: {} targets, {} decoys ({} detected in multiple runs)",
+        "Inter-replicate consensus: {} targets, {} decoys ({} detected in multiple runs)",
         n_targets,
         n_decoys,
         multi_run
@@ -183,7 +183,7 @@ pub fn compute_consensus_rts(
 ///
 /// Uses (consensus_library_rt → run's detected apex_rt) pairs for target peptides
 /// detected in this run. Produces a tighter calibration curve based on high-quality
-/// cross-run consensus points.
+/// inter-replicate consensus points.
 ///
 /// Only uses target peptides (not decoys) for the calibration fit, since targets
 /// have biologically meaningful RTs while decoy RTs are arbitrary.
@@ -208,7 +208,7 @@ pub fn refit_calibration_with_consensus(
     let mut measured_rts = Vec::new();
 
     for entry in entries {
-        if entry.is_decoy || entry.run_qvalue > consensus_fdr {
+        if entry.is_decoy || entry.run_qvalue.min(entry.experiment_qvalue) > consensus_fdr {
             continue;
         }
         if let Some(&consensus_lib_rt) = consensus_map.get(entry.modified_sequence.as_str()) {
@@ -248,7 +248,7 @@ pub fn refit_calibration_with_consensus(
     }
 }
 
-/// Result of cross-run peak reconciliation for a single entry.
+/// Result of inter-replicate peak reconciliation for a single entry.
 #[derive(Debug, Clone)]
 pub enum ReconcileAction {
     /// Keep existing peak (already matches consensus RT)
@@ -297,7 +297,7 @@ pub fn determine_reconcile_action(
     }
 }
 
-/// Plan cross-run peak reconciliation for all entries across all runs.
+/// Plan inter-replicate peak reconciliation for all entries across all runs.
 ///
 /// Returns a map of (file_name, entry_index) → ReconcileAction for entries
 /// that need modification. Entries not in the map should keep their current peaks.
@@ -362,7 +362,7 @@ pub fn plan_reconciliation(
     }
 
     log::info!(
-        "Cross-run reconciliation plan: {} keep, {} use alternate CWT peak, {} forced integration, {} not in consensus",
+        "Inter-replicate reconciliation plan: {} keep, {} use alternate CWT peak, {} forced integration, {} not in consensus",
         stats_keep,
         stats_cwt,
         stats_forced,

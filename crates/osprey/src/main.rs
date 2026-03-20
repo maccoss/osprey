@@ -142,8 +142,13 @@ struct Args {
     max_candidates: usize,
 
     /// Run-level FDR threshold
+    /// Run-level FDR threshold
     #[arg(long, default_value_t = 0.01)]
     run_fdr: f64,
+
+    /// Experiment-level FDR threshold (for multi-file analyses)
+    #[arg(long, default_value_t = 0.01)]
+    experiment_fdr: f64,
 
     /// Number of threads (default: all available)
     #[arg(long)]
@@ -262,6 +267,7 @@ fn main() -> Result<()> {
         report: args.report,
         rt_tolerance: Some(args.rt_tolerance),
         run_fdr: Some(args.run_fdr),
+        experiment_fdr: Some(args.experiment_fdr),
         n_threads: args.threads,
         verbose: args.verbose,
         disable_rt_calibration: args.no_rt_calibration,

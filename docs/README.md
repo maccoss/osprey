@@ -9,7 +9,7 @@ Osprey has a **working prototype** that can:
 - Load spectral libraries (DIA-NN TSV, EncyclopeDIA elib, BiblioSpec blib)
 - Generate enzyme-aware decoys
 - Run auto-calibration with target-decoy FDR control
-- Coelution search with 45 features extracted per precursor
+- Coelution search with 21 features extracted per precursor
 - Run FDR control via native Percolator (default), external Mokapot, or simple TDC
 - Output BiblioSpec .blib files for Skyline (library theoretical fragments)
 
@@ -92,58 +92,40 @@ OUTPUT
 
 ---
 
-## Feature Set (45 Features)
+## Feature Set (21 PIN Features)
 
-Osprey extracts 45 features per precursor for semi-supervised FDR control via native Percolator (default) or external Mokapot. All intensity-based spectral similarity scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks.
+Osprey computes ~47 features per precursor in the `CoelutionFeatureSet` struct, but only **21 are written to the PIN file** for semi-supervised FDR control via native Percolator (default) or external Mokapot. The remaining features were removed during feature weight optimization (they provided little discriminative value or were redundant). All intensity-based spectral similarity scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks.
 
-### Pairwise Coelution (11)
+### Pairwise Coelution (3)
 
 | Feature | Description |
 |---------|-------------|
 | `fragment_coelution_sum` | Sum of all pairwise Pearson correlations between fragment XICs |
-| `fragment_coelution_min` | Minimum pairwise correlation (worst pair) |
 | `fragment_coelution_max` | Maximum pairwise correlation (best pair) |
 | `n_coeluting_fragments` | Number of fragments with positive mean correlation |
-| `n_fragment_pairs` | Number of fragment pairs in correlation matrix |
-| `fragment_corr_0..5` | Per-fragment average correlation with all other fragments (top 6) |
 
-### Peak Shape (7)
-
-Derived from the reference XIC (best-correlated fragment):
+### Peak Shape (3)
 
 | Feature | Description |
 |---------|-------------|
 | `peak_apex` | Peak apex intensity (background-subtracted) |
 | `peak_area` | Integrated peak area within boundaries |
-| `peak_width` | Peak width (FWHM in minutes) |
-| `peak_symmetry` | Leading/trailing area ratio around apex |
-| `signal_to_noise` | Signal-to-noise ratio |
-| `n_scans` | Number of scans within peak boundaries |
 | `peak_sharpness` | Steepness of peak edges |
 
-### Spectral at Apex (15)
+### Spectral at Apex (3)
 
 | Feature | Description |
 |---------|-------------|
-| `hyperscore` | X!Tandem-style hyperscore |
 | `xcorr` | Comet-style cross-correlation |
-| `dot_product` | Library cosine (sqrt intensity preprocessing) |
-| `dot_product_smz` | Library cosine with sqrt(intensity) * mz^2 preprocessing |
-| `dot_product_top6/5/4` | Library cosine using only top N fragments |
-| `dot_product_smz_top6/5/4` | SMZ cosine using only top N fragments |
-| `fragment_coverage` | Fraction of library fragments matched |
-| `sequence_coverage` | Fraction of peptide backbone covered by b/y ions |
 | `consecutive_ions` | Longest consecutive b or y ion series |
 | `explained_intensity` | Fraction of observed intensity explained by matches |
-| `elution_weighted_cosine` | LibCosine at each scan, weighted by reference XIC intensity^2, averaged |
 
-### Mass Accuracy (3)
+### Mass Accuracy (2)
 
 | Feature | Description |
 |---------|-------------|
 | `mass_accuracy_deviation_mean` | Mean signed mass error (ppm) across matched fragments |
 | `abs_mass_accuracy_deviation_mean` | Mean absolute mass error (ppm) |
-| `mass_accuracy_std` | Standard deviation of mass errors (ppm) |
 
 ### RT Deviation (2)
 
@@ -161,22 +143,36 @@ HRAM only; 0.0 for unit resolution or when MS1 data is unavailable:
 | `ms1_precursor_coelution` | Pearson correlation between reference XIC and MS1 monoisotopic precursor XIC |
 | `ms1_isotope_cosine` | Cosine similarity between observed MS1 isotope envelope and theoretical distribution |
 
-### Peptide Properties (2)
-
-| Feature | Description |
-|---------|-------------|
-| `peptide_length` | Number of amino acids in peptide sequence |
-| `missed_cleavages` | Number of missed enzymatic cleavages |
-
-### Tukey Median Polish Features (3)
-
-Fragment XIC matrix decomposition via Tukey median polish:
+### Tukey Median Polish (2)
 
 | Feature | Description |
 |---------|-------------|
 | `median_polish_cosine` | Cosine similarity between data-derived fragment intensities (row effects) and library intensities, sqrt preprocessing |
-| `median_polish_rsquared` | R^2 of the additive model in sqrt space. Measures how well the shared elution profile + fragment intensities explain the XIC matrix. |
 | `median_polish_residual_ratio` | Fraction of total signal unexplained by the model: sum|obs-pred| / sum(obs) in linear space. Lower = cleaner co-elution. |
+
+### SG-Weighted Multi-Scan (4)
+
+Spectral scores computed on raw DIA spectra at apex ±2 scans, weighted by Savitzky-Golay smoothed reference XIC:
+
+| Feature | Description |
+|---------|-------------|
+| `sg_weighted_xcorr` | XCorr on raw DIA spectra, Savitzky-Golay weighted |
+| `sg_weighted_cosine` | Cosine similarity on raw DIA spectra, SG weighted |
+| `median_polish_min_fragment_r2` | Minimum per-fragment R² with the shared elution profile (weakest link) |
+| `median_polish_residual_correlation` | Mean pairwise correlation of median polish residuals across fragments |
+
+### Removed Features (26, computed but not in PIN)
+
+These features are still in the `CoelutionFeatureSet` struct but are **not written to the PIN file**:
+
+| Category | Removed Features |
+|----------|-----------------|
+| Pairwise coelution | `fragment_corr_0..5`, `fragment_coelution_min`, `n_fragment_pairs` |
+| Peak shape | `peak_width`, `peak_symmetry`, `signal_to_noise`, `n_scans` |
+| Spectral at apex | `hyperscore`, `dot_product`, `dot_product_smz`, `dot_product_top4..6`, `dot_product_smz_top4..6`, `fragment_coverage`, `sequence_coverage`, `elution_weighted_cosine` |
+| Mass accuracy | `mass_accuracy_std` |
+| Peptide properties | `peptide_length`, `missed_cleavages` |
+| Median polish | `median_polish_rsquared` |
 
 ---
 

@@ -21,6 +21,7 @@ osprey/
 │   ├── osprey-chromatography/    # Peak detection, RT/mass calibration
 │   ├── osprey-scoring/           # Feature extraction, decoy generation
 │   ├── osprey-fdr/               # FDR control, Mokapot integration
+│   ├── osprey-ml/                # Machine learning (SVM, LDA, PEP, q-values)
 │   └── osprey/                   # Main library + CLI binary
 ├── scripts/
 │   ├── evaluate_calibration.py   # Calibration report generator
@@ -35,6 +36,7 @@ osprey/
 - **osprey-chromatography**: `PeakDetector`, `RTCalibrator`, `MzCalibration`, `CalibrationParams`
 - **osprey-scoring**: `SpectralScorer`, `DecoyGenerator`, batch scoring
 - **osprey-fdr**: `FdrController`, `MokapotRunner` (PIN file + semi-supervised FDR)
+- **osprey-ml**: `LinearSvmClassifier`, `PepEstimator`, `LDA`, matrix operations
 
 ## Build Commands
 
@@ -76,7 +78,7 @@ CI runs `cargo fmt --check` and `cargo clippy -D warnings` (including test targe
 - `crates/osprey/src/main.rs` - CLI entry point
 - `crates/osprey-fdr/src/mokapot.rs` - Mokapot integration
 - `crates/osprey-io/src/output/blib.rs` - BiblioSpec blib writer
-- `crates/osprey-core/src/types.rs` - CoelutionFeatureSet (45 features)
+- `crates/osprey-core/src/types.rs` - CoelutionFeatureSet (~47 fields, 21 used in PIN)
 - `crates/osprey-chromatography/src/calibration/` - RT and mass calibration
 
 ## Configuration
@@ -117,7 +119,7 @@ External:
 - Enzyme-aware decoy generation (reversal)
 - RT calibration with LOESS regression
 - MS1/MS2 mass calibration
-- Fragment XIC co-elution search with pairwise correlation scoring (45 features)
+- Fragment XIC co-elution search with pairwise correlation scoring (21 PIN features)
 - Peak detection in XIC time series
 - Tukey median polish for robust peak boundaries and fragment scoring
 - Two-level FDR control (run + experiment level)
@@ -130,29 +132,24 @@ External:
 - Calibration JSON save/load
 - Calibration HTML report generation
 
-### Feature Set (45 Features for PIN)
+### Feature Set (21 PIN Features)
 
-Pairwise coelution (11):
-- fragment_coelution_sum, fragment_coelution_min, fragment_coelution_max
-- n_coeluting_fragments, n_fragment_pairs
-- fragment_corr_0..5 (per-fragment avg correlation with other fragments)
+The `CoelutionFeatureSet` struct has ~47 fields total, but only 21 are written to the PIN file for FDR scoring. The remaining fields are computed but not used (removed during feature weight optimization).
 
-Peak shape (7):
-- peak_apex, peak_area, peak_width, peak_symmetry
-- signal_to_noise, n_scans, peak_sharpness
-
-Spectral at apex (15):
-- hyperscore, xcorr, dot_product, dot_product_smz
-- dot_product_top6, dot_product_top5, dot_product_top4
-- dot_product_smz_top6, dot_product_smz_top5, dot_product_smz_top4
-- fragment_coverage, sequence_coverage, consecutive_ions
-- explained_intensity, elution_weighted_cosine
-
-Mass accuracy (3): mass_accuracy_deviation_mean, abs_mass_accuracy_deviation_mean, mass_accuracy_std
+Pairwise coelution (3): fragment_coelution_sum, fragment_coelution_max, n_coeluting_fragments
+Peak shape (3): peak_apex, peak_area, peak_sharpness
+Spectral at apex (3): xcorr, consecutive_ions, explained_intensity
+Mass accuracy (2): mass_accuracy_deviation_mean, abs_mass_accuracy_deviation_mean
 RT deviation (2): rt_deviation, abs_rt_deviation
 MS1 features (2): ms1_precursor_coelution, ms1_isotope_cosine
-Peptide properties (2): peptide_length, missed_cleavages
-Tukey median polish (3): median_polish_cosine, median_polish_rsquared, median_polish_residual_ratio
+Median polish (2): median_polish_cosine, median_polish_residual_ratio
+SG-weighted multi-scan (4): sg_weighted_xcorr, sg_weighted_cosine, median_polish_min_fragment_r2, median_polish_residual_correlation
+
+26 features removed from PIN (still in CoelutionFeatureSet struct but not used for scoring):
+fragment_corr_0..5, fragment_coelution_min, n_fragment_pairs, dot_product, dot_product_smz,
+dot_product_top4..6, dot_product_smz_top4..6, signal_to_noise, peak_symmetry,
+elution_weighted_cosine, peptide_length, missed_cleavages, peak_width, n_scans,
+fragment_coverage, hyperscore, sequence_coverage, mass_accuracy_std, median_polish_rsquared
 
 ### TODO (Future)
 

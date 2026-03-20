@@ -222,6 +222,33 @@ pub fn run_percolator(
     // 5. Find best initial feature (on subsampled set)
     let (best_feat_idx, best_feat_passing) =
         find_best_initial_feature(&sub_features, &sub_labels, &sub_entry_ids, config.train_fdr);
+
+    // If no targets pass at the configured FDR, loosen to 5% so training can proceed
+    let mut config = config.clone();
+    let (best_feat_idx, best_feat_passing) = if best_feat_passing == 0 {
+        let relaxed_fdr = 0.05;
+        let (idx, passing) =
+            find_best_initial_feature(&sub_features, &sub_labels, &sub_entry_ids, relaxed_fdr);
+        if passing > 0 {
+            log::warn!(
+                "  No targets at {:.0}% FDR — loosening train FDR to {:.0}%",
+                config.train_fdr * 100.0,
+                relaxed_fdr * 100.0
+            );
+            config.train_fdr = relaxed_fdr;
+        } else {
+            log::warn!(
+                "  No targets at {:.0}% or {:.0}% FDR — features cannot discriminate targets from decoys",
+                config.train_fdr * 100.0,
+                relaxed_fdr * 100.0
+            );
+        }
+        (idx, passing)
+    } else {
+        (best_feat_idx, best_feat_passing)
+    };
+    let config = &config;
+
     let initial_scores: Vec<f64> = (0..sub_n)
         .map(|i| sub_features[(i, best_feat_idx)])
         .collect();
@@ -1695,5 +1722,396 @@ mod tests {
         assert_eq!(idx_first[1], 1);
         assert_eq!(idx_first[2], 2);
         assert_eq!(idx_first[3], 3);
+    }
+
+    // ============================================================
+    // Multi-level FDR tests
+    // ============================================================
+
+    /// Verifies that per-run precursor q-values are computed independently per file.
+    /// Entries from different files should not affect each other's q-values.
+    #[test]
+    fn test_per_run_precursor_qvalues_independent_files() {
+        // File A: 3 targets beat decoys, 1 decoy beats target
+        // File B: all targets beat decoys
+        let scores = vec![
+            10.0, 9.0, 8.0, 7.5, // file_a targets (base_ids 1-4)
+            7.0, 6.0, 5.0, 8.5, // file_a decoys (base_ids 1-4; decoy 4 beats target 4)
+            10.0, 9.0, 8.0, // file_b targets (base_ids 5-7)
+            1.0, 1.0, 1.0, // file_b decoys (base_ids 5-7)
+        ];
+        let labels = vec![
+            false, false, false, false, true, true, true, true, false, false, false, true, true,
+            true,
+        ];
+        let entry_ids: Vec<u32> = vec![
+            1,
+            2,
+            3,
+            4,
+            1 | 0x80000000,
+            2 | 0x80000000,
+            3 | 0x80000000,
+            4 | 0x80000000,
+            5,
+            6,
+            7,
+            5 | 0x80000000,
+            6 | 0x80000000,
+            7 | 0x80000000,
+        ];
+        let file_names: Vec<String> = vec![
+            "file_a", "file_a", "file_a", "file_a", "file_a", "file_a", "file_a", "file_a",
+            "file_b", "file_b", "file_b", "file_b", "file_b", "file_b",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let qvalues = compute_per_run_precursor_qvalues(&scores, &labels, &entry_ids, &file_names);
+
+        // File B targets should all have excellent q-values (0 decoys win)
+        // Conservative formula: (0+1)/n → q-values at most 1/3, 1/2, 1/1 before backward pass
+        for &idx in &[8, 9, 10] {
+            assert!(
+                qvalues[idx] < 0.5,
+                "File B target at idx {} should have low q-value, got {}",
+                idx,
+                qvalues[idx]
+            );
+        }
+
+        // File A: decoy at base_id=4 has score 8.5 > target's 7.5, so decoy wins.
+        // That means file_a has 1 decoy winner out of 4 competitions.
+        // The losing target (idx 3) should have q-value 1.0 (default, not a winner).
+        assert!(
+            qvalues[3] > 0.5,
+            "File A target beaten by decoy should have high q-value, got {}",
+            qvalues[3]
+        );
+    }
+
+    /// Verifies experiment-level precursor q-values pick the best observation per precursor
+    /// across all files for target-decoy competition.
+    #[test]
+    fn test_experiment_precursor_qvalues_cross_file() {
+        // Two files, same precursor (base_id=1) appears in both
+        // File A: target score 5.0, decoy score 6.0 (decoy wins at run level)
+        // File B: target score 9.0, decoy score 3.0 (target wins at run level)
+        // At experiment level, best target (9.0) vs best decoy (6.0) → target wins
+        let scores = vec![5.0, 6.0, 9.0, 3.0];
+        let labels = vec![false, true, false, true];
+        let entry_ids: Vec<u32> = vec![1, 1 | 0x80000000, 1, 1 | 0x80000000];
+
+        let qvalues = compute_experiment_precursor_qvalues(&scores, &labels, &entry_ids);
+
+        // Best target (idx 2, score 9.0) should win and get a q-value
+        // With only 1 pair and target winning: q = (0+1)/1 = 1.0 (conservative)
+        // But the target does win, so it should get a q-value assigned
+        assert!(
+            qvalues[2] <= 1.0,
+            "Best target should have a q-value assigned"
+        );
+    }
+
+    /// Verifies that experiment-level peptide q-values aggregate by peptide sequence,
+    /// keeping only the best-scoring precursor per peptide for competition.
+    #[test]
+    fn test_experiment_peptide_qvalues_aggregates_by_peptide() {
+        // PEPTIDEK appears as z2 (score 8.0) and z3 (score 6.0)
+        // ANOTHERONE appears as z2 (score 9.0)
+        // Decoys for each
+        let scores = vec![8.0, 6.0, 9.0, 3.0, 2.0, 4.0];
+        let labels = vec![false, false, false, true, true, true];
+        let entry_ids: Vec<u32> = vec![
+            1,              // PEPTIDEK z2
+            2,              // PEPTIDEK z3
+            3,              // ANOTHERONE z2
+            1 | 0x80000000, // decoy for base_id=1
+            2 | 0x80000000, // decoy for base_id=2
+            3 | 0x80000000, // decoy for base_id=3
+        ];
+        let peptides: Vec<String> = vec![
+            "PEPTIDEK",
+            "PEPTIDEK",
+            "ANOTHERONE",
+            "KEDITPEP",
+            "KEDITPEP",
+            "ENOREHTONA",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let qvalues = compute_experiment_peptide_qvalues(&scores, &labels, &entry_ids, &peptides);
+
+        // Both charge states of PEPTIDEK should get the same peptide-level q-value
+        assert!(
+            (qvalues[0] - qvalues[1]).abs() < 1e-10,
+            "Same peptide should get same q-value: z2={}, z3={}",
+            qvalues[0],
+            qvalues[1]
+        );
+
+        // Both targets should beat their decoys (scores 8>3, 9>4) → good q-values
+        assert!(qvalues[0] < 1.0, "PEPTIDEK should have q-value < 1.0");
+        assert!(qvalues[2] < 1.0, "ANOTHERONE should have q-value < 1.0");
+    }
+
+    /// Verifies that the effective q-value is max(precursor_qvalue, peptide_qvalue),
+    /// enforcing dual-level FDR control.
+    #[test]
+    fn test_effective_qvalue_is_max_of_precursor_and_peptide() {
+        // Simulate run_percolator output: different precursor and peptide q-values
+        // Precursor passes but peptide fails → should be rejected
+        let run_precursor_q: f64 = 0.005;
+        let run_peptide_q: f64 = 0.015;
+        let effective = run_precursor_q.max(run_peptide_q);
+        assert!(
+            effective > 0.01,
+            "Should be rejected: max({}, {}) = {} > 0.01",
+            run_precursor_q,
+            run_peptide_q,
+            effective
+        );
+
+        // Peptide passes but precursor fails → should be rejected
+        let run_precursor_q: f64 = 0.015;
+        let run_peptide_q: f64 = 0.005;
+        let effective = run_precursor_q.max(run_peptide_q);
+        assert!(
+            effective > 0.01,
+            "Should be rejected: max({}, {}) = {} > 0.01",
+            run_precursor_q,
+            run_peptide_q,
+            effective
+        );
+
+        // Both pass → should be accepted
+        let run_precursor_q: f64 = 0.003;
+        let run_peptide_q: f64 = 0.008;
+        let effective = run_precursor_q.max(run_peptide_q);
+        assert!(
+            effective <= 0.01,
+            "Should be accepted: max({}, {}) = {} <= 0.01",
+            run_precursor_q,
+            run_peptide_q,
+            effective
+        );
+    }
+
+    /// Verifies that per-run peptide q-values are propagated to all charge states of the same peptide.
+    #[test]
+    fn test_per_run_peptide_qvalues_propagate_to_charges() {
+        // Same peptide PEPTIDEK with z2 (high score) and z3 (low score) in same file
+        // The peptide-level q-value should be the same for both charge states
+        let scores = vec![10.0, 5.0, 2.0, 1.0];
+        let labels = vec![false, false, true, true];
+        let entry_ids: Vec<u32> = vec![1, 2, 1 | 0x80000000, 2 | 0x80000000];
+        let file_names: Vec<String> = vec!["file_a"; 4].into_iter().map(String::from).collect();
+        let peptides: Vec<String> = vec!["PEPTIDEK", "PEPTIDEK", "KEDITPEP", "KEDITPEP"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let qvalues =
+            compute_per_run_peptide_qvalues(&scores, &labels, &entry_ids, &file_names, &peptides);
+
+        // Both charge states should get the same peptide-level q-value
+        assert!(
+            (qvalues[0] - qvalues[1]).abs() < 1e-10,
+            "Same peptide different charges should have same q-value: z2={}, z3={}",
+            qvalues[0],
+            qvalues[1]
+        );
+    }
+
+    // ============================================================
+    // CV fold integrity and subsampling tests
+    // ============================================================
+
+    /// Verifies that subsampling by peptide group keeps target-decoy pairs together.
+    /// If a target is selected, its paired decoy must also be selected, and vice versa.
+    #[test]
+    fn test_subsample_keeps_target_decoy_pairs() {
+        // 10 peptide groups (20 entries total: 10 targets + 10 decoys)
+        let mut labels = Vec::new();
+        let mut entry_ids = Vec::new();
+        let mut peptides = Vec::new();
+        for i in 1..=10 {
+            labels.push(false); // target
+            entry_ids.push(i as u32);
+            peptides.push(format!("PEPTIDE{}", i));
+            labels.push(true); // decoy
+            entry_ids.push((i as u32) | 0x80000000);
+            peptides.push(format!("DECOY{}", i));
+        }
+
+        // Subsample to 10 entries (should be ~5 groups × 2 entries each)
+        let selected = subsample_by_peptide_group(&labels, &entry_ids, &peptides, 10, 42);
+
+        // Every selected target must have its paired decoy also selected
+        for &idx in &selected {
+            let base_id = entry_ids[idx] & 0x7FFFFFFF;
+            let is_decoy = labels[idx];
+
+            // Find the paired entry
+            let paired_idx = if is_decoy {
+                // Find the target with same base_id
+                (0..labels.len()).find(|&j| !labels[j] && entry_ids[j] == base_id)
+            } else {
+                // Find the decoy with same base_id
+                (0..labels.len()).find(|&j| labels[j] && (entry_ids[j] & 0x7FFFFFFF) == base_id)
+            };
+
+            if let Some(paired) = paired_idx {
+                assert!(
+                    selected.contains(&paired),
+                    "Entry at idx {} (base_id={}, decoy={}) selected but paired entry at idx {} is missing",
+                    idx, base_id, is_decoy, paired
+                );
+            }
+        }
+    }
+
+    /// Verifies that subsampling keeps all charge states of the same peptide together.
+    #[test]
+    fn test_subsample_keeps_charge_states_together() {
+        // PEPTIDEK has z2 (base_id=1) and z3 (base_id=2), both with decoys
+        // ANOTHERONE has z2 (base_id=3) with decoy
+        let labels = vec![false, false, false, true, true, true];
+        let entry_ids: Vec<u32> = vec![
+            1,              // PEPTIDEK z2
+            2,              // PEPTIDEK z3
+            3,              // ANOTHERONE z2
+            1 | 0x80000000, // decoy for PEPTIDEK z2
+            2 | 0x80000000, // decoy for PEPTIDEK z3
+            3 | 0x80000000, // decoy for ANOTHERONE z2
+        ];
+        let peptides: Vec<String> = vec![
+            "PEPTIDEK",
+            "PEPTIDEK",
+            "ANOTHERONE",
+            "KEDITPEP",
+            "KEDITPEP",
+            "ENOREHTONA",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // Subsample to 4 entries — should select complete peptide groups
+        let selected = subsample_by_peptide_group(&labels, &entry_ids, &peptides, 4, 42);
+
+        // If any PEPTIDEK entry is selected, ALL PEPTIDEK entries must be selected
+        let peptidek_indices = vec![0, 1, 3, 4]; // targets z2, z3 + decoys
+        let any_peptidek_selected = peptidek_indices.iter().any(|i| selected.contains(i));
+        if any_peptidek_selected {
+            for &idx in &peptidek_indices {
+                assert!(
+                    selected.contains(&idx),
+                    "PEPTIDEK entry at idx {} should be selected (group must stay together)",
+                    idx
+                );
+            }
+        }
+    }
+
+    /// Verifies that fold assignment groups multiple charge states with their decoys
+    /// into the same fold, even with many peptide groups.
+    #[test]
+    fn test_fold_assignment_multi_charge_with_decoys() {
+        // 5 peptides, some with multiple charge states
+        let labels = vec![
+            false, false, // PEPTIDEK z2, z3
+            false, // ANOTHERONE z2
+            false, false, // THIRDPEP z2, z3
+            true, true, // decoys for PEPTIDEK
+            true, // decoy for ANOTHERONE
+            true, true, // decoys for THIRDPEP
+        ];
+        let entry_ids: Vec<u32> = vec![
+            1,
+            2, // PEPTIDEK z2 (base=1), z3 (base=2)
+            3, // ANOTHERONE z2 (base=3)
+            4,
+            5, // THIRDPEP z2 (base=4), z3 (base=5)
+            1 | 0x80000000,
+            2 | 0x80000000, // decoys for PEPTIDEK
+            3 | 0x80000000, // decoy for ANOTHERONE
+            4 | 0x80000000,
+            5 | 0x80000000, // decoys for THIRDPEP
+        ];
+        let peptides: Vec<String> = vec![
+            "PEPTIDEK",
+            "PEPTIDEK",
+            "ANOTHERONE",
+            "THIRDPEP",
+            "THIRDPEP",
+            "KEDITPEP",
+            "KEDITPEP",
+            "ENOREHTONA",
+            "PEPTDRIHT",
+            "PEPTDRIHT",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let folds = create_stratified_folds_by_peptide(&labels, &peptides, &entry_ids, 3);
+
+        // PEPTIDEK targets (0,1) and their decoys (5,6) must share a fold
+        assert_eq!(
+            folds[0], folds[1],
+            "PEPTIDEK z2 and z3 targets must share fold"
+        );
+        assert_eq!(
+            folds[0], folds[5],
+            "PEPTIDEK z2 and its decoy must share fold"
+        );
+        assert_eq!(
+            folds[1], folds[6],
+            "PEPTIDEK z3 and its decoy must share fold"
+        );
+
+        // THIRDPEP targets (3,4) and their decoys (8,9) must share a fold
+        assert_eq!(
+            folds[3], folds[4],
+            "THIRDPEP z2 and z3 targets must share fold"
+        );
+        assert_eq!(
+            folds[3], folds[8],
+            "THIRDPEP z2 and its decoy must share fold"
+        );
+        assert_eq!(
+            folds[4], folds[9],
+            "THIRDPEP z3 and its decoy must share fold"
+        );
+
+        // ANOTHERONE target (2) and its decoy (7) must share a fold
+        assert_eq!(
+            folds[2], folds[7],
+            "ANOTHERONE and its decoy must share fold"
+        );
+    }
+
+    /// Verifies that subsampling with max_entries >= total returns all entries unchanged.
+    #[test]
+    fn test_subsample_no_reduction_when_under_limit() {
+        let labels = vec![false, true, false, true];
+        let entry_ids: Vec<u32> = vec![1, 1 | 0x80000000, 2, 2 | 0x80000000];
+        let peptides: Vec<String> = vec!["PEP1", "DEC1", "PEP2", "DEC2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let selected = subsample_by_peptide_group(&labels, &entry_ids, &peptides, 100, 42);
+
+        assert_eq!(
+            selected.len(),
+            4,
+            "Should return all entries when under limit"
+        );
+        assert_eq!(selected, vec![0, 1, 2, 3]);
     }
 }

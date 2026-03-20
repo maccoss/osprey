@@ -885,16 +885,45 @@ pub fn strip_flanking_chars(seq: &str) -> String {
     let trimmed = seq.trim_matches(|c| c == '_' || c == '.' || c == '-');
 
     // Also handle internal patterns like "K.PEPTIDE.R" -> "PEPTIDE"
-    if let Some(start) = trimmed.find('.') {
-        if let Some(end) = trimmed.rfind('.') {
-            if start < end {
-                // Extract the middle part between the first and last dots
-                return trimmed[start + 1..end].to_string();
-            }
+    // But ignore dots inside modification brackets like [+57.02146]
+    let first_dot = find_dot_outside_brackets(trimmed, false);
+    let last_dot = find_dot_outside_brackets(trimmed, true);
+    if let (Some(start), Some(end)) = (first_dot, last_dot) {
+        if start < end {
+            return trimmed[start + 1..end].to_string();
         }
     }
 
     trimmed.to_string()
+}
+
+/// Find the first (or last) dot that is NOT inside square brackets.
+fn find_dot_outside_brackets(s: &str, reverse: bool) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if reverse {
+        let mut depth: i32 = 0;
+        for i in (0..bytes.len()).rev() {
+            if bytes[i] == b']' {
+                depth += 1;
+            } else if bytes[i] == b'[' {
+                depth -= 1;
+            } else if bytes[i] == b'.' && depth == 0 {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+    let mut depth: i32 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'[' {
+            depth += 1;
+        } else if b == b']' {
+            depth -= 1;
+        } else if b == b'.' && depth == 0 {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Write a simple TSV report of mokapot results
@@ -1124,6 +1153,40 @@ mod tests {
         assert_eq!(format_peptide("K.PEPTIDE.R"), "-.PEPTIDE.-");
     }
 
+    /// Verifies that dots inside modification brackets are NOT treated as flanking separators.
+    #[test]
+    fn test_strip_flanking_chars_preserves_modification_dots() {
+        // No flanking chars — modification dots must be preserved
+        assert_eq!(
+            strip_flanking_chars("C[+57.02146]GPSPC[+57.02146]GLLK"),
+            "C[+57.02146]GPSPC[+57.02146]GLLK"
+        );
+
+        // Multiple modifications with decimal dots
+        assert_eq!(
+            strip_flanking_chars("AC[+57.02146]AC[+57.02146]AHGMLAEDGASC[+57.02146]R"),
+            "AC[+57.02146]AC[+57.02146]AHGMLAEDGASC[+57.02146]R"
+        );
+
+        // Flanking chars with modification dots — flanking stripped, mod dots preserved
+        assert_eq!(
+            strip_flanking_chars("K.C[+57.02146]PEPTIDE.R"),
+            "C[+57.02146]PEPTIDE"
+        );
+
+        // N-terminal modification
+        assert_eq!(
+            strip_flanking_chars("[+42.011]PEPTC[+57.02146]IDE"),
+            "[+42.011]PEPTC[+57.02146]IDE"
+        );
+
+        // format_peptide should also work correctly with modification dots
+        assert_eq!(
+            format_peptide("C[+57.02146]GPSPC[+57.02146]GLLK"),
+            "-.C[+57.02146]GPSPC[+57.02146]GLLK.-"
+        );
+    }
+
     /// Verifies that the PIN feature header contains expected feature names.
     #[test]
     fn test_feature_header() {
@@ -1192,5 +1255,137 @@ mod tests {
         }
         // Out of range should return 0.0
         assert_eq!(pin_feature_value(&features, 99), 0.0);
+    }
+
+    // ============================================================
+    // parse_results tests
+    // ============================================================
+
+    /// Verifies that parse_results correctly parses a standard mokapot PSM output file.
+    #[test]
+    fn test_parse_results_standard_headers() {
+        let dir = std::env::temp_dir().join("osprey_test_parse_standard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("mokapot.psms.txt");
+
+        let content = "PSMId\tpeptide\tscore\tq-value\tposterior_error_prob\n\
+                        file1_PEPTIDEK_2_100\t-.PEPTIDEK.-\t2.5\t0.001\t0.0005\n\
+                        file1_ANOTHERONE_3_200\t-.ANOTHERONE.-\t1.8\t0.005\t0.003\n\
+                        file1_LASTPEP_2_300\t-.LASTPEP.-\t0.5\t0.05\t0.04\n";
+
+        std::fs::write(&file_path, content).unwrap();
+
+        let runner = MokapotRunner::new();
+        let results = runner.parse_results(&file_path).unwrap();
+
+        assert_eq!(results.len(), 3);
+
+        assert_eq!(results[0].psm_id, "file1_PEPTIDEK_2_100");
+        assert_eq!(results[0].peptide, "-.PEPTIDEK.-");
+        assert!((results[0].score - 2.5).abs() < 1e-10);
+        assert!((results[0].q_value - 0.001).abs() < 1e-10);
+        assert!((results[0].pep - 0.0005).abs() < 1e-10);
+
+        assert_eq!(results[1].psm_id, "file1_ANOTHERONE_3_200");
+        assert!((results[1].q_value - 0.005).abs() < 1e-10);
+
+        assert_eq!(results[2].psm_id, "file1_LASTPEP_2_300");
+        assert!((results[2].q_value - 0.05).abs() < 1e-10);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Verifies that parse_results handles alternative mokapot header names
+    /// (e.g., "specid", "mokapot_score", "mokapot_qvalue", "mokapot_pep").
+    #[test]
+    fn test_parse_results_alternative_headers() {
+        let dir = std::env::temp_dir().join("osprey_test_parse_alt_headers");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("mokapot.psms.txt");
+
+        let content = "specid\tpeptide\tmokapot_score\tmokapot_qvalue\tmokapot_pep\n\
+             file1_PEP_2_100\t-.PEP.-\t3.0\t0.002\t0.001\n\
+             file1_PEP2_3_200\t-.PEP2.-\t1.5\t0.01\t0.008\n";
+
+        std::fs::write(&file_path, content).unwrap();
+
+        let runner = MokapotRunner::new();
+        let results = runner.parse_results(&file_path).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].psm_id, "file1_PEP_2_100");
+        assert!((results[0].score - 3.0).abs() < 1e-10);
+        assert!((results[0].q_value - 0.002).abs() < 1e-10);
+        assert!((results[0].pep - 0.001).abs() < 1e-10);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Verifies that parse_results handles the "psmid" header variant.
+    #[test]
+    fn test_parse_results_psmid_header() {
+        let dir = std::env::temp_dir().join("osprey_test_parse_psmid");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("mokapot.psms.txt");
+
+        let content = "psmid\tpeptide\tmokapot score\tmokapot q-value\tpep\n\
+                        id_1\t-.ABC.-\t1.0\t0.01\t0.005\n";
+
+        std::fs::write(&file_path, content).unwrap();
+
+        let runner = MokapotRunner::new();
+        let results = runner.parse_results(&file_path).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].psm_id, "id_1");
+        assert!((results[0].q_value - 0.01).abs() < 1e-10);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Verifies that parse_results returns an empty vec for a file with only a header.
+    #[test]
+    fn test_parse_results_empty_file() {
+        let dir = std::env::temp_dir().join("osprey_test_parse_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("mokapot.psms.txt");
+
+        let content = "PSMId\tpeptide\tscore\tq-value\tposterior_error_prob\n";
+        std::fs::write(&file_path, content).unwrap();
+
+        let runner = MokapotRunner::new();
+        let results = runner.parse_results(&file_path).unwrap();
+
+        assert!(
+            results.is_empty(),
+            "Header-only file should produce no results"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Verifies that parse_results skips lines with too few columns rather than panicking.
+    #[test]
+    fn test_parse_results_skips_malformed_lines() {
+        let dir = std::env::temp_dir().join("osprey_test_parse_malformed");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("mokapot.psms.txt");
+
+        let content = "PSMId\tpeptide\tscore\tq-value\tposterior_error_prob\n\
+                        good_line\t-.PEP.-\t2.0\t0.01\t0.005\n\
+                        bad_line\n\
+                        also_good\t-.OTHER.-\t1.5\t0.02\t0.01\n";
+
+        std::fs::write(&file_path, content).unwrap();
+
+        let runner = MokapotRunner::new();
+        let results = runner.parse_results(&file_path).unwrap();
+
+        // Should have 2 results (bad_line skipped)
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].psm_id, "good_line");
+        assert_eq!(results[1].psm_id, "also_good");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

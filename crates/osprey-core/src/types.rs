@@ -614,7 +614,7 @@ pub struct CoelutionFeatureSet {
 /// A CWT candidate peak with boundaries and coelution score.
 ///
 /// Stored in parquet as packed LE bytes for top-N peak storage,
-/// enabling cross-run peak reconciliation without re-running CWT.
+/// enabling inter-replicate peak reconciliation without re-running CWT.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CwtCandidate {
     /// Peak apex RT (minutes)
@@ -676,7 +676,7 @@ pub struct CoelutionScoredEntry {
     /// Posterior error probability (computed on the final SVM score)
     pub pep: f64,
     /// Top-N CWT candidate peaks (sorted by coelution_score descending).
-    /// Used for cross-run peak reconciliation.
+    /// Used for inter-replicate peak reconciliation.
     pub cwt_candidates: Vec<CwtCandidate>,
 }
 

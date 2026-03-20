@@ -4063,4 +4063,570 @@ mod tests {
             ToleranceUnit::Ppm
         ));
     }
+
+    // --- pearson_correlation_raw tests ---
+
+    #[test]
+    fn test_pearson_identical_vectors() {
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let r = pearson_correlation_raw(&x, &x);
+        assert!(
+            (r - 1.0).abs() < 1e-10,
+            "Identical vectors should have r=1.0, got {}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_pearson_perfect_negative() {
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![5.0, 4.0, 3.0, 2.0, 1.0];
+        let r = pearson_correlation_raw(&x, &y);
+        assert!(
+            (r - (-1.0)).abs() < 1e-10,
+            "Perfectly anti-correlated vectors should have r=-1.0, got {}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_pearson_uncorrelated() {
+        // Symmetric about zero — no linear correlation
+        let x = vec![1.0, -1.0, 1.0, -1.0];
+        let y = vec![1.0, 1.0, -1.0, -1.0];
+        let r = pearson_correlation_raw(&x, &y);
+        assert!(
+            r.abs() < 1e-10,
+            "Uncorrelated vectors should have r≈0, got {}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_pearson_too_short() {
+        assert_eq!(pearson_correlation_raw(&[], &[]), 0.0);
+        assert_eq!(pearson_correlation_raw(&[1.0], &[2.0]), 0.0);
+    }
+
+    #[test]
+    fn test_pearson_constant_input() {
+        // Constant vector has zero variance — denom should be clamped, not NaN
+        let x = vec![5.0, 5.0, 5.0, 5.0];
+        let y = vec![1.0, 2.0, 3.0, 4.0];
+        let r = pearson_correlation_raw(&x, &y);
+        assert!(
+            r.is_finite(),
+            "Constant input should not produce NaN, got {}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_pearson_known_value() {
+        // x=[1,2,3], y=[2,4,5] → verified: r ≈ 0.9819805
+        let x = vec![1.0, 2.0, 3.0];
+        let y = vec![2.0, 4.0, 5.0];
+        let r = pearson_correlation_raw(&x, &y);
+        assert!((r - 0.9819805).abs() < 1e-4, "Expected r≈0.9820, got {}", r);
+    }
+
+    #[test]
+    fn test_pearson_linear_transform() {
+        // r should be invariant to positive linear scaling: y = 3x + 10
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y: Vec<f64> = x.iter().map(|&v| 3.0 * v + 10.0).collect();
+        let r = pearson_correlation_raw(&x, &y);
+        assert!(
+            (r - 1.0).abs() < 1e-10,
+            "Linear transform should give r=1.0, got {}",
+            r
+        );
+    }
+
+    // --- coelution_sum (pairwise Pearson sum) tests ---
+
+    /// Compute coelution_sum the same way the pipeline does: sum of all unique
+    /// pairwise Pearson correlations between fragment XICs within peak bounds.
+    fn coelution_sum_from_xics(xic_values: &[Vec<f64>]) -> f64 {
+        let n = xic_values.len();
+        let mut sum = 0.0;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                sum += pearson_correlation_raw(&xic_values[i], &xic_values[j]);
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn test_coelution_sum_perfect_coelution() {
+        // 4 fragments with identical elution profiles → every pair has r=1.0
+        // n_pairs = C(4,2) = 6, so coelution_sum should be 6.0
+        let profile = vec![0.0, 1.0, 5.0, 10.0, 5.0, 1.0, 0.0];
+        let xics: Vec<Vec<f64>> = (0..4).map(|_| profile.clone()).collect();
+
+        let sum = coelution_sum_from_xics(&xics);
+        assert!(
+            (sum - 6.0).abs() < 1e-6,
+            "4 identical fragment XICs → C(4,2)=6 pairs × r=1.0 = 6.0, got {}",
+            sum
+        );
+    }
+
+    #[test]
+    fn test_coelution_sum_scaled_fragments() {
+        // Different absolute intensities but same shape → still r=1.0 per pair
+        let base = [0.0, 1.0, 5.0, 10.0, 5.0, 1.0, 0.0];
+        let xics: Vec<Vec<f64>> = vec![
+            base.iter().map(|v| v * 1.0).collect(),
+            base.iter().map(|v| v * 0.5).collect(),
+            base.iter().map(|v| v * 3.0).collect(),
+        ];
+
+        let sum = coelution_sum_from_xics(&xics);
+        // C(3,2) = 3 pairs, all r=1.0
+        assert!(
+            (sum - 3.0).abs() < 1e-6,
+            "Scaled profiles should give sum=3.0, got {}",
+            sum
+        );
+    }
+
+    #[test]
+    fn test_coelution_sum_one_interferer() {
+        // 3 co-eluting fragments + 1 fragment with a shifted peak (interference)
+        let good = vec![0.0, 1.0, 5.0, 10.0, 5.0, 1.0, 0.0];
+        let bad = vec![10.0, 5.0, 1.0, 0.0, 0.0, 1.0, 5.0]; // peaks at opposite end
+        let xics = vec![good.clone(), good.clone(), good.clone(), bad];
+
+        let sum = coelution_sum_from_xics(&xics);
+
+        // 3 good-good pairs: r≈1.0 each → contribute ~3.0
+        // 3 good-bad pairs: strongly negative r → pull sum down
+        // Total should be substantially lower than the perfect case (6.0)
+        assert!(
+            sum < 3.0,
+            "Interference should reduce sum well below 6.0 (perfect), got {}",
+            sum
+        );
+        // The 3 good-good pairs are still perfect
+        let good_only = vec![good.clone(), good.clone(), good.clone()];
+        let good_sum = coelution_sum_from_xics(&good_only);
+        assert!(
+            (good_sum - 3.0).abs() < 1e-6,
+            "Good-only subset should have sum=3.0, got {}",
+            good_sum
+        );
+    }
+
+    #[test]
+    fn test_coelution_sum_two_fragments() {
+        // Minimum case: 2 fragments → 1 pair, exactly proportional
+        let a = vec![0.0, 3.0, 8.0, 3.0, 0.0];
+        let b: Vec<f64> = a.iter().map(|v| v * 0.75).collect();
+        let xics = vec![a.clone(), b.clone()];
+
+        let sum = coelution_sum_from_xics(&xics);
+        let expected = pearson_correlation_raw(&a, &b);
+        assert!(
+            (sum - expected).abs() < 1e-10,
+            "2 fragments: sum should equal single pairwise r={}, got {}",
+            expected,
+            sum
+        );
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "Proportional profiles should give r≈1.0, got {}",
+            sum
+        );
+    }
+
+    #[test]
+    fn test_coelution_sum_noise_reduces_score() {
+        // Same base shape but add noise → correlations drop below 1.0
+        let base = vec![0.0, 1.0, 5.0, 10.0, 5.0, 1.0, 0.0];
+        let noisy1 = vec![0.1, 1.2, 4.8, 10.3, 5.1, 0.8, 0.2];
+        let noisy2 = vec![0.0, 0.8, 5.3, 9.7, 4.7, 1.3, 0.1];
+        let xics = vec![base, noisy1, noisy2];
+
+        let sum = coelution_sum_from_xics(&xics);
+        // Still highly correlated, but not perfectly
+        assert!(
+            sum > 2.5 && sum < 3.0,
+            "Noisy co-eluting fragments should give sum close to but below 3.0, got {}",
+            sum
+        );
+    }
+
+    #[test]
+    fn test_coelution_sum_peak_selection() {
+        // Simulate picking the best peak from two candidates, the way the pipeline does.
+        // Candidate 1: fragments co-elute well within this window
+        let peak1_frag_a = vec![0.0, 2.0, 8.0, 10.0, 8.0, 2.0, 0.0];
+        let peak1_frag_b = vec![0.0, 1.5, 6.0, 7.5, 6.0, 1.5, 0.0];
+        let peak1_frag_c = vec![0.0, 1.0, 4.0, 5.0, 4.0, 1.0, 0.0];
+
+        // Candidate 2: fragments don't co-elute (interfered peak)
+        let peak2_frag_a = vec![5.0, 1.0, 0.0, 0.0, 2.0, 8.0, 3.0];
+        let peak2_frag_b = vec![0.0, 3.0, 7.0, 2.0, 0.0, 1.0, 0.0];
+        let peak2_frag_c = vec![1.0, 0.0, 2.0, 6.0, 8.0, 0.0, 1.0];
+
+        let sum1 = coelution_sum_from_xics(&[peak1_frag_a, peak1_frag_b, peak1_frag_c]);
+        let sum2 = coelution_sum_from_xics(&[peak2_frag_a, peak2_frag_b, peak2_frag_c]);
+
+        assert!(
+            sum1 > sum2,
+            "Co-eluting peak (sum={}) should score higher than interfered peak (sum={})",
+            sum1,
+            sum2
+        );
+        // The good peak should be near-perfect
+        assert!(
+            sum1 > 2.9,
+            "Well co-eluting peak should have sum near 3.0, got {}",
+            sum1
+        );
+    }
+
+    /// Computes mean pairwise Pearson correlation as used in pipeline peak selection.
+    /// This mirrors the scoring logic in pipeline.rs that selects the best CWT candidate.
+    fn mean_pairwise_correlation(xics: &[Vec<f64>]) -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0u32;
+        for i in 0..xics.len() {
+            for j in (i + 1)..xics.len() {
+                sum += pearson_correlation_raw(&xics[i], &xics[j]);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            sum / count as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Verifies that mean pairwise correlation (the pipeline's peak selection metric)
+    /// correctly discriminates between co-eluting and interfered peaks.
+    #[test]
+    fn test_mean_pairwise_correlation_peak_selection() {
+        // Good candidate: all fragments co-elute with the same Gaussian-like shape
+        let good_a = vec![0.0, 2.0, 8.0, 10.0, 8.0, 2.0, 0.0];
+        let good_b: Vec<f64> = good_a.iter().map(|v| v * 0.75).collect();
+        let good_c: Vec<f64> = good_a.iter().map(|v| v * 0.5).collect();
+
+        // Bad candidate: fragments peak at different times (interference)
+        let bad_a = vec![10.0, 5.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let bad_b = vec![0.0, 0.0, 0.0, 0.0, 1.0, 5.0, 10.0];
+        let bad_c = vec![0.0, 0.0, 5.0, 10.0, 5.0, 0.0, 0.0];
+
+        let mean_good = mean_pairwise_correlation(&[good_a, good_b, good_c]);
+        let mean_bad = mean_pairwise_correlation(&[bad_a, bad_b, bad_c]);
+
+        // Co-eluting fragments should have mean ≈ 1.0
+        assert!(
+            (mean_good - 1.0).abs() < 1e-6,
+            "Co-eluting fragments should have mean correlation ≈ 1.0, got {}",
+            mean_good
+        );
+
+        // Interfered fragments should have low or negative mean
+        assert!(
+            mean_bad < 0.0,
+            "Interfered fragments should have negative mean correlation, got {}",
+            mean_bad
+        );
+
+        // Pipeline would pick the good candidate
+        assert!(
+            mean_good > mean_bad,
+            "Pipeline should prefer co-eluting peak (mean={}) over interfered (mean={})",
+            mean_good,
+            mean_bad
+        );
+    }
+
+    /// Verifies that mean pairwise correlation handles the minimum case of 2 fragments.
+    #[test]
+    fn test_mean_pairwise_correlation_two_fragments() {
+        let a = vec![1.0, 3.0, 7.0, 10.0, 7.0, 3.0, 1.0];
+        let b = vec![0.5, 1.5, 3.5, 5.0, 3.5, 1.5, 0.5];
+
+        let mean = mean_pairwise_correlation(&[a.clone(), b.clone()]);
+        let direct = pearson_correlation_raw(&a, &b);
+
+        assert!(
+            (mean - direct).abs() < 1e-10,
+            "Mean with 2 fragments should equal single Pearson r: mean={}, direct={}",
+            mean,
+            direct
+        );
+    }
+
+    /// Verifies that single fragment or empty input returns 0.0 (no pairs to compute).
+    #[test]
+    fn test_mean_pairwise_correlation_degenerate() {
+        let single = vec![vec![1.0, 2.0, 3.0]];
+        assert!(
+            (mean_pairwise_correlation(&single) - 0.0).abs() < 1e-10,
+            "Single fragment should have mean=0 (no pairs)"
+        );
+
+        let empty: Vec<Vec<f64>> = vec![];
+        assert!(
+            (mean_pairwise_correlation(&empty) - 0.0).abs() < 1e-10,
+            "Empty input should have mean=0"
+        );
+    }
+
+    // ============================================================
+    // XCorr known-answer tests
+    // ============================================================
+
+    /// Verifies XCorr scores a perfect match higher than a partial match.
+    /// Uses two fragment libraries against the same observed spectrum to test discrimination.
+    #[test]
+    fn test_xcorr_perfect_vs_partial_match() {
+        let scorer = SpectralScorer::new();
+
+        // Observed spectrum with 3 peaks
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![300.0, 500.0, 700.0],
+            intensities: vec![1000.0, 500.0, 800.0],
+        };
+
+        // Library that matches all 3 peaks
+        let mut full_match =
+            LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
+        full_match.fragments = vec![
+            LibraryFragment {
+                mz: 300.0,
+                relative_intensity: 100.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 500.0,
+                relative_intensity: 50.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 700.0,
+                relative_intensity: 80.0,
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+
+        // Library that matches only 1 peak
+        let mut partial_match =
+            LibraryEntry::new(2, "OTHER".into(), "OTHER".into(), 2, 500.0, 10.0);
+        partial_match.fragments = vec![LibraryFragment {
+            mz: 300.0,
+            relative_intensity: 100.0,
+            annotation: FragmentAnnotation::default(),
+        }];
+
+        let score_full = scorer.xcorr(&spectrum, &full_match);
+        let score_partial = scorer.xcorr(&spectrum, &partial_match);
+
+        assert!(
+            score_full.xcorr > score_partial.xcorr,
+            "Full match xcorr ({}) should exceed partial match xcorr ({})",
+            score_full.xcorr,
+            score_partial.xcorr
+        );
+        assert!(
+            score_full.xcorr > 0.0,
+            "Full match should have positive xcorr: {}",
+            score_full.xcorr
+        );
+    }
+
+    /// Verifies XCorr is zero when library fragments don't match any observed peaks.
+    #[test]
+    fn test_xcorr_no_match_is_low() {
+        let scorer = SpectralScorer::new();
+
+        // Observed spectrum at 300 and 500
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![300.0, 500.0],
+            intensities: vec![1000.0, 500.0],
+        };
+
+        // Library at completely different m/z values (no overlap)
+        let mut entry = LibraryEntry::new(1, "PEP".into(), "PEP".into(), 2, 500.0, 10.0);
+        entry.fragments = vec![
+            LibraryFragment {
+                mz: 800.0,
+                relative_intensity: 100.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 900.0,
+                relative_intensity: 50.0,
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+
+        let score = scorer.xcorr(&spectrum, &entry);
+
+        // XCorr at non-matching bins should be very low (near zero or negative)
+        // because the sliding window subtraction yields negative background
+        assert!(
+            score.xcorr < 0.01,
+            "Non-matching XCorr should be near zero, got {}",
+            score.xcorr
+        );
+    }
+
+    /// Verifies that XCorr uses the Comet 0.005 scaling factor.
+    /// The raw dot product of preprocessed spectrum at fragment bins is multiplied by 0.005.
+    #[test]
+    fn test_xcorr_scaling_factor() {
+        let scorer = SpectralScorer::new();
+
+        // Single strong peak at 400.0
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![400.0],
+            intensities: vec![10000.0],
+        };
+
+        let mut entry = LibraryEntry::new(1, "PEP".into(), "PEP".into(), 2, 500.0, 10.0);
+        entry.fragments = vec![LibraryFragment {
+            mz: 400.0,
+            relative_intensity: 100.0,
+            annotation: FragmentAnnotation::default(),
+        }];
+
+        let score = scorer.xcorr(&spectrum, &entry);
+
+        // With windowing normalization (max=50.0) and offset=75,
+        // a single isolated peak becomes 50.0 after windowing,
+        // then after sliding window subtraction at the peak bin it becomes:
+        //   50.0 - (sum excluding center) / 150
+        // Since there's only one peak, sum in window is just the peak itself (excluded),
+        // so the preprocessed value should be close to 50.0.
+        // XCorr = preprocessed_value * 0.005 ≈ 0.25
+        assert!(
+            score.xcorr > 0.1,
+            "Single matching peak should produce significant XCorr: {}",
+            score.xcorr
+        );
+        // Should not be unreasonably large
+        assert!(
+            score.xcorr < 1.0,
+            "Single peak XCorr should be modest: {}",
+            score.xcorr
+        );
+    }
+
+    /// Verifies XCorr returns zero for empty inputs.
+    #[test]
+    fn test_xcorr_empty_inputs() {
+        let scorer = SpectralScorer::new();
+
+        let empty_spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![],
+            intensities: vec![],
+        };
+
+        let mut entry = LibraryEntry::new(1, "PEP".into(), "PEP".into(), 2, 500.0, 10.0);
+        entry.fragments = vec![LibraryFragment {
+            mz: 300.0,
+            relative_intensity: 100.0,
+            annotation: FragmentAnnotation::default(),
+        }];
+
+        let score = scorer.xcorr(&empty_spectrum, &entry);
+        assert!(
+            (score.xcorr - 0.0).abs() < 1e-10,
+            "Empty spectrum should produce zero XCorr"
+        );
+
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![300.0],
+            intensities: vec![100.0],
+        };
+
+        let empty_lib = LibraryEntry::new(2, "PEP".into(), "PEP".into(), 2, 500.0, 10.0);
+        let score2 = scorer.xcorr(&spectrum, &empty_lib);
+        assert!(
+            (score2.xcorr - 0.0).abs() < 1e-10,
+            "Empty library should produce zero XCorr"
+        );
+    }
+
+    /// Verifies that XCorr with preprocess_spectrum_for_xcorr matches the one-shot xcorr method.
+    /// This tests the batch preprocessing path produces equivalent results.
+    #[test]
+    fn test_xcorr_preprocessed_matches_direct() {
+        let scorer = SpectralScorer::new();
+
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![200.0, 400.0, 600.0, 800.0],
+            intensities: vec![500.0, 1000.0, 750.0, 250.0],
+        };
+
+        let mut entry = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
+        entry.fragments = vec![
+            LibraryFragment {
+                mz: 200.0,
+                relative_intensity: 50.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 400.0,
+                relative_intensity: 100.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 600.0,
+                relative_intensity: 75.0,
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+
+        // One-shot XCorr
+        let direct_score = scorer.xcorr(&spectrum, &entry);
+
+        // Preprocessed XCorr: manually compute what xcorr does
+        let preprocessed = scorer.preprocess_spectrum_for_xcorr(&spectrum);
+        let xcorr_raw: f32 = entry
+            .fragments
+            .iter()
+            .filter_map(|frag| scorer.bin_config().mz_to_bin(frag.mz))
+            .map(|bin| preprocessed[bin])
+            .sum();
+        let xcorr_preprocessed = (xcorr_raw * 0.005) as f64;
+
+        assert!(
+            (direct_score.xcorr - xcorr_preprocessed).abs() < 1e-6,
+            "Direct XCorr ({}) should match preprocessed XCorr ({})",
+            direct_score.xcorr,
+            xcorr_preprocessed
+        );
+    }
 }

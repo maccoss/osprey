@@ -69,7 +69,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use osprey_scoring::batch::{pair_calibration_matches, CalibrationMatch};
+use osprey_scoring::batch::CalibrationMatch;
 
 /// Extract isolation window scheme from the first cycle of MS2 spectra
 ///
@@ -388,21 +388,6 @@ fn run_calibration_discovery_windowed(
         let linear_rt_mapping = |lib_rt: f64| -> f64 { rt_slope * lib_rt + rt_intercept };
         let expected_rt_fn: Option<&dyn Fn(f64) -> f64> = Some(&linear_rt_mapping);
 
-        let matches_owned: Vec<CalibrationMatch> = accumulated_matches.values().cloned().collect();
-        if let Err(e) = write_calibration_debug_csv(
-            &matches_owned,
-            &calibration_library,
-            &debug_path,
-            expected_rt_fn,
-        ) {
-            log::warn!("Failed to write calibration debug CSV: {}", e);
-        } else {
-            log::debug!(
-                "Wrote paired calibration debug CSV to: {}",
-                debug_path.display()
-            );
-        }
-
         // LDA-based scoring on accumulated matches
         // Don't use isotope feature during calibration — MS1 isotope scoring
         // is only reliable after mass calibration, which hasn't happened yet.
@@ -451,6 +436,11 @@ fn run_calibration_discovery_windowed(
             n_target_wins,
             n_decoy_wins
         );
+
+        // Write calibration debug CSV (after LDA scoring, so discriminant/q-value are populated)
+        if let Err(e) = write_calibration_debug_csv(&all_matches, &debug_path, expected_rt_fn) {
+            log::warn!("Failed to write calibration debug CSV: {}", e);
+        }
 
         // Log S/N filter impact
         if passing_targets.len() < n_target_wins {
@@ -1618,7 +1608,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Process each file
     let mut per_file_entries: Vec<(String, Vec<CoelutionScoredEntry>)> = Vec::new();
     let mut pin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
-    // Retain per-file RT calibrations for cross-run reconciliation
+    // Retain per-file RT calibrations for inter-replicate reconciliation
     let mut per_file_calibrations: HashMap<String, RTCalibration> = HashMap::new();
 
     for (file_idx, input_file) in config.input_files.iter().enumerate() {
@@ -1646,7 +1636,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         entries.len(),
                         scores_path.display()
                     );
-                    // Load cached calibration for cross-run reconciliation
+                    // Load cached calibration for inter-replicate reconciliation
                     if let Some(input_dir) = input_file.parent() {
                         let cal_path = calibration_path_for_input(input_file, input_dir);
                         if cal_path.exists() {
@@ -1744,7 +1734,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 (None, None)
             };
 
-            // Retain RT calibration for cross-run reconciliation
+            // Retain RT calibration for inter-replicate reconciliation
             if let Some(ref cal) = rt_cal {
                 per_file_calibrations.insert(file_name.clone(), cal.clone());
             }
@@ -1843,7 +1833,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // Post-FDR re-scoring: multi-charge consensus + cross-run reconciliation.
+    // Post-FDR re-scoring: multi-charge consensus + inter-replicate reconciliation.
     // Both phases need to load spectra and re-score entries, so we merge them
     // into a single spectra-load pass per file to avoid redundant I/O.
     {
@@ -1890,7 +1880,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             );
         }
 
-        // 2. Cross-run reconciliation: compute per-file rescore targets
+        // 2. Inter-replicate reconciliation: compute per-file rescore targets
         //    Uses first-pass FDR results to build consensus RTs across runs,
         //    then plans which entries need re-scoring at reconciled boundaries.
         let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
@@ -1900,7 +1890,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         if reconciliation_enabled {
             log::info!("");
-            log::info!("=== Cross-Run Peak Reconciliation ===");
+            log::info!("=== Inter-Replicate Peak Reconciliation ===");
 
             let consensus = compute_consensus_rts(
                 &per_file_entries,
@@ -1977,7 +1967,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
             // Merge both target sets, deduplicating by entry index
             // (if an entry appears in both consensus and reconciliation,
-            // prefer the reconciliation target since it's cross-run informed)
+            // prefer the reconciliation target since it's inter-replicate informed)
             let mut combined_targets: HashMap<usize, (f64, f64, f64)> = HashMap::new();
             for (idx, apex, start, end) in &consensus_targets {
                 combined_targets.insert(*idx, (*apex, *start, *end));
@@ -2119,10 +2109,30 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // Write blib output
+    // Write blib output — write to a local temp file first, then move to the
+    // final destination. This avoids SQLite locking issues on network filesystems.
     if !passing_entries.is_empty() {
         log::info!("Writing blib to {}", config.output_blib.display());
-        write_blib_output(&config, &library, &passing_entries)?;
+
+        let final_path = &config.output_blib;
+        let temp_path = std::env::temp_dir().join(format!("osprey_{}.blib", std::process::id()));
+
+        // Write to local temp file
+        let mut temp_config = config.clone();
+        temp_config.output_blib = temp_path.clone();
+        write_blib_output(&temp_config, &library, &passing_entries)?;
+
+        // Move to final destination (try rename first, fall back to copy+delete)
+        if std::fs::rename(&temp_path, final_path).is_err() {
+            std::fs::copy(&temp_path, final_path).map_err(|e| {
+                std::io::Error::other(format!(
+                    "Failed to copy blib to {}: {}",
+                    final_path.display(),
+                    e
+                ))
+            })?;
+            let _ = std::fs::remove_file(&temp_path);
+        }
     } else {
         log::warn!("No peptides passed FDR threshold, skipping blib output");
     }
@@ -2696,6 +2706,13 @@ fn deduplicate_double_counting(
                     continue;
                 }
 
+                // Never deduplicate across target/decoy types: removing a decoy because
+                // it shares fragments with a winning target destroys FDR estimation.
+                // Only deduplicate within the same class (target-target or decoy-decoy).
+                if entries[idx_a].is_decoy != entries[idx_b].is_decoy {
+                    continue;
+                }
+
                 // Check top-6 fragment overlap (look up library entries by ID)
                 let lib_idx_a = match lib_id_map.get(&entries[idx_a].entry_id) {
                     Some(&idx) => idx,
@@ -2740,9 +2757,17 @@ fn deduplicate_double_counting(
 
     let removed_count = removed.iter().filter(|r| r.load(Ordering::Relaxed)).count();
     if removed_count > 0 {
+        let removed_targets = removed
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| r.load(Ordering::Relaxed) && !entries[*i].is_decoy)
+            .count();
+        let removed_decoys = removed_count - removed_targets;
         log::info!(
-            "Double-counting deduplication: removed {} entries ({} remaining)",
+            "Double-counting deduplication: removed {} entries ({} targets, {} decoys; {} remaining)",
             removed_count,
+            removed_targets,
+            removed_decoys,
             original_count - removed_count
         );
     }
@@ -2987,10 +3012,19 @@ fn write_blib_output(
                     scored.peak_bounds.end_rt,
                 ));
 
-            // Only set retentionTime (ID line) if this run passes FDR;
-            // otherwise NULL retentionTime with startTime/endTime gives Skyline
-            // peak boundaries for quantification without an ID line.
-            let rt_for_id = if scored.run_qvalue <= config.run_fdr {
+            // Show an ID line (non-NULL retentionTime) if this observation passes
+            // EITHER run-level or experiment-level FDR. In GPF experiments, a precursor
+            // exists in only one file, so its run q-value may be slightly above the
+            // threshold while the experiment q-value (which benefits from global
+            // competition) passes. Since this entry is already in the output (it passed
+            // experiment FDR), it should get an ID line in the file where it was found.
+            //
+            // For multi-replicate DIA, observations propagated from other replicates
+            // (where the precursor wasn't independently identified) still get NULL
+            // retentionTime — their run_qvalue stays at 1.0 and experiment_qvalue
+            // reflects the best replicate, not this one.
+            let effective_qvalue = scored.run_qvalue.min(scored.experiment_qvalue);
+            let rt_for_id = if effective_qvalue <= config.run_fdr {
                 Some(run_apex)
             } else {
                 None
@@ -3506,7 +3540,7 @@ fn select_post_fdr_consensus(
 /// Context for re-scoring entries in a file.
 ///
 /// Loads spectra, calibration, sets up fragment tolerance and scorer —
-/// shared setup needed by both multi-charge consensus and cross-run reconciliation.
+/// shared setup needed by both multi-charge consensus and inter-replicate reconciliation.
 struct FileRescoreContext {
     spectra: Vec<Spectrum>,
     calibrated_spectra: Option<Vec<Spectrum>>,
@@ -3631,7 +3665,7 @@ impl FileRescoreContext {
 
 /// Re-score a single entry at specified RT boundaries.
 ///
-/// Used by both multi-charge consensus and cross-run reconciliation.
+/// Used by both multi-charge consensus and inter-replicate reconciliation.
 /// Uses binary search on pre-sorted spec_indices for efficient spectra selection.
 #[allow(clippy::too_many_arguments)]
 fn rescore_entry_at_boundaries(
@@ -3730,6 +3764,9 @@ fn rescore_entry_at_boundaries(
         } else {
             apex_index
         };
+        // Clamp apex to within peak boundaries so ID line is always inside
+        // the integration window written to blib
+        let apex_index = apex_index.clamp(start_index, end_index);
 
         if end_index <= start_index + 1 {
             continue;
@@ -3781,7 +3818,7 @@ fn rescore_entry_at_boundaries(
     best_result
 }
 
-/// Re-score entries at cross-run reconciled peak boundaries.
+/// Re-score entries at inter-replicate reconciled peak boundaries.
 ///
 /// For each entry with a reconciliation action (`UseCwtPeak` or `ForcedIntegration`),
 /// extracts XICs from the appropriate isolation window and computes all features
@@ -4263,7 +4300,7 @@ fn run_search(
                         .collect();
                     scored_candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-                    // Store top-N CWT candidates for cross-run reconciliation
+                    // Store top-N CWT candidates for inter-replicate reconciliation
                     let top_n = config.reconciliation.top_n_peaks;
                     let cwt_top_n: Vec<CwtCandidate> = scored_candidates
                         .iter()
@@ -4341,7 +4378,6 @@ fn run_search(
                 })
                 .collect();
 
-            pb.inc(candidate_indices.len().saturating_sub(window_entries.len()) as u64);
             window_entries
         })
         .collect();
@@ -4600,131 +4636,118 @@ fn select_candidates(
     )
 }
 
-/// Write calibration debug CSV for diagnosis of scoring results
+/// Write calibration debug CSV showing LDA features and discriminant scores
 ///
-/// This produces a paired CSV with target and decoy results on the same row,
-/// making it easy to analyze what separates targets from decoys.
+/// Produces a paired target-decoy CSV sorted by discriminant score descending,
+/// showing the 4 LDA features, discriminant score, q-value, and RT info.
 fn write_calibration_debug_csv(
     matches: &[CalibrationMatch],
-    _library: &[LibraryEntry],
     output_path: &std::path::Path,
     expected_rt_fn: Option<&dyn Fn(f64) -> f64>,
 ) -> Result<()> {
+    use std::collections::HashMap as DebugMap;
     use std::fs::File;
 
     let file = File::create(output_path)
         .map_err(|e| OspreyError::OutputError(format!("Failed to create debug CSV: {}", e)))?;
     let mut writer = std::io::BufWriter::new(file);
 
-    // Pair targets with their decoys
-    let paired = pair_calibration_matches(matches, expected_rt_fn);
+    // Pair targets with their decoys by base_id
+    let mut target_map: DebugMap<u32, &CalibrationMatch> = DebugMap::new();
+    let mut decoy_map: DebugMap<u32, &CalibrationMatch> = DebugMap::new();
+    for m in matches {
+        let base_id = m.entry_id & 0x7FFFFFFF;
+        if m.is_decoy {
+            decoy_map.insert(base_id, m);
+        } else {
+            target_map.insert(base_id, m);
+        }
+    }
 
-    log::debug!(
-        "Writing {} paired target-decoy results to debug CSV",
-        paired.len()
-    );
+    struct PairedRow<'a> {
+        target: &'a CalibrationMatch,
+        decoy: &'a CalibrationMatch,
+    }
 
-    // Write header with paired columns
-    // Note: sorted by winning_evalue ascending (best matches first, lower E-value = better)
+    let mut paired: Vec<PairedRow> = Vec::new();
+    for (&base_id, &target) in &target_map {
+        if let Some(&decoy) = decoy_map.get(&base_id) {
+            paired.push(PairedRow { target, decoy });
+        }
+    }
+
+    // Sort by target discriminant score descending (best first)
+    paired.sort_by(|a, b| {
+        b.target
+            .discriminant_score
+            .total_cmp(&a.target.discriminant_score)
+    });
+
     writeln!(
         writer,
-        "target_entry_id,charge,target_sequence,decoy_sequence,\
-         winning_evalue,target_evalue,decoy_evalue,target_wins_evalue,\
-         winning_xcorr,target_xcorr,decoy_xcorr,\
-         winning_hyperscore,target_hyperscore,decoy_hyperscore,\
-         target_n_b,target_n_y,decoy_n_b,decoy_n_y,\
-         target_isotope_score,decoy_isotope_score,\
-         target_precursor_error_ppm,decoy_precursor_error_ppm,\
-         target_rt,decoy_rt,library_rt,expected_rt,target_delta_rt,decoy_delta_rt,\
-         target_matched_frags,decoy_matched_frags,target_wins"
+        "entry_id,charge,target_sequence,decoy_sequence,\
+         target_correlation,decoy_correlation,\
+         target_libcosine,decoy_libcosine,\
+         target_top6,decoy_top6,\
+         target_xcorr,decoy_xcorr,\
+         target_discriminant,decoy_discriminant,\
+         target_qvalue,decoy_qvalue,\
+         target_snr,decoy_snr,\
+         target_rt,decoy_rt,library_rt,expected_rt,\
+         target_delta_rt,decoy_delta_rt,\
+         target_matched_frags,decoy_matched_frags,\
+         target_wins"
     )
     .map_err(|e| OspreyError::OutputError(format!("Failed to write header: {}", e)))?;
 
-    // Write each paired result (sorted by winning_evalue ascending - best first)
     for p in &paired {
+        let t = p.target;
+        let d = p.decoy;
+        let expected_rt = expected_rt_fn.map(|f| f(t.library_rt));
+        let ref_rt = expected_rt.unwrap_or(t.library_rt);
+        let target_delta = (t.measured_rt - ref_rt).abs();
+        let decoy_delta = (d.measured_rt - ref_rt).abs();
+        let target_wins = t.discriminant_score > d.discriminant_score;
+
         writeln!(
             writer,
-            "{},{},{},{},{:.2e},{:.2e},{:.2e},{},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{},{:.2},{:.2},{},{},{}",
-            p.target_entry_id,
-            p.charge,
-            p.target_sequence,
-            p.decoy_sequence,
-            p.winning_evalue,
-            p.target_evalue,
-            p.decoy_evalue,
-            p.target_wins_evalue,
-            p.winning_xcorr,
-            p.target_xcorr,
-            p.decoy_xcorr,
-            p.winning_hyperscore,
-            p.target_hyperscore,
-            p.decoy_hyperscore,
-            p.target_n_b,
-            p.target_n_y,
-            p.decoy_n_b,
-            p.decoy_n_y,
-            p.target_isotope_score.map(|v| format!("{:.4}", v)).unwrap_or_default(),
-            p.decoy_isotope_score.map(|v| format!("{:.4}", v)).unwrap_or_default(),
-            p.target_precursor_error_ppm.map(|v| format!("{:.2}", v)).unwrap_or_default(),
-            p.decoy_precursor_error_ppm.map(|v| format!("{:.2}", v)).unwrap_or_default(),
-            p.target_rt,
-            p.decoy_rt,
-            p.library_rt,
-            p.expected_rt.map(|v| format!("{:.2}", v)).unwrap_or_default(),
-            p.target_delta_rt,
-            p.decoy_delta_rt,
-            p.target_matched_frags,
-            p.decoy_matched_frags,
-            p.target_wins
-        ).map_err(|e| OspreyError::OutputError(format!("Failed to write row: {}", e)))?;
+            "{},{},{},{},{:.4},{:.4},{:.4},{:.4},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{},{:.2},{:.2},{},{},{}",
+            t.entry_id,
+            t.charge,
+            t.sequence,
+            d.sequence,
+            t.correlation_score,
+            d.correlation_score,
+            t.libcosine_apex,
+            d.libcosine_apex,
+            t.top6_matched_apex,
+            d.top6_matched_apex,
+            t.xcorr_score,
+            d.xcorr_score,
+            t.discriminant_score,
+            d.discriminant_score,
+            t.q_value,
+            d.q_value,
+            t.signal_to_noise,
+            d.signal_to_noise,
+            t.measured_rt,
+            d.measured_rt,
+            t.library_rt,
+            expected_rt.map(|v| format!("{:.2}", v)).unwrap_or_default(),
+            target_delta,
+            decoy_delta,
+            t.n_matched_fragments,
+            d.n_matched_fragments,
+            target_wins
+        )
+        .map_err(|e| OspreyError::OutputError(format!("Failed to write row: {}", e)))?;
     }
 
-    Ok(())
-}
-
-/// Write unpaired calibration debug CSV (original format for backwards compatibility)
-#[allow(dead_code)]
-fn write_calibration_debug_csv_unpaired(
-    matches: &[CalibrationMatch],
-    library: &[LibraryEntry],
-    output_path: &std::path::Path,
-) -> Result<()> {
-    use std::fs::File;
-
-    let file = File::create(output_path)
-        .map_err(|e| OspreyError::OutputError(format!("Failed to create debug CSV: {}", e)))?;
-    let mut writer = std::io::BufWriter::new(file);
-
-    // Write header
-    writeln!(writer, "entry_id,peptide,charge,precursor_mz,library_rt,measured_rt,score,xcorr,isotope_score,n_matched,is_decoy")
-        .map_err(|e| OspreyError::OutputError(format!("Failed to write header: {}", e)))?;
-
-    // Build lookup
-    let id_to_entry: HashMap<u32, &LibraryEntry> = library.iter().map(|e| (e.id, e)).collect();
-
-    // Write each match
-    for m in matches {
-        if let Some(entry) = id_to_entry.get(&m.entry_id) {
-            writeln!(
-                writer,
-                "{},{},{},{:.4},{:.2},{:.2},{:.6},{:.6},{},{},{}",
-                m.entry_id,
-                entry.sequence,
-                entry.charge,
-                entry.precursor_mz,
-                entry.retention_time,
-                m.measured_rt,
-                m.score,
-                m.xcorr_score,
-                m.isotope_cosine_score
-                    .map(|v| format!("{:.4}", v))
-                    .unwrap_or_default(),
-                m.n_matched_fragments,
-                m.is_decoy
-            )
-            .map_err(|e| OspreyError::OutputError(format!("Failed to write row: {}", e)))?;
-        }
-    }
+    log::debug!(
+        "Wrote calibration debug CSV ({} pairs) to: {}",
+        paired.len(),
+        output_path.display()
+    );
 
     Ok(())
 }
