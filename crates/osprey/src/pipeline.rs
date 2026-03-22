@@ -4077,9 +4077,17 @@ fn run_search(
     );
 
     // Process each isolation window — candidates within each window in parallel
-    let all_entries: Vec<CoelutionScoredEntry> = window_groups
+    // Use fold/reduce instead of flat_map+collect so results are deduplicated
+    // per-thread as each window finishes, then merged pairwise.  This avoids
+    // the peak-memory spike where a flat Vec of ALL scored entries (up to ~600 MB)
+    // had to exist simultaneously with the dedup HashMap.  With fold/reduce the
+    // working set at any point is bounded by the total number of unique entries
+    // (≈ final size), not twice that.
+    let best_by_id: HashMap<u32, CoelutionScoredEntry> = window_groups
         .par_iter()
-        .flat_map(|((lower, upper), spectrum_indices)| {
+        .fold(
+        || HashMap::<u32, CoelutionScoredEntry>::new(),
+        |mut map, ((lower, upper), spectrum_indices)| {
             // Gather spectra for this window, sorted by RT
             let mut window_pairs: Vec<(usize, &Spectrum)> = spectrum_indices
                 .iter()
@@ -4092,7 +4100,7 @@ fn run_search(
             });
 
             if window_pairs.len() < MIN_COELUTION_SPECTRA {
-                return Vec::new();
+                return map;
             }
 
             let window_spectra: Vec<&Spectrum> = window_pairs.iter().map(|(_, s)| *s).collect();
@@ -4370,35 +4378,50 @@ fn run_search(
                     }
                     result
                 })
-                .collect();
+                .collect::<Vec<_>>();
+
+            // Dedup within this window (handles any intra-window duplicates) and
+            // merge into the thread-local map, keeping the best coelution_sum.
+            for entry in window_entries {
+                let is_better = map
+                    .get(&entry.entry_id)
+                    .map(|existing| entry.features.coelution_sum > existing.features.coelution_sum)
+                    .unwrap_or(true);
+                if is_better {
+                    map.insert(entry.entry_id, entry);
+                }
+            }
 
             pb.inc(1);
-            window_entries
+            map
         })
-        .collect();
+        .reduce(
+            || HashMap::<u32, CoelutionScoredEntry>::new(),
+            |mut a, b| {
+                // Merge two thread-local maps, keeping best coelution_sum per entry.
+                for (id, entry) in b {
+                    let is_better = a
+                        .get(&id)
+                        .map(|existing| {
+                            entry.features.coelution_sum > existing.features.coelution_sum
+                        })
+                        .unwrap_or(true);
+                    if is_better {
+                        a.insert(id, entry);
+                    }
+                }
+                a
+            },
+        );
 
     pb.finish_with_message("Done");
 
     log::info!(
         "Coelution search complete: {} scored entries ({} targets, {} decoys)",
-        all_entries.len(),
-        all_entries.iter().filter(|e| !e.is_decoy).count(),
-        all_entries.iter().filter(|e| e.is_decoy).count(),
+        best_by_id.len(),
+        best_by_id.values().filter(|e| !e.is_decoy).count(),
+        best_by_id.values().filter(|e| e.is_decoy).count(),
     );
-
-    // Keep best score per precursor (a precursor can be scored in multiple
-    // overlapping DIA windows; keep the one with highest coelution_sum)
-    let pre_count = all_entries.len();
-    let mut best_by_id: HashMap<u32, CoelutionScoredEntry> = HashMap::new();
-    for entry in all_entries {
-        let is_better = best_by_id
-            .get(&entry.entry_id)
-            .map(|existing| entry.features.coelution_sum > existing.features.coelution_sum)
-            .unwrap_or(true);
-        if is_better {
-            best_by_id.insert(entry.entry_id, entry);
-        }
-    }
 
     let mut deduped: Vec<CoelutionScoredEntry> = best_by_id.into_values().collect();
 
@@ -4409,14 +4432,6 @@ fn run_search(
             .cmp(&b.entry_id)
             .then(a.scan_number.cmp(&b.scan_number))
     });
-
-    if deduped.len() < pre_count {
-        log::info!(
-            "Best per precursor: {} entries (removed {} duplicate window hits)",
-            deduped.len(),
-            pre_count - deduped.len()
-        );
-    }
 
     // Multi-charge consensus is handled post-FDR (see run_analysis),
     // where the full SVM score is available to pick the correct peak.
