@@ -1791,6 +1791,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             pin_files.insert(file_name.clone(), pin_path);
         }
 
+        // Drop heavy blib-only fields (fragment_mzs, fragment_intensities,
+        // reference_xic, protein_ids) to avoid accumulating ~600 bytes/entry
+        // across hundreds of files.  These are already persisted to parquet and
+        // will be reloaded for the small subset that passes FDR.
+        let mut entries = entries;
+        for e in entries.iter_mut() {
+            e.shrink_for_fdr();
+        }
+
         per_file_entries.push((file_name, entries));
     }
 
@@ -2950,14 +2959,27 @@ fn write_blib_output(
             .min_by(|a, b| a.run_qvalue.total_cmp(&b.run_qvalue))
             .unwrap();
 
-        if best.fragment_mzs.is_empty() {
+        // Fragment m/z and intensities from library (entries may have been
+        // shrunk to save memory across hundreds of files).
+        let (frag_mzs, frag_intensities): (Vec<f64>, Vec<f32>) = if !best.fragment_mzs.is_empty() {
+            (best.fragment_mzs.clone(), best.fragment_intensities.clone())
+        } else if let Some(lib_entry) = lib_by_id.get(&best.entry_id) {
+            (
+                lib_entry.fragments.iter().map(|f| f.mz).collect(),
+                lib_entry
+                    .fragments
+                    .iter()
+                    .map(|f| f.relative_intensity)
+                    .collect(),
+            )
+        } else {
             continue;
-        }
+        };
 
         let n_runs_detected = group.len() as i32;
         let file_id = *file_stem_to_id.get(&best.file_name).unwrap_or(&1);
 
-        let tic: f64 = best.fragment_intensities.iter().map(|&x| x as f64).sum();
+        let tic: f64 = frag_intensities.iter().map(|&x| x as f64).sum();
 
         // Use shared boundaries from the best charge state for this peptide in this file
         let shared_key = (best.modified_sequence.clone(), best.file_name.clone());
@@ -2977,8 +2999,8 @@ fn write_blib_output(
             shared_apex,
             shared_start,
             shared_end,
-            &best.fragment_mzs,
-            &best.fragment_intensities,
+            &frag_mzs,
+            &frag_intensities,
             best.experiment_qvalue,
             file_id,
             n_runs_detected,
@@ -4086,317 +4108,330 @@ fn run_search(
     let best_by_id: HashMap<u32, CoelutionScoredEntry> = window_groups
         .par_iter()
         .fold(
-        || HashMap::<u32, CoelutionScoredEntry>::new(),
-        |mut map, ((lower, upper), spectrum_indices)| {
-            // Gather spectra for this window, sorted by RT
-            let mut window_pairs: Vec<(usize, &Spectrum)> = spectrum_indices
-                .iter()
-                .map(|&idx| (idx, &spectra_ref[idx]))
-                .collect();
-            window_pairs.sort_by(|a, b| {
-                a.1.retention_time
-                    .partial_cmp(&b.1.retention_time)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            HashMap::<u32, CoelutionScoredEntry>::new,
+            |mut map, ((lower, upper), spectrum_indices)| {
+                // Gather spectra for this window, sorted by RT
+                let mut window_pairs: Vec<(usize, &Spectrum)> = spectrum_indices
+                    .iter()
+                    .map(|&idx| (idx, &spectra_ref[idx]))
+                    .collect();
+                window_pairs.sort_by(|a, b| {
+                    a.1.retention_time
+                        .partial_cmp(&b.1.retention_time)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
 
-            if window_pairs.len() < MIN_COELUTION_SPECTRA {
-                return map;
-            }
+                if window_pairs.len() < MIN_COELUTION_SPECTRA {
+                    return map;
+                }
 
-            let window_spectra: Vec<&Spectrum> = window_pairs.iter().map(|(_, s)| *s).collect();
-            let _global_indices: Vec<usize> = window_pairs.iter().map(|(idx, _)| *idx).collect();
+                let window_spectra: Vec<&Spectrum> = window_pairs.iter().map(|(_, s)| *s).collect();
+                let _global_indices: Vec<usize> =
+                    window_pairs.iter().map(|(idx, _)| *idx).collect();
 
-            // Find candidate library entries for this window using MzRTIndex
-            // Collect unique library indices whose precursor_mz falls in this window
-            let _window_center = (*lower + *upper) / 2.0;
-            let lower_bin = lower.floor() as i32;
-            let upper_bin = upper.ceil() as i32;
+                // Find candidate library entries for this window using MzRTIndex
+                // Collect unique library indices whose precursor_mz falls in this window
+                let _window_center = (*lower + *upper) / 2.0;
+                let lower_bin = lower.floor() as i32;
+                let upper_bin = upper.ceil() as i32;
 
-            let mut candidate_indices: Vec<usize> = Vec::new();
-            let mut seen = std::collections::HashSet::new();
+                let mut candidate_indices: Vec<usize> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
 
-            // Get median RT of spectra in this window for RT range filtering
-            let window_rt_min = window_spectra
-                .first()
-                .map(|s| s.retention_time)
-                .unwrap_or(0.0);
-            let window_rt_max = window_spectra
-                .last()
-                .map(|s| s.retention_time)
-                .unwrap_or(0.0);
+                // Get median RT of spectra in this window for RT range filtering
+                let window_rt_min = window_spectra
+                    .first()
+                    .map(|s| s.retention_time)
+                    .unwrap_or(0.0);
+                let window_rt_max = window_spectra
+                    .last()
+                    .map(|s| s.retention_time)
+                    .unwrap_or(0.0);
 
-            for bin in lower_bin..=upper_bin {
-                if let Some(entries) = mz_rt_index.get(bin) {
-                    for &(expected_rt, idx) in entries {
-                        if seen.contains(&idx) {
-                            continue;
+                for bin in lower_bin..=upper_bin {
+                    if let Some(entries) = mz_rt_index.get(bin) {
+                        for &(expected_rt, idx) in entries {
+                            if seen.contains(&idx) {
+                                continue;
+                            }
+                            // Check m/z falls within isolation window.
+                            // Use half-open [lower, upper) so entries at the boundary
+                            // belong to exactly one window, preventing double-counting.
+                            let entry = &library[idx];
+                            if entry.precursor_mz < *lower || entry.precursor_mz >= *upper {
+                                continue;
+                            }
+                            // Check RT is within a reasonable range of window spectra
+                            if expected_rt < window_rt_min - rt_tolerance
+                                || expected_rt > window_rt_max + rt_tolerance
+                            {
+                                continue;
+                            }
+                            seen.insert(idx);
+                            candidate_indices.push(idx);
                         }
-                        // Check m/z falls within isolation window.
-                        // Use half-open [lower, upper) so entries at the boundary
-                        // belong to exactly one window, preventing double-counting.
-                        let entry = &library[idx];
-                        if entry.precursor_mz < *lower || entry.precursor_mz >= *upper {
-                            continue;
-                        }
-                        // Check RT is within a reasonable range of window spectra
-                        if expected_rt < window_rt_min - rt_tolerance
-                            || expected_rt > window_rt_max + rt_tolerance
-                        {
-                            continue;
-                        }
-                        seen.insert(idx);
-                        candidate_indices.push(idx);
                     }
                 }
-            }
 
-            // Score each candidate precursor
-            let window_entries: Vec<CoelutionScoredEntry> = candidate_indices
-                .iter()
-                .filter_map(|&lib_idx| {
-                    let entry = &library[lib_idx];
+                // Score each candidate precursor
+                let window_entries: Vec<CoelutionScoredEntry> = candidate_indices
+                    .iter()
+                    .filter_map(|&lib_idx| {
+                        let entry = &library[lib_idx];
 
-                    // Expected RT for this entry
-                    let expected_rt = rt_calibration
-                        .map(|cal| cal.predict(entry.retention_time))
-                        .unwrap_or(entry.retention_time);
+                        // Expected RT for this entry
+                        let expected_rt = rt_calibration
+                            .map(|cal| cal.predict(entry.retention_time))
+                            .unwrap_or(entry.retention_time);
 
-                    // Filter spectra within RT tolerance of expected RT
-                    let rt_spec_pairs: Vec<(usize, &Spectrum)> = window_pairs
-                        .iter()
-                        .filter(|(_, spec)| {
-                            (spec.retention_time - expected_rt).abs() <= rt_tolerance
-                        })
-                        .map(|(idx, spec)| (*idx, *spec))
-                        .collect();
+                        // Filter spectra within RT tolerance of expected RT
+                        let rt_spec_pairs: Vec<(usize, &Spectrum)> = window_pairs
+                            .iter()
+                            .filter(|(_, spec)| {
+                                (spec.retention_time - expected_rt).abs() <= rt_tolerance
+                            })
+                            .map(|(idx, spec)| (*idx, *spec))
+                            .collect();
 
-                    if rt_spec_pairs.len() < MIN_COELUTION_SPECTRA {
-                        return None;
-                    }
-
-                    // Signal pre-filter: sliding window of 4 consecutive scans
-                    // (in RT order), requiring ≥3 of the 4 to have ≥2 of the
-                    // top-6 fragments matching. Disabled for unit-resolution data
-                    // (lower fragment specificity) or via --no-prefilter.
-                    if config.prefilter_enabled {
-                        let tol = if tol_ppm > 0.0 { tol_ppm } else { tol_da };
-                        let tol_unit = if tol_ppm > 0.0 {
-                            ToleranceUnit::Ppm
-                        } else {
-                            ToleranceUnit::Mz
-                        };
-                        const WIN: usize = 4;
-                        const MIN_PASS: u32 = 3;
-                        let mut window = [false; WIN];
-                        let mut win_sum = 0u32;
-                        let mut has_signal = false;
-                        for (i, (_, spec)) in rt_spec_pairs.iter().enumerate() {
-                            let passes =
-                                has_topn_fragment_match(&entry.fragments, &spec.mzs, tol, tol_unit);
-                            let slot = i % WIN;
-                            if window[slot] {
-                                win_sum -= 1;
-                            }
-                            window[slot] = passes;
-                            if passes {
-                                win_sum += 1;
-                            }
-                            if i + 1 >= WIN && win_sum >= MIN_PASS {
-                                has_signal = true;
-                                break;
-                            }
-                        }
-                        if !has_signal {
+                        if rt_spec_pairs.len() < MIN_COELUTION_SPECTRA {
                             return None;
                         }
-                    }
 
-                    let cand_spectra: Vec<&Spectrum> =
-                        rt_spec_pairs.iter().map(|(_, s)| *s).collect();
-                    let cand_global: Vec<usize> =
-                        rt_spec_pairs.iter().map(|(idx, _)| *idx).collect();
-
-                    // 1. Extract top-6 fragment XICs
-                    let xics =
-                        extract_fragment_xics(&entry.fragments, &cand_spectra, tol_da, tol_ppm, 6);
-
-                    if xics.len() < 2 {
-                        return None;
-                    }
-
-                    // 2. Find reference XIC (highest total intensity) for scoring
-                    let ref_idx = xics
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| {
-                            let sum_a: f64 = a.1 .1.iter().map(|(_, v)| *v).sum();
-                            let sum_b: f64 = b.1 .1.iter().map(|(_, v)| *v).sum();
-                            sum_a.total_cmp(&sum_b)
-                        })
-                        .map(|(i, _)| i)?;
-
-                    let ref_xic = &xics[ref_idx].1;
-
-                    // 3. Detect candidate peaks using CWT consensus across all transitions.
-                    // The Mexican Hat wavelet convolution of each fragment XIC, followed by
-                    // pointwise median, produces a consensus signal that is only high where
-                    // the majority of transitions exhibit peak-like shapes simultaneously.
-                    // Falls back to median polish profile or reference XIC if CWT finds nothing.
-                    let full_polish = tukey_median_polish(&xics, 10, 0.01);
-                    let candidates = {
-                        let cwt_candidates = detect_cwt_consensus_peaks(&xics, 0.0);
-                        if cwt_candidates.is_empty() {
-                            // Fallback: median polish elution profile, then reference XIC
-                            let mp_candidates = full_polish
-                                .as_ref()
-                                .map(|mp| detect_all_xic_peaks(&mp.elution_profile, 0.01, 5.0))
-                                .unwrap_or_default();
-                            if mp_candidates.is_empty() {
-                                detect_all_xic_peaks(ref_xic, 0.01, 5.0)
+                        // Signal pre-filter: sliding window of 4 consecutive scans
+                        // (in RT order), requiring ≥3 of the 4 to have ≥2 of the
+                        // top-6 fragments matching. Disabled for unit-resolution data
+                        // (lower fragment specificity) or via --no-prefilter.
+                        if config.prefilter_enabled {
+                            let tol = if tol_ppm > 0.0 { tol_ppm } else { tol_da };
+                            let tol_unit = if tol_ppm > 0.0 {
+                                ToleranceUnit::Ppm
                             } else {
-                                mp_candidates
-                            }
-                        } else {
-                            cwt_candidates
-                        }
-                    };
-
-                    if candidates.is_empty() {
-                        return None;
-                    }
-
-                    // Score each candidate by mean pairwise fragment correlation
-                    let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
-                    let mut scored_candidates: Vec<(&XICPeakBounds, f64)> = candidates
-                        .iter()
-                        .map(|bp| {
-                            let si = bp.start_index;
-                            let ei = bp.end_index;
-                            let peak_len = ei - si + 1;
-
-                            let coelution_score = if peak_len >= 3 {
-                                let vals: Vec<Vec<f64>> = xics
-                                    .iter()
-                                    .map(|(_, xic_data)| {
-                                        xic_data[si..=ei].iter().map(|(_, v)| *v).collect()
-                                    })
-                                    .collect();
-                                let mut sum = 0.0f64;
-                                let mut count = 0u32;
-                                for ii in 0..vals.len() {
-                                    for jj in (ii + 1)..vals.len() {
-                                        sum += pearson_correlation_raw(&vals[ii], &vals[jj]);
-                                        count += 1;
-                                    }
+                                ToleranceUnit::Mz
+                            };
+                            const WIN: usize = 4;
+                            const MIN_PASS: u32 = 3;
+                            let mut window = [false; WIN];
+                            let mut win_sum = 0u32;
+                            let mut has_signal = false;
+                            for (i, (_, spec)) in rt_spec_pairs.iter().enumerate() {
+                                let passes = has_topn_fragment_match(
+                                    &entry.fragments,
+                                    &spec.mzs,
+                                    tol,
+                                    tol_unit,
+                                );
+                                let slot = i % WIN;
+                                if window[slot] {
+                                    win_sum -= 1;
                                 }
-                                if count > 0 {
-                                    sum / count as f64
+                                window[slot] = passes;
+                                if passes {
+                                    win_sum += 1;
+                                }
+                                if i + 1 >= WIN && win_sum >= MIN_PASS {
+                                    has_signal = true;
+                                    break;
+                                }
+                            }
+                            if !has_signal {
+                                return None;
+                            }
+                        }
+
+                        let cand_spectra: Vec<&Spectrum> =
+                            rt_spec_pairs.iter().map(|(_, s)| *s).collect();
+                        let cand_global: Vec<usize> =
+                            rt_spec_pairs.iter().map(|(idx, _)| *idx).collect();
+
+                        // 1. Extract top-6 fragment XICs
+                        let xics = extract_fragment_xics(
+                            &entry.fragments,
+                            &cand_spectra,
+                            tol_da,
+                            tol_ppm,
+                            6,
+                        );
+
+                        if xics.len() < 2 {
+                            return None;
+                        }
+
+                        // 2. Find reference XIC (highest total intensity) for scoring
+                        let ref_idx = xics
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| {
+                                let sum_a: f64 = a.1 .1.iter().map(|(_, v)| *v).sum();
+                                let sum_b: f64 = b.1 .1.iter().map(|(_, v)| *v).sum();
+                                sum_a.total_cmp(&sum_b)
+                            })
+                            .map(|(i, _)| i)?;
+
+                        let ref_xic = &xics[ref_idx].1;
+
+                        // 3. Detect candidate peaks using CWT consensus across all transitions.
+                        // The Mexican Hat wavelet convolution of each fragment XIC, followed by
+                        // pointwise median, produces a consensus signal that is only high where
+                        // the majority of transitions exhibit peak-like shapes simultaneously.
+                        // Falls back to median polish profile or reference XIC if CWT finds nothing.
+                        let full_polish = tukey_median_polish(&xics, 10, 0.01);
+                        let candidates = {
+                            let cwt_candidates = detect_cwt_consensus_peaks(&xics, 0.0);
+                            if cwt_candidates.is_empty() {
+                                // Fallback: median polish elution profile, then reference XIC
+                                let mp_candidates = full_polish
+                                    .as_ref()
+                                    .map(|mp| detect_all_xic_peaks(&mp.elution_profile, 0.01, 5.0))
+                                    .unwrap_or_default();
+                                if mp_candidates.is_empty() {
+                                    detect_all_xic_peaks(ref_xic, 0.01, 5.0)
+                                } else {
+                                    mp_candidates
+                                }
+                            } else {
+                                cwt_candidates
+                            }
+                        };
+
+                        if candidates.is_empty() {
+                            return None;
+                        }
+
+                        // Score each candidate by mean pairwise fragment correlation
+                        let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+                        let mut scored_candidates: Vec<(&XICPeakBounds, f64)> = candidates
+                            .iter()
+                            .map(|bp| {
+                                let si = bp.start_index;
+                                let ei = bp.end_index;
+                                let peak_len = ei - si + 1;
+
+                                let coelution_score = if peak_len >= 3 {
+                                    let vals: Vec<Vec<f64>> = xics
+                                        .iter()
+                                        .map(|(_, xic_data)| {
+                                            xic_data[si..=ei].iter().map(|(_, v)| *v).collect()
+                                        })
+                                        .collect();
+                                    let mut sum = 0.0f64;
+                                    let mut count = 0u32;
+                                    for ii in 0..vals.len() {
+                                        for jj in (ii + 1)..vals.len() {
+                                            sum += pearson_correlation_raw(&vals[ii], &vals[jj]);
+                                            count += 1;
+                                        }
+                                    }
+                                    if count > 0 {
+                                        sum / count as f64
+                                    } else {
+                                        0.0
+                                    }
                                 } else {
                                     0.0
+                                };
+
+                                (bp, coelution_score)
+                            })
+                            .collect();
+                        scored_candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+                        // Store top-N CWT candidates for inter-replicate reconciliation
+                        let top_n = config.reconciliation.top_n_peaks;
+                        let cwt_top_n: Vec<CwtCandidate> = scored_candidates
+                            .iter()
+                            .take(top_n)
+                            .map(|(bp, score)| {
+                                let si = bp.start_index;
+                                let ei = bp.end_index;
+                                let area = trapezoidal_area(&ref_xic[si..=ei]);
+                                let (apex_idx, _) = ref_xic[si..=ei]
+                                    .iter()
+                                    .enumerate()
+                                    .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                                    .map(|(i, &(_, v))| (si + i, v))
+                                    .unwrap_or((bp.apex_index, 0.0));
+                                let snr = compute_snr(&raw_ints, apex_idx, si, ei);
+                                CwtCandidate {
+                                    apex_rt: ref_xic[apex_idx].0,
+                                    start_rt: ref_xic[si].0,
+                                    end_rt: ref_xic[ei].0,
+                                    area,
+                                    snr,
+                                    coelution_score: *score,
                                 }
-                            } else {
-                                0.0
-                            };
+                            })
+                            .collect();
 
-                            (bp, coelution_score)
+                        // Build peak from best candidate
+                        let (best_bp, _) = scored_candidates[0];
+                        let si = best_bp.start_index;
+                        let ei = best_bp.end_index;
+                        let (apex_idx, apex_val) = ref_xic[si..=ei]
+                            .iter()
+                            .enumerate()
+                            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                            .map(|(i, &(_, v))| (si + i, v))
+                            .unwrap_or((best_bp.apex_index, 0.0));
+                        let area = trapezoidal_area(&ref_xic[si..=ei]);
+                        let snr = compute_snr(&raw_ints, apex_idx, si, ei);
+                        let peak = XICPeakBounds {
+                            apex_rt: ref_xic[apex_idx].0,
+                            apex_intensity: apex_val,
+                            apex_index: apex_idx,
+                            start_rt: ref_xic[si].0,
+                            end_rt: ref_xic[ei].0,
+                            start_index: si,
+                            end_index: ei,
+                            area,
+                            signal_to_noise: snr,
+                        };
+
+                        // CWT zero-crossing boundaries are the final boundaries.
+                        // Compute all 45 features at these boundaries.
+                        let ctx = FeatureComputeContext {
+                            entry,
+                            xics: &xics,
+                            ref_xic,
+                            cand_spectra: &cand_spectra,
+                            cand_global: &cand_global,
+                            scorer: &scorer,
+                            ms1_index,
+                            calibration,
+                            tol_da,
+                            tol_ppm,
+                            expected_rt,
+                            is_hram,
+                            file_name,
+                        };
+
+                        let mut result = compute_features_at_peak(&ctx, peak);
+                        if let Some(ref mut entry) = result {
+                            entry.cwt_candidates = cwt_top_n;
+                        }
+                        result
+                    })
+                    .collect::<Vec<_>>();
+
+                // Dedup within this window (handles any intra-window duplicates) and
+                // merge into the thread-local map, keeping the best coelution_sum.
+                for entry in window_entries {
+                    let is_better = map
+                        .get(&entry.entry_id)
+                        .map(|existing| {
+                            entry.features.coelution_sum > existing.features.coelution_sum
                         })
-                        .collect();
-                    scored_candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-                    // Store top-N CWT candidates for inter-replicate reconciliation
-                    let top_n = config.reconciliation.top_n_peaks;
-                    let cwt_top_n: Vec<CwtCandidate> = scored_candidates
-                        .iter()
-                        .take(top_n)
-                        .map(|(bp, score)| {
-                            let si = bp.start_index;
-                            let ei = bp.end_index;
-                            let area = trapezoidal_area(&ref_xic[si..=ei]);
-                            let (apex_idx, _) = ref_xic[si..=ei]
-                                .iter()
-                                .enumerate()
-                                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                                .map(|(i, &(_, v))| (si + i, v))
-                                .unwrap_or((bp.apex_index, 0.0));
-                            let snr = compute_snr(&raw_ints, apex_idx, si, ei);
-                            CwtCandidate {
-                                apex_rt: ref_xic[apex_idx].0,
-                                start_rt: ref_xic[si].0,
-                                end_rt: ref_xic[ei].0,
-                                area,
-                                snr,
-                                coelution_score: *score,
-                            }
-                        })
-                        .collect();
-
-                    // Build peak from best candidate
-                    let (best_bp, _) = scored_candidates[0];
-                    let si = best_bp.start_index;
-                    let ei = best_bp.end_index;
-                    let (apex_idx, apex_val) = ref_xic[si..=ei]
-                        .iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
-                        .map(|(i, &(_, v))| (si + i, v))
-                        .unwrap_or((best_bp.apex_index, 0.0));
-                    let area = trapezoidal_area(&ref_xic[si..=ei]);
-                    let snr = compute_snr(&raw_ints, apex_idx, si, ei);
-                    let peak = XICPeakBounds {
-                        apex_rt: ref_xic[apex_idx].0,
-                        apex_intensity: apex_val,
-                        apex_index: apex_idx,
-                        start_rt: ref_xic[si].0,
-                        end_rt: ref_xic[ei].0,
-                        start_index: si,
-                        end_index: ei,
-                        area,
-                        signal_to_noise: snr,
-                    };
-
-                    // CWT zero-crossing boundaries are the final boundaries.
-                    // Compute all 45 features at these boundaries.
-                    let ctx = FeatureComputeContext {
-                        entry,
-                        xics: &xics,
-                        ref_xic,
-                        cand_spectra: &cand_spectra,
-                        cand_global: &cand_global,
-                        scorer: &scorer,
-                        ms1_index,
-                        calibration,
-                        tol_da,
-                        tol_ppm,
-                        expected_rt,
-                        is_hram,
-                        file_name,
-                    };
-
-                    let mut result = compute_features_at_peak(&ctx, peak);
-                    if let Some(ref mut entry) = result {
-                        entry.cwt_candidates = cwt_top_n;
+                        .unwrap_or(true);
+                    if is_better {
+                        map.insert(entry.entry_id, entry);
                     }
-                    result
-                })
-                .collect::<Vec<_>>();
-
-            // Dedup within this window (handles any intra-window duplicates) and
-            // merge into the thread-local map, keeping the best coelution_sum.
-            for entry in window_entries {
-                let is_better = map
-                    .get(&entry.entry_id)
-                    .map(|existing| entry.features.coelution_sum > existing.features.coelution_sum)
-                    .unwrap_or(true);
-                if is_better {
-                    map.insert(entry.entry_id, entry);
                 }
-            }
 
-            pb.inc(1);
-            map
-        })
+                pb.inc(1);
+                map
+            },
+        )
         .reduce(
-            || HashMap::<u32, CoelutionScoredEntry>::new(),
+            HashMap::<u32, CoelutionScoredEntry>::new,
             |mut a, b| {
                 // Merge two thread-local maps, keeping best coelution_sum per entry.
                 for (id, entry) in b {

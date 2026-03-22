@@ -87,6 +87,42 @@ See [FDR Control](07-fdr-control.md) for full details on the target-decoy strate
 
 From the FDR-filtered winners, an additional quality filter removes matches with signal-to-noise < 5.0. This prevents peptides with good spectral scores but poor peak quality from corrupting RT calibration.
 
+## Two-Pass Calibration Refinement
+
+After the initial calibration discovery, Osprey performs an optional second pass to improve the RT calibration. This addresses a chicken-and-egg problem: accurate calibration requires a narrow RT window, but finding matches in the first place requires a wide RT window.
+
+### Why Two Passes?
+
+**Pass 1** uses a wide RT tolerance (typically 20% of the gradient, e.g. 4.8 min) because no calibration exists yet. This wide window is necessary to find matches when library RTs may be offset from measured RTs, but it also means each candidate is compared against many spectra. Some false matches survive — they happen to have a good spectral score against a spectrum at the wrong RT. These false matches add noise to the LOESS fit.
+
+**Pass 2** re-scores the same sampled candidates using the LOESS-calibrated RT predictions from pass 1 and the much tighter tolerance derived from the fit (e.g. 0.78 min — often 6× narrower). With the narrow window, false matches that only survived pass 1 due to the wide tolerance are eliminated. The result is a cleaner set of confident peptides: typically *more* peptides pass FDR (fewer false decoy wins contaminate the competition), the LOESS R² improves, and the residual SD drops.
+
+```
+Example from a real run:
+  Pass 1: 4.8 min tolerance → 302 peptides, R²=0.9923, residual_SD=0.427 min
+  Pass 2: 0.78 min tolerance → 369 peptides, R²=0.9963, residual_SD=0.292 min
+```
+
+### When Refinement Runs
+
+Refinement only triggers when the first-pass tolerance narrowed at least 2× from the initial tolerance:
+
+```
+pass1_tolerance < initial_tolerance × 0.5
+```
+
+If the initial tolerance was already tight (e.g. loaded from a cached calibration), refinement is skipped.
+
+### Acceptance Criteria
+
+The refined calibration replaces the original only if R² does not degrade:
+
+```
+refined_R² ≥ original_R² × 0.99
+```
+
+If refinement produces fewer calibration points than the absolute minimum (50), or if R² drops, the original pass-1 calibration is kept. Mass error statistics (MS1 and MS2) are also re-collected from the refined matches when the refined calibration is accepted.
+
 ## RT Calibration
 
 ### LOESS Fitting

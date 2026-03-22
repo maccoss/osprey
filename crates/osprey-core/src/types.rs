@@ -680,6 +680,20 @@ pub struct CoelutionScoredEntry {
     pub cwt_candidates: Vec<CwtCandidate>,
 }
 
+impl CoelutionScoredEntry {
+    /// Drop heavy fields that are only needed for blib output.
+    ///
+    /// After per-file scores are cached to parquet, these fields are not needed
+    /// during FDR or reconciliation. They can be reloaded from parquet later
+    /// for the small subset of entries that pass FDR.
+    pub fn shrink_for_fdr(&mut self) {
+        self.fragment_mzs = Vec::new();
+        self.fragment_intensities = Vec::new();
+        self.reference_xic = Vec::new();
+        self.protein_ids = Vec::new();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
