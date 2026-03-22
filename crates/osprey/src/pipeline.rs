@@ -4065,13 +4065,12 @@ fn run_search(
         SpectralScorer::new().with_tolerance_da(fragment_tolerance.tolerance)
     };
 
-    // Progress bar — each library entry belongs to exactly one window (half-open
-    // [lower, upper) convention), so total candidates == library.len().
-    let pb = ProgressBar::new(library.len() as u64);
+    // Progress bar — one tick per isolation window.
+    let pb = ProgressBar::new(window_groups.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} candidates",
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} windows",
             )
             .unwrap()
             .progress_chars("#>-"),
@@ -4164,7 +4163,6 @@ fn run_search(
                         .collect();
 
                     if rt_spec_pairs.len() < MIN_COELUTION_SPECTRA {
-                        pb.inc(1);
                         return None;
                     }
 
@@ -4201,7 +4199,6 @@ fn run_search(
                             }
                         }
                         if !has_signal {
-                            pb.inc(1);
                             return None;
                         }
                     }
@@ -4216,7 +4213,6 @@ fn run_search(
                         extract_fragment_xics(&entry.fragments, &cand_spectra, tol_da, tol_ppm, 6);
 
                     if xics.len() < 2 {
-                        pb.inc(1);
                         return None;
                     }
 
@@ -4258,7 +4254,6 @@ fn run_search(
                     };
 
                     if candidates.is_empty() {
-                        pb.inc(1);
                         return None;
                     }
 
@@ -4369,7 +4364,6 @@ fn run_search(
                         file_name,
                     };
 
-                    pb.inc(1);
                     let mut result = compute_features_at_peak(&ctx, peak);
                     if let Some(ref mut entry) = result {
                         entry.cwt_candidates = cwt_top_n;
@@ -4378,6 +4372,7 @@ fn run_search(
                 })
                 .collect();
 
+            pb.inc(1);
             window_entries
         })
         .collect();
