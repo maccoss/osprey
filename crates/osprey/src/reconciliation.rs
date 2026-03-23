@@ -8,7 +8,9 @@
 
 use osprey_chromatography::RTCalibration;
 use osprey_core::{CwtCandidate, FdrEntry};
+use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Consensus RT for a peptide across all runs.
 ///
@@ -326,73 +328,79 @@ pub fn plan_reconciliation(
     per_file_refined_cal: &HashMap<String, RTCalibration>,
     per_file_original_cal: &HashMap<String, RTCalibration>,
 ) -> HashMap<(String, usize), ReconcileAction> {
-    let mut actions: HashMap<(String, usize), ReconcileAction> = HashMap::new();
-
     // Build consensus lookup by (modified_sequence, is_decoy)
     let consensus_map: HashMap<(&str, bool), &PeptideConsensusRT> = consensus
         .iter()
         .map(|c| ((c.modified_sequence.as_str(), c.is_decoy), c))
         .collect();
 
-    let mut stats_keep = 0usize;
-    let mut stats_cwt = 0usize;
-    let mut stats_forced = 0usize;
-    let mut stats_no_consensus = 0usize;
+    let stats_keep = AtomicUsize::new(0);
+    let stats_cwt = AtomicUsize::new(0);
+    let stats_forced = AtomicUsize::new(0);
+    let stats_no_consensus = AtomicUsize::new(0);
 
     let empty_cwt: Vec<Vec<CwtCandidate>> = Vec::new();
 
-    for (file_name, entries) in per_file_entries {
-        // Use refined calibration if available, fall back to original
-        let cal = per_file_refined_cal
-            .get(file_name)
-            .or_else(|| per_file_original_cal.get(file_name));
+    // Process files in parallel — each file's entries are independent
+    let actions: HashMap<(String, usize), ReconcileAction> = per_file_entries
+        .par_iter()
+        .flat_map(|(file_name, entries)| {
+            // Use refined calibration if available, fall back to original
+            let cal = per_file_refined_cal
+                .get(file_name)
+                .or_else(|| per_file_original_cal.get(file_name));
 
-        let cal = match cal {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let file_cwt = per_file_cwt_candidates.get(file_name).unwrap_or(&empty_cwt);
-
-        for (entry_idx, entry) in entries.iter().enumerate() {
-            let key = (entry.modified_sequence.as_str(), entry.is_decoy);
-            let consensus_entry = match consensus_map.get(&key) {
+            let cal = match cal {
                 Some(c) => c,
-                None => {
-                    stats_no_consensus += 1;
-                    continue;
-                }
+                None => return Vec::new(),
             };
 
-            let expected_rt = cal.predict(consensus_entry.consensus_library_rt);
-            let cwt = file_cwt.get(entry_idx).map(|v| v.as_slice()).unwrap_or(&[]);
-            let action = determine_reconcile_action(
-                entry.start_rt,
-                entry.end_rt,
-                cwt,
-                expected_rt,
-                consensus_entry.median_peak_width,
-            );
+            let file_cwt = per_file_cwt_candidates.get(file_name).unwrap_or(&empty_cwt);
 
-            match &action {
-                ReconcileAction::Keep => stats_keep += 1,
-                ReconcileAction::UseCwtPeak { .. } => stats_cwt += 1,
-                ReconcileAction::ForcedIntegration { .. } => stats_forced += 1,
-            }
+            let mut file_actions = Vec::new();
+            for (entry_idx, entry) in entries.iter().enumerate() {
+                let key = (entry.modified_sequence.as_str(), entry.is_decoy);
+                let consensus_entry = match consensus_map.get(&key) {
+                    Some(c) => c,
+                    None => {
+                        stats_no_consensus.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                };
 
-            // Only store non-Keep actions
-            if !matches!(action, ReconcileAction::Keep) {
-                actions.insert((file_name.clone(), entry_idx), action);
+                let expected_rt = cal.predict(consensus_entry.consensus_library_rt);
+                let cwt = file_cwt.get(entry_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+                let action = determine_reconcile_action(
+                    entry.start_rt,
+                    entry.end_rt,
+                    cwt,
+                    expected_rt,
+                    consensus_entry.median_peak_width,
+                );
+
+                match &action {
+                    ReconcileAction::Keep => stats_keep.fetch_add(1, Ordering::Relaxed),
+                    ReconcileAction::UseCwtPeak { .. } => stats_cwt.fetch_add(1, Ordering::Relaxed),
+                    ReconcileAction::ForcedIntegration { .. } => {
+                        stats_forced.fetch_add(1, Ordering::Relaxed)
+                    }
+                };
+
+                // Only store non-Keep actions
+                if !matches!(action, ReconcileAction::Keep) {
+                    file_actions.push(((file_name.clone(), entry_idx), action));
+                }
             }
-        }
-    }
+            file_actions
+        })
+        .collect();
 
     log::info!(
         "Inter-replicate reconciliation plan: {} keep, {} use alternate CWT peak, {} forced integration, {} not in consensus",
-        stats_keep,
-        stats_cwt,
-        stats_forced,
-        stats_no_consensus
+        stats_keep.load(Ordering::Relaxed),
+        stats_cwt.load(Ordering::Relaxed),
+        stats_forced.load(Ordering::Relaxed),
+        stats_no_consensus.load(Ordering::Relaxed),
     );
 
     actions

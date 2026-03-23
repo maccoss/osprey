@@ -262,6 +262,11 @@ impl MS1Index {
             self.spectra.last().unwrap().retention_time,
         ))
     }
+
+    /// Get a reference to the underlying MS1 spectra
+    pub fn spectra(&self) -> &[MS1Spectrum] {
+        &self.spectra
+    }
 }
 
 /// Load all spectra (both MS1 and MS2) from an mzML file in a single pass

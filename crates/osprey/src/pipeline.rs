@@ -50,7 +50,10 @@ use osprey_core::{
 use osprey_fdr::{
     get_pin_feature_names, percolator, pin_feature_value, MokapotRunner, NUM_PIN_FEATURES,
 };
-use osprey_io::{load_all_spectra, load_library, BlibWriter, MS1Index};
+use osprey_io::{
+    load_all_spectra, load_library, load_spectra_cache, save_spectra_cache, spectra_cache_path,
+    BlibWriter, MS1Index,
+};
 use osprey_scoring::{
     batch::{run_coelution_calibration_scoring, sample_library_for_calibration, MS1SpectrumLookup},
     has_topn_fragment_match, DecoyGenerator, DecoyMethod, Enzyme, SpectralScorer,
@@ -67,7 +70,7 @@ impl<'a> MS1SpectrumLookup for MS1IndexWrapper<'a> {
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use osprey_scoring::batch::CalibrationMatch;
 
@@ -1749,6 +1752,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 continue;
             }
 
+            // Save binary spectra cache for fast reload during re-scoring
+            let cache_path = spectra_cache_path(input_file);
+            if let Err(e) = save_spectra_cache(&cache_path, &spectra, &ms1_index) {
+                log::debug!("Failed to save spectra cache: {}", e);
+            }
+
             // Run calibration (reuse the windowed calibration discovery)
             let (rt_cal, cal_params): (Option<RTCalibration>, Option<CalibrationParams>) = if config
                 .rt_calibration
@@ -1986,24 +1995,25 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     })
                     .collect();
 
-                // Load CWT candidates per-file for reconciliation planning
-                let mut per_file_cwt: HashMap<String, Vec<Vec<CwtCandidate>>> = HashMap::new();
-                for (file_name, _) in per_file_entries.iter() {
-                    if let Some(cache_path) = per_file_cache_paths.get(file_name) {
-                        match load_cwt_candidates_from_parquet(cache_path) {
-                            Ok(cwt) => {
-                                per_file_cwt.insert(file_name.clone(), cwt);
+                // Load CWT candidates per-file for reconciliation planning (parallel)
+                let per_file_cwt: HashMap<String, Vec<Vec<CwtCandidate>>> = per_file_entries
+                    .par_iter()
+                    .filter_map(|(file_name, _)| {
+                        per_file_cache_paths.get(file_name).and_then(|cache_path| {
+                            match load_cwt_candidates_from_parquet(cache_path) {
+                                Ok(cwt) => Some((file_name.clone(), cwt)),
+                                Err(e) => {
+                                    log::warn!(
+                                        "Failed to load CWT candidates for {}: {}",
+                                        file_name,
+                                        e
+                                    );
+                                    None
+                                }
                             }
-                            Err(e) => {
-                                log::warn!(
-                                    "Failed to load CWT candidates for {}: {}",
-                                    file_name,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                }
+                        })
+                    })
+                    .collect();
 
                 reconciliation_actions = plan_reconciliation(
                     &consensus,
@@ -2031,139 +2041,152 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // 3. Load spectra once per file and re-score both consensus + reconciliation targets.
         //    For re-scoring, we reload full CoelutionScoredEntry from parquet, rescore,
         //    save updated entries back to parquet, and update FdrEntry stubs.
-        let mut total_rescored = 0usize;
+        //    Files are processed in parallel for throughput.
 
-        for (file_name, fdr_entries) in per_file_entries.iter_mut() {
-            // Collect consensus targets for this file
-            let consensus_targets = per_file_consensus_targets
-                .get(file_name.as_str())
-                .cloned()
-                .unwrap_or_default();
-
-            // Collect reconciliation targets for this file
-            let reconciliation_targets: Vec<(usize, f64, f64, f64)> = reconciliation_actions
-                .iter()
-                .filter(|((f, _), _)| f == file_name)
-                .filter_map(|((_, idx), action)| {
-                    let (start, apex, end) = match action {
-                        ReconcileAction::Keep => return None,
-                        ReconcileAction::UseCwtPeak {
-                            start_rt,
-                            apex_rt,
-                            end_rt,
-                            ..
-                        } => (*start_rt, *apex_rt, *end_rt),
-                        ReconcileAction::ForcedIntegration {
-                            expected_rt,
-                            half_width,
-                        } => (
-                            expected_rt - half_width,
-                            *expected_rt,
-                            expected_rt + half_width,
-                        ),
-                    };
-                    Some((*idx, apex, start, end))
-                })
-                .collect();
-
-            // Merge both target sets, deduplicating by entry index
-            // (if an entry appears in both consensus and reconciliation,
-            // prefer the reconciliation target since it's inter-replicate informed)
-            let mut combined_targets: HashMap<usize, (f64, f64, f64)> = HashMap::new();
-            for (idx, apex, start, end) in &consensus_targets {
-                combined_targets.insert(*idx, (*apex, *start, *end));
-            }
-            for (idx, apex, start, end) in &reconciliation_targets {
-                combined_targets.insert(*idx, (*apex, *start, *end));
-            }
-
-            let all_targets: Vec<(usize, f64, f64, f64)> = combined_targets
-                .into_iter()
-                .map(|(idx, (apex, start, end))| (idx, apex, start, end))
-                .collect();
-
-            if all_targets.is_empty() {
-                continue;
-            }
-
-            let input_idx = match file_name_to_idx.get(file_name.as_str()) {
-                Some(idx) => *idx,
-                None => continue,
+        // Pre-group reconciliation actions by file name for efficient per-file lookup
+        let mut per_file_reconciliation_targets: HashMap<String, Vec<(usize, f64, f64, f64)>> =
+            HashMap::new();
+        for ((file_name, idx), action) in &reconciliation_actions {
+            let (start, apex, end) = match action {
+                ReconcileAction::Keep => continue,
+                ReconcileAction::UseCwtPeak {
+                    start_rt,
+                    apex_rt,
+                    end_rt,
+                    ..
+                } => (*start_rt, *apex_rt, *end_rt),
+                ReconcileAction::ForcedIntegration {
+                    expected_rt,
+                    half_width,
+                } => (
+                    expected_rt - half_width,
+                    *expected_rt,
+                    expected_rt + half_width,
+                ),
             };
-            let input_file = &config.input_files[input_idx];
-
-            let n_consensus = consensus_targets.len();
-            let n_reconciliation = reconciliation_targets.len();
-            log::info!(
-                "Re-scoring {} entries in {} ({} consensus, {} reconciliation, {} combined)",
-                all_targets.len(),
-                file_name,
-                n_consensus,
-                n_reconciliation,
-                all_targets.len(),
-            );
-
-            let ctx = match FileRescoreContext::load(input_file, &config) {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    log::warn!("Failed to load spectra for {}: {}", file_name, e);
-                    continue;
-                }
-            };
-
-            // Use refined calibration if available, fall back to original
-            let rt_cal = refined_calibrations
-                .get(file_name.as_str())
-                .or_else(|| per_file_calibrations.get(file_name.as_str()));
-
-            // Load full entries from parquet for re-scoring
-            let cache_path = match per_file_cache_paths.get(file_name.as_str()) {
-                Some(p) => p.clone(),
-                None => continue,
-            };
-            let mut full_entries = match load_scores_parquet(&cache_path) {
-                Ok(e) => e,
-                Err(e) => {
-                    log::warn!("Failed to load parquet for {}: {}", file_name, e);
-                    continue;
-                }
-            };
-
-            let n_rescored = rescore_for_reconciliation(
-                &mut full_entries,
-                &all_targets,
-                &library,
-                ctx.spectra_ref(),
-                &ctx.window_groups,
-                &ctx.ms1_index,
-                ctx.cal_params.as_ref(),
-                rt_cal,
-                &ctx.scorer,
-                ctx.tol_da,
-                ctx.tol_ppm,
-                ctx.rt_tolerance,
-                ctx.is_hram,
-                file_name,
-            );
-
-            total_rescored += n_rescored;
-            log::info!(
-                "  {} of {} entries successfully re-scored",
-                n_rescored,
-                all_targets.len()
-            );
-
-            // Save updated entries back to parquet and update FdrEntry stubs
-            if n_rescored > 0 {
-                if let Err(e) = write_scores_parquet(&cache_path, &full_entries) {
-                    log::warn!("Failed to save updated scores for {}: {}", file_name, e);
-                }
-                // Update FdrEntry stubs from the rescored full entries
-                for (fdr, full) in fdr_entries.iter_mut().zip(full_entries.iter()) {
-                    *fdr = full.to_fdr_entry();
-                }
-            }
+            per_file_reconciliation_targets
+                .entry(file_name.clone())
+                .or_default()
+                .push((*idx, apex, start, end));
         }
+
+        let total_rescored = AtomicUsize::new(0);
+
+        per_file_entries
+            .par_iter_mut()
+            .for_each(|(file_name, fdr_entries)| {
+                // Collect consensus targets for this file
+                let consensus_targets = per_file_consensus_targets
+                    .get(file_name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+
+                // Collect reconciliation targets for this file (pre-grouped)
+                let reconciliation_targets = per_file_reconciliation_targets
+                    .get(file_name.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+
+                // Merge both target sets, deduplicating by entry index
+                // (if an entry appears in both consensus and reconciliation,
+                // prefer the reconciliation target since it's inter-replicate informed)
+                let mut combined_targets: HashMap<usize, (f64, f64, f64)> = HashMap::new();
+                for (idx, apex, start, end) in &consensus_targets {
+                    combined_targets.insert(*idx, (*apex, *start, *end));
+                }
+                for (idx, apex, start, end) in &reconciliation_targets {
+                    combined_targets.insert(*idx, (*apex, *start, *end));
+                }
+
+                let all_targets: Vec<(usize, f64, f64, f64)> = combined_targets
+                    .into_iter()
+                    .map(|(idx, (apex, start, end))| (idx, apex, start, end))
+                    .collect();
+
+                if all_targets.is_empty() {
+                    return;
+                }
+
+                let input_idx = match file_name_to_idx.get(file_name.as_str()) {
+                    Some(idx) => *idx,
+                    None => return,
+                };
+                let input_file = &config.input_files[input_idx];
+
+                let n_consensus = consensus_targets.len();
+                let n_reconciliation = reconciliation_targets.len();
+                log::info!(
+                    "Re-scoring {} entries in {} ({} consensus, {} reconciliation, {} combined)",
+                    all_targets.len(),
+                    file_name,
+                    n_consensus,
+                    n_reconciliation,
+                    all_targets.len(),
+                );
+
+                let ctx = match FileRescoreContext::load(input_file, &config) {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        log::warn!("Failed to load spectra for {}: {}", file_name, e);
+                        return;
+                    }
+                };
+
+                // Use refined calibration if available, fall back to original
+                let rt_cal = refined_calibrations
+                    .get(file_name.as_str())
+                    .or_else(|| per_file_calibrations.get(file_name.as_str()));
+
+                // Load full entries from parquet for re-scoring
+                let cache_path = match per_file_cache_paths.get(file_name.as_str()) {
+                    Some(p) => p.clone(),
+                    None => return,
+                };
+                let mut full_entries = match load_scores_parquet(&cache_path) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("Failed to load parquet for {}: {}", file_name, e);
+                        return;
+                    }
+                };
+
+                let n_rescored = rescore_for_reconciliation(
+                    &mut full_entries,
+                    &all_targets,
+                    &library,
+                    ctx.spectra_ref(),
+                    &ctx.window_groups,
+                    &ctx.ms1_index,
+                    ctx.cal_params.as_ref(),
+                    rt_cal,
+                    &ctx.scorer,
+                    ctx.tol_da,
+                    ctx.tol_ppm,
+                    ctx.rt_tolerance,
+                    ctx.is_hram,
+                    file_name,
+                );
+
+                total_rescored.fetch_add(n_rescored, Ordering::Relaxed);
+                log::info!(
+                    "  {} of {} entries successfully re-scored",
+                    n_rescored,
+                    all_targets.len()
+                );
+
+                // Save updated entries back to parquet and update FdrEntry stubs
+                if n_rescored > 0 {
+                    if let Err(e) = write_scores_parquet(&cache_path, &full_entries) {
+                        log::warn!("Failed to save updated scores for {}: {}", file_name, e);
+                    }
+                    // Update FdrEntry stubs from the rescored full entries
+                    for (fdr, full) in fdr_entries.iter_mut().zip(full_entries.iter()) {
+                        *fdr = full.to_fdr_entry();
+                    }
+                }
+            });
+
+        let total_rescored = total_rescored.load(Ordering::Relaxed);
 
         // 4. Single second-pass FDR after all re-scoring
         if total_rescored > 0 {
@@ -3779,10 +3802,29 @@ struct FileRescoreContext {
 
 impl FileRescoreContext {
     /// Load spectra and calibration for a file, set up scoring context.
+    /// Tries binary spectra cache first for fast reload (~seconds vs ~minutes for mzML).
     fn load(input_file: &std::path::Path, config: &OspreyConfig) -> Result<Self> {
         use osprey_scoring::batch::group_spectra_by_isolation_window;
 
-        let (spectra, ms1_index) = load_all_spectra(input_file)?;
+        let cache_path = spectra_cache_path(input_file);
+        let (spectra, ms1_index) = if cache_path.exists() {
+            match load_spectra_cache(&cache_path) {
+                Ok(result) => {
+                    log::info!(
+                        "Loaded {} MS2 spectra from cache '{}'",
+                        result.0.len(),
+                        cache_path.display()
+                    );
+                    result
+                }
+                Err(e) => {
+                    log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
+                    load_all_spectra(input_file)?
+                }
+            }
+        } else {
+            load_all_spectra(input_file)?
+        };
         if spectra.is_empty() {
             return Err(OspreyError::MzmlParseError("No spectra found".into()));
         }

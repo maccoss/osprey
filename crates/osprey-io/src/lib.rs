@@ -15,5 +15,8 @@ pub mod mzml;
 pub mod output;
 
 pub use library::{load_library, BlibLoader, DiannTsvLoader, ElibLoader};
-pub use mzml::{load_all_spectra, load_ms1_spectra, MS1Index, MzmlReader};
+pub use mzml::{
+    load_all_spectra, load_ms1_spectra, load_spectra_cache, save_spectra_cache, spectra_cache_path,
+    MS1Index, MzmlReader,
+};
 pub use output::BlibWriter;

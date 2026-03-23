@@ -16,5 +16,7 @@
 //! - `MS1Index` - Index for efficient nearest-neighbor lookup by RT
 
 mod parser;
+mod spectra_cache;
 
 pub use parser::{load_all_spectra, load_ms1_spectra, MS1Index, MzmlReader};
+pub use spectra_cache::{load_spectra_cache, save_spectra_cache, spectra_cache_path};
