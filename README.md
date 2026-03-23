@@ -16,6 +16,7 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 - **Skyline integration**: Outputs BiblioSpec (.blib) format for seamless quantification in Skyline
 - **FDR control**: Built-in Percolator-style semi-supervised SVM with target-decoy competition; optional Mokapot integration for an alternative semi-supervised approach
 - **Flexible input**: Supports DIA-NN TSV, EncyclopeDIA elib, and BiblioSpec blib libraries
+- **Scalable**: Disk-backed memory architecture processes 1000+ files without running out of memory
 - **Configurable**: YAML configuration files for reproducible analyses
 
 ## Installation
@@ -396,7 +397,7 @@ osprey/
 
 ### Key Components
 
-- **osprey-core**: `LibraryEntry`, `Spectrum`, `OspreyConfig`, `IsolationWindow`
+- **osprey-core**: `LibraryEntry`, `Spectrum`, `OspreyConfig`, `IsolationWindow`, `FdrEntry`
 - **osprey-io**: `MzmlReader`, `DiannTsvLoader`, `ElibLoader`, `BlibLoader`, `BlibWriter`
 - **osprey-chromatography**: `PeakDetector`, `RTCalibrator`, `RTStratifiedSampler`
 - **osprey-scoring**: `DecoyGenerator`, `FeatureExtractor`

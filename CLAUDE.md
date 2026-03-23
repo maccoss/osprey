@@ -31,7 +31,7 @@ osprey/
 
 ### Key Components
 
-- **osprey-core**: `LibraryEntry`, `Spectrum`, `OspreyConfig`, `IsolationWindow`, `CoelutionFeatureSet`
+- **osprey-core**: `LibraryEntry`, `Spectrum`, `OspreyConfig`, `IsolationWindow`, `CoelutionFeatureSet`, `FdrEntry`
 - **osprey-io**: `MzmlReader` (uses mzdata crate), `DiannTsvLoader`, `ElibLoader`, `BlibLoader`, `BlibWriter`
 - **osprey-chromatography**: `PeakDetector`, `RTCalibrator`, `MzCalibration`, `CalibrationParams`
 - **osprey-scoring**: `SpectralScorer`, `DecoyGenerator`, batch scoring
@@ -78,7 +78,7 @@ CI runs `cargo fmt --check` and `cargo clippy -D warnings` (including test targe
 - `crates/osprey/src/main.rs` - CLI entry point
 - `crates/osprey-fdr/src/mokapot.rs` - Mokapot integration
 - `crates/osprey-io/src/output/blib.rs` - BiblioSpec blib writer
-- `crates/osprey-core/src/types.rs` - CoelutionFeatureSet (~47 fields, 21 used in PIN)
+- `crates/osprey-core/src/types.rs` - CoelutionFeatureSet (~47 fields, 21 used in PIN), FdrEntry (~188 bytes, 14 fields)
 - `crates/osprey-chromatography/src/calibration/` - RT and mass calibration
 
 ## Configuration
@@ -131,6 +131,7 @@ External:
 - CLI with all core options
 - Calibration JSON save/load
 - Calibration HTML report generation
+- FdrEntry memory optimization with per-file Parquet caching
 
 ### Feature Set (21 PIN Features)
 
@@ -254,15 +255,26 @@ This distinction is important: a NULL `retentionTime` with populated `startTime`
 
 ### FDR Pipeline Flow (Multi-File)
 
-1. Train model on all data (all files combined)
-2. Score all entries with trained model
-3. Compute run-level q-values per file (precursor + peptide level)
-4. Select best observation per precursor across experiment
-5. Compute experiment-level q-values (precursor + peptide level)
-6. Apply `max(precursor, peptide)` at both run and experiment levels
-7. Determine passing precursors: `experiment_qvalue <= threshold`
-8. Include ALL per-file observations for passing precursors in output
-9. Propagate best experiment_qvalue to all observations
+1. Score each file: write full entries to per-file Parquet cache, convert to FdrEntry stubs
+2. Load PIN features from Parquet on-demand, train model on all files
+3. Score all entries with trained model, update FdrEntry stubs
+4. Compute run-level q-values per file (precursor + peptide level)
+5. Select best observation per precursor across experiment
+6. Compute experiment-level q-values (precursor + peptide level)
+7. Apply `max(precursor, peptide)` at both run and experiment levels
+8. Determine passing precursors: `experiment_qvalue <= threshold`
+9. Reload full entries from Parquet only for files with passing precursors
+10. Include ALL per-file observations for passing precursors in output
+11. Propagate best experiment_qvalue to all observations
+
+### Memory Architecture
+
+Osprey uses a disk-backed stub architecture to scale to 1000+ files:
+
+- **FdrEntry** (~188 bytes): Lightweight stub with 14 fields (entry_id, is_decoy, charge, scan_number, apex/start/end_rt, coelution_sum, score, run/experiment_qvalue, pep, modified_sequence, file_name)
+- **Parquet caches** (`.scores.parquet`): Per-file ZSTD-compressed caches storing 21 PIN features, fragments, CWT candidates
+- **Selective loading**: `load_scores_parquet()` for full entry rehydration, `load_cwt_candidates_from_parquet()` for CWT-only reconciliation planning
+- **Steady-state RAM**: ~188 bytes × entries × files (vs ~940 bytes without caching)
 
 ## Recent Changes
 
@@ -291,3 +303,6 @@ This distinction is important: a NULL `retentionTime` with populated `startTime`
 - Added binary spectra cache (.spectra.bin) for faster second-pass mzML loading
 - Merged multi-charge consensus + cross-run reconciliation into single post-FDR phase (one spectra load per file)
 - Skip consensus re-scoring for peptide groups where no charge state passes FDR
+- FdrEntry memory architecture: lightweight stubs (~188 bytes) replace full scored entries (~940 bytes) in memory after per-file Parquet caching; heavy data (features, fragments, CWT candidates) reloaded on-demand from disk, enabling 1000+ file experiments without OOM
+- Selective Parquet loaders: `load_cwt_candidates_from_parquet()` for reconciliation, PIN feature loading for FDR, full entry reload for blib output
+- Removed `shrink_for_fdr()` in favor of FdrEntry conversion + Parquet caching

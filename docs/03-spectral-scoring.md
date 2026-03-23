@@ -294,7 +294,7 @@ Final scores:
 
 ## Main Search Scoring (Phase 3-4)
 
-The main search uses a fundamentally different scoring approach than calibration. Instead of XCorr with E-value, the main search uses **fragment XIC co-elution analysis** with 45 features.
+The main search uses a fundamentally different scoring approach than calibration. Instead of XCorr with E-value, the main search uses **fragment XIC co-elution analysis** with 21 PIN features (out of ~47 computed).
 
 ### Peak Detection
 
@@ -337,7 +337,7 @@ After the main search, all charge states of the same peptide are forced to share
 
 ### Feature Computation
 
-All 45 features are computed via `compute_features_at_peak()`, a reusable function that takes a `FeatureComputeContext` (read-only references to library entry, XICs, spectra, calibration, etc.) and an `XICPeakBounds`. This function is called both during the initial per-precursor search and during multi-charge consensus re-scoring.
+All features are computed via `compute_features_at_peak()`, a reusable function that takes a `FeatureComputeContext` (read-only references to library entry, XICs, spectra, calibration, etc.) and an `XICPeakBounds`. This function is called both during the initial per-precursor search and during multi-charge consensus re-scoring.
 
 ---
 

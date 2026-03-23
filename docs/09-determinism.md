@@ -99,6 +99,10 @@ When the same precursor is detected in two overlapping DIA windows, the entry wi
 // so the >= tiebreaker (outer loop wins ties) is also deterministic.
 ```
 
+### 8. Parquet Round-Trip Determinism
+
+Per-file score caches (`.scores.parquet`) are written once after scoring and reloaded on-demand for FDR, reconciliation, and blib output. The Parquet format preserves exact floating-point values (no rounding), so entries rehydrated from Parquet are bit-identical to the original in-memory entries. Column ordering and row ordering in the Parquet file match the deterministic entry order established by the sort-after-collect patterns above.
+
 ---
 
 ## Checklist for New Code
@@ -128,6 +132,11 @@ When adding new code to Osprey, verify these invariants:
 - [ ] Subsampling operates on paired groups, not individual entries
 - [ ] See [FDR Control](07-fdr-control.md) for the full grouping invariant
 
+### If you write/read Parquet caches:
+- [ ] Entries are written in a deterministic order (sorted before writing)
+- [ ] Reloaded entries are used in the same order as they were written
+- [ ] No floating-point rounding is introduced by the serialize/deserialize round-trip
+
 ---
 
 ## Known Determinism-Critical Paths
@@ -142,6 +151,8 @@ When adding new code to Osprey, verify these invariants:
 | `calibration_ml.rs` | Fold assignment by sequence hash | Cross-validation reproducibility |
 | `percolator.rs` | Seeded Xorshift64 (seed=42) | SVM weight initialization |
 | `pipeline.rs` | Window groups sorted by lower m/z | Window processing order |
+| `pipeline.rs` | FdrEntry stubs maintain entry order | Parquet write order = sorted entry order |
+| `pipeline.rs` | Parquet round-trip preserves f64 values | No floating-point drift across reload |
 | `pipeline.rs:rt_mz_index` | Entries sorted by expected_rt within m/z bins | Binary search reproducibility |
 
 ---

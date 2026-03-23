@@ -21,11 +21,12 @@ In this case, file3 has detected a completely different peptide or artifact. Cro
 
 ```
 After per-run FDR (first pass):
-  1. collect_consensus_peptides() — targets at consensus_fdr in any run
-  2. compute_consensus_rts()      — weighted median library RT across runs
+  1. collect_consensus_peptides() — targets at consensus_fdr in any run (from FdrEntry stubs)
+  2. compute_consensus_rts()      — weighted median library RT across runs (from FdrEntry stubs)
   3. refit_calibration()          — tighter per-run LOESS from consensus points
   4. plan_reconciliation()        — Keep | UseCwtPeak | ForcedIntegration per entry
-  5. Re-score reconciled entries  — reload spectra, recompute 45 features at new bounds
+       (CWT candidates loaded selectively from per-file Parquet caches)
+  5. Re-score reconciled entries  — reload full entries from Parquet, recompute features
   6. Second-pass FDR              — final experiment-level q-values
 ```
 
@@ -103,7 +104,7 @@ Three actions are possible:
 | **UseCwtPeak** | An alternate stored CWT candidate contains `expected_rt` | Switch to that candidate's boundaries |
 | **ForcedIntegration** | No CWT candidate contains `expected_rt` | Integrate at `expected_rt ± median_peak_width/2` |
 
-The CWT candidates are stored during the initial search (configurable, default 5 per precursor). This lets reconciliation switch to an alternate peak that was already detected but not selected as the best, without requiring a full re-extraction.
+The CWT candidates are stored during the initial search (configurable, default 5 per precursor) and persisted in the per-file Parquet score cache. During reconciliation planning, only the CWT candidate column is loaded selectively via `load_cwt_candidates_from_parquet()`, avoiding the cost of reloading full entries with all features and fragment data. This lets reconciliation switch to an alternate peak that was already detected but not selected as the best, without requiring a full re-extraction.
 
 `ForcedIntegration` is a last resort — it integrates at the expected position even if no CWT peak was found there, using the median peak width from all detections as the integration window.
 
@@ -112,8 +113,10 @@ The CWT candidates are stored during the initial search (configurable, default 5
 ## Step 5: Re-Scoring
 
 Entries with `UseCwtPeak` or `ForcedIntegration` actions are re-scored at their new boundaries:
+- Full `CoelutionScoredEntry` data is reloaded from the per-file Parquet cache
 - Spectra are loaded once per file (shared load for all reconciled entries in that file)
-- All 45 features are recomputed at the new peak boundaries via `compute_features_at_peak()`
+- All features are recomputed at the new peak boundaries via `compute_features_at_peak()`
+- Updated entries are converted back to FdrEntry stubs for the second-pass FDR
 - Entries that cannot be re-scored (no spectral data at the expected RT) are dropped
 
 ---
@@ -197,11 +200,12 @@ If file3 had no CWT candidate near the expected RT (e.g., the peptide was truly 
 
 | File | Function | Purpose |
 |------|----------|---------|
-| `crates/osprey/src/reconciliation.rs` | `compute_consensus_rts()` | Collect detections, compute weighted median library RTs |
+| `crates/osprey/src/reconciliation.rs` | `compute_consensus_rts()` | Collect detections from FdrEntry stubs, compute weighted median library RTs |
 | `crates/osprey/src/reconciliation.rs` | `refit_calibration_with_consensus()` | Refit per-run LOESS from consensus points |
 | `crates/osprey/src/reconciliation.rs` | `plan_reconciliation()` | Determine Keep/UseCwtPeak/ForcedIntegration per entry |
 | `crates/osprey/src/reconciliation.rs` | `determine_reconcile_action()` | Single-entry action determination |
-| `crates/osprey/src/pipeline.rs` | reconciliation orchestration | Load spectra, re-score, second-pass FDR |
+| `crates/osprey/src/pipeline.rs` | `load_cwt_candidates_from_parquet()` | Selective CWT-only Parquet column reader |
+| `crates/osprey/src/pipeline.rs` | reconciliation orchestration | Load data from Parquet, re-score, second-pass FDR |
 
 ### Tests
 

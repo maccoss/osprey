@@ -6,14 +6,16 @@ Osprey uses two-level FDR (False Discovery Rate) control to ensure high-quality 
 
 ```
 FDR Control Workflow:
-  1. Extract 45 features per precursor
-  2. Dispatch to selected FDR method:
+  1. Extract features per precursor (21 PIN features written to per-file Parquet cache)
+  2. Convert to FdrEntry stubs (lightweight, ~188 bytes each)
+  3. Dispatch to selected FDR method:
      - Percolator (default): native linear SVM with cross-validation
+       (loads PIN features on-demand from Parquet)
      - Mokapot: write PIN files, run external mokapot CLI
      - Simple: direct target-decoy FDR on a single feature
-  3. Two-level q-values: per-run (within file) and experiment-level (across files)
-  4. Posterior error probabilities (PEP) via KDE + isotonic regression
-  5. Blib output: only precursors passing experiment-level FDR
+  4. Two-level q-values: per-run (within file) and experiment-level (across files)
+  5. Posterior error probabilities (PEP) via KDE + isotonic regression
+  6. Blib output: reload full entries from Parquet only for files with passing precursors
 ```
 
 ## Key Terminology
@@ -299,7 +301,7 @@ When only one mzML file is provided:
 
 ### PIN File Format
 
-Osprey writes one PIN file per mzML file with 45 feature columns. PIN files contain **only competition winners** (pre-competed using the best feature by ROC AUC).
+Osprey writes one PIN file per mzML file with 21 feature columns. PIN files contain **only competition winners** (pre-competed using the best feature by ROC AUC).
 
 ```
 SpecId  Label  ScanNr  ChargeState  peak_apex  peak_area  ...  Peptide  Proteins
@@ -342,22 +344,24 @@ The subset is used only for model training. All PSMs are still scored using the 
 
 The simplest method applies target-decoy competition directly on the best single feature (selected by ROC AUC) without SVM reranking. Useful as a baseline or when the feature set is small.
 
-## Feature Set (45 Features)
+## Feature Set (21 PIN Features)
 
 All intensity-based spectral similarity scores include ALL library fragments within the spectrum's mass range, using 0 intensity for unmatched peaks.
 
-Osprey extracts fragment XICs and scores based on pairwise correlations and spectral matching.
+Osprey computes ~47 features per precursor in the `CoelutionFeatureSet` struct, but only **21 are written to the PIN file** for scoring. The remaining features were removed during feature weight optimization (they provided little discriminative value or were redundant). Osprey extracts fragment XICs and scores based on pairwise correlations and spectral matching.
 
-| Category | Count | Features |
-|----------|-------|----------|
-| Pairwise coelution | 11 | fragment_coelution_sum/min/max, n_coeluting_fragments, n_fragment_pairs, fragment_corr_0..5 |
-| Peak shape | 7 | peak_apex, peak_area, peak_width, peak_symmetry, signal_to_noise, n_scans, peak_sharpness |
-| Spectral at apex | 15 | hyperscore, xcorr, dot_product, dot_product_smz, dot_product_top6/5/4, dot_product_smz_top6/5/4, fragment_coverage, sequence_coverage, consecutive_ions, explained_intensity, elution_weighted_cosine |
-| Mass accuracy | 3 | mass_accuracy_deviation_mean, abs_mass_accuracy_deviation_mean, mass_accuracy_std |
+| Category | Count | PIN Features |
+|----------|-------|--------------|
+| Pairwise coelution | 3 | fragment_coelution_sum, fragment_coelution_max, n_coeluting_fragments |
+| Peak shape | 3 | peak_apex, peak_area, peak_sharpness |
+| Spectral at apex | 3 | xcorr, consecutive_ions, explained_intensity |
+| Mass accuracy | 2 | mass_accuracy_deviation_mean, abs_mass_accuracy_deviation_mean |
 | RT deviation | 2 | rt_deviation, abs_rt_deviation |
 | MS1 | 2 | ms1_precursor_coelution, ms1_isotope_cosine |
-| Peptide properties | 2 | peptide_length, missed_cleavages |
-| Tukey median polish | 3 | median_polish_cosine, median_polish_rsquared, median_polish_residual_ratio |
+| Tukey median polish | 2 | median_polish_cosine, median_polish_residual_ratio |
+| SG-weighted multi-scan | 4 | sg_weighted_xcorr, sg_weighted_cosine, median_polish_min_fragment_r2, median_polish_residual_correlation |
+
+See [Pipeline Overview](README.md#feature-set-21-pin-features) for the full feature set documentation including removed features.
 
 ## Feature Weight Inspection
 
@@ -389,15 +393,17 @@ After experiment-level FDR determines which precursors pass, **all per-file targ
 ```
 FDR Pipeline Flow (Multi-File):
 
-  1. Train model on all data (all files combined)
-  2. Score all entries with trained model
-  3. Compute run-level q-values per file (precursor + peptide level)
-  4. Select best observation per precursor across experiment
-  5. Compute experiment-level q-values (precursor + peptide level)
-  6. Apply max(precursor, peptide) at both run and experiment levels
-  7. Determine passing precursors: experiment_qvalue <= threshold
-  8. Include ALL per-file observations for passing precursors in output
-  9. Propagate best experiment_qvalue to all observations
+  1. Score each file: write full entries to Parquet, convert to FdrEntry stubs
+  2. Load PIN features from Parquet, train model on all files
+  3. Score all entries with trained model, update FdrEntry stubs
+  4. Compute run-level q-values per file (precursor + peptide level)
+  5. Select best observation per precursor across experiment
+  6. Compute experiment-level q-values (precursor + peptide level)
+  7. Apply max(precursor, peptide) at both run and experiment levels
+  8. Determine passing precursors: experiment_qvalue <= threshold
+  9. Reload full entries from Parquet only for files with passing precursors
+  10. Include ALL per-file observations for passing precursors in output
+  11. Propagate best experiment_qvalue to all observations
 ```
 
 **Why this matters:**

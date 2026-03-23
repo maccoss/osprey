@@ -66,11 +66,14 @@ PHASE 3: COELUTION SEARCH (per file)
   +- CWT consensus peak detection (Mexican Hat wavelet, median across transitions)
   +- Fallback: median polish profile or reference XIC peak detection
   +- Peak boundaries: zero-crossings ±2σ (valley guard)
-  +- 45-feature extraction (coelution, spectral, peak shape, mass accuracy, MS1)
+  +- Feature extraction (21 PIN features used for scoring, ~47 computed total)
   +- Multi-charge consensus: all charge states of same peptide share peak boundaries
+  +- Write full scored entries to per-file Parquet cache (ZSTD compressed)
+  +- Convert to FdrEntry stubs (~188 bytes each) — drop features, fragments, CWT
   |
   v
 PHASE 4: FIRST-PASS FDR
+  +- Load PIN features on-demand from per-file Parquet caches
   +- FDR control (Percolator SVM or Mokapot) -> run-level q-values
   |
   v
@@ -81,11 +84,13 @@ PHASE 5: CROSS-RUN RECONCILIATION (multi-file only)
   +- Refit per-run LOESS calibration using consensus peptides
   +- Plan reconciliation for each entry:
   |    Keep | UseCwtPeak (alternate stored candidate) | ForcedIntegration
+  |    (CWT candidates loaded selectively from Parquet — no full entry reload)
   +- Re-score reconciled entries at updated peak boundaries
   +- Second-pass FDR -> final q-values
   |
   v
 OUTPUT
+  +- Reload full entries from Parquet only for files with FDR-passing precursors
   +- BiblioSpec (.blib) for Skyline (library theoretical fragments)
   +- SVM/Mokapot model weights for feature analysis
 ```
@@ -219,7 +224,7 @@ Osprey uses **two-level FDR control** with three available methods (`--fdr-metho
 
 ### Run-Level FDR
 - Per-file target-decoy competition and q-value computation
-- All 45 features used by SVM
+- PIN features loaded on-demand from per-file Parquet caches (not held in memory)
 - Q-values assigned at both precursor and peptide level
 - Effective q-value: `max(precursor_qvalue, peptide_qvalue)` — must pass both
 
@@ -233,6 +238,21 @@ Osprey uses **two-level FDR control** with three available methods (`--fdr-metho
 - After experiment-level FDR determines passing precursors, **all per-file target observations** for those precursors are included in the blib output
 - Each file gets its own RT boundaries; best experiment_qvalue is propagated to all observations
 - This enables Skyline to use per-file peak boundaries for quantification across replicates/GPF files
+
+### Memory Architecture: FdrEntry Stubs + Parquet Caching
+
+For multi-file experiments (100s–1000s of files), Osprey uses a disk-backed memory architecture to keep RAM usage constant regardless of file count:
+
+1. **Per-file Parquet caching**: After scoring each file, the full `CoelutionScoredEntry` data (features, fragments, CWT candidates) is written to a ZSTD-compressed Parquet cache file (`.scores.parquet`).
+
+2. **FdrEntry conversion**: Full entries are then converted to lightweight `FdrEntry` stubs (~188 bytes each vs ~940 bytes for the full entry). Stubs retain only the fields needed for FDR control: `entry_id`, `is_decoy`, `charge`, `scan_number`, `apex_rt`, `start_rt`, `end_rt`, `coelution_sum`, `score`, `run_qvalue`, `experiment_qvalue`, `pep`, `modified_sequence`, `file_name`.
+
+3. **On-demand loading**: When downstream phases need heavy data, they load selectively from the Parquet cache:
+   - **FDR**: Loads PIN feature columns to build `PercolatorEntry` for SVM scoring
+   - **Reconciliation**: Loads CWT candidates only via `load_cwt_candidates_from_parquet()`
+   - **Output**: Loads full entries only for files containing FDR-passing precursors
+
+This reduces steady-state memory from ~45 GB (200K entries × 240 files × 940 bytes) to ~9 GB (200K × 240 × 188 bytes), enabling experiments with 1000+ files on standard hardware.
 
 See [FDR Control](07-fdr-control.md) for full algorithm details, fold assignment, and the target-decoy competition strategy.
 
@@ -307,7 +327,7 @@ FWHM on this profile determines peak integration boundaries at +/-1.96*sigma fro
 
 ### Step 3: Score Computation
 
-All 45 features are computed within or at the peak boundaries:
+All 21 PIN features are computed within or at the peak boundaries:
 
 - **Pairwise coelution**: Fragment XIC pairwise correlations
 - **Peak shape**: Apex, area, width, symmetry, S/N, sharpness
@@ -320,7 +340,7 @@ All 45 features are computed within or at the peak boundaries:
 
 ### Step 4: First-Pass FDR
 
-All 45 features are combined into an optimal discriminant score via semi-supervised learning (linear SVM). The default native Percolator receives both targets and decoys and performs internal paired competition. For external Mokapot, targets and decoys are pre-competed using the best feature (selected by ROC AUC) and only winners are written to PIN files.
+All 21 PIN features are combined into an optimal discriminant score via semi-supervised learning (linear SVM). The default native Percolator receives both targets and decoys and performs internal paired competition. For external Mokapot, targets and decoys are pre-competed using the best feature (selected by ROC AUC) and only winners are written to PIN files.
 
 This produces **run-level q-values** for each file, used as input to cross-run reconciliation.
 
@@ -358,7 +378,7 @@ See: [FDR Control](07-fdr-control.md)
 | **Purpose** | Establish RT/mass calibration | Determine peptide detections |
 | **Peak detection** | CWT consensus (with fallback) | CWT consensus (with fallback) |
 | **Method** | XCorr + E-value | Coelution search |
-| **Features** | E-value only | 45 features |
+| **Features** | E-value only | 21 PIN features |
 | **FDR method** | Target-decoy on LDA score | Semi-supervised SVM (Percolator/Mokapot) |
 | **Scope** | First file only, wide tolerance | All files, tight calibrated tolerance |
 
@@ -393,7 +413,7 @@ osprey/
 +-- osprey-core/              # Core types, config, errors, traits
 |   +-- config.rs             # YAML configuration structures (incl. ReconciliationConfig)
 |   +-- isotope.rs            # Isotope distribution calculations
-|   +-- types.rs              # LibraryEntry, Spectrum, CoelutionFeatureSet
+|   +-- types.rs              # LibraryEntry, Spectrum, CoelutionFeatureSet, FdrEntry
 |   +-- traits.rs             # MS1SpectrumLookup, etc.
 |
 +-- osprey-io/                # File I/O

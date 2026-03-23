@@ -415,8 +415,11 @@ How data flows from library through search to blib output:
 2. **Deduplication**: Entries grouped by (modified_sequence, charge); best spectrum kept per precursor
 3. **Decoy generation**: Reversed-sequence decoys generated for each target
 4. **Search**: Each library precursor scored against DIA data (coelution search)
-5. **FDR control**: Mokapot semi-supervised learning assigns q-values
-6. **Blib output**: Passing precursors written with:
+5. **Parquet caching**: Full scored entries persisted to per-file `.scores.parquet` (ZSTD compressed)
+6. **FdrEntry conversion**: Full entries replaced by lightweight stubs (~188 bytes) in memory
+7. **FDR control**: PIN features loaded on-demand from Parquet; Percolator/Mokapot assigns q-values to FdrEntry stubs
+8. **Output loading**: Full entries reloaded from Parquet only for files with FDR-passing precursors
+9. **Blib output**: Passing precursors written with:
    - **RefSpectra**: Peptide sequence, precursor m/z, charge, apex RT, peak boundaries
    - **RefSpectraPeaks**: Library theoretical fragment m/z and intensities (not observed DIA peaks)
    - **Modifications**: From library entry (UniMod converted to mass notation)

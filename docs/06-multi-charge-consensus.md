@@ -58,7 +58,7 @@ For entries that selected a different peak than the consensus:
 2. Gather spectra from that window near the consensus apex RT
 3. Extract fragment XICs from those spectra
 4. Map the consensus RT boundaries to XIC scan indices (find closest RT in XIC time grid)
-5. Compute all 45 features at the consensus boundaries via `compute_features_at_peak()`
+5. Compute all features at the consensus boundaries via `compute_features_at_peak()`
 6. If no signal is found at the consensus RT (too few spectra, no fragment evidence): **drop the entry** — this charge state has no evidence at the peptide's true elution time
 
 ### Step 4: Merge Results
@@ -117,7 +117,7 @@ Re-scoring charge 3+ at consensus boundaries [24.8, 25.9]:
   Find spectra from window [300, 310] near RT = 25.3
   Extract fragment XICs
   Map [24.8, 25.9] to XIC scan indices
-  Compute all 45 features at these boundaries
+  Compute all features at these boundaries
 
 Result:
   Both charge states now share RT = 25.3 and boundaries [24.8, 25.9]
@@ -135,7 +135,7 @@ Result:
 ### What stays unchanged
 
 - CWT peak detection within the per-precursor loop
-- All 45 PIN features and Mokapot/Percolator scoring
+- All 21 PIN features and Mokapot/Percolator scoring
 - FDR control, blib output, everything downstream
 - Calibration path (`batch.rs`) — does not need multi-charge consensus
 - Existing blib `build_shared_boundaries()` function (uses same grouping pattern for output)
