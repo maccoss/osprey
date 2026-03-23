@@ -7,7 +7,7 @@
 //! 4. Runs a second FDR pass on the reconciled consensus set
 
 use osprey_chromatography::RTCalibration;
-use osprey_core::CoelutionScoredEntry;
+use osprey_core::{CwtCandidate, FdrEntry};
 use std::collections::HashMap;
 
 /// Consensus RT for a peptide across all runs.
@@ -42,7 +42,7 @@ pub struct PeptideConsensusRT {
 /// * `per_file_calibrations` - Per-file RT calibrations for inverse prediction
 /// * `consensus_fdr` - FDR threshold for selecting consensus peptides (typically 0.01)
 pub fn compute_consensus_rts(
-    per_file_entries: &[(String, Vec<CoelutionScoredEntry>)],
+    per_file_entries: &[(String, Vec<FdrEntry>)],
     per_file_calibrations: &HashMap<String, RTCalibration>,
     consensus_fdr: f64,
 ) -> Vec<PeptideConsensusRT> {
@@ -106,14 +106,14 @@ pub fn compute_consensus_rts(
             };
 
             if include {
-                let peak_width = entry.peak_bounds.end_rt - entry.peak_bounds.start_rt;
+                let peak_width = entry.end_rt - entry.start_rt;
                 detections
                     .entry((entry.modified_sequence.clone(), entry.is_decoy))
                     .or_default()
                     .push((
                         file_name.clone(),
                         entry.apex_rt,
-                        entry.features.coelution_sum,
+                        entry.coelution_sum,
                         peak_width,
                     ));
             }
@@ -192,7 +192,7 @@ pub fn compute_consensus_rts(
 /// A refined RTCalibration, or None if too few consensus points for this run.
 pub fn refit_calibration_with_consensus(
     consensus: &[PeptideConsensusRT],
-    entries: &[CoelutionScoredEntry],
+    entries: &[FdrEntry],
     consensus_fdr: f64,
 ) -> Option<RTCalibration> {
     use osprey_chromatography::RTCalibrator;
@@ -257,6 +257,12 @@ pub enum ReconcileAction {
     UseCwtPeak {
         /// Index into the entry's cwt_candidates
         candidate_idx: usize,
+        /// CWT peak start RT
+        start_rt: f64,
+        /// CWT peak apex RT
+        apex_rt: f64,
+        /// CWT peak end RT
+        end_rt: f64,
     },
     /// No CWT peak overlaps — forced integration at consensus RT
     ForcedIntegration {
@@ -272,21 +278,26 @@ pub enum ReconcileAction {
 /// Checks if the entry's current peak or any stored CWT candidate overlaps
 /// the expected measured RT. If not, returns ForcedIntegration.
 pub fn determine_reconcile_action(
-    entry: &CoelutionScoredEntry,
+    start_rt: f64,
+    end_rt: f64,
+    cwt_candidates: &[CwtCandidate],
     expected_measured_rt: f64,
     median_peak_width: f64,
 ) -> ReconcileAction {
     // Check if the current peak already contains the expected RT
-    if entry.peak_bounds.start_rt <= expected_measured_rt
-        && expected_measured_rt <= entry.peak_bounds.end_rt
-    {
+    if start_rt <= expected_measured_rt && expected_measured_rt <= end_rt {
         return ReconcileAction::Keep;
     }
 
     // Check stored CWT candidates for overlap
-    for (idx, cand) in entry.cwt_candidates.iter().enumerate() {
+    for (idx, cand) in cwt_candidates.iter().enumerate() {
         if cand.start_rt <= expected_measured_rt && expected_measured_rt <= cand.end_rt {
-            return ReconcileAction::UseCwtPeak { candidate_idx: idx };
+            return ReconcileAction::UseCwtPeak {
+                candidate_idx: idx,
+                start_rt: cand.start_rt,
+                apex_rt: cand.apex_rt,
+                end_rt: cand.end_rt,
+            };
         }
     }
 
@@ -304,9 +315,14 @@ pub fn determine_reconcile_action(
 ///
 /// This function only plans the reconciliation — actual re-scoring happens
 /// in the pipeline where spectra are available.
+///
+/// `per_file_cwt_candidates` provides the CWT candidates per entry for each file,
+/// loaded from parquet caches on demand. If a file has no CWT data, entries default
+/// to forced integration when not matching the current peak.
 pub fn plan_reconciliation(
     consensus: &[PeptideConsensusRT],
-    per_file_entries: &[(String, Vec<CoelutionScoredEntry>)],
+    per_file_entries: &[(String, Vec<FdrEntry>)],
+    per_file_cwt_candidates: &HashMap<String, Vec<Vec<CwtCandidate>>>,
     per_file_refined_cal: &HashMap<String, RTCalibration>,
     per_file_original_cal: &HashMap<String, RTCalibration>,
 ) -> HashMap<(String, usize), ReconcileAction> {
@@ -323,6 +339,8 @@ pub fn plan_reconciliation(
     let mut stats_forced = 0usize;
     let mut stats_no_consensus = 0usize;
 
+    let empty_cwt: Vec<Vec<CwtCandidate>> = Vec::new();
+
     for (file_name, entries) in per_file_entries {
         // Use refined calibration if available, fall back to original
         let cal = per_file_refined_cal
@@ -333,6 +351,8 @@ pub fn plan_reconciliation(
             Some(c) => c,
             None => continue,
         };
+
+        let file_cwt = per_file_cwt_candidates.get(file_name).unwrap_or(&empty_cwt);
 
         for (entry_idx, entry) in entries.iter().enumerate() {
             let key = (entry.modified_sequence.as_str(), entry.is_decoy);
@@ -345,8 +365,14 @@ pub fn plan_reconciliation(
             };
 
             let expected_rt = cal.predict(consensus_entry.consensus_library_rt);
-            let action =
-                determine_reconcile_action(entry, expected_rt, consensus_entry.median_peak_width);
+            let cwt = file_cwt.get(entry_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+            let action = determine_reconcile_action(
+                entry.start_rt,
+                entry.end_rt,
+                cwt,
+                expected_rt,
+                consensus_entry.median_peak_width,
+            );
 
             match &action {
                 ReconcileAction::Keep => stats_keep += 1,

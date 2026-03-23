@@ -681,17 +681,71 @@ pub struct CoelutionScoredEntry {
 }
 
 impl CoelutionScoredEntry {
-    /// Drop heavy fields that are only needed for blib output.
+    /// Convert to a lightweight FDR stub, dropping heavy fields.
     ///
-    /// After per-file scores are cached to parquet, these fields are not needed
-    /// during FDR or reconciliation. They can be reloaded from parquet later
-    /// for the small subset of entries that pass FDR.
-    pub fn shrink_for_fdr(&mut self) {
-        self.fragment_mzs = Vec::new();
-        self.fragment_intensities = Vec::new();
-        self.reference_xic = Vec::new();
-        self.protein_ids = Vec::new();
+    /// The full entry data is already persisted to a `.scores.parquet` cache file
+    /// and can be reloaded on demand for Percolator feature extraction,
+    /// reconciliation CWT lookup, or blib/report output.
+    pub fn to_fdr_entry(&self) -> FdrEntry {
+        FdrEntry {
+            entry_id: self.entry_id,
+            is_decoy: self.is_decoy,
+            charge: self.charge,
+            scan_number: self.scan_number,
+            apex_rt: self.apex_rt,
+            start_rt: self.peak_bounds.start_rt,
+            end_rt: self.peak_bounds.end_rt,
+            coelution_sum: self.features.coelution_sum,
+            score: self.score,
+            run_qvalue: self.run_qvalue,
+            experiment_qvalue: self.experiment_qvalue,
+            pep: self.pep,
+            modified_sequence: self.modified_sequence.clone(),
+            file_name: self.file_name.clone(),
+        }
     }
+}
+
+/// Lightweight stub for FDR scoring and cross-file reconciliation.
+///
+/// Keeps only the fields needed for Percolator/Mokapot result mapping,
+/// target-decoy competition, consensus RT computation, and reconciliation
+/// planning.  Full entry data (features, CWT candidates, fragments) is
+/// stored in per-file `.scores.parquet` caches and reloaded on demand.
+///
+/// ~130 bytes inline + ~58 bytes heap ≈ 188 bytes/entry, versus ~940 bytes
+/// for a shrunk `CoelutionScoredEntry`.  At 200K entries/file × 240 files
+/// this reduces steady-state memory from ~45 GB to ~9 GB.
+#[derive(Debug, Clone)]
+pub struct FdrEntry {
+    /// Library entry ID (for psm_id construction and library lookup)
+    pub entry_id: u32,
+    /// Whether this is a decoy
+    pub is_decoy: bool,
+    /// Precursor charge (for psm_id and passing_precursors key)
+    pub charge: u8,
+    /// Scan number at apex (for psm_id construction)
+    pub scan_number: u32,
+    /// Apex RT in minutes (for consensus computation and blib)
+    pub apex_rt: f64,
+    /// Peak start RT in minutes (for consensus and reconciliation overlap)
+    pub start_rt: f64,
+    /// Peak end RT in minutes (for consensus and reconciliation overlap)
+    pub end_rt: f64,
+    /// Coelution sum score (for simple FDR sort and consensus weighting)
+    pub coelution_sum: f64,
+    /// SVM discriminant score (for consensus ranking)
+    pub score: f64,
+    /// Run-level q-value (mutated by FDR)
+    pub run_qvalue: f64,
+    /// Experiment-level q-value (mutated by FDR)
+    pub experiment_qvalue: f64,
+    /// Posterior error probability (mutated by FDR)
+    pub pep: f64,
+    /// Modified sequence (for psm_id, grouping, passing_precursors)
+    pub modified_sequence: String,
+    /// Source file name / stem (for grouping and file mapping)
+    pub file_name: String,
 }
 
 #[cfg(test)]
