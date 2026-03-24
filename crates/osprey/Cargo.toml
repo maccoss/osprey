@@ -32,8 +32,8 @@ indicatif = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 pathdiff = "0.2"
-arrow = "57"
-parquet = "57"
+arrow = { workspace = true }
+parquet = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -11,6 +11,7 @@
 //! Osprey is peptide-centric: the units are precursors (peptide + charge)
 //! and peptides (unique modified sequences), not PSMs.
 
+use osprey_core::types::FdrEntry;
 use osprey_ml::matrix::Matrix;
 use osprey_ml::pep::PepEstimator;
 use osprey_ml::svm::{self, FeatureStandardizer, LinearSvm};
@@ -821,7 +822,7 @@ fn compete_subset(
 }
 
 /// Core competition logic: group by base_id, compete, return winners sorted by score desc
-fn compete_from_indices(
+pub fn compete_from_indices(
     scores: &[f64],
     labels: &[bool],
     entry_ids: &[u32],
@@ -893,7 +894,7 @@ fn compete_from_indices(
 /// Compute conservative q-values: FDR = (n_decoy + 1) / n_target
 ///
 /// Input must be sorted by score descending (winners from competition).
-fn compute_conservative_qvalues(_scores: &[f64], is_decoy: &[bool], q_values: &mut [f64]) {
+pub fn compute_conservative_qvalues(_scores: &[f64], is_decoy: &[bool], q_values: &mut [f64]) {
     assert_eq!(is_decoy.len(), q_values.len());
     let n = is_decoy.len();
 
@@ -1308,7 +1309,7 @@ fn compute_experiment_peptide_qvalues(
 }
 
 /// Find the best-scoring precursor per peptide from a set of indices
-fn best_precursor_per_peptide(
+pub fn best_precursor_per_peptide(
     indices: &[usize],
     scores: &[f64],
     _labels: &[bool],
@@ -1594,6 +1595,355 @@ pub fn compute_fdr_from_scores(
             pep: peps[i],
         })
         .collect()
+}
+
+/// Compute FDR (q-values + PEP) directly from per-file FdrEntry stubs.
+///
+/// Memory-efficient alternative to `compute_fdr_from_scores` that avoids
+/// allocating flat metadata arrays (peptides, file_names) for all entries.
+/// Instead, it operates directly on per_file_entries using temporary per-file
+/// arrays (~30 MB each) and small HashMaps (~10 MB total).
+///
+/// Scores must already be written to `entry.score` before calling this.
+///
+/// Writes results directly to FdrEntry fields:
+/// - `entry.run_qvalue = max(run_precursor_q, run_peptide_q)`
+/// - `entry.experiment_qvalue = max(exp_precursor_q, exp_peptide_q)`
+/// - `entry.pep` = posterior error probability (1.0 for non-competition-winners)
+pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], test_fdr: f64) {
+    let n_files = per_file_entries.len();
+    let is_single_file = n_files <= 1;
+
+    // === PEP estimation via global target-decoy competition ===
+    // Find best target and best decoy per base_id across all files
+    let mut targets: HashMap<u32, (f64, usize, usize)> = HashMap::new();
+    let mut decoys: HashMap<u32, (f64, usize, usize)> = HashMap::new();
+
+    for (file_idx, (_, entries)) in per_file_entries.iter().enumerate() {
+        for (local_idx, entry) in entries.iter().enumerate() {
+            let base_id = entry.entry_id & 0x7FFF_FFFF;
+            let map = if entry.is_decoy {
+                &mut decoys
+            } else {
+                &mut targets
+            };
+            map.entry(base_id)
+                .and_modify(|(best_score, best_fi, best_li)| {
+                    if entry.score > *best_score {
+                        *best_score = entry.score;
+                        *best_fi = file_idx;
+                        *best_li = local_idx;
+                    }
+                })
+                .or_insert((entry.score, file_idx, local_idx));
+        }
+    }
+
+    // Compete target-decoy pairs for PEP fitting
+    let mut winner_scores: Vec<f64> = Vec::with_capacity(targets.len());
+    let mut winner_is_decoy: Vec<bool> = Vec::with_capacity(targets.len());
+    let mut winner_locations: Vec<(usize, usize)> = Vec::with_capacity(targets.len());
+
+    for (&base_id, &(t_score, t_fi, t_li)) in &targets {
+        if let Some(&(d_score, d_fi, d_li)) = decoys.get(&base_id) {
+            if t_score > d_score {
+                winner_scores.push(t_score);
+                winner_is_decoy.push(false);
+                winner_locations.push((t_fi, t_li));
+            } else {
+                winner_scores.push(d_score);
+                winner_is_decoy.push(true);
+                winner_locations.push((d_fi, d_li));
+            }
+        } else {
+            winner_scores.push(t_score);
+            winner_is_decoy.push(false);
+            winner_locations.push((t_fi, t_li));
+        }
+    }
+    for (&base_id, &(d_score, d_fi, d_li)) in &decoys {
+        if !targets.contains_key(&base_id) {
+            winner_scores.push(d_score);
+            winner_is_decoy.push(true);
+            winner_locations.push((d_fi, d_li));
+        }
+    }
+
+    // Fit PEP model and apply to winners only (non-winners keep pep = 1.0)
+    let pep_estimator = PepEstimator::fit_default(&winner_scores, &winner_is_decoy);
+    for (i, &(fi, li)) in winner_locations.iter().enumerate() {
+        per_file_entries[fi].1[li].pep = pep_estimator.posterior_error(winner_scores[i]);
+    }
+
+    // Free global competition structures
+    drop(targets);
+    drop(decoys);
+    drop(winner_scores);
+    drop(winner_is_decoy);
+    drop(winner_locations);
+
+    // === Per-file run-level q-values ===
+    // Process one file at a time with temporary flat arrays (~30 MB each)
+    for (file_name, entries) in per_file_entries.iter_mut() {
+        let n = entries.len();
+        if n == 0 {
+            continue;
+        }
+
+        // Build per-file flat arrays (temporary)
+        let scores: Vec<f64> = entries.iter().map(|e| e.score).collect();
+        let labels: Vec<bool> = entries.iter().map(|e| e.is_decoy).collect();
+        let eids: Vec<u32> = entries.iter().map(|e| e.entry_id).collect();
+        let all_indices: Vec<usize> = (0..n).collect();
+
+        // Precursor-level q-values
+        let (prec_winner_local, _, prec_winner_is_decoy) =
+            compete_from_indices(&scores, &labels, &eids, &all_indices);
+        let mut prec_q = vec![1.0; prec_winner_local.len()];
+        let prec_ws: Vec<f64> = prec_winner_local.iter().map(|&i| scores[i]).collect();
+        compute_conservative_qvalues(&prec_ws, &prec_winner_is_decoy, &mut prec_q);
+
+        let mut entry_prec_qvalue = vec![1.0; n];
+        for (rank, &local_idx) in prec_winner_local.iter().enumerate() {
+            entry_prec_qvalue[local_idx] = prec_q[rank];
+        }
+
+        // Peptide-level q-values
+        let mut best_per_pept: HashMap<&str, (usize, f64)> = HashMap::new();
+        for (i, entry) in entries.iter().enumerate() {
+            best_per_pept
+                .entry(entry.modified_sequence.as_str())
+                .and_modify(|(best_idx, best_score)| {
+                    if scores[i] > *best_score {
+                        *best_idx = i;
+                        *best_score = scores[i];
+                    }
+                })
+                .or_insert((i, scores[i]));
+        }
+        let mut pept_reps: Vec<usize> = best_per_pept.values().map(|&(idx, _)| idx).collect();
+        pept_reps.sort();
+
+        let pept_scores: Vec<f64> = pept_reps.iter().map(|&i| scores[i]).collect();
+        let pept_labels: Vec<bool> = pept_reps.iter().map(|&i| labels[i]).collect();
+        let pept_eids: Vec<u32> = pept_reps.iter().map(|&i| eids[i]).collect();
+
+        let (pept_winner_local, _, pept_winner_is_decoy) = compete_from_indices(
+            &pept_scores,
+            &pept_labels,
+            &pept_eids,
+            &(0..pept_reps.len()).collect::<Vec<_>>(),
+        );
+        let mut pept_q = vec![1.0; pept_winner_local.len()];
+        let pept_ws: Vec<f64> = pept_winner_local.iter().map(|&i| pept_scores[i]).collect();
+        compute_conservative_qvalues(&pept_ws, &pept_winner_is_decoy, &mut pept_q);
+
+        // Map peptide q-values back via peptide string (owned keys to avoid borrow conflict)
+        let mut peptide_qvalue: HashMap<String, f64> = HashMap::new();
+        for (rank, &local_idx) in pept_winner_local.iter().enumerate() {
+            let global_idx = pept_reps[local_idx];
+            peptide_qvalue.insert(entries[global_idx].modified_sequence.clone(), pept_q[rank]);
+        }
+
+        // Write run_qvalue = max(precursor, peptide)
+        for (i, entry) in entries.iter_mut().enumerate() {
+            let pept_qv = peptide_qvalue
+                .get(entry.modified_sequence.as_str())
+                .copied()
+                .unwrap_or(1.0);
+            entry.run_qvalue = entry_prec_qvalue[i].max(pept_qv);
+        }
+
+        // Log per-file stats
+        let passing: Vec<&FdrEntry> = entries
+            .iter()
+            .filter(|e| !e.is_decoy && e.run_qvalue <= test_fdr)
+            .collect();
+        let precursor_count = passing
+            .iter()
+            .map(|e| (e.modified_sequence.as_str(), e.entry_id & 0x7FFF_FFFF))
+            .collect::<HashSet<_>>()
+            .len();
+        let peptide_count = passing
+            .iter()
+            .map(|e| e.modified_sequence.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        log::info!(
+            "  {}: {} precursors, {} peptides",
+            file_name,
+            precursor_count,
+            peptide_count
+        );
+    }
+
+    // === Experiment-level q-values ===
+    if is_single_file {
+        // Single file: experiment q-values = run q-values
+        for (_, entries) in per_file_entries.iter_mut() {
+            for entry in entries.iter_mut() {
+                entry.experiment_qvalue = entry.run_qvalue;
+            }
+        }
+    } else {
+        // Experiment-level precursor q-values:
+        // Find best observation per base_id across all files, compete, compute q-values
+        let mut best_target: HashMap<u32, (f64, usize, usize)> = HashMap::new();
+        let mut best_decoy: HashMap<u32, (f64, usize, usize)> = HashMap::new();
+        for (file_idx, (_, entries)) in per_file_entries.iter().enumerate() {
+            for (local_idx, entry) in entries.iter().enumerate() {
+                let base_id = entry.entry_id & 0x7FFF_FFFF;
+                let map = if entry.is_decoy {
+                    &mut best_decoy
+                } else {
+                    &mut best_target
+                };
+                map.entry(base_id)
+                    .and_modify(|(best_score, best_fi, best_li)| {
+                        if entry.score > *best_score {
+                            *best_score = entry.score;
+                            *best_fi = file_idx;
+                            *best_li = local_idx;
+                        }
+                    })
+                    .or_insert((entry.score, file_idx, local_idx));
+            }
+        }
+
+        // Compete and compute q-values
+        let mut exp_winners: Vec<(f64, bool, u32)> = Vec::with_capacity(best_target.len());
+        for (&base_id, &(t_score, _, _)) in &best_target {
+            if let Some(&(d_score, _, _)) = best_decoy.get(&base_id) {
+                if t_score > d_score {
+                    exp_winners.push((t_score, false, base_id));
+                } else {
+                    exp_winners.push((d_score, true, base_id));
+                }
+            } else {
+                exp_winners.push((t_score, false, base_id));
+            }
+        }
+        for (&base_id, &(d_score, _, _)) in &best_decoy {
+            if !best_target.contains_key(&base_id) {
+                exp_winners.push((d_score, true, base_id));
+            }
+        }
+
+        // Sort by score desc, base_id for deterministic tiebreaking
+        exp_winners.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2.cmp(&b.2)));
+
+        let exp_w_scores: Vec<f64> = exp_winners.iter().map(|w| w.0).collect();
+        let exp_w_decoy: Vec<bool> = exp_winners.iter().map(|w| w.1).collect();
+        let mut exp_q = vec![1.0; exp_winners.len()];
+        compute_conservative_qvalues(&exp_w_scores, &exp_w_decoy, &mut exp_q);
+
+        // Map base_id -> experiment precursor q-value (for winners only)
+        let mut base_id_exp_prec_q: HashMap<u32, f64> = HashMap::new();
+        for (rank, &(_, _, base_id)) in exp_winners.iter().enumerate() {
+            base_id_exp_prec_q.insert(base_id, exp_q[rank]);
+        }
+
+        drop(best_target);
+        drop(best_decoy);
+        drop(exp_winners);
+
+        // Experiment-level peptide q-values:
+        // Find best precursor per peptide across all files (owned keys)
+        let mut best_per_pept: HashMap<String, (f64, bool, u32)> = HashMap::new();
+        for (_, entries) in per_file_entries.iter() {
+            for entry in entries.iter() {
+                best_per_pept
+                    .entry(entry.modified_sequence.clone())
+                    .and_modify(|(best_score, best_decoy, best_eid)| {
+                        if entry.score > *best_score {
+                            *best_score = entry.score;
+                            *best_decoy = entry.is_decoy;
+                            *best_eid = entry.entry_id;
+                        }
+                    })
+                    .or_insert((entry.score, entry.is_decoy, entry.entry_id));
+            }
+        }
+
+        let n_pept = best_per_pept.len();
+        let mut pept_data: Vec<(String, f64, bool, u32)> = best_per_pept
+            .into_iter()
+            .map(|(pept, (score, is_decoy, eid))| (pept, score, is_decoy, eid))
+            .collect();
+        pept_data.sort_by_key(|d| d.0.clone());
+
+        let pept_scores: Vec<f64> = pept_data.iter().map(|d| d.1).collect();
+        let pept_labels: Vec<bool> = pept_data.iter().map(|d| d.2).collect();
+        let pept_eids: Vec<u32> = pept_data.iter().map(|d| d.3).collect();
+
+        let (pept_winner_local, _, pept_winner_is_decoy) = compete_from_indices(
+            &pept_scores,
+            &pept_labels,
+            &pept_eids,
+            &(0..n_pept).collect::<Vec<_>>(),
+        );
+        let mut pept_q = vec![1.0; pept_winner_local.len()];
+        let pept_ws: Vec<f64> = pept_winner_local.iter().map(|&i| pept_scores[i]).collect();
+        compute_conservative_qvalues(&pept_ws, &pept_winner_is_decoy, &mut pept_q);
+
+        let mut peptide_exp_q: HashMap<String, f64> = HashMap::new();
+        for (rank, &local_idx) in pept_winner_local.iter().enumerate() {
+            peptide_exp_q.insert(pept_data[local_idx].0.clone(), pept_q[rank]);
+        }
+
+        // Free intermediate structures
+        drop(pept_data);
+
+        // Write experiment q-values = max(precursor_q, peptide_q)
+        for (_, entries) in per_file_entries.iter_mut() {
+            for entry in entries.iter_mut() {
+                let base_id = entry.entry_id & 0x7FFF_FFFF;
+                let prec_q = base_id_exp_prec_q.get(&base_id).copied().unwrap_or(1.0);
+                let pept_q = peptide_exp_q
+                    .get(entry.modified_sequence.as_str())
+                    .copied()
+                    .unwrap_or(1.0);
+                entry.experiment_qvalue = prec_q.max(pept_q);
+            }
+        }
+    }
+
+    // Log experiment-level stats
+    let total_entries: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
+    let exp_passing: Vec<&FdrEntry> = per_file_entries
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .filter(|e| !e.is_decoy && e.experiment_qvalue <= test_fdr)
+        .collect();
+    let exp_precursors = exp_passing
+        .iter()
+        .map(|e| (e.modified_sequence.as_str(), e.entry_id & 0x7FFF_FFFF))
+        .collect::<HashSet<_>>()
+        .len();
+    let exp_peptides = exp_passing
+        .iter()
+        .map(|e| e.modified_sequence.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+
+    log::info!("");
+    log::info!(
+        "=== Per-file results (run-level FDR at {:.0}%) ===",
+        test_fdr * 100.0
+    );
+    // Per-file stats were already logged above
+
+    log::info!("");
+    log::info!(
+        "=== Experiment-level results ({:.0}% FDR) ===",
+        test_fdr * 100.0
+    );
+    log::info!(
+        "  Experiment: {} precursors, {} peptides (from {} total entries)",
+        exp_precursors,
+        exp_peptides,
+        total_entries
+    );
 }
 
 #[cfg(test)]

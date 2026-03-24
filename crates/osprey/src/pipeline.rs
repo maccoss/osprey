@@ -1438,11 +1438,7 @@ fn load_pin_features_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<f64>
                 .iter()
                 .map(|col| {
                     let v = col.value(row);
-                    if v.is_finite() {
-                        v
-                    } else {
-                        0.0
-                    }
+                    if v.is_finite() { v } else { 0.0 }
                 })
                 .collect();
             all_features.push(features);
@@ -1959,13 +1955,14 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         } else {
                             // Need full entries for PIN writing
                             if let Ok(full_entries) = load_scores_parquet(&scores_path) {
-                                let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
-                                    compete_target_decoy_pairs(full_entries)
-                                } else {
-                                    full_entries
-                                };
-                                if let Ok(pin_path) =
-                                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)
+                                let pin_entries =
+                                    if config.fdr_method == FdrMethod::Mokapot {
+                                        compete_target_decoy_pairs(full_entries)
+                                    } else {
+                                        full_entries
+                                    };
+                                if let Ok(pin_path) = mokapot
+                                    .write_pin_file(&file_name, &pin_entries, &mokapot_dir)
                                 {
                                     pin_files.insert(file_name.clone(), pin_path);
                                 }
@@ -2105,7 +2102,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 } else {
                     entries.clone()
                 };
-                let pin_path = mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
+                let pin_path =
+                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
                 pin_files.insert(file_name.clone(), pin_path);
             }
 
@@ -2665,6 +2663,9 @@ fn run_percolator_fdr(
     }
 
     // === Streaming path for large experiments ===
+    // Memory-efficient: no flat metadata arrays for all entries.
+    // Subsamples directly from per_file_entries (~16 MB HashMaps),
+    // scores directly to entry.score, computes q-values per-file.
     log::info!(
         "Percolator streaming: {} entries across {} files (training on {} subset)",
         total_entries,
@@ -2672,103 +2673,154 @@ fn run_percolator_fdr(
         max_train
     );
 
-    // Phase 1: Build flat metadata arrays from FdrEntry stubs
-    // Also record per-file offsets for mapping global indices back to (file, local)
-    let mut all_labels = Vec::with_capacity(total_entries);
-    let mut all_entry_ids = Vec::with_capacity(total_entries);
-    let mut all_peptides: Vec<String> = Vec::with_capacity(total_entries);
-    let mut all_file_names: Vec<String> = Vec::with_capacity(total_entries);
-    let mut all_charges: Vec<u8> = Vec::with_capacity(total_entries);
-    let mut file_offsets: Vec<(usize, usize)> = Vec::with_capacity(n_files); // (start, len)
-
-    for (file_name, entries) in per_file_entries.iter() {
-        let offset = all_labels.len();
-        for entry in entries {
-            all_labels.push(entry.is_decoy);
-            all_entry_ids.push(entry.entry_id);
-            all_peptides.push(entry.modified_sequence.clone());
-            all_file_names.push(file_name.clone());
-            all_charges.push(entry.charge);
+    // Phase 1: Subsample by peptide group directly from per_file_entries
+    // Build base_id -> target peptide mapping (~150K entries, ~8 MB)
+    let mut base_id_to_target_peptide: HashMap<u32, String> = HashMap::new();
+    for (_, entries) in per_file_entries.iter() {
+        for entry in entries.iter() {
+            let base_id = entry.entry_id & 0x7FFF_FFFF;
+            if !entry.is_decoy {
+                base_id_to_target_peptide
+                    .entry(base_id)
+                    .or_insert_with(|| entry.modified_sequence.clone());
+            }
         }
-        file_offsets.push((offset, entries.len()));
+    }
+    // Handle decoy-only base_ids
+    for (_, entries) in per_file_entries.iter() {
+        for entry in entries.iter() {
+            if entry.is_decoy {
+                let base_id = entry.entry_id & 0x7FFF_FFFF;
+                base_id_to_target_peptide
+                    .entry(base_id)
+                    .or_insert_with(|| entry.modified_sequence.clone());
+            }
+        }
     }
 
-    // Phase 2: Subsample from metadata (no feature loading needed)
-    let subset_indices = percolator::subsample_by_peptide_group(
-        &all_labels,
-        &all_entry_ids,
-        &all_peptides,
-        max_train,
-        perc_config.seed,
-    );
-    let sub_targets = subset_indices.iter().filter(|&&i| !all_labels[i]).count();
-    let sub_decoys = subset_indices.iter().filter(|&&i| all_labels[i]).count();
+    // Count entries per peptide group (just counts, no index storage)
+    let mut peptide_count: HashMap<&str, usize> = HashMap::new();
+    for (_, entries) in per_file_entries.iter() {
+        for entry in entries.iter() {
+            let base_id = entry.entry_id & 0x7FFF_FFFF;
+            let key = base_id_to_target_peptide
+                .get(&base_id)
+                .map(|s| s.as_str())
+                .unwrap_or(entry.modified_sequence.as_str());
+            *peptide_count.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    // Shuffle groups and select until reaching max_train
+    let mut groups: Vec<(&str, usize)> = peptide_count.into_iter().collect();
+    groups.sort_by_key(|&(k, _)| k);
+
+    // Fisher-Yates shuffle with xorshift64 RNG (same as subsample_by_peptide_group)
+    let mut rng_state = perc_config.seed;
+    for i in (1..groups.len()).rev() {
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        let j = rng_state as usize % (i + 1);
+        groups.swap(i, j);
+    }
+
+    let mut selected_peptides: HashSet<&str> = HashSet::new();
+    let mut selected_count = 0usize;
+    for &(peptide, count) in &groups {
+        if selected_count + count > max_train && selected_count > 0 {
+            break;
+        }
+        selected_peptides.insert(peptide);
+        selected_count += count;
+    }
+
+    // Collect (file_idx, local_idx) for selected entries (second pass)
+    let mut subset: Vec<(usize, usize)> = Vec::with_capacity(selected_count);
+    let mut sub_targets = 0usize;
+    let mut sub_decoys = 0usize;
+    for (file_idx, (_, entries)) in per_file_entries.iter().enumerate() {
+        for (local_idx, entry) in entries.iter().enumerate() {
+            let base_id = entry.entry_id & 0x7FFF_FFFF;
+            let key = base_id_to_target_peptide
+                .get(&base_id)
+                .map(|s| s.as_str())
+                .unwrap_or(entry.modified_sequence.as_str());
+            if selected_peptides.contains(key) {
+                subset.push((file_idx, local_idx));
+                if entry.is_decoy {
+                    sub_decoys += 1;
+                } else {
+                    sub_targets += 1;
+                }
+            }
+        }
+    }
+
+    // Free subsampling structures
+    drop(groups);
+    drop(selected_peptides);
+    drop(peptide_count);
+
     log::info!(
         "  Subsampled {} entries ({} targets, {} decoys) for SVM training",
-        subset_indices.len(),
+        subset.len(),
         sub_targets,
         sub_decoys
     );
 
-    // Phase 3: Load features only for subsampled entries from Parquet
-    // Group subset indices by file to minimize Parquet loads
-    let mut subset_by_file: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_files];
-    for &global_idx in &subset_indices {
-        // Find which file this global index belongs to
-        for (file_idx, &(offset, len)) in file_offsets.iter().enumerate() {
-            if global_idx >= offset && global_idx < offset + len {
-                let local_idx = global_idx - offset;
-                subset_by_file[file_idx].push((global_idx, local_idx));
-                break;
-            }
-        }
+    // Phase 2: Load features only for subsampled entries from Parquet
+    // Group subset by file to minimize Parquet loads
+    let mut subset_by_file: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+    for (pos, &(file_idx, local_idx)) in subset.iter().enumerate() {
+        subset_by_file
+            .entry(file_idx)
+            .or_default()
+            .push((pos, local_idx));
     }
 
-    // Load features from Parquet only for files with subsampled entries
-    let mut subset_features: Vec<Vec<f64>> = vec![Vec::new(); subset_indices.len()];
-    // Build global_idx → subset_position map
-    let subset_pos_map: HashMap<usize, usize> = subset_indices
-        .iter()
-        .enumerate()
-        .map(|(pos, &global)| (global, pos))
-        .collect();
-
-    for (file_idx, entries_in_file) in subset_by_file.iter().enumerate() {
-        if entries_in_file.is_empty() {
-            continue;
-        }
+    let mut subset_features: Vec<Vec<f64>> = vec![Vec::new(); subset.len()];
+    for (&file_idx, entries_in_file) in &subset_by_file {
         let (file_name, _) = &per_file_entries[file_idx];
         let cache_path = per_file_cache_paths
             .get(file_name.as_str())
-            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
+            .ok_or_else(|| {
+                OspreyError::config(format!("No parquet cache for {}", file_name))
+            })?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
-        for &(global_idx, local_idx) in entries_in_file {
+        for &(pos, local_idx) in entries_in_file {
             if local_idx < file_features.len() {
-                let pos = subset_pos_map[&global_idx];
                 subset_features[pos] = file_features[local_idx].clone();
             }
         }
     }
+    drop(subset_by_file);
 
-    // Phase 4: Train SVM models on the subsample via run_percolator
+    // Phase 3: Train SVM models on the subsample via run_percolator
     // Create PercolatorEntry objects only for the subset (~300K, ~130 MB)
-    let subset_perc_entries: Vec<percolator::PercolatorEntry> = subset_indices
+    let subset_perc_entries: Vec<percolator::PercolatorEntry> = subset
         .iter()
         .zip(subset_features.iter())
-        .map(|(&global_idx, features)| percolator::PercolatorEntry {
-            id: format!("sub_{}", global_idx),
-            file_name: all_file_names[global_idx].clone(),
-            peptide: all_peptides[global_idx].clone(),
-            charge: all_charges[global_idx],
-            is_decoy: all_labels[global_idx],
-            entry_id: all_entry_ids[global_idx],
-            features: features.clone(),
+        .map(|(&(file_idx, local_idx), features)| {
+            let (file_name, entries) = &per_file_entries[file_idx];
+            let entry = &entries[local_idx];
+            percolator::PercolatorEntry {
+                id: format!("sub_{}_{}", file_idx, local_idx),
+                file_name: file_name.clone(),
+                peptide: entry.modified_sequence.clone(),
+                charge: entry.charge,
+                is_decoy: entry.is_decoy,
+                entry_id: entry.entry_id,
+                features: features.clone(),
+            }
         })
         .collect();
 
-    // Free subset features memory — no longer needed
+    // Free subset memory
+    drop(subset);
     drop(subset_features);
+    drop(base_id_to_target_peptide);
 
     let train_results = percolator::run_percolator(&subset_perc_entries, &perc_config)
         .map_err(|e| OspreyError::config(format!("Percolator training failed: {}", e)))?;
@@ -2799,60 +2851,49 @@ fn run_percolator_fdr(
     }
     avg_bias /= n_models_f;
 
-    let standardizer = &train_results.standardizer;
+    let standardizer = train_results.standardizer.clone();
 
-    // Free subset PercolatorEntry objects
+    // Free training memory
     drop(subset_perc_entries);
-    // Free training results entries (q-values for subset only — not needed)
-    drop(train_results.entries);
+    drop(train_results);
 
-    // Phase 5: Score ALL entries by streaming through Parquet files
-    let mut all_scores = vec![0.0f64; total_entries];
-
-    for (file_idx, (file_name, _fdr_entries)) in per_file_entries.iter().enumerate() {
+    // Phase 4: Score ALL entries by streaming through Parquet files
+    // Write scores directly to entry.score (no flat scores array)
+    for (file_idx, (file_name, fdr_entries)) in per_file_entries.iter_mut().enumerate() {
         let cache_path = per_file_cache_paths
             .get(file_name.as_str())
-            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
+            .ok_or_else(|| {
+                OspreyError::config(format!("No parquet cache for {}", file_name))
+            })?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
-        let (offset, _) = file_offsets[file_idx];
 
         for (local_idx, mut features) in file_features.into_iter().enumerate() {
-            let global_idx = offset + local_idx;
             standardizer.transform_slice(&mut features);
-            // Score = w · x + b
             let mut score = avg_bias;
             for (w, x) in avg_weights.iter().zip(features.iter()) {
                 score += w * x;
             }
-            all_scores[global_idx] = score;
+            fdr_entries[local_idx].score = score;
+        }
+
+        if (file_idx + 1) % 10 == 0 || file_idx + 1 == n_files {
+            log::info!(
+                "  Scored {}/{} files",
+                file_idx + 1,
+                n_files
+            );
         }
     }
 
-    // Phase 6: Compute q-values and PEP from flat scores array
-    let fdr_results = percolator::compute_fdr_from_scores(
-        &all_scores,
-        &all_labels,
-        &all_entry_ids,
-        &all_peptides,
-        &all_file_names,
-        perc_config.test_fdr,
+    // Phase 5: Compute q-values and PEP directly from per_file_entries
+    // This avoids building any flat metadata arrays (~0 extra memory vs 33 GB before)
+    log::info!("");
+    log::info!(
+        "=== Per-file results (run-level FDR at {:.0}%) ===",
+        perc_config.test_fdr * 100.0
     );
-
-    // Phase 7: Map results back to FdrEntry stubs
-    for (file_idx, (_, entries)) in per_file_entries.iter_mut().enumerate() {
-        let (offset, _) = file_offsets[file_idx];
-        for (local_idx, entry) in entries.iter_mut().enumerate() {
-            let global_idx = offset + local_idx;
-            let result = &fdr_results[global_idx];
-            entry.run_qvalue = result.run_precursor_qvalue.max(result.run_peptide_qvalue);
-            entry.experiment_qvalue = result
-                .experiment_precursor_qvalue
-                .max(result.experiment_peptide_qvalue);
-            entry.score = all_scores[global_idx];
-            entry.pep = result.pep;
-        }
-    }
+    percolator::compute_fdr_from_stubs(per_file_entries, perc_config.test_fdr);
 
     Ok(())
 }
@@ -4271,7 +4312,10 @@ impl FileRescoreContext {
                     result
                 }
                 Err(e) => {
-                    log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
+                    log::warn!(
+                        "Failed to load spectra cache, falling back to mzML: {}",
+                        e
+                    );
                     load_all_spectra(input_file)?
                 }
             }
