@@ -158,6 +158,16 @@ impl LinearSvm {
         scores.iter().map(|&s| s + self.bias).collect()
     }
 
+    /// Score a single feature vector: w · x + b
+    #[inline]
+    pub fn score_single(&self, features: &[f64]) -> f64 {
+        let mut score = self.bias;
+        for (w, x) in self.weights.iter().zip(features.iter()) {
+            score += w * x;
+        }
+        score
+    }
+
     /// Get the learned feature weights
     pub fn weights(&self) -> &[f64] {
         &self.weights
@@ -411,6 +421,51 @@ impl FeatureStandardizer {
         let standardizer = Self::fit(features);
         let transformed = standardizer.transform(features);
         (standardizer, transformed)
+    }
+
+    /// Fit from a collection of feature slices (avoids building a full Matrix).
+    ///
+    /// Each entry in `rows` must have exactly `n_features` elements.
+    pub fn fit_from_slices(rows: &[Vec<f64>], n_features: usize) -> Self {
+        let n = rows.len() as f64;
+        let mut means = vec![0.0; n_features];
+        let mut stds = vec![0.0; n_features];
+
+        for row in rows {
+            for (col, &val) in row.iter().enumerate() {
+                means[col] += val;
+            }
+        }
+        for m in means.iter_mut() {
+            *m /= n;
+        }
+
+        for row in rows {
+            for (col, &val) in row.iter().enumerate() {
+                let diff = val - means[col];
+                stds[col] += diff * diff;
+            }
+        }
+        for s in stds.iter_mut() {
+            *s = (*s / n).sqrt();
+            if *s < 1e-12 {
+                *s = 1.0;
+            }
+        }
+
+        FeatureStandardizer { means, stds }
+    }
+
+    /// Transform a single feature vector in-place.
+    pub fn transform_slice(&self, features: &mut [f64]) {
+        for (col, val) in features.iter_mut().enumerate() {
+            *val = (*val - self.means[col]) / self.stds[col];
+        }
+    }
+
+    /// Get the number of features this standardizer was fit on.
+    pub fn n_features(&self) -> usize {
+        self.means.len()
     }
 }
 

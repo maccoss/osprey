@@ -103,8 +103,27 @@ pub struct PercolatorResults {
     pub entries: Vec<PercolatorResult>,
     /// Feature weights from best model per fold
     pub fold_weights: Vec<Vec<f64>>,
+    /// Bias terms from best model per fold
+    pub fold_biases: Vec<f64>,
+    /// Feature standardizer used during training (for scoring additional entries)
+    pub standardizer: FeatureStandardizer,
     /// Number of iterations used per fold
     pub iterations_per_fold: Vec<usize>,
+}
+
+/// FDR result for a single entry from compute_fdr_from_scores
+#[derive(Debug, Clone)]
+pub struct FdrScoreResult {
+    /// Per-run precursor-level q-value
+    pub run_precursor_qvalue: f64,
+    /// Per-run peptide-level q-value
+    pub run_peptide_qvalue: f64,
+    /// Experiment-wide precursor-level q-value
+    pub experiment_precursor_qvalue: f64,
+    /// Experiment-wide peptide-level q-value
+    pub experiment_peptide_qvalue: f64,
+    /// Posterior error probability
+    pub pep: f64,
 }
 
 /// Run the Percolator algorithm on a collection of entries
@@ -123,6 +142,8 @@ pub fn run_percolator(
         return Ok(PercolatorResults {
             entries: Vec::new(),
             fold_weights: Vec::new(),
+            fold_biases: Vec::new(),
+            standardizer: FeatureStandardizer::fit_from_slices(&[], 0),
             iterations_per_fold: Vec::new(),
         });
     }
@@ -159,7 +180,7 @@ pub fn run_percolator(
     let peptides: Vec<String> = entries.iter().map(|e| e.peptide.clone()).collect();
 
     // 2. Standardize features (on ALL entries — standardization must be global)
-    let (_standardizer, std_features) = FeatureStandardizer::fit_transform(&features);
+    let (standardizer, std_features) = FeatureStandardizer::fit_transform(&features);
     log::debug!("  Features standardized to zero mean, unit variance");
 
     // 3. Subsample by peptide groups if needed (before fold splitting, per PMC5059416)
@@ -323,20 +344,23 @@ pub fn run_percolator(
                 }
             }
 
-            // For non-subset entries: average scores from all fold models
+            // For non-subset entries: average scores from all fold models (batch)
             let non_subset_indices: Vec<usize> =
                 (0..n).filter(|i| !in_subset.contains(i)).collect();
             if !non_subset_indices.is_empty() {
                 let non_sub_features = extract_rows(&std_features, &non_subset_indices);
                 let models: Vec<&LinearSvm> = fold_results.iter().map(|(_, m, _)| m).collect();
+                let n_models = models.len() as f64;
+                // Batch score all non-subset entries per model, then average
+                let mut avg_scores = vec![0.0f64; non_subset_indices.len()];
+                for model in &models {
+                    let model_scores = model.decision_function(&non_sub_features);
+                    for (i, s) in model_scores.iter().enumerate() {
+                        avg_scores[i] += s;
+                    }
+                }
                 for (i, &idx) in non_subset_indices.iter().enumerate() {
-                    let row = extract_rows(&non_sub_features, &[i]);
-                    let avg_score: f64 = models
-                        .iter()
-                        .map(|m| m.decision_function(&row)[0])
-                        .sum::<f64>()
-                        / models.len() as f64;
-                    final_scores[idx] = avg_score;
+                    final_scores[idx] = avg_scores[i] / n_models;
                 }
             }
         }
@@ -354,8 +378,10 @@ pub fn run_percolator(
         }
     }
 
+    let mut fold_biases: Vec<f64> = Vec::new();
     for (fold, best_model, n_iterations) in &fold_results {
         fold_weights.push(best_model.weights().to_vec());
+        fold_biases.push(best_model.bias());
         iterations_per_fold.push(*n_iterations);
         log::info!(
             "    Fold {} best model weights: [{}]",
@@ -536,6 +562,8 @@ pub fn run_percolator(
     Ok(PercolatorResults {
         entries: results,
         fold_weights,
+        fold_biases,
+        standardizer,
         iterations_per_fold,
     })
 }
@@ -1375,7 +1403,7 @@ fn create_stratified_folds_by_peptide(
 ///
 /// Per The et al. (2016, PMC5059416): subsample paired PSMs before fold splitting,
 /// then apply CV to the subset. The trained model is applied to ALL entries.
-fn subsample_by_peptide_group(
+pub fn subsample_by_peptide_group(
     labels: &[bool],
     entry_ids: &[u32],
     peptides: &[String],
@@ -1443,6 +1471,129 @@ fn extract_rows(matrix: &Matrix, row_indices: &[usize]) -> Matrix {
         .flat_map(|&row| matrix.row_slice(row).iter().copied())
         .collect();
     Matrix::new(data, row_indices.len(), n_cols)
+}
+
+/// Compute FDR results (q-values + PEP) for pre-scored entries.
+///
+/// This is used by the streaming Percolator path where the caller has already
+/// scored all entries using trained models. Computes:
+/// - Per-run precursor and peptide q-values
+/// - Experiment-level precursor and peptide q-values
+/// - Posterior error probabilities via KDE + isotonic regression
+///
+/// Returns one FdrScoreResult per entry, in the same order as the input arrays.
+pub fn compute_fdr_from_scores(
+    scores: &[f64],
+    labels: &[bool],
+    entry_ids: &[u32],
+    peptides: &[String],
+    file_names: &[String],
+    test_fdr: f64,
+) -> Vec<FdrScoreResult> {
+    let n = scores.len();
+
+    // PEP estimation on competition winners
+    let (winner_indices, winner_scores, winner_is_decoy) = compete_all(scores, labels, entry_ids);
+
+    let pep_estimator = PepEstimator::fit_default(&winner_scores, &winner_is_decoy);
+    let mut peps = vec![1.0; n];
+    for &idx in &winner_indices {
+        peps[idx] = pep_estimator.posterior_error(scores[idx]);
+    }
+
+    // Q-values at all four levels
+    let unique_files: HashSet<&str> = file_names.iter().map(|s| s.as_str()).collect();
+    let is_single_file = unique_files.len() <= 1;
+
+    let run_precursor_qvalues =
+        compute_per_run_precursor_qvalues(scores, labels, entry_ids, file_names);
+    let run_peptide_qvalues =
+        compute_per_run_peptide_qvalues(scores, labels, entry_ids, file_names, peptides);
+
+    let (exp_precursor_qvalues, exp_peptide_qvalues) = if is_single_file {
+        (run_precursor_qvalues.clone(), run_peptide_qvalues.clone())
+    } else {
+        let exp_prec = compute_experiment_precursor_qvalues(scores, labels, entry_ids);
+        let exp_pept = compute_experiment_peptide_qvalues(scores, labels, entry_ids, peptides);
+        (exp_prec, exp_pept)
+    };
+
+    // Log per-file statistics
+    let mut file_groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, fname) in file_names.iter().enumerate() {
+        file_groups.entry(fname.as_str()).or_default().push(i);
+    }
+    let mut sorted_files: Vec<&str> = file_groups.keys().copied().collect();
+    sorted_files.sort();
+
+    log::info!("");
+    log::info!(
+        "=== Per-file results (run-level FDR at {:.0}%) ===",
+        test_fdr * 100.0
+    );
+    for file_name in &sorted_files {
+        let indices = &file_groups[file_name];
+        let passing: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|&i| {
+                !labels[i] && run_precursor_qvalues[i].max(run_peptide_qvalues[i]) <= test_fdr
+            })
+            .collect();
+        let precursor_count = passing
+            .iter()
+            .map(|&i| (peptides[i].as_str(), entry_ids[i] & 0x7FFFFFFF))
+            .collect::<HashSet<_>>()
+            .len();
+        let peptide_count = passing
+            .iter()
+            .map(|&i| peptides[i].as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        log::info!(
+            "  {}: {} precursors, {} peptides",
+            file_name,
+            precursor_count,
+            peptide_count
+        );
+    }
+
+    // Experiment-level stats
+    let exp_passing: Vec<usize> = (0..n)
+        .filter(|&i| !labels[i] && exp_precursor_qvalues[i].max(exp_peptide_qvalues[i]) <= test_fdr)
+        .collect();
+    let exp_precursors = exp_passing
+        .iter()
+        .map(|&i| (peptides[i].as_str(), entry_ids[i] & 0x7FFFFFFF))
+        .collect::<HashSet<_>>()
+        .len();
+    let exp_peptides = exp_passing
+        .iter()
+        .map(|&i| peptides[i].as_str())
+        .collect::<HashSet<_>>()
+        .len();
+
+    log::info!("");
+    log::info!(
+        "=== Experiment-level results ({:.0}% FDR) ===",
+        test_fdr * 100.0
+    );
+    log::info!(
+        "  Experiment: {} precursors, {} peptides",
+        exp_precursors,
+        exp_peptides
+    );
+
+    // Build results
+    (0..n)
+        .map(|i| FdrScoreResult {
+            run_precursor_qvalue: run_precursor_qvalues[i],
+            run_peptide_qvalue: run_peptide_qvalues[i],
+            experiment_precursor_qvalue: exp_precursor_qvalues[i],
+            experiment_peptide_qvalue: exp_peptide_qvalues[i],
+            pep: peps[i],
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -1371,6 +1371,87 @@ fn set_features_from_pin_values(
     features.median_polish_residual_correlation = v(20);
 }
 
+/// Load only PIN feature values from a parquet cache file.
+///
+/// Returns one Vec<f64> per entry (with NUM_PIN_FEATURES elements each).
+/// This is a lightweight alternative to `load_scores_parquet` that only reads
+/// the 21 feature columns — no fragments, CWT candidates, XICs, or strings.
+/// Dramatically reduces I/O and memory for large experiments.
+fn load_pin_features_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<f64>>> {
+    use arrow::array::Float64Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ProjectionMask;
+
+    let feature_names = get_pin_feature_names();
+
+    let file = std::fs::File::open(path).map_err(|e| {
+        OspreyError::config(format!("Failed to open parquet {}: {}", path.display(), e))
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        OspreyError::config(format!("Failed to read parquet {}: {}", path.display(), e))
+    })?;
+
+    // Build projection mask to only read feature columns
+    let parquet_schema = builder.parquet_schema().clone();
+    let arrow_schema = builder.schema().clone();
+    let feature_indices: Vec<usize> = feature_names
+        .iter()
+        .filter_map(|name| arrow_schema.column_with_name(name).map(|(idx, _)| idx))
+        .collect();
+
+    if feature_indices.len() != feature_names.len() {
+        return Err(OspreyError::OutputError(format!(
+            "Stale scores cache {}: missing feature columns. Delete and re-run.",
+            path.display(),
+        )));
+    }
+
+    let projection = ProjectionMask::roots(&parquet_schema, feature_indices);
+    let reader = builder.with_projection(projection).build().map_err(|e| {
+        OspreyError::config(format!(
+            "Failed to build reader for {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let mut all_features = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| OspreyError::config(format!("Failed to read batch: {}", e)))?;
+
+        // Read feature columns by name (projection may reorder them)
+        let feat_cols: Vec<&Float64Array> = feature_names
+            .iter()
+            .map(|name| {
+                batch
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+            })
+            .collect();
+
+        for row in 0..batch.num_rows() {
+            let features: Vec<f64> = feat_cols
+                .iter()
+                .map(|col| {
+                    let v = col.value(row);
+                    if v.is_finite() {
+                        v
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            all_features.push(features);
+        }
+    }
+
+    Ok(all_features)
+}
+
 /// Load only CWT candidates from a parquet cache file.
 ///
 /// Returns one Vec<CwtCandidate> per entry, in the same order as entries were written.
@@ -2376,16 +2457,256 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
 /// Run native Percolator FDR on coelution entries.
 ///
-/// Loads PIN features from per-file parquet caches to build PercolatorEntry,
-/// then writes results (q-values, score, PEP) back to FdrEntry stubs.
+/// Uses a streaming approach for scalability with large experiments:
+/// 1. Build lightweight metadata from FdrEntry stubs (already in memory)
+/// 2. Subsample ~300K entries for SVM training (no feature loading needed)
+/// 3. Load PIN features only for the subsampled entries from Parquet
+/// 4. Train SVM models via run_percolator on the subsample
+/// 5. Score ALL entries by streaming through Parquet files one at a time
+/// 6. Compute q-values and PEP from the flat scores array
+///
+/// This avoids loading all Parquet files into memory simultaneously and
+/// avoids creating PercolatorEntry objects for all entries.
 fn run_percolator_fdr(
     per_file_entries: &mut [(String, Vec<FdrEntry>)],
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
     config: &OspreyConfig,
 ) -> Result<()> {
+    use osprey_fdr::percolator;
+
     log::info!("Running native Percolator FDR on coelution entries");
 
-    // Build PercolatorEntry by loading features from parquet caches per-file
+    let total_entries: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
+    let n_files = per_file_entries.len();
+    let perc_config = percolator::PercolatorConfig {
+        train_fdr: config.run_fdr,
+        test_fdr: config.run_fdr,
+        feature_names: Some(
+            get_pin_feature_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        ..Default::default()
+    };
+    let max_train = perc_config.max_train_size;
+
+    // For small experiments (total entries fit comfortably), use the direct path
+    // to preserve full cross-validation scoring semantics
+    let use_streaming = max_train > 0 && total_entries > max_train * 2;
+
+    if !use_streaming {
+        // Direct path: load all features and call run_percolator
+        log::info!(
+            "Percolator: loading features for {} entries across {} files",
+            total_entries,
+            n_files
+        );
+        return run_percolator_fdr_direct(per_file_entries, per_file_cache_paths, &perc_config);
+    }
+
+    // === Streaming path for large experiments ===
+    log::info!(
+        "Percolator streaming: {} entries across {} files (training on {} subset)",
+        total_entries,
+        n_files,
+        max_train
+    );
+
+    // Phase 1: Build flat metadata arrays from FdrEntry stubs
+    // Also record per-file offsets for mapping global indices back to (file, local)
+    let mut all_labels = Vec::with_capacity(total_entries);
+    let mut all_entry_ids = Vec::with_capacity(total_entries);
+    let mut all_peptides: Vec<String> = Vec::with_capacity(total_entries);
+    let mut all_file_names: Vec<String> = Vec::with_capacity(total_entries);
+    let mut all_charges: Vec<u8> = Vec::with_capacity(total_entries);
+    let mut file_offsets: Vec<(usize, usize)> = Vec::with_capacity(n_files); // (start, len)
+
+    for (file_name, entries) in per_file_entries.iter() {
+        let offset = all_labels.len();
+        for entry in entries {
+            all_labels.push(entry.is_decoy);
+            all_entry_ids.push(entry.entry_id);
+            all_peptides.push(entry.modified_sequence.clone());
+            all_file_names.push(file_name.clone());
+            all_charges.push(entry.charge);
+        }
+        file_offsets.push((offset, entries.len()));
+    }
+
+    // Phase 2: Subsample from metadata (no feature loading needed)
+    let subset_indices = percolator::subsample_by_peptide_group(
+        &all_labels,
+        &all_entry_ids,
+        &all_peptides,
+        max_train,
+        perc_config.seed,
+    );
+    let sub_targets = subset_indices.iter().filter(|&&i| !all_labels[i]).count();
+    let sub_decoys = subset_indices.iter().filter(|&&i| all_labels[i]).count();
+    log::info!(
+        "  Subsampled {} entries ({} targets, {} decoys) for SVM training",
+        subset_indices.len(),
+        sub_targets,
+        sub_decoys
+    );
+
+    // Phase 3: Load features only for subsampled entries from Parquet
+    // Group subset indices by file to minimize Parquet loads
+    let mut subset_by_file: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_files];
+    for &global_idx in &subset_indices {
+        // Find which file this global index belongs to
+        for (file_idx, &(offset, len)) in file_offsets.iter().enumerate() {
+            if global_idx >= offset && global_idx < offset + len {
+                let local_idx = global_idx - offset;
+                subset_by_file[file_idx].push((global_idx, local_idx));
+                break;
+            }
+        }
+    }
+
+    // Load features from Parquet only for files with subsampled entries
+    let mut subset_features: Vec<Vec<f64>> = vec![Vec::new(); subset_indices.len()];
+    // Build global_idx → subset_position map
+    let subset_pos_map: HashMap<usize, usize> = subset_indices
+        .iter()
+        .enumerate()
+        .map(|(pos, &global)| (global, pos))
+        .collect();
+
+    for (file_idx, entries_in_file) in subset_by_file.iter().enumerate() {
+        if entries_in_file.is_empty() {
+            continue;
+        }
+        let (file_name, _) = &per_file_entries[file_idx];
+        let cache_path = per_file_cache_paths
+            .get(file_name.as_str())
+            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
+
+        let file_features = load_pin_features_from_parquet(cache_path)?;
+        for &(global_idx, local_idx) in entries_in_file {
+            if local_idx < file_features.len() {
+                let pos = subset_pos_map[&global_idx];
+                subset_features[pos] = file_features[local_idx].clone();
+            }
+        }
+    }
+
+    // Phase 4: Train SVM models on the subsample via run_percolator
+    // Create PercolatorEntry objects only for the subset (~300K, ~130 MB)
+    let subset_perc_entries: Vec<percolator::PercolatorEntry> = subset_indices
+        .iter()
+        .zip(subset_features.iter())
+        .map(|(&global_idx, features)| percolator::PercolatorEntry {
+            id: format!("sub_{}", global_idx),
+            file_name: all_file_names[global_idx].clone(),
+            peptide: all_peptides[global_idx].clone(),
+            charge: all_charges[global_idx],
+            is_decoy: all_labels[global_idx],
+            entry_id: all_entry_ids[global_idx],
+            features: features.clone(),
+        })
+        .collect();
+
+    // Free subset features memory — no longer needed
+    drop(subset_features);
+
+    let train_results = percolator::run_percolator(&subset_perc_entries, &perc_config)
+        .map_err(|e| OspreyError::config(format!("Percolator training failed: {}", e)))?;
+
+    // Extract averaged model weights and standardizer
+    let n_models = train_results.fold_weights.len();
+    let n_features = if n_models > 0 {
+        train_results.fold_weights[0].len()
+    } else {
+        return Err(OspreyError::config("Percolator produced no models"));
+    };
+
+    let mut avg_weights = vec![0.0f64; n_features];
+    let mut avg_bias = 0.0f64;
+    for (weights, &bias) in train_results
+        .fold_weights
+        .iter()
+        .zip(train_results.fold_biases.iter())
+    {
+        for (j, &w) in weights.iter().enumerate() {
+            avg_weights[j] += w;
+        }
+        avg_bias += bias;
+    }
+    let n_models_f = n_models as f64;
+    for w in &mut avg_weights {
+        *w /= n_models_f;
+    }
+    avg_bias /= n_models_f;
+
+    let standardizer = &train_results.standardizer;
+
+    // Free subset PercolatorEntry objects
+    drop(subset_perc_entries);
+    // Free training results entries (q-values for subset only — not needed)
+    drop(train_results.entries);
+
+    // Phase 5: Score ALL entries by streaming through Parquet files
+    let mut all_scores = vec![0.0f64; total_entries];
+
+    for (file_idx, (file_name, _fdr_entries)) in per_file_entries.iter().enumerate() {
+        let cache_path = per_file_cache_paths
+            .get(file_name.as_str())
+            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
+
+        let file_features = load_pin_features_from_parquet(cache_path)?;
+        let (offset, _) = file_offsets[file_idx];
+
+        for (local_idx, mut features) in file_features.into_iter().enumerate() {
+            let global_idx = offset + local_idx;
+            standardizer.transform_slice(&mut features);
+            // Score = w · x + b
+            let mut score = avg_bias;
+            for (w, x) in avg_weights.iter().zip(features.iter()) {
+                score += w * x;
+            }
+            all_scores[global_idx] = score;
+        }
+    }
+
+    // Phase 6: Compute q-values and PEP from flat scores array
+    let fdr_results = percolator::compute_fdr_from_scores(
+        &all_scores,
+        &all_labels,
+        &all_entry_ids,
+        &all_peptides,
+        &all_file_names,
+        perc_config.test_fdr,
+    );
+
+    // Phase 7: Map results back to FdrEntry stubs
+    for (file_idx, (_, entries)) in per_file_entries.iter_mut().enumerate() {
+        let (offset, _) = file_offsets[file_idx];
+        for (local_idx, entry) in entries.iter_mut().enumerate() {
+            let global_idx = offset + local_idx;
+            let result = &fdr_results[global_idx];
+            entry.run_qvalue = result.run_precursor_qvalue.max(result.run_peptide_qvalue);
+            entry.experiment_qvalue = result
+                .experiment_precursor_qvalue
+                .max(result.experiment_peptide_qvalue);
+            entry.score = all_scores[global_idx];
+            entry.pep = result.pep;
+        }
+    }
+
+    Ok(())
+}
+
+/// Direct (non-streaming) Percolator FDR for small-to-medium experiments.
+///
+/// Loads all features into memory and passes them to run_percolator.
+/// Used when total entries are small enough to fit in memory.
+fn run_percolator_fdr_direct(
+    per_file_entries: &mut [(String, Vec<FdrEntry>)],
+    per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
+    perc_config: &percolator::PercolatorConfig,
+) -> Result<()> {
     let mut perc_entries = Vec::new();
     for (file_name, fdr_entries) in per_file_entries.iter() {
         let cache_path = per_file_cache_paths
@@ -2393,28 +2714,17 @@ fn run_percolator_fdr(
             .ok_or_else(|| {
                 OspreyError::config(format!("No parquet cache path for file {}", file_name))
             })?;
-        let full_entries = load_scores_parquet(cache_path)?;
-        if full_entries.len() != fdr_entries.len() {
+        let file_features = load_pin_features_from_parquet(cache_path)?;
+        if file_features.len() != fdr_entries.len() {
             return Err(OspreyError::config(format!(
                 "Parquet cache entry count mismatch for {}: {} vs {}",
                 file_name,
-                full_entries.len(),
+                file_features.len(),
                 fdr_entries.len()
             )));
         }
 
-        for (fdr_entry, full_entry) in fdr_entries.iter().zip(full_entries.iter()) {
-            let features: Vec<f64> = (0..NUM_PIN_FEATURES)
-                .map(|i| {
-                    let v = pin_feature_value(&full_entry.features, i);
-                    if v.is_finite() {
-                        v
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
-
+        for (fdr_entry, features) in fdr_entries.iter().zip(file_features.into_iter()) {
             let psm_id = format!(
                 "{}_{}_{}_{}",
                 file_name, fdr_entry.modified_sequence, fdr_entry.charge, fdr_entry.scan_number
@@ -2432,20 +2742,7 @@ fn run_percolator_fdr(
         }
     }
 
-    let coelution_feature_names = get_pin_feature_names();
-    let perc_config = percolator::PercolatorConfig {
-        train_fdr: config.run_fdr,
-        test_fdr: config.run_fdr,
-        feature_names: Some(
-            coelution_feature_names
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        ),
-        ..Default::default()
-    };
-
-    let results = percolator::run_percolator(&perc_entries, &perc_config)
+    let results = percolator::run_percolator(&perc_entries, perc_config)
         .map_err(|e| OspreyError::config(format!("Percolator failed: {}", e)))?;
 
     // Build result lookup
@@ -2460,7 +2757,6 @@ fn run_percolator_fdr(
                 file_name, entry.modified_sequence, entry.charge, entry.scan_number
             );
             if let Some(result) = result_map.get(psm_id.as_str()) {
-                // Enforce dual FDR: max of precursor and peptide q-values
                 entry.run_qvalue = result.run_precursor_qvalue.max(result.run_peptide_qvalue);
                 entry.experiment_qvalue = result
                     .experiment_precursor_qvalue
@@ -2470,8 +2766,6 @@ fn run_percolator_fdr(
             }
         }
     }
-
-    // Per-file and experiment stats already logged by percolator.rs
 
     Ok(())
 }
