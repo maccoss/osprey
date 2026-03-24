@@ -2760,7 +2760,6 @@ fn run_percolator_fdr(
     // Free subsampling structures
     drop(groups);
     drop(selected_peptides);
-    drop(peptide_count);
 
     log::info!(
         "  Subsampled {} entries ({} targets, {} decoys) for SVM training",
