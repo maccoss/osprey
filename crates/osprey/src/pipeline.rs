@@ -1452,6 +1452,150 @@ fn load_pin_features_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<f64>
     Ok(all_features)
 }
 
+/// Load only FdrEntry stub fields from a parquet cache file.
+///
+/// Reads only 10 columns (entry_id, is_decoy, charge, scan_number, apex_rt,
+/// start_rt, end_rt, modified_sequence, file_name, fragment_coelution_sum)
+/// using a ProjectionMask. This avoids deserializing binary columns (fragments,
+/// CWT candidates, XICs) and most feature columns, reducing I/O from ~940 bytes
+/// to ~100 bytes per entry.
+fn load_fdr_stubs_from_parquet(path: &std::path::Path) -> Result<Vec<FdrEntry>> {
+    use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array, UInt8Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ProjectionMask;
+
+    let stub_columns = [
+        "entry_id",
+        "is_decoy",
+        "charge",
+        "scan_number",
+        "apex_rt",
+        "start_rt",
+        "end_rt",
+        "modified_sequence",
+        "file_name",
+        "fragment_coelution_sum",
+    ];
+
+    let file = std::fs::File::open(path).map_err(|e| {
+        OspreyError::config(format!("Failed to open parquet {}: {}", path.display(), e))
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        OspreyError::config(format!("Failed to read parquet {}: {}", path.display(), e))
+    })?;
+
+    let parquet_schema = builder.parquet_schema().clone();
+    let arrow_schema = builder.schema().clone();
+    let col_indices: Vec<usize> = stub_columns
+        .iter()
+        .filter_map(|name| arrow_schema.column_with_name(name).map(|(idx, _)| idx))
+        .collect();
+
+    if col_indices.len() != stub_columns.len() {
+        return Err(OspreyError::OutputError(format!(
+            "Stale scores cache {}: missing FdrEntry columns. Delete and re-run.",
+            path.display(),
+        )));
+    }
+
+    let projection = ProjectionMask::roots(&parquet_schema, col_indices);
+    let reader = builder.with_projection(projection).build().map_err(|e| {
+        OspreyError::config(format!(
+            "Failed to build reader for {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let mut stubs = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| OspreyError::config(format!("Failed to read batch: {}", e)))?;
+
+        let entry_id_col = batch
+            .column_by_name("entry_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let decoy_col = batch
+            .column_by_name("is_decoy")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let charge_col = batch
+            .column_by_name("charge")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+        let scan_col = batch
+            .column_by_name("scan_number")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let apex_col = batch
+            .column_by_name("apex_rt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let start_col = batch
+            .column_by_name("start_rt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let end_col = batch
+            .column_by_name("end_rt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let modseq_col = batch
+            .column_by_name("modified_sequence")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let fname_col = batch
+            .column_by_name("file_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let coelution_col = batch
+            .column_by_name("fragment_coelution_sum")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        for row in 0..batch.num_rows() {
+            stubs.push(FdrEntry {
+                entry_id: entry_id_col.value(row),
+                is_decoy: decoy_col.value(row),
+                charge: charge_col.value(row),
+                scan_number: scan_col.value(row),
+                apex_rt: apex_col.value(row),
+                start_rt: start_col.value(row),
+                end_rt: end_col.value(row),
+                coelution_sum: coelution_col.value(row),
+                score: 0.0,
+                run_qvalue: 1.0,
+                experiment_qvalue: 1.0,
+                pep: 1.0,
+                modified_sequence: modseq_col.value(row).to_string(),
+                file_name: fname_col.value(row).to_string(),
+            });
+        }
+    }
+
+    Ok(stubs)
+}
+
 /// Load only CWT candidates from a parquet cache file.
 ///
 /// Returns one Vec<CwtCandidate> per entry, in the same order as entries were written.
@@ -1780,12 +1924,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         // Check for cached scores parquet (skip search if already scored)
         let scores_path = scores_path_for_input(input_file);
-        let entries = if scores_path.exists() {
-            match load_scores_parquet(&scores_path) {
-                Ok(entries) => {
+        let cached_stubs = if scores_path.exists() {
+            match load_fdr_stubs_from_parquet(&scores_path) {
+                Ok(stubs) => {
                     log::info!(
                         "Loaded {} cached scores from {}",
-                        entries.len(),
+                        stubs.len(),
                         scores_path.display()
                     );
                     // Load cached calibration for inter-replicate reconciliation
@@ -1806,7 +1950,29 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                             }
                         }
                     }
-                    entries
+                    // For PIN writing: if needed and PIN doesn't exist yet,
+                    // fall back to full parquet load for this file
+                    if write_pin {
+                        let pin_path_check = mokapot_dir.join(format!("{}.pin", file_name));
+                        if pin_path_check.exists() {
+                            pin_files.insert(file_name.clone(), pin_path_check);
+                        } else {
+                            // Need full entries for PIN writing
+                            if let Ok(full_entries) = load_scores_parquet(&scores_path) {
+                                let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
+                                    compete_target_decoy_pairs(full_entries)
+                                } else {
+                                    full_entries
+                                };
+                                if let Ok(pin_path) =
+                                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)
+                                {
+                                    pin_files.insert(file_name.clone(), pin_path);
+                                }
+                            }
+                        }
+                    }
+                    Some(stubs)
                 }
                 Err(e) => {
                     log::warn!(
@@ -1814,17 +1980,16 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         scores_path.display(),
                         e
                     );
-                    // Fall through to scoring below
-                    Vec::new()
+                    None
                 }
             }
         } else {
-            Vec::new()
+            None
         };
 
-        // If we got cached entries, skip loading spectra and scoring
-        let entries = if !entries.is_empty() {
-            entries
+        // If we got cached stubs, skip loading spectra and scoring
+        let fdr_entries = if let Some(stubs) = cached_stubs {
+            stubs
         } else {
             // Load spectra
             let (spectra, ms1_index) = load_all_spectra(input_file)?;
@@ -1933,28 +2098,22 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 log::warn!("Failed to save scores to {}: {}", scores_path.display(), e);
             }
 
-            entries
+            // Write coelution PIN file (if mokapot or --write-pin)
+            if write_pin {
+                let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
+                    compete_target_decoy_pairs(entries.clone())
+                } else {
+                    entries.clone()
+                };
+                let pin_path = mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
+                pin_files.insert(file_name.clone(), pin_path);
+            }
+
+            // Convert to lightweight FdrEntry stubs
+            entries.iter().map(|e| e.to_fdr_entry()).collect()
         };
 
-        // Write coelution PIN file (if mokapot or --write-pin)
-        // Mokapot expects pre-competed data (winners only), so compete before writing PIN.
-        // Native Percolator does internal paired competition, so keep both target and decoy.
-        if write_pin {
-            let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
-                compete_target_decoy_pairs(entries.clone())
-            } else {
-                entries.clone()
-            };
-            let pin_path = mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
-            pin_files.insert(file_name.clone(), pin_path);
-        }
-
-        // Convert to lightweight FdrEntry stubs. Full entry data is persisted
-        // in the .scores.parquet cache and reloaded on demand for Percolator
-        // feature extraction, reconciliation, and blib/report output.
-        let fdr_entries: Vec<FdrEntry> = entries.iter().map(|e| e.to_fdr_entry()).collect();
         per_file_cache_paths.insert(file_name.clone(), scores_path);
-
         per_file_entries.push((file_name, fdr_entries));
     }
 
