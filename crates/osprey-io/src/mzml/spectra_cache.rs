@@ -6,7 +6,7 @@
 //!
 //! Format (little-endian):
 //! ```text
-//! [magic: 8 bytes "OSPRYSPEC"]
+//! [magic: 8 bytes "OSPRSPC\0"]
 //! [version: u32]
 //! [n_ms2: u32]
 //! [n_ms1: u32]
@@ -30,7 +30,11 @@ const MAGIC: &[u8; 8] = b"OSPRSPC\0";
 const VERSION: u32 = 1;
 
 /// Save spectra to a binary cache file for fast reload.
-pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Index) -> Result<()> {
+pub fn save_spectra_cache(
+    path: &Path,
+    spectra: &[Spectrum],
+    ms1_index: &MS1Index,
+) -> Result<()> {
     let file = File::create(path).map_err(|e| {
         OspreyError::IoError(std::io::Error::other(format!(
             "Failed to create spectra cache '{}': {}",
@@ -52,8 +56,7 @@ pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Inde
 
     // MS2 spectra
     for s in spectra {
-        w.write_all(&s.scan_number.to_le_bytes())
-            .map_err(write_err)?;
+        w.write_all(&s.scan_number.to_le_bytes()).map_err(write_err)?;
         w.write_all(&s.retention_time.to_le_bytes())
             .map_err(write_err)?;
         w.write_all(&s.precursor_mz.to_le_bytes())
@@ -67,8 +70,9 @@ pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Inde
         w.write_all(&(s.mzs.len() as u32).to_le_bytes())
             .map_err(write_err)?;
         // Write mzs as raw bytes
-        let mz_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(s.mzs.as_ptr() as *const u8, s.mzs.len() * 8) };
+        let mz_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(s.mzs.as_ptr() as *const u8, s.mzs.len() * 8)
+        };
         w.write_all(mz_bytes).map_err(write_err)?;
         // Write intensities as raw bytes
         let int_bytes: &[u8] = unsafe {
@@ -79,14 +83,14 @@ pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Inde
 
     // MS1 spectra
     for s in ms1_spectra {
-        w.write_all(&s.scan_number.to_le_bytes())
-            .map_err(write_err)?;
+        w.write_all(&s.scan_number.to_le_bytes()).map_err(write_err)?;
         w.write_all(&s.retention_time.to_le_bytes())
             .map_err(write_err)?;
         w.write_all(&(s.mzs.len() as u32).to_le_bytes())
             .map_err(write_err)?;
-        let mz_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(s.mzs.as_ptr() as *const u8, s.mzs.len() * 8) };
+        let mz_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(s.mzs.as_ptr() as *const u8, s.mzs.len() * 8)
+        };
         w.write_all(mz_bytes).map_err(write_err)?;
         let int_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(s.intensities.as_ptr() as *const u8, s.intensities.len() * 4)
@@ -141,8 +145,9 @@ pub fn load_spectra_cache(path: &Path) -> Result<(Vec<Spectrum>, MS1Index)> {
         let n_peaks = read_u32(&mut r)? as usize;
 
         let mut mzs = vec![0f64; n_peaks];
-        let mz_bytes: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(mzs.as_mut_ptr() as *mut u8, n_peaks * 8) };
+        let mz_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(mzs.as_mut_ptr() as *mut u8, n_peaks * 8)
+        };
         r.read_exact(mz_bytes).map_err(read_err)?;
 
         let mut intensities = vec![0f32; n_peaks];
@@ -169,8 +174,9 @@ pub fn load_spectra_cache(path: &Path) -> Result<(Vec<Spectrum>, MS1Index)> {
         let n_peaks = read_u32(&mut r)? as usize;
 
         let mut mzs = vec![0f64; n_peaks];
-        let mz_bytes: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(mzs.as_mut_ptr() as *mut u8, n_peaks * 8) };
+        let mz_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(mzs.as_mut_ptr() as *mut u8, n_peaks * 8)
+        };
         r.read_exact(mz_bytes).map_err(read_err)?;
 
         let mut intensities = vec![0f32; n_peaks];

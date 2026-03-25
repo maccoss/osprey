@@ -27,6 +27,7 @@ Osprey has a **working prototype** that can:
 | [08 - BiblioSpec Output Schema](08-blib-output-schema.md) | blib output format and Skyline integration |
 | [09 - Determinism](09-determinism.md) | Deterministic analysis: patterns, invariants, and maintenance |
 | [10 - Cross-Run Reconciliation](10-cross-run-reconciliation.md) | Consensus RT computation and peak alignment across replicates |
+| [12 - Intermediate File Formats](12-intermediate-files.md) | Calibration JSON, spectra cache, Parquet scores, blib output |
 
 ---
 
