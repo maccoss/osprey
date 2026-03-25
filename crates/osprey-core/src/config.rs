@@ -483,9 +483,9 @@ pub struct ReconciliationConfig {
     pub enabled: bool,
     /// Number of CWT candidate peaks to store per precursor (default: 5)
     pub top_n_peaks: usize,
-    /// FDR threshold for selecting consensus peptides (default: 0.05)
-    /// More liberal than final FDR to cast a wider net and rescue peptides
-    /// with supporting evidence across replicates.
+    /// FDR threshold for selecting consensus peptides (default: 0.01)
+    /// Uses the same threshold as the final FDR to avoid reconciling
+    /// low-confidence peptides that generate excessive forced integrations.
     pub consensus_fdr: f64,
 }
 
@@ -494,7 +494,7 @@ impl Default for ReconciliationConfig {
         Self {
             enabled: true,
             top_n_peaks: 5,
-            consensus_fdr: 0.05,
+            consensus_fdr: 0.01,
         }
     }
 }

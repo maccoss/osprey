@@ -1438,7 +1438,11 @@ fn load_pin_features_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<f64>
                 .iter()
                 .map(|col| {
                     let v = col.value(row);
-                    if v.is_finite() { v } else { 0.0 }
+                    if v.is_finite() {
+                        v
+                    } else {
+                        0.0
+                    }
                 })
                 .collect();
             all_features.push(features);
@@ -1955,14 +1959,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         } else {
                             // Need full entries for PIN writing
                             if let Ok(full_entries) = load_scores_parquet(&scores_path) {
-                                let pin_entries =
-                                    if config.fdr_method == FdrMethod::Mokapot {
-                                        compete_target_decoy_pairs(full_entries)
-                                    } else {
-                                        full_entries
-                                    };
-                                if let Ok(pin_path) = mokapot
-                                    .write_pin_file(&file_name, &pin_entries, &mokapot_dir)
+                                let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
+                                    compete_target_decoy_pairs(full_entries)
+                                } else {
+                                    full_entries
+                                };
+                                if let Ok(pin_path) =
+                                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)
                                 {
                                     pin_files.insert(file_name.clone(), pin_path);
                                 }
@@ -2102,8 +2105,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 } else {
                     entries.clone()
                 };
-                let pin_path =
-                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
+                let pin_path = mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
                 pin_files.insert(file_name.clone(), pin_path);
             }
 
@@ -2783,9 +2785,7 @@ fn run_percolator_fdr(
         let (file_name, _) = &per_file_entries[file_idx];
         let cache_path = per_file_cache_paths
             .get(file_name.as_str())
-            .ok_or_else(|| {
-                OspreyError::config(format!("No parquet cache for {}", file_name))
-            })?;
+            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
         for &(pos, local_idx) in entries_in_file {
@@ -2861,9 +2861,7 @@ fn run_percolator_fdr(
     for (file_idx, (file_name, fdr_entries)) in per_file_entries.iter_mut().enumerate() {
         let cache_path = per_file_cache_paths
             .get(file_name.as_str())
-            .ok_or_else(|| {
-                OspreyError::config(format!("No parquet cache for {}", file_name))
-            })?;
+            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
 
@@ -2877,11 +2875,7 @@ fn run_percolator_fdr(
         }
 
         if (file_idx + 1) % 10 == 0 || file_idx + 1 == n_files {
-            log::info!(
-                "  Scored {}/{} files",
-                file_idx + 1,
-                n_files
-            );
+            log::info!("  Scored {}/{} files", file_idx + 1, n_files);
         }
     }
 
@@ -4311,10 +4305,7 @@ impl FileRescoreContext {
                     result
                 }
                 Err(e) => {
-                    log::warn!(
-                        "Failed to load spectra cache, falling back to mzML: {}",
-                        e
-                    );
+                    log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
                     load_all_spectra(input_file)?
                 }
             }
