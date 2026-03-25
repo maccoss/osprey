@@ -1438,11 +1438,7 @@ fn load_pin_features_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<f64>
                 .iter()
                 .map(|col| {
                     let v = col.value(row);
-                    if v.is_finite() {
-                        v
-                    } else {
-                        0.0
-                    }
+                    if v.is_finite() { v } else { 0.0 }
                 })
                 .collect();
             all_features.push(features);
@@ -1959,13 +1955,14 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         } else {
                             // Need full entries for PIN writing
                             if let Ok(full_entries) = load_scores_parquet(&scores_path) {
-                                let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
-                                    compete_target_decoy_pairs(full_entries)
-                                } else {
-                                    full_entries
-                                };
-                                if let Ok(pin_path) =
-                                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)
+                                let pin_entries =
+                                    if config.fdr_method == FdrMethod::Mokapot {
+                                        compete_target_decoy_pairs(full_entries)
+                                    } else {
+                                        full_entries
+                                    };
+                                if let Ok(pin_path) = mokapot
+                                    .write_pin_file(&file_name, &pin_entries, &mokapot_dir)
                                 {
                                     pin_files.insert(file_name.clone(), pin_path);
                                 }
@@ -2105,7 +2102,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 } else {
                     entries.clone()
                 };
-                let pin_path = mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
+                let pin_path =
+                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
                 pin_files.insert(file_name.clone(), pin_path);
             }
 
@@ -2312,8 +2310,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         let total_rescored = AtomicUsize::new(0);
 
+        // Process files sequentially to limit peak memory — each file loads spectra
+        // (~1-2 GB) and full parquet entries (~1.4 GB), so parallel loading would OOM
+        // on large experiments. Per-file re-scoring is already internally parallelized.
         per_file_entries
-            .par_iter_mut()
+            .iter_mut()
             .for_each(|(file_name, fdr_entries)| {
                 // Collect consensus targets for this file
                 let consensus_targets = per_file_consensus_targets
@@ -2767,7 +2768,8 @@ fn run_percolator_fdr(
             peptide_groups.entry(key).or_default().push((fi, li));
         }
 
-        let mut groups: Vec<(&str, Vec<(usize, usize)>)> = peptide_groups.into_iter().collect();
+        let mut groups: Vec<(&str, Vec<(usize, usize)>)> =
+            peptide_groups.into_iter().collect();
         groups.sort_by_key(|&(k, _)| k);
 
         // Fisher-Yates shuffle
@@ -2819,7 +2821,9 @@ fn run_percolator_fdr(
         let (file_name, _) = &per_file_entries[file_idx];
         let cache_path = per_file_cache_paths
             .get(file_name.as_str())
-            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
+            .ok_or_else(|| {
+                OspreyError::config(format!("No parquet cache for {}", file_name))
+            })?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
         for &(pos, local_idx) in entries_in_file {
@@ -2854,7 +2858,9 @@ fn run_percolator_fdr(
     drop(subset);
     drop(subset_features);
 
-    let train_results = percolator::run_percolator(&subset_perc_entries, &perc_config)
+    let mut train_config = perc_config.clone();
+    train_config.train_only = true;
+    let train_results = percolator::run_percolator(&subset_perc_entries, &train_config)
         .map_err(|e| OspreyError::config(format!("Percolator training failed: {}", e)))?;
 
     // Extract averaged model weights and standardizer
@@ -2894,7 +2900,9 @@ fn run_percolator_fdr(
     for (file_idx, (file_name, fdr_entries)) in per_file_entries.iter_mut().enumerate() {
         let cache_path = per_file_cache_paths
             .get(file_name.as_str())
-            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
+            .ok_or_else(|| {
+                OspreyError::config(format!("No parquet cache for {}", file_name))
+            })?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
 
@@ -2908,7 +2916,11 @@ fn run_percolator_fdr(
         }
 
         if (file_idx + 1) % 10 == 0 || file_idx + 1 == n_files {
-            log::info!("  Scored {}/{} files", file_idx + 1, n_files);
+            log::info!(
+                "  Scored {}/{} files",
+                file_idx + 1,
+                n_files
+            );
         }
     }
 
@@ -4338,7 +4350,10 @@ impl FileRescoreContext {
                     result
                 }
                 Err(e) => {
-                    log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
+                    log::warn!(
+                        "Failed to load spectra cache, falling back to mzML: {}",
+                        e
+                    );
                     load_all_spectra(input_file)?
                 }
             }

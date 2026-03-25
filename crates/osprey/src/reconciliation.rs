@@ -32,7 +32,7 @@ pub struct PeptideConsensusRT {
 
 /// Compute consensus library RTs for peptides detected across runs.
 ///
-/// For each target peptide passing `consensus_fdr` in any run, and its
+/// For each target peptide passing `consensus_fdr` at experiment level, and its
 /// paired decoy, computes a consensus library RT using the weighted median
 /// of per-run detections mapped back to library RT space.
 ///
@@ -48,11 +48,11 @@ pub fn compute_consensus_rts(
     per_file_calibrations: &HashMap<String, RTCalibration>,
     consensus_fdr: f64,
 ) -> Vec<PeptideConsensusRT> {
-    // 1. Collect target peptides passing FDR in any run (run-level OR experiment-level)
+    // 1. Collect target peptides passing experiment-level FDR
     let mut target_peptides: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.run_qvalue.min(entry.experiment_qvalue) <= consensus_fdr {
+            if !entry.is_decoy && entry.experiment_qvalue <= consensus_fdr {
                 target_peptides.insert(entry.modified_sequence.clone());
             }
         }
@@ -63,7 +63,7 @@ pub fn compute_consensus_rts(
     }
 
     log::info!(
-        "Inter-replicate reconciliation: {} target peptides pass {:.1}% FDR in at least one run",
+        "Inter-replicate reconciliation: {} target peptides pass {:.1}% experiment-level FDR",
         target_peptides.len(),
         consensus_fdr * 100.0
     );
@@ -210,7 +210,7 @@ pub fn refit_calibration_with_consensus(
     let mut measured_rts = Vec::new();
 
     for entry in entries {
-        if entry.is_decoy || entry.run_qvalue.min(entry.experiment_qvalue) > consensus_fdr {
+        if entry.is_decoy || entry.experiment_qvalue > consensus_fdr {
             continue;
         }
         if let Some(&consensus_lib_rt) = consensus_map.get(entry.modified_sequence.as_str()) {

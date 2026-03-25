@@ -42,6 +42,10 @@ pub struct PercolatorConfig {
     /// ALL entries. 300K divides evenly by 3 folds (100K per fold).
     /// Set to 0 to disable subsampling.
     pub max_train_size: usize,
+    /// When true, suppress per-file/experiment FDR summary logging.
+    /// Used in the streaming path where run_percolator is called on a training
+    /// subset and the FDR numbers are meaningless.
+    pub train_only: bool,
 }
 
 impl Default for PercolatorConfig {
@@ -55,6 +59,7 @@ impl Default for PercolatorConfig {
             c_values: vec![0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
             feature_names: None,
             max_train_size: 300_000,
+            train_only: false,
         }
     }
 }
@@ -481,84 +486,86 @@ pub fn run_percolator(
         })
         .collect();
 
-    // Log per-file run-level statistics
-    let mut file_groups: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, entry) in entries.iter().enumerate() {
-        file_groups
-            .entry(entry.file_name.as_str())
-            .or_default()
-            .push(i);
-    }
-    let mut sorted_files: Vec<&str> = file_groups.keys().copied().collect();
-    sorted_files.sort();
+    // Log per-file and experiment-level FDR statistics (skip in train_only mode)
+    if !config.train_only {
+        let mut file_groups: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, entry) in entries.iter().enumerate() {
+            file_groups
+                .entry(entry.file_name.as_str())
+                .or_default()
+                .push(i);
+        }
+        let mut sorted_files: Vec<&str> = file_groups.keys().copied().collect();
+        sorted_files.sort();
 
-    log::info!("");
-    log::info!(
-        "=== Per-file results (run-level FDR at {:.0}%) ===",
-        config.test_fdr * 100.0
-    );
-    for file_name in &sorted_files {
-        let indices = &file_groups[file_name];
-        let passing: Vec<usize> = indices
-            .iter()
-            .copied()
+        log::info!("");
+        log::info!(
+            "=== Per-file results (run-level FDR at {:.0}%) ===",
+            config.test_fdr * 100.0
+        );
+        for file_name in &sorted_files {
+            let indices = &file_groups[file_name];
+            let passing: Vec<usize> = indices
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    !entries[i].is_decoy
+                        && results[i]
+                            .run_precursor_qvalue
+                            .max(results[i].run_peptide_qvalue)
+                            <= config.test_fdr
+                })
+                .collect();
+            let precursor_count = passing
+                .iter()
+                .map(|&i| (entries[i].peptide.as_str(), entries[i].charge))
+                .collect::<HashSet<_>>()
+                .len();
+            let peptide_count = passing
+                .iter()
+                .map(|&i| entries[i].peptide.as_str())
+                .collect::<HashSet<_>>()
+                .len();
+            log::info!(
+                "  {}: {} precursors, {} peptides",
+                file_name,
+                precursor_count,
+                peptide_count
+            );
+        }
+
+        // Log experiment-level statistics (using effective q-value = max of precursor and peptide)
+        let exp_passing: Vec<usize> = (0..results.len())
             .filter(|&i| {
                 !entries[i].is_decoy
                     && results[i]
-                        .run_precursor_qvalue
-                        .max(results[i].run_peptide_qvalue)
+                        .experiment_precursor_qvalue
+                        .max(results[i].experiment_peptide_qvalue)
                         <= config.test_fdr
             })
             .collect();
-        let precursor_count = passing
+        let exp_precursors = exp_passing
             .iter()
             .map(|&i| (entries[i].peptide.as_str(), entries[i].charge))
             .collect::<HashSet<_>>()
             .len();
-        let peptide_count = passing
+        let exp_peptides = exp_passing
             .iter()
             .map(|&i| entries[i].peptide.as_str())
             .collect::<HashSet<_>>()
             .len();
+
+        log::info!("");
         log::info!(
-            "  {}: {} precursors, {} peptides",
-            file_name,
-            precursor_count,
-            peptide_count
+            "=== Experiment-level results ({:.0}% FDR) ===",
+            config.test_fdr * 100.0
+        );
+        log::info!(
+            "  Experiment: {} precursors, {} peptides",
+            exp_precursors,
+            exp_peptides
         );
     }
-
-    // Log experiment-level statistics (using effective q-value = max of precursor and peptide)
-    let exp_passing: Vec<usize> = (0..results.len())
-        .filter(|&i| {
-            !entries[i].is_decoy
-                && results[i]
-                    .experiment_precursor_qvalue
-                    .max(results[i].experiment_peptide_qvalue)
-                    <= config.test_fdr
-        })
-        .collect();
-    let exp_precursors = exp_passing
-        .iter()
-        .map(|&i| (entries[i].peptide.as_str(), entries[i].charge))
-        .collect::<HashSet<_>>()
-        .len();
-    let exp_peptides = exp_passing
-        .iter()
-        .map(|&i| entries[i].peptide.as_str())
-        .collect::<HashSet<_>>()
-        .len();
-
-    log::info!("");
-    log::info!(
-        "=== Experiment-level results ({:.0}% FDR) ===",
-        config.test_fdr * 100.0
-    );
-    log::info!(
-        "  Experiment: {} precursors, {} peptides",
-        exp_precursors,
-        exp_peptides
-    );
 
     Ok(PercolatorResults {
         entries: results,
@@ -1925,13 +1932,6 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
         .map(|e| e.modified_sequence.as_str())
         .collect::<HashSet<_>>()
         .len();
-
-    log::info!("");
-    log::info!(
-        "=== Per-file results (run-level FDR at {:.0}%) ===",
-        test_fdr * 100.0
-    );
-    // Per-file stats were already logged above
 
     log::info!("");
     log::info!(
