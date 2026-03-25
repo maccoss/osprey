@@ -2675,93 +2675,127 @@ fn run_percolator_fdr(
         max_train
     );
 
-    // Phase 1: Subsample by peptide group directly from per_file_entries
-    // Build base_id -> target peptide mapping (~150K entries, ~8 MB)
-    let mut base_id_to_target_peptide: HashMap<u32, String> = HashMap::new();
-    for (_, entries) in per_file_entries.iter() {
-        for entry in entries.iter() {
-            let base_id = entry.entry_id & 0x7FFF_FFFF;
-            if !entry.is_decoy {
-                base_id_to_target_peptide
-                    .entry(base_id)
-                    .or_insert_with(|| entry.modified_sequence.clone());
-            }
-        }
-    }
-    // Handle decoy-only base_ids
-    for (_, entries) in per_file_entries.iter() {
-        for entry in entries.iter() {
-            if entry.is_decoy {
-                let base_id = entry.entry_id & 0x7FFF_FFFF;
-                base_id_to_target_peptide
-                    .entry(base_id)
-                    .or_insert_with(|| entry.modified_sequence.clone());
-            }
-        }
-    }
+    // Phase 1: Select best observation per precursor across all files for training.
+    //
+    // With 240 files × ~1M entries/file, each peptide has ~480 entries (target+decoy × 240).
+    // Selecting peptide groups would give only ~625 unique peptides to reach 300K entries.
+    // Instead, pick the BEST-scoring observation per base_id (one target, one decoy),
+    // giving ~500K unique precursor observations with maximum peptide diversity.
+    // Then subsample from those if still > max_train.
 
-    // Count entries per peptide group (just counts, no index storage)
-    let mut peptide_count: HashMap<&str, usize> = HashMap::new();
-    for (_, entries) in per_file_entries.iter() {
-        for entry in entries.iter() {
-            let base_id = entry.entry_id & 0x7FFF_FFFF;
-            let key = base_id_to_target_peptide
-                .get(&base_id)
-                .map(|s| s.as_str())
-                .unwrap_or(entry.modified_sequence.as_str());
-            *peptide_count.entry(key).or_insert(0) += 1;
-        }
-    }
-
-    // Shuffle groups and select until reaching max_train
-    let mut groups: Vec<(&str, usize)> = peptide_count.into_iter().collect();
-    groups.sort_by_key(|&(k, _)| k);
-
-    // Fisher-Yates shuffle with xorshift64 RNG (same as subsample_by_peptide_group)
-    let mut rng_state = perc_config.seed;
-    for i in (1..groups.len()).rev() {
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        let j = rng_state as usize % (i + 1);
-        groups.swap(i, j);
-    }
-
-    let mut selected_peptides: HashSet<&str> = HashSet::new();
-    let mut selected_count = 0usize;
-    for &(peptide, count) in &groups {
-        if selected_count + count > max_train && selected_count > 0 {
-            break;
-        }
-        selected_peptides.insert(peptide);
-        selected_count += count;
-    }
-
-    // Collect (file_idx, local_idx) for selected entries (second pass)
-    let mut subset: Vec<(usize, usize)> = Vec::with_capacity(selected_count);
-    let mut sub_targets = 0usize;
-    let mut sub_decoys = 0usize;
+    // Find best target and best decoy per base_id, tracking (file_idx, local_idx, score)
+    let mut best_target: HashMap<u32, (usize, usize, f64)> = HashMap::new();
+    let mut best_decoy: HashMap<u32, (usize, usize, f64)> = HashMap::new();
     for (file_idx, (_, entries)) in per_file_entries.iter().enumerate() {
         for (local_idx, entry) in entries.iter().enumerate() {
             let base_id = entry.entry_id & 0x7FFF_FFFF;
-            let key = base_id_to_target_peptide
-                .get(&base_id)
-                .map(|s| s.as_str())
-                .unwrap_or(entry.modified_sequence.as_str());
-            if selected_peptides.contains(key) {
-                subset.push((file_idx, local_idx));
-                if entry.is_decoy {
-                    sub_decoys += 1;
-                } else {
-                    sub_targets += 1;
-                }
-            }
+            let map = if entry.is_decoy {
+                &mut best_decoy
+            } else {
+                &mut best_target
+            };
+            map.entry(base_id)
+                .and_modify(|(best_fi, best_li, best_score)| {
+                    if entry.coelution_sum > *best_score {
+                        *best_fi = file_idx;
+                        *best_li = local_idx;
+                        *best_score = entry.coelution_sum;
+                    }
+                })
+                .or_insert((file_idx, local_idx, entry.coelution_sum));
         }
     }
 
-    // Free subsampling structures
-    drop(groups);
-    drop(selected_peptides);
+    // Collect all best observations: (file_idx, local_idx) pairs
+    let mut best_observations: Vec<(usize, usize)> =
+        Vec::with_capacity(best_target.len() + best_decoy.len());
+    for &(fi, li, _) in best_target.values() {
+        best_observations.push((fi, li));
+    }
+    for &(fi, li, _) in best_decoy.values() {
+        best_observations.push((fi, li));
+    }
+    best_observations.sort(); // deterministic order
+
+    let dedup_count = best_observations.len();
+    log::info!(
+        "  Best-per-precursor: {} entries ({} targets, {} decoys) from {} total",
+        dedup_count,
+        best_target.len(),
+        best_decoy.len(),
+        total_entries
+    );
+
+    drop(best_target);
+    drop(best_decoy);
+
+    // Subsample from deduplicated set if still > max_train
+    let subset: Vec<(usize, usize)> = if dedup_count <= max_train {
+        best_observations
+    } else {
+        // Build peptide groups for fair subsampling (target-decoy pairs together)
+        let mut base_id_to_peptide: HashMap<u32, String> = HashMap::new();
+        for &(fi, li) in &best_observations {
+            let entry = &per_file_entries[fi].1[li];
+            let base_id = entry.entry_id & 0x7FFF_FFFF;
+            if !entry.is_decoy {
+                base_id_to_peptide
+                    .entry(base_id)
+                    .or_insert_with(|| entry.modified_sequence.clone());
+            }
+        }
+        // Handle decoy-only base_ids
+        for &(fi, li) in &best_observations {
+            let entry = &per_file_entries[fi].1[li];
+            let base_id = entry.entry_id & 0x7FFF_FFFF;
+            if entry.is_decoy {
+                base_id_to_peptide
+                    .entry(base_id)
+                    .or_insert_with(|| entry.modified_sequence.clone());
+            }
+        }
+
+        // Group observations by peptide identity
+        let mut peptide_groups: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+        for &(fi, li) in &best_observations {
+            let entry = &per_file_entries[fi].1[li];
+            let base_id = entry.entry_id & 0x7FFF_FFFF;
+            let key = base_id_to_peptide
+                .get(&base_id)
+                .map(|s| s.as_str())
+                .unwrap_or(entry.modified_sequence.as_str());
+            peptide_groups.entry(key).or_default().push((fi, li));
+        }
+
+        let mut groups: Vec<(&str, Vec<(usize, usize)>)> = peptide_groups.into_iter().collect();
+        groups.sort_by_key(|&(k, _)| k);
+
+        // Fisher-Yates shuffle
+        let mut rng_state = perc_config.seed;
+        for i in (1..groups.len()).rev() {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            let j = rng_state as usize % (i + 1);
+            groups.swap(i, j);
+        }
+
+        let mut selected: Vec<(usize, usize)> = Vec::with_capacity(max_train);
+        for (_, indices) in &groups {
+            if selected.len() + indices.len() > max_train && !selected.is_empty() {
+                break;
+            }
+            selected.extend_from_slice(indices);
+        }
+        selected.sort();
+        selected
+    };
+
+    let sub_targets = subset
+        .iter()
+        .filter(|&&(fi, li)| !per_file_entries[fi].1[li].is_decoy)
+        .count();
+    let sub_decoys = subset.len() - sub_targets;
 
     log::info!(
         "  Subsampled {} entries ({} targets, {} decoys) for SVM training",
@@ -2819,7 +2853,6 @@ fn run_percolator_fdr(
     // Free subset memory
     drop(subset);
     drop(subset_features);
-    drop(base_id_to_target_peptide);
 
     let train_results = percolator::run_percolator(&subset_perc_entries, &perc_config)
         .map_err(|e| OspreyError::config(format!("Percolator training failed: {}", e)))?;
