@@ -69,7 +69,7 @@ PHASE 3: COELUTION SEARCH (per file)
   +- Feature extraction (21 PIN features used for scoring, ~47 computed total)
   +- Multi-charge consensus: all charge states of same peptide share peak boundaries
   +- Write full scored entries to per-file Parquet cache (ZSTD compressed)
-  +- Convert to FdrEntry stubs (~188 bytes each) — drop features, fragments, CWT
+  +- Convert to FdrEntry stubs (~80 bytes inline each) — drop features, fragments, CWT
   |
   v
 PHASE 4: FIRST-PASS FDR
@@ -248,7 +248,7 @@ For multi-file experiments (100s–1000s of files), Osprey uses a disk-backed me
 
 1. **Per-file Parquet caching**: After scoring each file, the full `CoelutionScoredEntry` data (features, fragments, CWT candidates) is written to a ZSTD-compressed Parquet cache file (`.scores.parquet`).
 
-2. **FdrEntry conversion**: Full entries are then converted to lightweight `FdrEntry` stubs (~188 bytes each vs ~940 bytes for the full entry). Stubs retain only the fields needed for FDR control: `entry_id`, `is_decoy`, `charge`, `scan_number`, `apex_rt`, `start_rt`, `end_rt`, `coelution_sum`, `score`, `run_qvalue`, `experiment_qvalue`, `pep`, `modified_sequence`, `file_name`.
+2. **FdrEntry conversion**: Full entries are then converted to lightweight `FdrEntry` stubs (~80 bytes inline each vs ~940 bytes for the full entry). Stubs retain only the 13 fields needed for FDR control: `entry_id`, `is_decoy`, `charge`, `scan_number`, `apex_rt`, `start_rt`, `end_rt`, `coelution_sum`, `score`, `run_qvalue`, `experiment_qvalue`, `pep`, `modified_sequence`. The `file_name` is not stored in FdrEntry — entries are keyed by file name in the outer container. The `modified_sequence` field uses `Arc<str>` for string interning, deduplicating identical peptide sequences across files (e.g., 240M entries → ~3.5M unique strings).
 
 3. **On-demand loading**: When downstream phases need heavy data, they load selectively from the Parquet cache:
    - **FDR**: Loads PIN feature columns to build `PercolatorEntry` for SVM scoring
@@ -256,7 +256,7 @@ For multi-file experiments (100s–1000s of files), Osprey uses a disk-backed me
    - **Re-scoring**: Loads full entries per file sequentially (not parallel) to limit memory — each file loads ~3 GB (spectra + full Parquet entries)
    - **Output**: Loads full entries only for files containing FDR-passing precursors
 
-This reduces steady-state memory from ~45 GB (200K entries × 240 files × 940 bytes) to ~9 GB (200K × 240 × 188 bytes), enabling experiments with 1000+ files on standard hardware.
+This reduces steady-state memory from ~45 GB (200K entries × 240 files × 940 bytes) to ~4 GB (200K × 240 × 80 bytes), enabling experiments with 1000+ files on standard hardware.
 
 See [FDR Control](07-fdr-control.md) for full algorithm details, fold assignment, and the target-decoy competition strategy.
 

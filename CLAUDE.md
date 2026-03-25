@@ -78,7 +78,7 @@ CI runs `cargo fmt --check` and `cargo clippy -D warnings` (including test targe
 - `crates/osprey/src/main.rs` - CLI entry point
 - `crates/osprey-fdr/src/mokapot.rs` - Mokapot integration
 - `crates/osprey-io/src/output/blib.rs` - BiblioSpec blib writer
-- `crates/osprey-core/src/types.rs` - CoelutionFeatureSet (~47 fields, 21 used in PIN), FdrEntry (~188 bytes, 14 fields)
+- `crates/osprey-core/src/types.rs` - CoelutionFeatureSet (~47 fields, 21 used in PIN), FdrEntry (~80 bytes inline, 13 fields)
 - `crates/osprey-chromatography/src/calibration/` - RT and mass calibration
 
 ## Configuration
@@ -272,11 +272,11 @@ This distinction is important: a NULL `retentionTime` with populated `startTime`
 
 Osprey uses a disk-backed stub architecture to scale to 1000+ files:
 
-- **FdrEntry** (~188 bytes): Lightweight stub with 14 fields (entry_id, is_decoy, charge, scan_number, apex/start/end_rt, coelution_sum, score, run/experiment_qvalue, pep, modified_sequence, file_name)
+- **FdrEntry** (~80 bytes inline): Lightweight stub with 13 fields (entry_id, is_decoy, charge, scan_number, apex/start/end_rt, coelution_sum, score, run/experiment_qvalue, pep, modified_sequence). The `file_name` is not stored in FdrEntry — entries are keyed by file name in the outer `Vec<(String, Vec<FdrEntry>)>`. The `modified_sequence` field uses `Arc<str>` for string interning, deduplicating identical peptide sequences across files (e.g., 240M entries → ~3.5M unique strings).
 - **Parquet caches** (`.scores.parquet`): Per-file ZSTD-compressed caches storing 21 PIN features, fragments, CWT candidates
 - **Selective loading**: `load_scores_parquet()` for full entry rehydration, `load_cwt_candidates_from_parquet()` for CWT-only reconciliation planning
 - **Sequential re-scoring**: Reconciliation re-scoring processes files sequentially (not parallel) because each file loads ~3 GB (spectra + full Parquet entries); parallel loading causes OOM on large experiments
-- **Steady-state RAM**: ~188 bytes × entries × files (vs ~940 bytes without caching)
+- **Steady-state RAM**: ~80 bytes × entries × files (vs ~940 bytes without caching), plus shared `Arc<str>` interning pool
 
 ## Recent Changes
 
@@ -305,7 +305,7 @@ Osprey uses a disk-backed stub architecture to scale to 1000+ files:
 - Added binary spectra cache (.spectra.bin) for faster second-pass mzML loading
 - Merged multi-charge consensus + cross-run reconciliation into single post-FDR phase (one spectra load per file)
 - Skip consensus re-scoring for peptide groups where no charge state passes FDR
-- FdrEntry memory architecture: lightweight stubs (~188 bytes) replace full scored entries (~940 bytes) in memory after per-file Parquet caching; heavy data (features, fragments, CWT candidates) reloaded on-demand from disk, enabling 1000+ file experiments without OOM
+- FdrEntry memory architecture: lightweight stubs (~80 bytes inline, `Arc<str>`-interned `modified_sequence`) replace full scored entries (~940 bytes) in memory after per-file Parquet caching; heavy data (features, fragments, CWT candidates) reloaded on-demand from disk, enabling 1000+ file experiments without OOM
 - Selective Parquet loaders: `load_cwt_candidates_from_parquet()` for reconciliation, PIN feature loading for FDR, full entry reload for blib output
 - Removed `shrink_for_fdr()` in favor of FdrEntry conversion + Parquet caching
 - Best-per-precursor subsampling for streaming Percolator: finds best observation per base_id across all files before subsampling, maximizing peptide diversity for SVM training on 100+ file experiments
@@ -313,3 +313,5 @@ Osprey uses a disk-backed stub architecture to scale to 1000+ files:
 - Reconciliation consensus uses experiment-level FDR only (was `min(run, experiment)`), reducing consensus set to truly confident identifications
 - Sequential reconciliation re-scoring: `iter_mut()` instead of `par_iter_mut()` to prevent OOM from parallel spectra loading (~3 GB per file)
 - Changed `consensus_fdr` default from 0.05 to 0.01
+- Removed `file_name` from FdrEntry (redundant with outer `Vec<(String, Vec<FdrEntry>)>` key) — saves ~40 bytes heap per entry
+- Interned `modified_sequence` with `Arc<str>` — deduplicates peptide strings across GPF replicates, saving ~25 bytes heap per entry on large experiments

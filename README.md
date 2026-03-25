@@ -307,6 +307,7 @@ The primary output is a SQLite database in BiblioSpec format, compatible with Sk
 - **RefSpectraPeaks**: Fragment m/z and intensities
 - **Modifications**: Modification positions and masses
 - **Proteins/RefSpectraProteins**: Protein accessions and mappings
+- **RetentionTimes**: Per-file peak boundaries with nullable retentionTime for Skyline ID lines
 - **OspreyPeakBoundaries**: Peak boundaries (StartRT, EndRT, ApexRT) per run
 - **OspreyRunScores**: Run-level q-values and scores
 - **OspreyExperimentScores**: Experiment-level q-values
@@ -379,6 +380,22 @@ For each candidate precursor:
 4. Score using spectral matching (dot product, XCorr, hyperscore) at the apex
 5. Extract 21 features per precursor for machine learning scoring via built-in Percolator SVM (or optionally Mokapot)
 
+### Cross-Run Peak Reconciliation
+
+For multi-file experiments, Osprey reconciles peak integration boundaries across replicates after the initial FDR pass:
+
+1. Collect peptides passing FDR across all files
+2. Compute consensus library RTs using weighted median of per-run detections
+3. Refit per-run LOESS calibration using consensus peptides
+4. For each entry in each run: keep the existing peak, switch to an alternate CWT candidate at the consensus RT, or perform forced integration
+5. Re-score reconciled entries and compute final experiment-level q-values
+
+This ensures consistent quantification across replicates by aligning peak boundaries to the same chromatographic feature. See [Cross-Run Reconciliation](docs/10-cross-run-reconciliation.md) for algorithm details.
+
+### Disk-Backed Memory Architecture
+
+Osprey uses per-file Parquet caching to scale to 1000+ file experiments without running out of memory. After scoring each file, the full scored entries are written to ZSTD-compressed Parquet caches and replaced in memory with lightweight FdrEntry stubs (~80 bytes each). Heavy data (features, fragments, CWT candidates) is reloaded on-demand from disk only when needed. Peptide sequence strings are deduplicated using `Arc<str>` interning across files. See [Pipeline Overview](docs/README.md) for memory architecture details.
+
 ## Development
 
 ### Project Structure
@@ -425,26 +442,34 @@ cargo doc --open
 - EncyclopeDIA elib library loading
 - BiblioSpec blib library loading
 - Fragment XIC co-elution analysis with ppm-based fragment matching
-- Peak detection with Tukey median polish peak boundaries
+- CWT consensus peak detection (Mexican Hat wavelet, median across transitions)
+- Tukey median polish for robust peak boundaries and fragment scoring
+- Signal pre-filter for ~30% speedup on HRAM data (disable with `--no-prefilter`)
 - RT calibration with LOESS regression and stratified sampling
 - MS1/MS2 mass calibration
 - Enzyme-aware decoy generation with fragment recalculation
 - 21-feature extraction per precursor for machine learning scoring
 - Built-in Percolator-style semi-supervised SVM for FDR control (no Python required)
-- Two-level FDR control (run + experiment level) with optional Mokapot integration
-- Tukey median polish for robust elution profiles and fragment scoring
+- Two-level FDR control (run + experiment level) with dual precursor + peptide level FDR
+- Optional Mokapot integration with parallel workers and progress streaming
+- Cross-run peak reconciliation: aligns integration boundaries across replicates using consensus RTs
+- Multi-file observation propagation: all per-file observations for passing precursors included in output
+- Disk-backed memory architecture with per-file Parquet caching for 1000+ file experiments
+- Binary spectra cache for faster second-pass mzML loading
 - Fragment co-elution scoring, elution-weighted cosine
 - Mass accuracy features (ppm-level)
 - MS1 isotope envelope and precursor co-elution features
-- blib output with Osprey extension tables
+- blib output with Osprey extension tables (library theoretical fragments)
 - YAML configuration
 - CLI with all core options
 - Calibration JSON save/load and HTML report generation
 
 ### TODO
 
-- Two-step search strategy
+- EMG peak fitting (Levenberg-Marquardt)
+- Feature weight optimization (remove low-value features)
 - Background correction
+- Two-step search strategy
 - Iterative candidate expansion
 
 ## Citation

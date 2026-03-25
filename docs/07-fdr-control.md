@@ -7,7 +7,7 @@ Osprey uses two-level FDR (False Discovery Rate) control to ensure high-quality 
 ```
 FDR Control Workflow:
   1. Extract features per precursor (21 PIN features written to per-file Parquet cache)
-  2. Convert to FdrEntry stubs (lightweight, ~188 bytes each)
+  2. Convert to FdrEntry stubs (lightweight, ~80 bytes inline each, Arc<str>-interned peptide sequences)
   3. Dispatch to selected FDR method:
      - Percolator (default): native linear SVM with cross-validation
        (loads PIN features on-demand from Parquet)
