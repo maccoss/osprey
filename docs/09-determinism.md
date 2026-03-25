@@ -21,6 +21,7 @@ Every time results are collected from a `HashMap`, they are immediately sorted i
 - `deduplicate_pairs()`: Groups entries by `base_id` using HashMap, then sorts results by `entry_id` (`pipeline.rs`)
 - `select_consensus_peaks()`: Groups entries by `modified_sequence` using HashMap, result sorted by `(entry_id, scan_number)` (`pipeline.rs`)
 - `compete_calibration_pairs()`: Collects winners from HashMap, sorts by `(score, base_id)` (`calibration_ml.rs`)
+- Best-per-precursor subsampling: Collects best target/decoy per `base_id` from HashMap, sorts `best_observations` by `(file_idx, local_idx)`, sorts peptide groups alphabetically before subsampling (`pipeline.rs`)
 
 **Pattern:**
 ```rust
@@ -146,6 +147,7 @@ When adding new code to Osprey, verify these invariants:
 | `pipeline.rs:run_search()` | Sort `all_entries` by `entry_id` | Rayon parallel window processing |
 | `pipeline.rs:run_search()` | Sort `deduped` by `(entry_id, scan_number)` | HashMap-based overlapping-window dedup |
 | `pipeline.rs:run_search()` | Re-sort after multi-charge consensus | HashMap-based grouping + re-scoring merge |
+| `pipeline.rs` | Best-per-precursor: sort `best_observations`, sort peptide groups | HashMap-based best target/decoy per base_id |
 | `pipeline.rs:deduplicate_pairs()` | Sort by `entry_id` | HashMap-based target-decoy pairing |
 | `calibration_ml.rs` | Sort winners by `(score, base_id)` | HashMap-based target-decoy competition |
 | `calibration_ml.rs` | Fold assignment by sequence hash | Cross-validation reproducibility |
@@ -153,6 +155,7 @@ When adding new code to Osprey, verify these invariants:
 | `pipeline.rs` | Window groups sorted by lower m/z | Window processing order |
 | `pipeline.rs` | FdrEntry stubs maintain entry order | Parquet write order = sorted entry order |
 | `pipeline.rs` | Parquet round-trip preserves f64 values | No floating-point drift across reload |
+| `pipeline.rs` | Sequential re-scoring (`iter_mut()`) | Avoids nondeterministic parallel float accumulation + OOM |
 | `pipeline.rs:rt_mz_index` | Entries sorted by expected_rt within m/z bins | Binary search reproducibility |
 
 ---

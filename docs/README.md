@@ -73,12 +73,14 @@ PHASE 3: COELUTION SEARCH (per file)
   |
   v
 PHASE 4: FIRST-PASS FDR
+  +- Best-per-precursor subsampling: find best observation per base_id across files
+  |    (maximizes peptide diversity for SVM training on multi-file experiments)
   +- Load PIN features on-demand from per-file Parquet caches
   +- FDR control (Percolator SVM or Mokapot) -> run-level q-values
   |
   v
 PHASE 5: CROSS-RUN RECONCILIATION (multi-file only)
-  +- Collect peptides passing FDR in any run (at consensus_fdr threshold)
+  +- Collect peptides passing experiment-level FDR (at consensus_fdr threshold)
   +- Compute consensus library RTs: weighted median of per-run detections
   |    (weight = coelution_sum; mapped back to library RT space via inverse calibration)
   +- Refit per-run LOESS calibration using consensus peptides
@@ -86,6 +88,7 @@ PHASE 5: CROSS-RUN RECONCILIATION (multi-file only)
   |    Keep | UseCwtPeak (alternate stored candidate) | ForcedIntegration
   |    (CWT candidates loaded selectively from Parquet — no full entry reload)
   +- Re-score reconciled entries at updated peak boundaries
+  |    (files processed sequentially to limit memory — each loads ~3 GB)
   +- Second-pass FDR -> final q-values
   |
   v
@@ -250,6 +253,7 @@ For multi-file experiments (100s–1000s of files), Osprey uses a disk-backed me
 3. **On-demand loading**: When downstream phases need heavy data, they load selectively from the Parquet cache:
    - **FDR**: Loads PIN feature columns to build `PercolatorEntry` for SVM scoring
    - **Reconciliation**: Loads CWT candidates only via `load_cwt_candidates_from_parquet()`
+   - **Re-scoring**: Loads full entries per file sequentially (not parallel) to limit memory — each file loads ~3 GB (spectra + full Parquet entries)
    - **Output**: Loads full entries only for files containing FDR-passing precursors
 
 This reduces steady-state memory from ~45 GB (200K entries × 240 files × 940 bytes) to ~9 GB (200K × 240 × 188 bytes), enabling experiments with 1000+ files on standard hardware.
@@ -350,7 +354,7 @@ See: [FDR Control](07-fdr-control.md)
 
 For multi-file experiments, cross-run reconciliation aligns peak boundaries across replicates before the final FDR pass:
 
-1. **Consensus RTs**: Peptides passing FDR in any run contribute (apex_rt → library_rt) pairs. The consensus library RT is computed as the weighted median across runs (weight = coelution_sum).
+1. **Consensus RTs**: Peptides passing experiment-level FDR contribute (apex_rt → library_rt) pairs. The consensus library RT is computed as the weighted median across runs (weight = coelution_sum).
 2. **Calibration refit**: Each run's LOESS calibration is refit using consensus peptides, improving RT prediction accuracy for the second pass.
 3. **Reconciliation plan**: For each entry, the expected measured RT is predicted from the refined calibration. Three outcomes: **Keep** (current peak contains expected RT), **UseCwtPeak** (alternate stored CWT candidate overlaps), or **ForcedIntegration** (no overlapping candidate — integrate at expected RT ± half of median peak width).
 4. **Second-pass FDR**: Reconciled entries are re-scored and FDR is recomputed, producing final experiment-level q-values.

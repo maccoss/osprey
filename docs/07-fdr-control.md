@@ -144,6 +144,20 @@ For large datasets (millions of entries), SVM training can be very slow (O(n²) 
 
 The default training cap is 300,000 total entries. Subsampling operates on peptide groups to preserve target-decoy pairs and charge state groupings.
 
+#### Best-Per-Precursor Subsampling (Multi-File Streaming)
+
+For multi-file experiments (100+ files), naive peptide-group subsampling can be catastrophically bad: with 240 files, each peptide has ~480 entries (target + decoy × 240 files), so 300K entries yields only ~625 unique peptides — far too few for SVM training.
+
+The streaming Percolator path uses **best-per-precursor subsampling**:
+
+1. Find the best-scoring observation (by `coelution_sum`) per `base_id` across ALL files — one target and one decoy per precursor
+2. This produces ~500K deduplicated entries with maximum peptide diversity
+3. If this deduplicated set exceeds `max_train`, subsample peptide groups from it
+4. Train SVM on the subsampled best-per-precursor entries (`train_only` mode suppresses FDR logging since q-values from the training subset are meaningless)
+5. Score ALL entries across all files with the trained model by streaming through per-file Parquet caches
+
+This ensures ~100K+ unique peptides in the training set regardless of file count, vs ~625 with naive subsampling.
+
 ### Initial Feature Selection
 
 Before SVM training, the single best-discriminating feature is found by testing **both ascending and descending** directions for each feature:

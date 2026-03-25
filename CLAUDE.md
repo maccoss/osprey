@@ -256,16 +256,17 @@ This distinction is important: a NULL `retentionTime` with populated `startTime`
 ### FDR Pipeline Flow (Multi-File)
 
 1. Score each file: write full entries to per-file Parquet cache, convert to FdrEntry stubs
-2. Load PIN features from Parquet on-demand, train model on all files
-3. Score all entries with trained model, update FdrEntry stubs
-4. Compute run-level q-values per file (precursor + peptide level)
-5. Select best observation per precursor across experiment
-6. Compute experiment-level q-values (precursor + peptide level)
-7. Apply `max(precursor, peptide)` at both run and experiment levels
-8. Determine passing precursors: `experiment_qvalue <= threshold`
-9. Reload full entries from Parquet only for files with passing precursors
-10. Include ALL per-file observations for passing precursors in output
-11. Propagate best experiment_qvalue to all observations
+2. **Best-per-precursor subsampling**: Find the best-scoring observation (by coelution_sum) per base_id across all files — one target + one decoy per precursor — to maximize peptide diversity for SVM training. Subsample from this deduplicated set if > max_train.
+3. Train SVM on the subsampled best-per-precursor entries (train_only mode suppresses FDR logging from training subset)
+4. Score ALL entries with trained model by streaming through per-file Parquet caches
+5. Compute run-level q-values per file (precursor + peptide level)
+6. Select best observation per precursor across experiment
+7. Compute experiment-level q-values (precursor + peptide level)
+8. Apply `max(precursor, peptide)` at both run and experiment levels
+9. Determine passing precursors: `experiment_qvalue <= threshold`
+10. Reload full entries from Parquet only for files with passing precursors
+11. Include ALL per-file observations for passing precursors in output
+12. Propagate best experiment_qvalue to all observations
 
 ### Memory Architecture
 
@@ -274,6 +275,7 @@ Osprey uses a disk-backed stub architecture to scale to 1000+ files:
 - **FdrEntry** (~188 bytes): Lightweight stub with 14 fields (entry_id, is_decoy, charge, scan_number, apex/start/end_rt, coelution_sum, score, run/experiment_qvalue, pep, modified_sequence, file_name)
 - **Parquet caches** (`.scores.parquet`): Per-file ZSTD-compressed caches storing 21 PIN features, fragments, CWT candidates
 - **Selective loading**: `load_scores_parquet()` for full entry rehydration, `load_cwt_candidates_from_parquet()` for CWT-only reconciliation planning
+- **Sequential re-scoring**: Reconciliation re-scoring processes files sequentially (not parallel) because each file loads ~3 GB (spectra + full Parquet entries); parallel loading causes OOM on large experiments
 - **Steady-state RAM**: ~188 bytes × entries × files (vs ~940 bytes without caching)
 
 ## Recent Changes
@@ -306,3 +308,8 @@ Osprey uses a disk-backed stub architecture to scale to 1000+ files:
 - FdrEntry memory architecture: lightweight stubs (~188 bytes) replace full scored entries (~940 bytes) in memory after per-file Parquet caching; heavy data (features, fragments, CWT candidates) reloaded on-demand from disk, enabling 1000+ file experiments without OOM
 - Selective Parquet loaders: `load_cwt_candidates_from_parquet()` for reconciliation, PIN feature loading for FDR, full entry reload for blib output
 - Removed `shrink_for_fdr()` in favor of FdrEntry conversion + Parquet caching
+- Best-per-precursor subsampling for streaming Percolator: finds best observation per base_id across all files before subsampling, maximizing peptide diversity for SVM training on 100+ file experiments
+- Added `train_only` flag to PercolatorConfig: suppresses per-file/experiment FDR logging when training on a subset (where FDR numbers are meaningless)
+- Reconciliation consensus uses experiment-level FDR only (was `min(run, experiment)`), reducing consensus set to truly confident identifications
+- Sequential reconciliation re-scoring: `iter_mut()` instead of `par_iter_mut()` to prevent OOM from parallel spectra loading (~3 GB per file)
+- Changed `consensus_fdr` default from 0.05 to 0.01

@@ -21,7 +21,7 @@ In this case, file3 has detected a completely different peptide or artifact. Cro
 
 ```
 After per-run FDR (first pass):
-  1. collect_consensus_peptides() — targets at consensus_fdr in any run (from FdrEntry stubs)
+  1. collect_consensus_peptides() — targets at consensus_fdr experiment-level (from FdrEntry stubs)
   2. compute_consensus_rts()      — weighted median library RT across runs (from FdrEntry stubs)
   3. refit_calibration()          — tighter per-run LOESS from consensus points
   4. plan_reconciliation()        — Keep | UseCwtPeak | ForcedIntegration per entry
@@ -34,10 +34,10 @@ After per-run FDR (first pass):
 
 ## Step 1: Consensus Peptide Selection
 
-Target peptides passing `consensus_fdr` (default 1%) in **any** run are collected. Their paired decoys (DECOY_ prefix) are included so target-decoy competition remains fair in the second FDR pass.
+Target peptides passing `consensus_fdr` (default 1%) at **experiment-level FDR** are collected. Their paired decoys (DECOY_ prefix) are included so target-decoy competition remains fair in the second FDR pass.
 
 ```
-targets: {PEPTIDEK, ANOTHERR, ...}     ← pass run-level FDR in ≥1 file
+targets: {PEPTIDEK, ANOTHERR, ...}     ← pass experiment-level FDR
 decoys:  {DECOY_PEPTIDEK, DECOY_ANOTHERR, ...}  ← paired decoys included
 ```
 
@@ -77,7 +77,7 @@ Working in library RT space is important: it decouples the consensus from run-sp
 
 ## Step 3: Calibration Refit
 
-For each run, the LOESS RT calibration is refit using `(consensus_library_rt → measured_apex_rt)` pairs from **target** peptides detected in that run at `consensus_fdr`.
+For each run, the LOESS RT calibration is refit using `(consensus_library_rt → measured_apex_rt)` pairs from **target** peptides detected in that run at experiment-level `consensus_fdr`.
 
 This produces a tighter calibration than the initial discovery pass because:
 - The calibration points are high-confidence FDR-controlled detections, not noisy initial matches
@@ -114,7 +114,7 @@ The CWT candidates are stored during the initial search (configurable, default 5
 
 Entries with `UseCwtPeak` or `ForcedIntegration` actions are re-scored at their new boundaries:
 - Full `CoelutionScoredEntry` data is reloaded from the per-file Parquet cache
-- Spectra are loaded once per file (shared load for all reconciled entries in that file)
+- Files are processed **sequentially** (not in parallel) to limit peak memory — each file loads spectra (~1-2 GB) and full Parquet entries (~1.4 GB), so parallel loading would OOM on large experiments
 - All features are recomputed at the new peak boundaries via `compute_features_at_peak()`
 - Updated entries are converted back to FdrEntry stubs for the second-pass FDR
 - Entries that cannot be re-scored (no spectral data at the expected RT) are dropped
@@ -192,7 +192,7 @@ If file3 had no CWT candidate near the expected RT (e.g., the peptide was truly 
 
 - `compute_consensus_rts()` sorts output by `(is_decoy, modified_sequence)` before returning
 - `plan_reconciliation()` iterates entries in deterministic order (per-file, per-entry index)
-- Re-scoring is done sequentially (not `par_iter`) to avoid nondeterministic floating-point accumulation
+- Re-scoring is done sequentially (`iter_mut()`, not `par_iter_mut()`) to avoid both nondeterministic floating-point accumulation and OOM from parallel spectra loading
 
 ---
 

@@ -70,7 +70,7 @@ impl<'a> MS1SpectrumLookup for MS1IndexWrapper<'a> {
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use osprey_scoring::batch::CalibrationMatch;
 
@@ -1371,6 +1371,31 @@ fn set_features_from_pin_values(
     features.median_polish_residual_correlation = v(20);
 }
 
+/// Extract PIN feature values from a CoelutionFeatureSet as a Vec<f64>.
+///
+/// Used to provide overlay (re-scored) features to FDR scoring without
+/// loading from parquet. Order matches get_pin_feature_names().
+fn pin_feature_vector(features: &CoelutionFeatureSet) -> Vec<f64> {
+    let n = get_pin_feature_names().len();
+    (0..n)
+        .map(|i| {
+            let v = pin_feature_value(features, i);
+            if v.is_finite() {
+                v
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// Type alias for the in-memory overlay of re-scored entries.
+///
+/// Maps file_name → {entry_index → re-scored entry}. Only entries that were
+/// re-scored during reconciliation appear in the overlay (~85K per file).
+/// This avoids loading/writing the full ~1.5M-entry parquet during re-scoring.
+type RescoreOverlay = HashMap<String, HashMap<usize, CoelutionScoredEntry>>;
+
 /// Load only PIN feature values from a parquet cache file.
 ///
 /// Returns one Vec<f64> per entry (with NUM_PIN_FEATURES elements each).
@@ -1438,7 +1463,11 @@ fn load_pin_features_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<f64>
                 .iter()
                 .map(|col| {
                     let v = col.value(row);
-                    if v.is_finite() { v } else { 0.0 }
+                    if v.is_finite() {
+                        v
+                    } else {
+                        0.0
+                    }
                 })
                 .collect();
             all_features.push(features);
@@ -1955,14 +1984,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         } else {
                             // Need full entries for PIN writing
                             if let Ok(full_entries) = load_scores_parquet(&scores_path) {
-                                let pin_entries =
-                                    if config.fdr_method == FdrMethod::Mokapot {
-                                        compete_target_decoy_pairs(full_entries)
-                                    } else {
-                                        full_entries
-                                    };
-                                if let Ok(pin_path) = mokapot
-                                    .write_pin_file(&file_name, &pin_entries, &mokapot_dir)
+                                let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
+                                    compete_target_decoy_pairs(full_entries)
+                                } else {
+                                    full_entries
+                                };
+                                if let Ok(pin_path) =
+                                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)
                                 {
                                     pin_files.insert(file_name.clone(), pin_path);
                                 }
@@ -2102,8 +2130,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 } else {
                     entries.clone()
                 };
-                let pin_path =
-                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
+                let pin_path = mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
                 pin_files.insert(file_name.clone(), pin_path);
             }
 
@@ -2134,9 +2161,17 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         config.fdr_method
     );
 
+    // No overlay for first-pass FDR (no re-scoring has happened yet)
+    let empty_overlay: RescoreOverlay = HashMap::new();
+
     match config.fdr_method {
         FdrMethod::Percolator => {
-            run_percolator_fdr(&mut per_file_entries, &per_file_cache_paths, &config)?;
+            run_percolator_fdr(
+                &mut per_file_entries,
+                &per_file_cache_paths,
+                &config,
+                &empty_overlay,
+            )?;
         }
         FdrMethod::Mokapot => {
             run_mokapot_fdr(
@@ -2158,6 +2193,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Post-FDR re-scoring: multi-charge consensus + inter-replicate reconciliation.
     // Both phases need to load spectra and re-score entries, so we merge them
     // into a single spectra-load pass per file to avoid redundant I/O.
+    //
+    // Overlay: re-scored entries are kept in memory (~170 MB per file) and merged
+    // at read time for second-pass FDR scoring and blib output, avoiding the need
+    // to load/write the full ~1.5M-entry parquet during re-scoring.
+    let mut per_file_overlays: RescoreOverlay = HashMap::new();
     {
         use crate::reconciliation::{
             compute_consensus_rts, plan_reconciliation, refit_calibration_with_consensus,
@@ -2308,126 +2348,109 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 .push((*idx, apex, start, end));
         }
 
-        let total_rescored = AtomicUsize::new(0);
+        let mut total_rescored: usize = 0;
 
         // Process files sequentially to limit peak memory — each file loads spectra
-        // (~1-2 GB) and full parquet entries (~1.4 GB), so parallel loading would OOM
-        // on large experiments. Per-file re-scoring is already internally parallelized.
-        per_file_entries
-            .iter_mut()
-            .for_each(|(file_name, fdr_entries)| {
-                // Collect consensus targets for this file
-                let consensus_targets = per_file_consensus_targets
-                    .get(file_name.as_str())
-                    .cloned()
-                    .unwrap_or_default();
+        // (~1.5 GB). Per-file re-scoring is already internally parallelized.
+        for (file_name, fdr_entries) in per_file_entries.iter_mut() {
+            // Collect consensus targets for this file
+            let consensus_targets = per_file_consensus_targets
+                .get(file_name.as_str())
+                .cloned()
+                .unwrap_or_default();
 
-                // Collect reconciliation targets for this file (pre-grouped)
-                let reconciliation_targets = per_file_reconciliation_targets
-                    .get(file_name.as_str())
-                    .cloned()
-                    .unwrap_or_default();
+            // Collect reconciliation targets for this file (pre-grouped)
+            let reconciliation_targets = per_file_reconciliation_targets
+                .get(file_name.as_str())
+                .cloned()
+                .unwrap_or_default();
 
-                // Merge both target sets, deduplicating by entry index
-                // (if an entry appears in both consensus and reconciliation,
-                // prefer the reconciliation target since it's inter-replicate informed)
-                let mut combined_targets: HashMap<usize, (f64, f64, f64)> = HashMap::new();
-                for (idx, apex, start, end) in &consensus_targets {
-                    combined_targets.insert(*idx, (*apex, *start, *end));
+            // Merge both target sets, deduplicating by entry index
+            // (if an entry appears in both consensus and reconciliation,
+            // prefer the reconciliation target since it's inter-replicate informed)
+            let mut combined_targets: HashMap<usize, (f64, f64, f64)> = HashMap::new();
+            for (idx, apex, start, end) in &consensus_targets {
+                combined_targets.insert(*idx, (*apex, *start, *end));
+            }
+            for (idx, apex, start, end) in &reconciliation_targets {
+                combined_targets.insert(*idx, (*apex, *start, *end));
+            }
+
+            let all_targets: Vec<(usize, f64, f64, f64)> = combined_targets
+                .into_iter()
+                .map(|(idx, (apex, start, end))| (idx, apex, start, end))
+                .collect();
+
+            if all_targets.is_empty() {
+                continue;
+            }
+
+            let input_idx = match file_name_to_idx.get(file_name.as_str()) {
+                Some(idx) => *idx,
+                None => continue,
+            };
+            let input_file = &config.input_files[input_idx];
+
+            let n_consensus = consensus_targets.len();
+            let n_reconciliation = reconciliation_targets.len();
+            log::info!(
+                "Re-scoring {} entries in {} ({} consensus, {} reconciliation, {} combined)",
+                all_targets.len(),
+                file_name,
+                n_consensus,
+                n_reconciliation,
+                all_targets.len(),
+            );
+
+            let ctx = match FileRescoreContext::load(input_file, &config) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    log::warn!("Failed to load spectra for {}: {}", file_name, e);
+                    continue;
                 }
-                for (idx, apex, start, end) in &reconciliation_targets {
-                    combined_targets.insert(*idx, (*apex, *start, *end));
+            };
+
+            // Use refined calibration if available, fall back to original
+            let rt_cal = refined_calibrations
+                .get(file_name.as_str())
+                .or_else(|| per_file_calibrations.get(file_name.as_str()));
+
+            let overlay = rescore_for_reconciliation(
+                fdr_entries,
+                &all_targets,
+                &library,
+                ctx.spectra_ref(),
+                &ctx.window_groups,
+                &ctx.ms1_index,
+                ctx.cal_params.as_ref(),
+                rt_cal,
+                &ctx.scorer,
+                ctx.tol_da,
+                ctx.tol_ppm,
+                ctx.rt_tolerance,
+                ctx.is_hram,
+                file_name,
+            );
+
+            // Drop spectra before updating stubs to free ~1.5-3 GB
+            drop(ctx);
+
+            let n_rescored = overlay.len();
+            total_rescored += n_rescored;
+            log::info!(
+                "  {} of {} entries successfully re-scored",
+                n_rescored,
+                all_targets.len()
+            );
+
+            // Update FdrEntry stubs from overlay (only re-scored entries)
+            if n_rescored > 0 {
+                for (&idx, entry) in &overlay {
+                    fdr_entries[idx] = entry.to_fdr_entry();
                 }
-
-                let all_targets: Vec<(usize, f64, f64, f64)> = combined_targets
-                    .into_iter()
-                    .map(|(idx, (apex, start, end))| (idx, apex, start, end))
-                    .collect();
-
-                if all_targets.is_empty() {
-                    return;
-                }
-
-                let input_idx = match file_name_to_idx.get(file_name.as_str()) {
-                    Some(idx) => *idx,
-                    None => return,
-                };
-                let input_file = &config.input_files[input_idx];
-
-                let n_consensus = consensus_targets.len();
-                let n_reconciliation = reconciliation_targets.len();
-                log::info!(
-                    "Re-scoring {} entries in {} ({} consensus, {} reconciliation, {} combined)",
-                    all_targets.len(),
-                    file_name,
-                    n_consensus,
-                    n_reconciliation,
-                    all_targets.len(),
-                );
-
-                let ctx = match FileRescoreContext::load(input_file, &config) {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        log::warn!("Failed to load spectra for {}: {}", file_name, e);
-                        return;
-                    }
-                };
-
-                // Use refined calibration if available, fall back to original
-                let rt_cal = refined_calibrations
-                    .get(file_name.as_str())
-                    .or_else(|| per_file_calibrations.get(file_name.as_str()));
-
-                // Load full entries from parquet for re-scoring
-                let cache_path = match per_file_cache_paths.get(file_name.as_str()) {
-                    Some(p) => p.clone(),
-                    None => return,
-                };
-                let mut full_entries = match load_scores_parquet(&cache_path) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        log::warn!("Failed to load parquet for {}: {}", file_name, e);
-                        return;
-                    }
-                };
-
-                let n_rescored = rescore_for_reconciliation(
-                    &mut full_entries,
-                    &all_targets,
-                    &library,
-                    ctx.spectra_ref(),
-                    &ctx.window_groups,
-                    &ctx.ms1_index,
-                    ctx.cal_params.as_ref(),
-                    rt_cal,
-                    &ctx.scorer,
-                    ctx.tol_da,
-                    ctx.tol_ppm,
-                    ctx.rt_tolerance,
-                    ctx.is_hram,
-                    file_name,
-                );
-
-                total_rescored.fetch_add(n_rescored, Ordering::Relaxed);
-                log::info!(
-                    "  {} of {} entries successfully re-scored",
-                    n_rescored,
-                    all_targets.len()
-                );
-
-                // Save updated entries back to parquet and update FdrEntry stubs
-                if n_rescored > 0 {
-                    if let Err(e) = write_scores_parquet(&cache_path, &full_entries) {
-                        log::warn!("Failed to save updated scores for {}: {}", file_name, e);
-                    }
-                    // Update FdrEntry stubs from the rescored full entries
-                    for (fdr, full) in fdr_entries.iter_mut().zip(full_entries.iter()) {
-                        *fdr = full.to_fdr_entry();
-                    }
-                }
-            });
-
-        let total_rescored = total_rescored.load(Ordering::Relaxed);
+                per_file_overlays.insert(file_name.clone(), overlay);
+            }
+        }
 
         // 4. Single second-pass FDR after all re-scoring
         if total_rescored > 0 {
@@ -2441,7 +2464,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             log::info!("Running second-pass FDR on re-scored entries...");
             match config.fdr_method {
                 FdrMethod::Percolator => {
-                    run_percolator_fdr(&mut per_file_entries, &per_file_cache_paths, &config)?;
+                    run_percolator_fdr(
+                        &mut per_file_entries,
+                        &per_file_cache_paths,
+                        &config,
+                        &per_file_overlays,
+                    )?;
                 }
                 FdrMethod::Mokapot => {
                     run_mokapot_fdr(
@@ -2521,13 +2549,21 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             }
         };
 
+        // Apply overlay: substitute re-scored entries from reconciliation
+        let file_overlay = per_file_overlays.get(file_name.as_str());
+
         // Merge FDR q-values from stubs into full entries — stubs have the
         // final q-values from Percolator/Mokapot, while parquet has original scores.
-        for (full, fdr) in full_entries.into_iter().zip(fdr_entries.iter()) {
+        for (idx, (full, fdr)) in full_entries.into_iter().zip(fdr_entries.iter()).enumerate() {
             if !fdr.is_decoy
                 && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
             {
-                let mut entry = full;
+                // Use overlay entry if this entry was re-scored, otherwise use parquet entry
+                let mut entry = if let Some(ov) = file_overlay.and_then(|o| o.get(&idx)) {
+                    ov.clone()
+                } else {
+                    full
+                };
                 entry.run_qvalue = fdr.run_qvalue;
                 entry.experiment_qvalue = best_exp_q
                     .get(&(fdr.modified_sequence.clone(), fdr.charge))
@@ -2631,6 +2667,7 @@ fn run_percolator_fdr(
     per_file_entries: &mut [(String, Vec<FdrEntry>)],
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
     config: &OspreyConfig,
+    overlay: &RescoreOverlay,
 ) -> Result<()> {
     use osprey_fdr::percolator;
 
@@ -2662,7 +2699,12 @@ fn run_percolator_fdr(
             total_entries,
             n_files
         );
-        return run_percolator_fdr_direct(per_file_entries, per_file_cache_paths, &perc_config);
+        return run_percolator_fdr_direct(
+            per_file_entries,
+            per_file_cache_paths,
+            &perc_config,
+            overlay,
+        );
     }
 
     // === Streaming path for large experiments ===
@@ -2768,8 +2810,7 @@ fn run_percolator_fdr(
             peptide_groups.entry(key).or_default().push((fi, li));
         }
 
-        let mut groups: Vec<(&str, Vec<(usize, usize)>)> =
-            peptide_groups.into_iter().collect();
+        let mut groups: Vec<(&str, Vec<(usize, usize)>)> = peptide_groups.into_iter().collect();
         groups.sort_by_key(|&(k, _)| k);
 
         // Fisher-Yates shuffle
@@ -2819,15 +2860,17 @@ fn run_percolator_fdr(
     let mut subset_features: Vec<Vec<f64>> = vec![Vec::new(); subset.len()];
     for (&file_idx, entries_in_file) in &subset_by_file {
         let (file_name, _) = &per_file_entries[file_idx];
+        let file_overlay = overlay.get(file_name.as_str());
         let cache_path = per_file_cache_paths
             .get(file_name.as_str())
-            .ok_or_else(|| {
-                OspreyError::config(format!("No parquet cache for {}", file_name))
-            })?;
+            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
         for &(pos, local_idx) in entries_in_file {
-            if local_idx < file_features.len() {
+            // Use overlay features for re-scored entries, parquet features otherwise
+            if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                subset_features[pos] = pin_feature_vector(&overlay_entry.features);
+            } else if local_idx < file_features.len() {
                 subset_features[pos] = file_features[local_idx].clone();
             }
         }
@@ -2898,15 +2941,21 @@ fn run_percolator_fdr(
     // Phase 4: Score ALL entries by streaming through Parquet files
     // Write scores directly to entry.score (no flat scores array)
     for (file_idx, (file_name, fdr_entries)) in per_file_entries.iter_mut().enumerate() {
+        let file_overlay = overlay.get(file_name.as_str());
         let cache_path = per_file_cache_paths
             .get(file_name.as_str())
-            .ok_or_else(|| {
-                OspreyError::config(format!("No parquet cache for {}", file_name))
-            })?;
+            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
 
-        for (local_idx, mut features) in file_features.into_iter().enumerate() {
+        for (local_idx, parquet_features) in file_features.into_iter().enumerate() {
+            // Use overlay features for re-scored entries, parquet features otherwise
+            let mut features =
+                if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                    pin_feature_vector(&overlay_entry.features)
+                } else {
+                    parquet_features
+                };
             standardizer.transform_slice(&mut features);
             let mut score = avg_bias;
             for (w, x) in avg_weights.iter().zip(features.iter()) {
@@ -2916,11 +2965,7 @@ fn run_percolator_fdr(
         }
 
         if (file_idx + 1) % 10 == 0 || file_idx + 1 == n_files {
-            log::info!(
-                "  Scored {}/{} files",
-                file_idx + 1,
-                n_files
-            );
+            log::info!("  Scored {}/{} files", file_idx + 1, n_files);
         }
     }
 
@@ -2944,9 +2989,11 @@ fn run_percolator_fdr_direct(
     per_file_entries: &mut [(String, Vec<FdrEntry>)],
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
     perc_config: &percolator::PercolatorConfig,
+    overlay: &RescoreOverlay,
 ) -> Result<()> {
     let mut perc_entries = Vec::new();
     for (file_name, fdr_entries) in per_file_entries.iter() {
+        let file_overlay = overlay.get(file_name.as_str());
         let cache_path = per_file_cache_paths
             .get(file_name.as_str())
             .ok_or_else(|| {
@@ -2962,7 +3009,18 @@ fn run_percolator_fdr_direct(
             )));
         }
 
-        for (fdr_entry, features) in fdr_entries.iter().zip(file_features.into_iter()) {
+        for (local_idx, (fdr_entry, parquet_features)) in fdr_entries
+            .iter()
+            .zip(file_features.into_iter())
+            .enumerate()
+        {
+            // Use overlay features for re-scored entries, parquet features otherwise
+            let features = if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx))
+            {
+                pin_feature_vector(&overlay_entry.features)
+            } else {
+                parquet_features
+            };
             let psm_id = format!(
                 "{}_{}_{}_{}",
                 file_name, fdr_entry.modified_sequence, fdr_entry.charge, fdr_entry.scan_number
@@ -3019,7 +3077,14 @@ fn run_mokapot_fdr(
 ) -> Result<()> {
     if !mokapot.is_available() {
         log::warn!("Mokapot not available, falling back to native Percolator");
-        return run_percolator_fdr(per_file_entries, per_file_cache_paths, config);
+        // Mokapot doesn't have overlay — pass empty (mokapot uses PIN files, not parquet)
+        let empty_overlay: RescoreOverlay = HashMap::new();
+        return run_percolator_fdr(
+            per_file_entries,
+            per_file_cache_paths,
+            config,
+            &empty_overlay,
+        );
     }
 
     match mokapot.run_two_step_analysis(pin_files, mokapot_dir) {
@@ -3125,7 +3190,14 @@ fn run_mokapot_fdr(
                 "Mokapot two-step FDR failed: {}. Falling back to Percolator.",
                 e
             );
-            run_percolator_fdr(per_file_entries, per_file_cache_paths, config)?;
+            // Mokapot's own overlay isn't tracked — pass empty
+            let empty_overlay: RescoreOverlay = HashMap::new();
+            run_percolator_fdr(
+                per_file_entries,
+                per_file_cache_paths,
+                config,
+                &empty_overlay,
+            )?;
         }
     }
 
@@ -4350,10 +4422,7 @@ impl FileRescoreContext {
                     result
                 }
                 Err(e) => {
-                    log::warn!(
-                        "Failed to load spectra cache, falling back to mzML: {}",
-                        e
-                    );
+                    log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
                     load_all_spectra(input_file)?
                 }
             }
@@ -4622,13 +4691,14 @@ fn rescore_entry_at_boundaries(
 ///
 /// For each entry with a reconciliation action (`UseCwtPeak` or `ForcedIntegration`),
 /// extracts XICs from the appropriate isolation window and computes all features
-/// at the specified reconciled boundaries. Updates entries in-place.
+/// at the specified reconciled boundaries.
 ///
-/// Uses rayon parallel iteration over actions, then merges results sequentially.
-/// Returns the number of successfully re-scored entries.
+/// Uses lightweight `FdrEntry` stubs for entry_id lookup (no full parquet load).
+/// Returns a HashMap of (entry_index → re-scored entry) as an in-memory overlay.
+/// The overlay is later merged at read time for FDR scoring and blib output.
 #[allow(clippy::too_many_arguments)]
 fn rescore_for_reconciliation(
-    entries: &mut [CoelutionScoredEntry],
+    fdr_entries: &[FdrEntry],
     actions: &[(usize, f64, f64, f64)], // (entry_idx, target_apex, target_start, target_end)
     library: &[LibraryEntry],
     spectra: &[Spectrum],
@@ -4642,20 +4712,20 @@ fn rescore_for_reconciliation(
     _rt_tolerance: f64,
     is_hram: bool,
     file_name: &str,
-) -> usize {
+) -> HashMap<usize, CoelutionScoredEntry> {
     // Parallel phase: compute new scored entries for each action
     let results: Vec<(usize, Option<CoelutionScoredEntry>)> = actions
         .par_iter()
         .map(|&(entry_idx, target_apex, target_start, target_end)| {
-            let orig_entry = &entries[entry_idx];
+            let stub = &fdr_entries[entry_idx];
 
-            // Look up the library entry
-            let lib_entry = if (orig_entry.entry_id as usize) < library.len()
-                && library[orig_entry.entry_id as usize].id == orig_entry.entry_id
+            // Look up the library entry using entry_id from the lightweight stub
+            let lib_entry = if (stub.entry_id as usize) < library.len()
+                && library[stub.entry_id as usize].id == stub.entry_id
             {
-                &library[orig_entry.entry_id as usize]
+                &library[stub.entry_id as usize]
             } else {
-                match library.iter().find(|e| e.id == orig_entry.entry_id) {
+                match library.iter().find(|e| e.id == stub.entry_id) {
                     Some(e) => e,
                     None => return (entry_idx, None),
                 }
@@ -4686,17 +4756,15 @@ fn rescore_for_reconciliation(
         })
         .collect();
 
-    // Sequential merge: update entries in-place from parallel results
-    let mut rescored_count = 0;
+    // Collect successfully re-scored entries into overlay
+    let mut overlay = HashMap::new();
     for (entry_idx, new_entry) in results {
-        if let Some(mut e) = new_entry {
-            e.cwt_candidates = entries[entry_idx].cwt_candidates.clone();
-            entries[entry_idx] = e;
-            rescored_count += 1;
+        if let Some(e) = new_entry {
+            overlay.insert(entry_idx, e);
         }
     }
 
-    rescored_count
+    overlay
 }
 
 /// For each precursor candidate in each isolation window:
