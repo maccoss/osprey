@@ -4,6 +4,7 @@
 //! the analysis pipeline, from spectral library entries to detection results.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Library entry representing a peptide precursor with spectral information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -700,8 +701,7 @@ impl CoelutionScoredEntry {
             run_qvalue: self.run_qvalue,
             experiment_qvalue: self.experiment_qvalue,
             pep: self.pep,
-            modified_sequence: self.modified_sequence.clone(),
-            file_name: self.file_name.clone(),
+            modified_sequence: Arc::from(self.modified_sequence.as_str()),
         }
     }
 }
@@ -713,9 +713,11 @@ impl CoelutionScoredEntry {
 /// planning.  Full entry data (features, CWT candidates, fragments) is
 /// stored in per-file `.scores.parquet` caches and reloaded on demand.
 ///
-/// ~130 bytes inline + ~58 bytes heap ≈ 188 bytes/entry, versus ~940 bytes
-/// for a shrunk `CoelutionScoredEntry`.  At 200K entries/file × 240 files
-/// this reduces steady-state memory from ~45 GB to ~9 GB.
+/// ~80 bytes inline per entry, versus ~940 bytes for `CoelutionScoredEntry`.
+/// `modified_sequence` uses `Arc<str>` for deduplication: with 240 GPF files
+/// the same ~3.5M unique sequences appear across all files, so interning
+/// reduces heap from ~6 GB to ~90 MB.  `file_name` is not stored — entries
+/// are already keyed by file in `Vec<(String, Vec<FdrEntry>)>`.
 #[derive(Debug, Clone)]
 pub struct FdrEntry {
     /// Library entry ID (for psm_id construction and library lookup)
@@ -742,10 +744,8 @@ pub struct FdrEntry {
     pub experiment_qvalue: f64,
     /// Posterior error probability (mutated by FDR)
     pub pep: f64,
-    /// Modified sequence (for psm_id, grouping, passing_precursors)
-    pub modified_sequence: String,
-    /// Source file name / stem (for grouping and file mapping)
-    pub file_name: String,
+    /// Modified sequence (interned Arc<str> for psm_id, grouping, passing_precursors)
+    pub modified_sequence: Arc<str>,
 }
 
 #[cfg(test)]

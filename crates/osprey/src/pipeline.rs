@@ -71,6 +71,7 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use osprey_scoring::batch::CalibrationMatch;
 
@@ -1396,6 +1397,22 @@ fn pin_feature_vector(features: &CoelutionFeatureSet) -> Vec<f64> {
 /// This avoids loading/writing the full ~1.5M-entry parquet during re-scoring.
 type RescoreOverlay = HashMap<String, HashMap<usize, CoelutionScoredEntry>>;
 
+/// Intern a `modified_sequence` string, returning a shared `Arc<str>`.
+///
+/// With 240 GPF files the same ~3.5M unique peptide sequences appear across
+/// all files.  Without interning, 240M separate `String` allocations consume
+/// ~6 GB of heap.  The interner deduplicates them into ~90 MB of shared
+/// `Arc<str>` pointers.
+fn intern_seq(interner: &mut HashSet<Arc<str>>, s: &str) -> Arc<str> {
+    if let Some(existing) = interner.get(s) {
+        existing.clone()
+    } else {
+        let arc: Arc<str> = Arc::from(s);
+        interner.insert(arc.clone());
+        arc
+    }
+}
+
 /// Load only PIN feature values from a parquet cache file.
 ///
 /// Returns one Vec<f64> per entry (with NUM_PIN_FEATURES elements each).
@@ -1479,12 +1496,14 @@ fn load_pin_features_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<f64>
 
 /// Load only FdrEntry stub fields from a parquet cache file.
 ///
-/// Reads only 10 columns (entry_id, is_decoy, charge, scan_number, apex_rt,
-/// start_rt, end_rt, modified_sequence, file_name, fragment_coelution_sum)
-/// using a ProjectionMask. This avoids deserializing binary columns (fragments,
-/// CWT candidates, XICs) and most feature columns, reducing I/O from ~940 bytes
-/// to ~100 bytes per entry.
-fn load_fdr_stubs_from_parquet(path: &std::path::Path) -> Result<Vec<FdrEntry>> {
+/// Reads only 9 columns (entry_id, is_decoy, charge, scan_number, apex_rt,
+/// start_rt, end_rt, modified_sequence, fragment_coelution_sum)
+/// using a ProjectionMask. `modified_sequence` values are interned via the
+/// shared `seq_interner` to deduplicate strings across files.
+fn load_fdr_stubs_from_parquet(
+    path: &std::path::Path,
+    seq_interner: &mut HashSet<Arc<str>>,
+) -> Result<Vec<FdrEntry>> {
     use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array, UInt8Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::ProjectionMask;
@@ -1498,7 +1517,6 @@ fn load_fdr_stubs_from_parquet(path: &std::path::Path) -> Result<Vec<FdrEntry>> 
         "start_rt",
         "end_rt",
         "modified_sequence",
-        "file_name",
         "fragment_coelution_sum",
     ];
 
@@ -1585,12 +1603,6 @@ fn load_fdr_stubs_from_parquet(path: &std::path::Path) -> Result<Vec<FdrEntry>> 
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        let fname_col = batch
-            .column_by_name("file_name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
         let coelution_col = batch
             .column_by_name("fragment_coelution_sum")
             .unwrap()
@@ -1612,8 +1624,7 @@ fn load_fdr_stubs_from_parquet(path: &std::path::Path) -> Result<Vec<FdrEntry>> 
                 run_qvalue: 1.0,
                 experiment_qvalue: 1.0,
                 pep: 1.0,
-                modified_sequence: modseq_col.value(row).to_string(),
-                file_name: fname_col.value(row).to_string(),
+                modified_sequence: intern_seq(seq_interner, modseq_col.value(row)),
             });
         }
     }
@@ -1931,6 +1942,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     let mut pin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
     // Retain per-file RT calibrations for inter-replicate reconciliation
     let mut per_file_calibrations: HashMap<String, RTCalibration> = HashMap::new();
+    // Interner for modified_sequence deduplication across files
+    let mut seq_interner: HashSet<Arc<str>> = HashSet::new();
 
     for (file_idx, input_file) in config.input_files.iter().enumerate() {
         log::info!("");
@@ -1950,7 +1963,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // Check for cached scores parquet (skip search if already scored)
         let scores_path = scores_path_for_input(input_file);
         let cached_stubs = if scores_path.exists() {
-            match load_fdr_stubs_from_parquet(&scores_path) {
+            match load_fdr_stubs_from_parquet(&scores_path, &mut seq_interner) {
                 Ok(stubs) => {
                     log::info!(
                         "Loaded {} cached scores from {}",
@@ -2134,8 +2147,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 pin_files.insert(file_name.clone(), pin_path);
             }
 
-            // Convert to lightweight FdrEntry stubs
-            entries.iter().map(|e| e.to_fdr_entry()).collect()
+            // Convert to lightweight FdrEntry stubs (intern modified_sequences)
+            let mut fdr_stubs: Vec<FdrEntry> = entries.iter().map(|e| e.to_fdr_entry()).collect();
+            for stub in &mut fdr_stubs {
+                stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
+            }
+            fdr_stubs
         };
 
         per_file_cache_paths.insert(file_name.clone(), scores_path);
@@ -2446,7 +2463,9 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             // Update FdrEntry stubs from overlay (only re-scored entries)
             if n_rescored > 0 {
                 for (&idx, entry) in &overlay {
-                    fdr_entries[idx] = entry.to_fdr_entry();
+                    let mut stub = entry.to_fdr_entry();
+                    stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
+                    fdr_entries[idx] = stub;
                 }
                 per_file_overlays.insert(file_name.clone(), overlay);
             }
@@ -2496,14 +2515,14 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         .flat_map(|(_, entries)| entries.iter())
         .collect();
 
-    let passing_precursors: HashSet<(String, u8)> = all_fdr_entries
+    let passing_precursors: HashSet<(Arc<str>, u8)> = all_fdr_entries
         .iter()
         .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
         .map(|e| (e.modified_sequence.clone(), e.charge))
         .collect();
 
     // Compute best experiment q-value per precursor from FdrEntry stubs
-    let mut best_exp_q: HashMap<(String, u8), f64> = HashMap::new();
+    let mut best_exp_q: HashMap<(Arc<str>, u8), f64> = HashMap::new();
     for e in all_fdr_entries.iter() {
         if !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge)) {
             best_exp_q
@@ -2777,7 +2796,7 @@ fn run_percolator_fdr(
         best_observations
     } else {
         // Build peptide groups for fair subsampling (target-decoy pairs together)
-        let mut base_id_to_peptide: HashMap<u32, String> = HashMap::new();
+        let mut base_id_to_peptide: HashMap<u32, Arc<str>> = HashMap::new();
         for &(fi, li) in &best_observations {
             let entry = &per_file_entries[fi].1[li];
             let base_id = entry.entry_id & 0x7FFF_FFFF;
@@ -2805,8 +2824,8 @@ fn run_percolator_fdr(
             let base_id = entry.entry_id & 0x7FFF_FFFF;
             let key = base_id_to_peptide
                 .get(&base_id)
-                .map(|s| s.as_str())
-                .unwrap_or(entry.modified_sequence.as_str());
+                .map(|s| &**s)
+                .unwrap_or(&entry.modified_sequence);
             peptide_groups.entry(key).or_default().push((fi, li));
         }
 
@@ -2888,7 +2907,7 @@ fn run_percolator_fdr(
             percolator::PercolatorEntry {
                 id: format!("sub_{}_{}", file_idx, local_idx),
                 file_name: file_name.clone(),
-                peptide: entry.modified_sequence.clone(),
+                peptide: entry.modified_sequence.to_string(),
                 charge: entry.charge,
                 is_decoy: entry.is_decoy,
                 entry_id: entry.entry_id,
@@ -3029,7 +3048,7 @@ fn run_percolator_fdr_direct(
             perc_entries.push(percolator::PercolatorEntry {
                 id: psm_id,
                 file_name: file_name.clone(),
-                peptide: fdr_entry.modified_sequence.clone(),
+                peptide: fdr_entry.modified_sequence.to_string(),
                 charge: fdr_entry.charge,
                 is_decoy: fdr_entry.is_decoy,
                 entry_id: fdr_entry.entry_id,
@@ -3162,7 +3181,7 @@ fn run_mokapot_fdr(
                         if let Some(&(q, score, pep)) = run_qmap.get(&psm_id) {
                             // Enforce dual FDR: max of precursor and peptide q-values
                             let peptide_q = peptide_qmap
-                                .and_then(|m| m.get(entry.modified_sequence.as_str()))
+                                .and_then(|m| m.get(&*entry.modified_sequence))
                                 .copied()
                                 .unwrap_or(1.0);
                             entry.run_qvalue = q.max(peptide_q);
@@ -3172,7 +3191,7 @@ fn run_mokapot_fdr(
                         if let Some(&q) = experiment_qmap.get(&psm_id) {
                             // Enforce dual FDR: max of precursor and peptide q-values
                             let peptide_q = exp_peptide_qmap
-                                .get(entry.modified_sequence.as_str())
+                                .get(&*entry.modified_sequence)
                                 .copied()
                                 .unwrap_or(1.0);
                             entry.experiment_qvalue = q.max(peptide_q);
@@ -4323,10 +4342,11 @@ fn compute_features_at_peak(
 
 /// Select multi-charge consensus targets after FDR scoring.
 ///
-/// Groups entries by (modified_sequence, file_name). For multi-charge groups
-/// where at least one charge state passes FDR, the best-scoring charge state
-/// defines the consensus peak. Other charge states at a different peak are
-/// returned as rescore targets: `(entry_index, consensus_apex, start, end)`.
+/// Groups entries by modified_sequence (within a single file's entries).
+/// For multi-charge groups where at least one charge state passes FDR,
+/// the best-scoring charge state defines the consensus peak. Other charge
+/// states at a different peak are returned as rescore targets:
+/// `(entry_index, consensus_apex, start, end)`.
 ///
 /// Groups where NO charge state passes FDR are skipped entirely — they have
 /// no impact on reported results and re-scoring them is wasted work.
@@ -4334,12 +4354,9 @@ fn select_post_fdr_consensus(
     entries: &[FdrEntry],
     fdr_threshold: f64,
 ) -> Vec<(usize, f64, f64, f64)> {
-    let mut groups: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, entry) in entries.iter().enumerate() {
-        groups
-            .entry((&entry.modified_sequence, &entry.file_name))
-            .or_default()
-            .push(i);
+        groups.entry(&entry.modified_sequence).or_default().push(i);
     }
 
     let mut targets = Vec::new();
@@ -6159,16 +6176,18 @@ mod tests {
     }
 
     #[test]
-    fn test_consensus_groups_by_file_name() {
-        // Same peptide in different files should be independent groups
-        let mut entries = vec![
+    fn test_consensus_per_file_grouping() {
+        // select_post_fdr_consensus is always called per-file, so all entries
+        // share the same file. Same peptide, different charge, different peak →
+        // the non-passing entry gets re-scored to the passing entry's peak.
+        let entries = vec![
             make_scored_entry_with_score(0, "PEPTIDEK", 2, 15.0, 14.5, 15.5, 8.0, 3.0, 0.005),
             make_scored_entry_with_score(1, "PEPTIDEK", 3, 22.0, 21.5, 22.5, 3.0, 1.0, 0.05),
         ];
-        entries[1].file_name = "other_file".to_string();
         let fdr = to_fdr(&entries);
         let rescore = select_post_fdr_consensus(&fdr, 0.01);
-        // Different files → different groups → no re-scoring
-        assert!(rescore.is_empty());
+        // Same group (same modified_sequence) → entry 1 at different peak gets re-scored
+        assert_eq!(rescore.len(), 1);
+        assert_eq!(rescore[0].0, 1);
     }
 }

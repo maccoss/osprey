@@ -1719,7 +1719,7 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
         let mut best_per_pept: HashMap<&str, (usize, f64)> = HashMap::new();
         for (i, entry) in entries.iter().enumerate() {
             best_per_pept
-                .entry(entry.modified_sequence.as_str())
+                .entry(&*entry.modified_sequence)
                 .and_modify(|(best_idx, best_score)| {
                     if scores[i] > *best_score {
                         *best_idx = i;
@@ -1749,13 +1749,16 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
         let mut peptide_qvalue: HashMap<String, f64> = HashMap::new();
         for (rank, &local_idx) in pept_winner_local.iter().enumerate() {
             let global_idx = pept_reps[local_idx];
-            peptide_qvalue.insert(entries[global_idx].modified_sequence.clone(), pept_q[rank]);
+            peptide_qvalue.insert(
+                entries[global_idx].modified_sequence.to_string(),
+                pept_q[rank],
+            );
         }
 
         // Write run_qvalue = max(precursor, peptide)
         for (i, entry) in entries.iter_mut().enumerate() {
             let pept_qv = peptide_qvalue
-                .get(entry.modified_sequence.as_str())
+                .get(&*entry.modified_sequence)
                 .copied()
                 .unwrap_or(1.0);
             entry.run_qvalue = entry_prec_qvalue[i].max(pept_qv);
@@ -1768,12 +1771,12 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
             .collect();
         let precursor_count = passing
             .iter()
-            .map(|e| (e.modified_sequence.as_str(), e.entry_id & 0x7FFF_FFFF))
+            .map(|e| (&*e.modified_sequence, e.entry_id & 0x7FFF_FFFF))
             .collect::<HashSet<_>>()
             .len();
         let peptide_count = passing
             .iter()
-            .map(|e| e.modified_sequence.as_str())
+            .map(|e| &*e.modified_sequence)
             .collect::<HashSet<_>>()
             .len();
         log::info!(
@@ -1860,7 +1863,7 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
         for (_, entries) in per_file_entries.iter() {
             for entry in entries.iter() {
                 best_per_pept
-                    .entry(entry.modified_sequence.clone())
+                    .entry(entry.modified_sequence.to_string())
                     .and_modify(|(best_score, best_decoy, best_eid)| {
                         if entry.score > *best_score {
                             *best_score = entry.score;
@@ -1907,7 +1910,7 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
                 let base_id = entry.entry_id & 0x7FFF_FFFF;
                 let prec_q = base_id_exp_prec_q.get(&base_id).copied().unwrap_or(1.0);
                 let pept_q = peptide_exp_q
-                    .get(entry.modified_sequence.as_str())
+                    .get(&*entry.modified_sequence)
                     .copied()
                     .unwrap_or(1.0);
                 entry.experiment_qvalue = prec_q.max(pept_q);
@@ -1924,12 +1927,12 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
         .collect();
     let exp_precursors = exp_passing
         .iter()
-        .map(|e| (e.modified_sequence.as_str(), e.entry_id & 0x7FFF_FFFF))
+        .map(|e| (&*e.modified_sequence, e.entry_id & 0x7FFF_FFFF))
         .collect::<HashSet<_>>()
         .len();
     let exp_peptides = exp_passing
         .iter()
-        .map(|e| e.modified_sequence.as_str())
+        .map(|e| &*e.modified_sequence)
         .collect::<HashSet<_>>()
         .len();
 

@@ -11,6 +11,7 @@ use osprey_core::{CwtCandidate, FdrEntry};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Consensus RT for a peptide across all runs.
 ///
@@ -49,7 +50,7 @@ pub fn compute_consensus_rts(
     consensus_fdr: f64,
 ) -> Vec<PeptideConsensusRT> {
     // 1. Collect target peptides passing experiment-level FDR
-    let mut target_peptides: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut target_peptides: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
             if !entry.is_decoy && entry.experiment_qvalue <= consensus_fdr {
@@ -76,7 +77,7 @@ pub fn compute_consensus_rts(
 
     // Identify decoy modified_sequences paired to target peptides
     // Decoys have DECOY_ prefix on modified_sequence
-    let mut decoy_peptides: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut decoy_peptides: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
             if entry.is_decoy {
@@ -102,15 +103,15 @@ pub fn compute_consensus_rts(
     for (file_name, entries) in per_file_entries {
         for entry in entries {
             let include = if entry.is_decoy {
-                decoy_peptides.contains(&entry.modified_sequence)
+                decoy_peptides.contains(&*entry.modified_sequence)
             } else {
-                target_peptides.contains(&entry.modified_sequence)
+                target_peptides.contains(&*entry.modified_sequence)
             };
 
             if include {
                 let peak_width = entry.end_rt - entry.start_rt;
                 detections
-                    .entry((entry.modified_sequence.clone(), entry.is_decoy))
+                    .entry((entry.modified_sequence.to_string(), entry.is_decoy))
                     .or_default()
                     .push((
                         file_name.clone(),
@@ -213,7 +214,7 @@ pub fn refit_calibration_with_consensus(
         if entry.is_decoy || entry.experiment_qvalue > consensus_fdr {
             continue;
         }
-        if let Some(&consensus_lib_rt) = consensus_map.get(entry.modified_sequence.as_str()) {
+        if let Some(&consensus_lib_rt) = consensus_map.get(&*entry.modified_sequence) {
             library_rts.push(consensus_lib_rt);
             measured_rts.push(entry.apex_rt);
         }
@@ -359,7 +360,7 @@ pub fn plan_reconciliation(
 
             let mut file_actions = Vec::new();
             for (entry_idx, entry) in entries.iter().enumerate() {
-                let key = (entry.modified_sequence.as_str(), entry.is_decoy);
+                let key = (&*entry.modified_sequence, entry.is_decoy);
                 let consensus_entry = match consensus_map.get(&key) {
                     Some(c) => c,
                     None => {
