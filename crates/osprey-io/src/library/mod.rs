@@ -6,18 +6,67 @@
 //! - EncyclopeDIA elib format
 
 mod blib;
+mod cache;
 mod diann;
 mod elib;
 
 pub use blib::BlibLoader;
+pub use cache::{load_library_cache, save_library_cache};
 pub use diann::DiannTsvLoader;
 pub use elib::ElibLoader;
 
 use osprey_core::{LibraryEntry, LibrarySource, OspreyError, Result};
 use std::collections::HashMap;
 
-/// Load a library from any supported source
+/// Load a library from any supported source.
+///
+/// Checks for a binary cache file (`.libcache`) alongside the source library.
+/// If the cache exists and is newer than the source, loads from cache directly
+/// (skipping TSV/blib/elib parsing and deduplication). Otherwise, loads from
+/// source, deduplicates, and saves the cache for future runs.
 pub fn load_library(source: &LibrarySource) -> Result<Vec<LibraryEntry>> {
+    let source_path = source.path();
+    let cache_path = source_path.with_extension(
+        source_path
+            .extension()
+            .map(|e| format!("{}.libcache", e.to_string_lossy()))
+            .unwrap_or_else(|| "libcache".to_string()),
+    );
+
+    // Try loading from cache if it exists and is newer than the source file
+    if cache_path.exists() {
+        let cache_ok = match (
+            std::fs::metadata(source_path),
+            std::fs::metadata(&cache_path),
+        ) {
+            (Ok(src_meta), Ok(cache_meta)) => match (src_meta.modified(), cache_meta.modified()) {
+                (Ok(src_time), Ok(cache_time)) => cache_time >= src_time,
+                _ => false,
+            },
+            _ => false,
+        };
+
+        if cache_ok {
+            match cache::load_library_cache(&cache_path) {
+                Ok(entries) => {
+                    log::info!(
+                        "Loaded {} library entries from cache '{}'",
+                        entries.len(),
+                        cache_path.display()
+                    );
+                    return Ok(entries);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to load library cache, falling back to source: {}",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Load from source format
     let entries = match source {
         LibrarySource::DiannTsv(path) => {
             let loader = DiannTsvLoader::new();
@@ -40,7 +89,23 @@ pub fn load_library(source: &LibrarySource) -> Result<Vec<LibraryEntry>> {
         }
     }?;
 
-    Ok(deduplicate_library(entries))
+    let deduped = deduplicate_library(entries);
+
+    // Save cache for future runs
+    match cache::save_library_cache(&deduped, &cache_path) {
+        Ok(()) => {
+            log::info!(
+                "Saved library cache ({} entries) to '{}'",
+                deduped.len(),
+                cache_path.display()
+            );
+        }
+        Err(e) => {
+            log::warn!("Failed to save library cache: {}", e);
+        }
+    }
+
+    Ok(deduped)
 }
 
 /// Deduplicate library entries by (modified_sequence, charge).
