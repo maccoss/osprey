@@ -57,10 +57,7 @@ pub fn load_library(source: &LibrarySource) -> Result<Vec<LibraryEntry>> {
                     return Ok(entries);
                 }
                 Err(e) => {
-                    log::warn!(
-                        "Failed to load library cache, falling back to source: {}",
-                        e
-                    );
+                    log::debug!("Library cache not usable, falling back to source: {}", e);
                 }
             }
         }

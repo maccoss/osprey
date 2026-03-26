@@ -4588,10 +4588,158 @@ impl FileRescoreContext {
     }
 }
 
-/// Re-score a single entry at specified RT boundaries.
+/// Re-score a single entry in a single isolation window at specified RT boundaries.
 ///
-/// Used by both multi-charge consensus and inter-replicate reconciliation.
-/// Uses binary search on pre-sorted spec_indices for efficient spectra selection.
+/// Extracted from `rescore_entry_at_boundaries` to enable per-window processing.
+/// When `window_xcorr` is provided, XCorr scoring uses pre-preprocessed spectrum
+/// data, eliminating redundant per-entry binning/normalization.
+#[allow(clippy::too_many_arguments)]
+fn rescore_entry_in_window(
+    lib_entry: &LibraryEntry,
+    target_apex: f64,
+    target_start: f64,
+    target_end: f64,
+    expected_rt: f64,
+    spectra: &[Spectrum],
+    spec_indices: &[usize],
+    window_xcorr: Option<&[Vec<f32>]>,
+    scorer: &SpectralScorer,
+    ms1_index: &MS1Index,
+    calibration: Option<&CalibrationParams>,
+    tol_da: f64,
+    tol_ppm: f64,
+    is_hram: bool,
+    file_name: &str,
+) -> Option<CoelutionScoredEntry> {
+    use osprey_chromatography::compute_snr;
+    use osprey_scoring::extract_fragment_xics;
+
+    // RT window: peak region + 1× peak width margin on each side for SNR context
+    let peak_width = (target_end - target_start).max(0.1);
+    let margin = peak_width.max(0.2); // At least 0.2 min margin
+    let rt_lo = target_start - margin;
+    let rt_hi = target_end + margin;
+
+    // Binary search for RT range — spec_indices are in mzML acquisition
+    // order which is chronological (RT-sorted) within each isolation window.
+    let lo = spec_indices.partition_point(|&idx| spectra[idx].retention_time < rt_lo);
+    let hi = spec_indices.partition_point(|&idx| spectra[idx].retention_time <= rt_hi);
+
+    let range = &spec_indices[lo..hi];
+    if range.len() < 3 {
+        return None;
+    }
+
+    // Already in RT order — no sort needed
+    let cand_spectra: Vec<&Spectrum> = range.iter().map(|&idx| &spectra[idx]).collect();
+    let cand_global: Vec<usize> = range.to_vec();
+
+    // Extract fragment XICs
+    let xics = extract_fragment_xics(&lib_entry.fragments, &cand_spectra, tol_da, tol_ppm, 6);
+
+    if xics.len() < 2 {
+        return None;
+    }
+
+    // Reference XIC (highest total intensity fragment)
+    let ref_idx = xics
+        .iter()
+        .enumerate()
+        .max_by(|a, b| {
+            let sum_a: f64 = a.1 .1.iter().map(|(_, v)| *v).sum();
+            let sum_b: f64 = b.1 .1.iter().map(|(_, v)| *v).sum();
+            sum_a.total_cmp(&sum_b)
+        })
+        .map(|(i, _)| i)?;
+
+    let ref_xic = &xics[ref_idx].1;
+
+    if ref_xic.len() < 3 {
+        return None;
+    }
+
+    // Map target RT boundaries to XIC scan indices (binary search on sorted XIC)
+    let start_index = ref_xic
+        .partition_point(|(rt, _)| *rt < target_start)
+        .saturating_sub(1)
+        .min(ref_xic.len() - 1);
+
+    let end_index = ref_xic
+        .partition_point(|(rt, _)| *rt < target_end)
+        .min(ref_xic.len() - 1);
+
+    let apex_index = ref_xic
+        .partition_point(|(rt, _)| *rt < target_apex)
+        .min(ref_xic.len() - 1);
+    // Check if the point before apex_index is actually closer
+    let apex_index = if apex_index > 0
+        && (ref_xic[apex_index - 1].0 - target_apex).abs()
+            < (ref_xic[apex_index].0 - target_apex).abs()
+    {
+        apex_index - 1
+    } else {
+        apex_index
+    };
+    // Clamp apex to within peak boundaries so ID line is always inside
+    // the integration window written to blib
+    let apex_index = apex_index.clamp(start_index, end_index);
+
+    if end_index <= start_index + 1 {
+        return None;
+    }
+
+    // Compute area and SNR from reference signal at target boundaries
+    let area = osprey_chromatography::trapezoidal_area(&ref_xic[start_index..=end_index]);
+    let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+    let snr = compute_snr(&raw_ints, apex_index, start_index, end_index);
+
+    let peak = XICPeakBounds {
+        apex_rt: ref_xic[apex_index].0,
+        apex_intensity: ref_xic[apex_index].1,
+        apex_index,
+        start_rt: ref_xic[start_index].0,
+        end_rt: ref_xic[end_index].0,
+        start_index,
+        end_index,
+        area,
+        signal_to_noise: snr,
+    };
+
+    // Build window-local index mapping for pre-preprocessed XCorr lookup
+    let cand_win_local;
+    let (pp_xcorr, pp_local): (Option<&[Vec<f32>]>, Option<&[usize]>) =
+        if let Some(win_xcorr) = window_xcorr {
+            cand_win_local = (lo..lo + range.len()).collect::<Vec<usize>>();
+            (Some(win_xcorr), Some(cand_win_local.as_slice()))
+        } else {
+            (None, None)
+        };
+
+    let ctx = FeatureComputeContext {
+        entry: lib_entry,
+        xics: &xics,
+        ref_xic,
+        cand_spectra: &cand_spectra,
+        cand_global: &cand_global,
+        scorer,
+        ms1_index,
+        calibration,
+        tol_da,
+        tol_ppm,
+        expected_rt,
+        is_hram,
+        file_name,
+        preprocessed_xcorr: pp_xcorr,
+        cand_window_local: pp_local,
+    };
+
+    compute_features_at_peak(&ctx, peak)
+}
+
+/// Re-score a single entry at specified RT boundaries across all matching windows.
+///
+/// Iterates over all isolation windows, scoring in each window whose m/z range
+/// contains the precursor, and returns the best result by coelution_sum.
 ///
 /// When `per_window_xcorr` is provided, XCorr scoring uses pre-preprocessed
 /// spectrum data (one Vec<f32> per spectrum in each window group), eliminating
@@ -4614,15 +4762,6 @@ fn rescore_entry_at_boundaries(
     file_name: &str,
     per_window_xcorr: Option<&[Vec<Vec<f32>>]>,
 ) -> Option<CoelutionScoredEntry> {
-    use osprey_chromatography::compute_snr;
-    use osprey_scoring::extract_fragment_xics;
-
-    // RT window: peak region + 1× peak width margin on each side for SNR context
-    let peak_width = (target_end - target_start).max(0.1);
-    let margin = peak_width.max(0.2); // At least 0.2 min margin
-    let rt_lo = target_start - margin;
-    let rt_hi = target_end + margin;
-
     let mut best_result: Option<CoelutionScoredEntry> = None;
 
     for (win_group_idx, &((lower, upper), ref spec_indices)) in window_groups.iter().enumerate() {
@@ -4630,129 +4769,25 @@ fn rescore_entry_at_boundaries(
             continue;
         }
 
-        // Binary search for RT range — spec_indices are in mzML acquisition
-        // order which is chronological (RT-sorted) within each isolation window.
-        let lo = spec_indices.partition_point(|&idx| spectra[idx].retention_time < rt_lo);
-        let hi = spec_indices.partition_point(|&idx| spectra[idx].retention_time <= rt_hi);
+        let window_xcorr = per_window_xcorr.map(|all_win| all_win[win_group_idx].as_slice());
 
-        let range = &spec_indices[lo..hi];
-        if range.len() < 3 {
-            continue;
-        }
-
-        // Already in RT order — no sort needed
-        let cand_spectra: Vec<&Spectrum> = range.iter().map(|&idx| &spectra[idx]).collect();
-        let cand_global: Vec<usize> = range.to_vec();
-
-        // Extract fragment XICs
-        let xics = extract_fragment_xics(&lib_entry.fragments, &cand_spectra, tol_da, tol_ppm, 6);
-
-        if xics.len() < 2 {
-            continue;
-        }
-
-        // Reference XIC (highest total intensity fragment)
-        let ref_idx = xics
-            .iter()
-            .enumerate()
-            .max_by(|a, b| {
-                let sum_a: f64 = a.1 .1.iter().map(|(_, v)| *v).sum();
-                let sum_b: f64 = b.1 .1.iter().map(|(_, v)| *v).sum();
-                sum_a.total_cmp(&sum_b)
-            })
-            .map(|(i, _)| i);
-
-        let ref_idx = match ref_idx {
-            Some(i) => i,
-            None => continue,
-        };
-        let ref_xic = &xics[ref_idx].1;
-
-        if ref_xic.len() < 3 {
-            continue;
-        }
-
-        // Map target RT boundaries to XIC scan indices (binary search on sorted XIC)
-        let start_index = ref_xic
-            .partition_point(|(rt, _)| *rt < target_start)
-            .saturating_sub(1)
-            .min(ref_xic.len() - 1);
-
-        let end_index = ref_xic
-            .partition_point(|(rt, _)| *rt < target_end)
-            .min(ref_xic.len() - 1);
-
-        let apex_index = ref_xic
-            .partition_point(|(rt, _)| *rt < target_apex)
-            .min(ref_xic.len() - 1);
-        // Check if the point before apex_index is actually closer
-        let apex_index = if apex_index > 0
-            && (ref_xic[apex_index - 1].0 - target_apex).abs()
-                < (ref_xic[apex_index].0 - target_apex).abs()
-        {
-            apex_index - 1
-        } else {
-            apex_index
-        };
-        // Clamp apex to within peak boundaries so ID line is always inside
-        // the integration window written to blib
-        let apex_index = apex_index.clamp(start_index, end_index);
-
-        if end_index <= start_index + 1 {
-            continue;
-        }
-
-        // Compute area and SNR from reference signal at target boundaries
-        let area = osprey_chromatography::trapezoidal_area(&ref_xic[start_index..=end_index]);
-        let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
-        let snr = compute_snr(&raw_ints, apex_index, start_index, end_index);
-
-        let peak = XICPeakBounds {
-            apex_rt: ref_xic[apex_index].0,
-            apex_intensity: ref_xic[apex_index].1,
-            apex_index,
-            start_rt: ref_xic[start_index].0,
-            end_rt: ref_xic[end_index].0,
-            start_index,
-            end_index,
-            area,
-            signal_to_noise: snr,
-        };
-
-        // Build window-local index mapping for pre-preprocessed XCorr lookup
-        let win_xcorr_ref;
-        let cand_win_local;
-        let (pp_xcorr, pp_local): (Option<&[Vec<f32>]>, Option<&[usize]>) =
-            if let Some(all_win) = per_window_xcorr {
-                win_xcorr_ref = &all_win[win_group_idx];
-                cand_win_local = (lo..lo + range.len()).collect::<Vec<usize>>();
-                (
-                    Some(win_xcorr_ref.as_slice()),
-                    Some(cand_win_local.as_slice()),
-                )
-            } else {
-                (None, None)
-            };
-
-        let ctx = FeatureComputeContext {
-            entry: lib_entry,
-            xics: &xics,
-            ref_xic,
-            cand_spectra: &cand_spectra,
-            cand_global: &cand_global,
+        if let Some(scored_entry) = rescore_entry_in_window(
+            lib_entry,
+            target_apex,
+            target_start,
+            target_end,
+            expected_rt,
+            spectra,
+            spec_indices,
+            window_xcorr,
             scorer,
             ms1_index,
             calibration,
             tol_da,
             tol_ppm,
-            expected_rt,
             is_hram,
             file_name,
-            preprocessed_xcorr: pp_xcorr,
-            cand_window_local: pp_local,
-        };
-
-        if let Some(scored_entry) = compute_features_at_peak(&ctx, peak) {
+        ) {
             let dominated = best_result.as_ref().is_some_and(|existing| {
                 existing.features.coelution_sum >= scored_entry.features.coelution_sum
             });
@@ -4771,8 +4806,11 @@ fn rescore_entry_at_boundaries(
 /// extracts XICs from the appropriate isolation window and computes all features
 /// at the specified reconciled boundaries.
 ///
-/// Pre-preprocesses all window spectra for XCorr once (same optimization as the
-/// first-pass search) to avoid redundant per-entry binning/normalization.
+/// Processes one isolation window at a time: preprocesses XCorr for that window's
+/// spectra, parallel-rescores all matching entries, then drops the preprocessed
+/// data before moving to the next window. This bounds peak memory to ~one window's
+/// worth of XCorr vectors (~480 MB for HRAM) instead of all windows at once
+/// (~80 GB for HRAM with 200K spectra).
 ///
 /// Uses lightweight `FdrEntry` stubs for entry_id lookup (no full parquet load).
 /// Returns a HashMap of (entry_index → re-scored entry) as an in-memory overlay.
@@ -4794,68 +4832,125 @@ fn rescore_for_reconciliation(
     is_hram: bool,
     file_name: &str,
 ) -> HashMap<usize, CoelutionScoredEntry> {
-    // Pre-preprocess all window spectra for XCorr (eliminates redundant per-entry
-    // spectrum binning/normalization/sliding-window subtraction).
-    let per_window_xcorr: Vec<Vec<Vec<f32>>> = window_groups
+    // Log memory estimate for the per-window approach
+    let max_spectra_per_window = window_groups
         .iter()
-        .map(|(_, spec_indices)| {
-            spec_indices
-                .iter()
-                .map(|&idx| scorer.preprocess_spectrum_for_xcorr(&spectra[idx]))
-                .collect()
-        })
-        .collect();
+        .map(|(_, s)| s.len())
+        .max()
+        .unwrap_or(0);
+    let bytes_per_vec = scorer.num_bins() * std::mem::size_of::<f32>();
+    let peak_mb = (max_spectra_per_window * bytes_per_vec) / (1024 * 1024);
+    log::debug!(
+        "Reconciliation XCorr: processing {} windows sequentially, \
+         largest window = {} spectra × {} bins = ~{} MB peak",
+        window_groups.len(),
+        max_spectra_per_window,
+        scorer.num_bins(),
+        peak_mb,
+    );
 
-    // Parallel phase: compute new scored entries for each action
-    let results: Vec<(usize, Option<CoelutionScoredEntry>)> = actions
-        .par_iter()
-        .map(|&(entry_idx, target_apex, target_start, target_end)| {
+    // Pre-map each action to its library entry for window assignment
+    let action_lib: Vec<Option<&LibraryEntry>> = actions
+        .iter()
+        .map(|&(entry_idx, _, _, _)| {
             let stub = &fdr_entries[entry_idx];
-
-            // Look up the library entry using entry_id from the lightweight stub
-            let lib_entry = if (stub.entry_id as usize) < library.len()
+            if (stub.entry_id as usize) < library.len()
                 && library[stub.entry_id as usize].id == stub.entry_id
             {
-                &library[stub.entry_id as usize]
+                Some(&library[stub.entry_id as usize])
             } else {
-                match library.iter().find(|e| e.id == stub.entry_id) {
-                    Some(e) => e,
-                    None => return (entry_idx, None),
-                }
-            };
-
-            let expected_rt = rt_calibration
-                .map(|cal| cal.predict(lib_entry.retention_time))
-                .unwrap_or(lib_entry.retention_time);
-
-            let result = rescore_entry_at_boundaries(
-                lib_entry,
-                target_apex,
-                target_start,
-                target_end,
-                expected_rt,
-                spectra,
-                window_groups,
-                scorer,
-                ms1_index,
-                calibration,
-                tol_da,
-                tol_ppm,
-                is_hram,
-                file_name,
-                Some(&per_window_xcorr),
-            );
-
-            (entry_idx, result)
+                library.iter().find(|e| e.id == stub.entry_id)
+            }
         })
         .collect();
 
-    // Collect successfully re-scored entries into overlay
-    let mut overlay = HashMap::new();
-    for (entry_idx, new_entry) in results {
-        if let Some(e) = new_entry {
-            overlay.insert(entry_idx, e);
+    // Pre-compute expected RTs for each action
+    let action_expected_rt: Vec<f64> = action_lib
+        .iter()
+        .map(|lib_entry| {
+            lib_entry
+                .map(|e| {
+                    rt_calibration
+                        .map(|cal| cal.predict(e.retention_time))
+                        .unwrap_or(e.retention_time)
+                })
+                .unwrap_or(0.0)
+        })
+        .collect();
+
+    // Group action indices by window (an action may appear in multiple windows
+    // if overlapping isolation windows contain its precursor m/z)
+    let mut actions_by_window: Vec<Vec<usize>> = vec![Vec::new(); window_groups.len()];
+    for (action_idx, lib_entry) in action_lib.iter().enumerate() {
+        if let Some(entry) = lib_entry {
+            for (win_idx, &((lower, upper), _)) in window_groups.iter().enumerate() {
+                if entry.precursor_mz >= lower && entry.precursor_mz <= upper {
+                    actions_by_window[win_idx].push(action_idx);
+                }
+            }
         }
+    }
+
+    let mut overlay: HashMap<usize, CoelutionScoredEntry> = HashMap::new();
+
+    // Process one window at a time to bound memory
+    for (win_idx, action_indices) in actions_by_window.iter().enumerate() {
+        if action_indices.is_empty() {
+            continue;
+        }
+
+        let (_, ref spec_indices) = window_groups[win_idx];
+
+        // Preprocess XCorr for this window only — dropped after this iteration
+        let window_xcorr: Vec<Vec<f32>> = spec_indices
+            .iter()
+            .map(|&idx| scorer.preprocess_spectrum_for_xcorr(&spectra[idx]))
+            .collect();
+
+        // Parallel rescore all actions assigned to this window
+        let results: Vec<(usize, Option<CoelutionScoredEntry>)> = action_indices
+            .par_iter()
+            .map(|&action_idx| {
+                let &(entry_idx, target_apex, target_start, target_end) = &actions[action_idx];
+                // Safety: action_idx is only in actions_by_window if action_lib[action_idx].is_some()
+                let lib_entry = action_lib[action_idx].unwrap();
+                let expected_rt = action_expected_rt[action_idx];
+
+                let result = rescore_entry_in_window(
+                    lib_entry,
+                    target_apex,
+                    target_start,
+                    target_end,
+                    expected_rt,
+                    spectra,
+                    spec_indices,
+                    Some(&window_xcorr),
+                    scorer,
+                    ms1_index,
+                    calibration,
+                    tol_da,
+                    tol_ppm,
+                    is_hram,
+                    file_name,
+                );
+
+                (entry_idx, result)
+            })
+            .collect();
+
+        // Merge into overlay, keeping best coelution_sum per entry
+        // (an entry in overlapping windows is scored in each and the best wins)
+        for (entry_idx, new_entry) in results {
+            if let Some(e) = new_entry {
+                let dominated = overlay.get(&entry_idx).is_some_and(|existing| {
+                    existing.features.coelution_sum >= e.features.coelution_sum
+                });
+                if !dominated {
+                    overlay.insert(entry_idx, e);
+                }
+            }
+        }
+        // window_xcorr is dropped here — memory freed before next window
     }
 
     overlay
