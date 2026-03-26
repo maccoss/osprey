@@ -1,19 +1,19 @@
 # Spectral Scoring
 
-Osprey uses spectral similarity scoring to assess whether an observed spectrum matches its predicted library spectrum. This is the primary score used for target-decoy FDR computation during calibration.
+Osprey uses spectral similarity scoring during calibration discovery. Multiple scores are computed per candidate (XCorr, E-value, isotope cosine, fragment correlation, libcosine), then combined via LDA into a single discriminant score for target-decoy competition.
 
 ## Overview
 
-The scoring system uses XCorr with E-value for calibration:
+The scoring system computes multiple features during calibration, which are combined by LDA for FDR:
 
 ```
 Calibration Workflow:
-  1. For each library entry, calculate XCorr against ALL spectra in RT window
-  2. Select best spectrum by XCorr (RT selection)
+  1. Co-elution search with CWT peak detection → find best peak per peptide
+  2. At apex, compute XCorr, libcosine, fragment correlation, top-6 matches
   3. Collect MS2 mass errors from top-3 fragment matches at best spectrum
-  4. Calculate E-value from XCorr survival function (Comet-style)
+  4. Calculate E-value from XCorr survival function (computed but not used for FDR)
   5. Extract MS1 isotope envelope → isotope cosine score
-  6. Use E-value for target-decoy competition
+  6. LDA scoring (4 features) → discriminant score for target-decoy competition
   7. FDR filtering → calibration points
 ```
 
@@ -56,7 +56,7 @@ E-value calculation:
   4. E-value = 10^(intercept - slope × best_xcorr)
 ```
 
-Lower E-value = better statistical significance. E-value is used for target-decoy competition.
+Lower E-value = better statistical significance. Note: E-value is computed and stored but **not used** for target-decoy competition — LDA scoring on 4 features (correlation, libcosine, top6_matched, xcorr) is used instead. See [Calibration](02-calibration.md).
 
 ### Top-3 Fragment Matching (MS2 Calibration)
 
@@ -112,22 +112,30 @@ Before XCorr scoring, candidates are filtered using the `has_top3_fragment_match
 
 ## Target-Decoy Competition
 
-During calibration, each target competes against its paired decoy:
+During calibration, each target competes against its paired decoy using the LDA discriminant score (not E-value):
 
 ```
 Target-decoy pairing: decoy_id = target_id | 0x80000000
 
+LDA features (normalized to 0–1):
+  - correlation_score / 6.0  (fragment XIC co-elution)
+  - libcosine_apex           (spectral similarity at apex)
+  - top6_matched_apex / 6.0  (number of top-6 fragments matched)
+  - xcorr_score / 3.0        (Comet-style XCorr)
+
 Competition rules:
-  1. Compare E-values for target and decoy
-  2. Lower E-value wins
+  1. Compare LDA discriminant scores for target and decoy
+  2. Higher discriminant score wins
   3. Ties go to decoy (conservative)
   4. Winner enters FDR calculation
 
 FDR calculation:
-  1. Sort winners by E-value (ascending - lower is better)
+  1. Sort winners by discriminant score (descending - higher is better)
   2. FDR = cumulative_decoys / cumulative_targets
   3. Filter to targets at ≤1% FDR
 ```
+
+See [Calibration](02-calibration.md) for full LDA training details.
 
 ## Scoring Flow Summary
 
@@ -146,7 +154,10 @@ Per peptide (target or decoy):
 │                                                             │
 │ 4. Calculate E-value from XCorr survival function           │
 │                                                             │
-│ 5. Output: E-value, XCorr, MS2 errors, isotope_cosine      │
+│ 5. LDA scoring → discriminant score (for FDR competition)   │
+│                                                             │
+│ 6. Output: discriminant_score, XCorr, MS2 errors,           │
+│    isotope_cosine, E-value (stored but not used for FDR)    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -286,8 +297,12 @@ Step 5: Isotope cosine (from MS1)
   Isotope cosine: 0.998
 
 Final scores:
-  E-value: 1.2e-8 (used for target-decoy competition)
-  XCorr: 0.42 (primary score)
+  E-value: 1.2e-8 (computed but not used for FDR)
+  XCorr: 0.42 (LDA feature)
+  Correlation: 4.2 (LDA feature — fragment co-elution sum)
+  Libcosine: 0.89 (LDA feature — spectral similarity at apex)
+  Top-6 matched: 5 (LDA feature — fragments matched at apex)
+  LDA discriminant score: 0.73 (used for target-decoy competition)
   MS2 errors: [+2.9, -2.2, +8.7] ppm (for MS2 calibration)
   Isotope cosine: 0.998
 ```
@@ -337,15 +352,33 @@ After the main search, all charge states of the same peptide are forced to share
 
 ### Feature Computation
 
-All features are computed via `compute_features_at_peak()`, a reusable function that takes a `FeatureComputeContext` (read-only references to library entry, XICs, spectra, calibration, etc.) and an `XICPeakBounds`. This function is called both during the initial per-precursor search and during multi-charge consensus re-scoring.
+All features are computed via `compute_features_at_peak()`, a reusable function that takes a `FeatureComputeContext` (read-only references to library entry, XICs, spectra, calibration, etc.) and an `XICPeakBounds`. This function is called in all scoring paths: initial search, multi-charge consensus, and cross-run reconciliation.
+
+### Shared Scoring Function: `run_search()` with Boundary Overrides
+
+The first-pass search and post-FDR re-scoring (multi-charge consensus and cross-run reconciliation) both use the same `run_search()` function. The difference is controlled by the `boundary_overrides` parameter:
+
+| Aspect | First-Pass Search | Post-FDR Re-Scoring |
+|--------|-------------------|---------------------|
+| `boundary_overrides` | `None` | `Some(&HashMap<u32, (f64, f64, f64)>)` |
+| **Pre-filter** | Enabled (3-of-4 consecutive scans) | Skipped (we're told to score here) |
+| **Peak detection** | CWT consensus + fallbacks | Skipped; given `(apex_rt, start_rt, end_rt)` |
+| **RT → index mapping** | CWT provides scan indices directly | Binary search (`partition_point`) maps target RTs to XIC indices |
+| **Feature computation** | `compute_features_at_peak()` | Same `compute_features_at_peak()` |
+| **XCorr preprocessing** | Once per window, shared across candidates | Same — reuses per-window `preprocessed_xcorr` |
+| **Parallelism** | Isolation windows in parallel via rayon | Same — windows in parallel via rayon |
+
+When `boundary_overrides` contains an entry's ID, `run_search()` skips CWT detection for that entry and instead maps the given RT boundaries to XIC scan indices. The feature computation is identical — the only difference is how peak boundaries are determined. This ensures that re-scored entries produce features on exactly the same scale as first-pass entries, which is critical for SVM/Percolator scoring.
+
+See [Cross-Run Reconciliation](10-cross-run-reconciliation.md) and [Boundary Overrides & Forced Integration](13-boundary-overrides.md) for full details.
 
 ---
 
 ## Notes
 
-1. **XCorr for everything**: XCorr is both the RT selection score and the primary calibration score
+1. **XCorr as an LDA feature**: XCorr is one of 4 LDA features (along with correlation, libcosine, top6_matched) used for calibration FDR
 2. **Unit resolution bins for calibration**: Always 2001 bins regardless of data type (~50x faster for HRAM)
-3. **E-value for competition**: E-value (from XCorr survival function) is used for target-decoy competition
+3. **LDA for competition**: LDA discriminant score (not E-value) is used for paired target-decoy competition. E-value is computed and stored but not used for FDR.
 4. **Top-3 for MS2 calibration**: MS2 mass errors come from top-3 fragment matching (binary search), not full fragment matching
 5. **Isotope scoring**: Only available when MS1 spectra are present in the mzML file
 6. **LibCosine in main search**: LibCosine (ppm fragment matching) is used during feature extraction (Phase 4), not during calibration

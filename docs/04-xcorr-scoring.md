@@ -292,6 +292,65 @@ xcorr *= 0.005;
 
 This avoids creating a dense theoretical vector and is faster when n_fragments << n_bins (typical: 20-50 fragments vs 2K-100K bins).
 
+## Per-Window Preprocessing Optimization
+
+During the coelution search (Phase 3), `run_search()` processes each DIA isolation window in parallel. Within a window, the same set of spectra is shared by hundreds of precursor candidates. Without optimization, each candidate would independently preprocess every spectrum in its RT range — redundantly repeating the same sqrt + windowing + flanking subtraction work.
+
+### The Problem
+
+A typical DIA window contains ~200 spectra and hundreds of candidate precursors. Naive per-candidate preprocessing would preprocess the same spectrum hundreds of times:
+
+```
+Window [400, 403] → 200 spectra, 300 candidates
+Without optimization:  300 × 200 = 60,000 preprocessing calls
+With optimization:                  200 preprocessing calls
+```
+
+### The Solution
+
+All spectra in a window are preprocessed **once** at the start of the per-window loop, before iterating over candidates:
+
+```rust
+let preprocessed_xcorr: Vec<Vec<f32>> = window_spectra
+    .iter()
+    .map(|s| scorer.preprocess_spectrum_for_xcorr(s))
+    .collect();
+```
+
+This `Vec<Vec<f32>>` is indexed by position in the window's spectrum list. Each candidate's `FeatureComputeContext` receives a reference to this shared array along with a mapping from the candidate's local spectrum indices to the window-level indices:
+
+```rust
+struct FeatureComputeContext<'a> {
+    // ... other fields ...
+    preprocessed_xcorr: Option<&'a [Vec<f32>]>,  // pre-preprocessed for all window spectra
+    cand_window_local: Option<&'a [usize]>,       // candidate spectra → window index mapping
+}
+```
+
+Inside `compute_features_at_peak()`, XCorr computation becomes an O(n_fragments) lookup per spectrum rather than O(n_bins) preprocessing + O(n_fragments) scoring:
+
+```rust
+// Look up the pre-preprocessed vector for this spectrum
+let preprocessed = &ctx.preprocessed_xcorr[window_idx];
+
+// O(n_fragments) bin lookups — no preprocessing needed
+let mut xcorr = 0.0;
+for fragment in &entry.fragments {
+    if let Some(bin) = bin_config.mz_to_bin(fragment.mz) {
+        xcorr += preprocessed[bin] as f64;
+    }
+}
+xcorr *= 0.005;
+```
+
+### Memory Impact
+
+Each preprocessed vector has `n_bins` entries of 4 bytes (f32):
+- **Unit resolution**: 2,001 bins × 4 bytes = ~8 KB per spectrum
+- **HRAM**: 100,000 bins × 4 bytes = ~400 KB per spectrum
+
+For a window with 200 spectra: ~80 MB (HRAM) or ~1.6 MB (unit resolution). This is allocated once per window and freed when the window loop moves on.
+
 ## Calibration: Always Unit Resolution Bins
 
 Calibration XCorr always uses **unit resolution bins** (2001 bins, 1.0005 Da) regardless of whether the data is unit resolution or HRAM. This provides ~50x faster scoring for HRAM data while maintaining sufficient discriminating power for calibration.

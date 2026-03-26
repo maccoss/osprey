@@ -43,7 +43,7 @@ cargo test --all   # Run all tests
 
 ## Test Overview
 
-**Total: ~290 tests** across 7 crates.
+**Total: ~302 tests** across 7 crates.
 
 | Crate | Tests | Focus |
 |---|---|---|
@@ -53,7 +53,7 @@ cargo test --all   # Run all tests
 | `osprey-scoring` | 70 | Spectral scoring, XCorr, coelution, decoy generation |
 | `osprey-fdr` | 41 | FDR control, Percolator, Mokapot integration |
 | `osprey-ml` | 30 | SVM, LDA, PEP estimation, q-value computation |
-| `osprey` | 26 | Pipeline logic, candidate selection, consensus, reconciliation |
+| `osprey` | 41 | Pipeline logic, candidate selection, consensus, reconciliation, boundary overrides |
 
 ---
 
@@ -610,7 +610,7 @@ Tests for the post-FDR consensus phase where charge states of the same peptide a
 | `test_consensus_single_charge_no_change` | Single charge not re-scored |
 | `test_consensus_two_charges_same_peak` | Same peak: no re-scoring needed |
 | `test_consensus_two_charges_different_peaks` | Different peaks: one re-scored |
-| `test_consensus_uses_svm_score_not_coelution` | SVM score preferred |
+| `test_consensus_uses_svm_score_not_coelution` | SVM score preferred for consensus leader |
 | `test_consensus_skips_groups_where_none_pass_fdr` | Non-passing groups skipped |
 | `test_consensus_three_charges_two_agree` | Multi-charge consensus |
 | `test_consensus_decoys_separate_from_targets` | Separate target/decoy groups |
@@ -627,6 +627,28 @@ Tests for the post-FDR consensus phase where charge states of the same peptide a
 | `test_simple_median_odd` | Odd-length median correct |
 | `test_simple_median_even` | Even-length median correct |
 | `test_weighted_median_empty` | Empty returns 0.0 |
+
+#### Boundary Overrides (`run_search`) — [crates/osprey/src/pipeline.rs](../crates/osprey/src/pipeline.rs)
+
+These tests verify that `run_search()` correctly handles the `boundary_overrides` parameter used by multi-charge consensus and cross-run reconciliation. They use synthetic data helpers that construct minimal library entries, Gaussian elution profile spectra, and unit-resolution configs.
+
+**Synthetic Data Helpers:**
+
+| Helper | Description |
+|---|---|
+| `make_lib_entry_with_fragments()` | Creates a `LibraryEntry` with 3 fragments at 300.0, 400.0, 500.0 Da |
+| `make_gaussian_spectra()` | Builds N spectra with Gaussian intensity profile (configurable center, sigma, RT range) |
+| `make_test_config()` | Unit resolution `OspreyConfig` with 0.5 Da tolerance and prefilter enabled |
+
+**Tests:**
+
+| Test | Description |
+|---|---|
+| `test_run_search_override_returns_entry_at_specified_boundaries` | Override produces a result with boundaries near the specified 9.0–11.0 range |
+| `test_run_search_override_skips_prefilter` | Zero-signal spectra (1 of 3 fragments): normal search fails prefilter, override bypasses it |
+| `test_run_search_mixed_override_and_cwt` | Two entries in same window: one with override, one with CWT — both produce results |
+| `test_run_search_no_override_normal_detection` | Baseline: `None` boundary_overrides still uses CWT peak detection correctly |
+| `test_run_search_override_narrow_boundaries` | Very tight 0.5-min override (9.75–10.25) on 60-spectra data; verifies narrow peaks handled |
 
 ---
 

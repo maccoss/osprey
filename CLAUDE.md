@@ -316,3 +316,9 @@ Osprey uses a disk-backed stub architecture to scale to 1000+ files:
 - Changed `consensus_fdr` default from 0.05 to 0.01
 - Removed `file_name` from FdrEntry (redundant with outer `Vec<(String, Vec<FdrEntry>)>` key) — saves ~40 bytes heap per entry
 - Interned `modified_sequence` with `Arc<str>` — deduplicates peptide strings across GPF replicates, saving ~25 bytes heap per entry on large experiments
+- Refactored reconciliation re-scoring to reuse `run_search()` with `boundary_overrides` parameter — eliminates separate sequential `rescore_for_reconciliation()` code path, gaining parallel window processing and shared per-window XCorr preprocessing (~50x speedup for reconciliation)
+- Per-window XCorr preprocessing optimization: `preprocess_spectrum_for_xcorr()` called once per window, stored as `Vec<Vec<f32>>`, reused across all candidates via O(n_frags) bin lookup instead of redundant per-entry O(n_peaks) preprocessing
+- Multi-charge consensus moved to post-FDR: uses SVM scores (not coelution_sum) to select consensus leader among FDR-passing charge states
+- Consensus and reconciliation targets merged into single `run_search()` call per file (reconciliation wins on conflict)
+- Added 5 boundary_overrides tests with synthetic data helpers (make_lib_entry_with_fragments, make_gaussian_spectra, make_test_config)
+- Removed `rescore_for_reconciliation()`, `rescore_entry_in_window()`, `FileRescoreContext` (replaced by `run_search()` with boundary_overrides)

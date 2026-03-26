@@ -26,7 +26,7 @@ After per-run FDR (first pass):
   3. refit_calibration()          — tighter per-run LOESS from consensus points
   4. plan_reconciliation()        — Keep | UseCwtPeak | ForcedIntegration per entry
        (CWT candidates loaded selectively from per-file Parquet caches)
-  5. Re-score reconciled entries  — reload full entries from Parquet, recompute features
+  5. Re-score via run_search()    — boundary_overrides skip CWT; parallel window processing
   6. Second-pass FDR              — final experiment-level q-values
 ```
 
@@ -110,14 +110,43 @@ The CWT candidates are stored during the initial search (configurable, default 5
 
 ---
 
-## Step 5: Re-Scoring
+## Step 5: Re-Scoring via `run_search()` with Boundary Overrides
 
-Entries with `UseCwtPeak` or `ForcedIntegration` actions are re-scored at their new boundaries:
-- Full `CoelutionScoredEntry` data is reloaded from the per-file Parquet cache
-- Files are processed **sequentially** (not in parallel) to limit peak memory — each file loads spectra (~1-2 GB) and full Parquet entries (~1.4 GB), so parallel loading would OOM on large experiments
-- All features are recomputed at the new peak boundaries via `compute_features_at_peak()`
-- Updated entries are converted back to FdrEntry stubs for the second-pass FDR
-- Entries that cannot be re-scored (no spectral data at the expected RT) are dropped
+Entries with `UseCwtPeak` or `ForcedIntegration` actions are re-scored by calling the same `run_search()` function used in the first-pass search, with `boundary_overrides` that direct it to score at specific RT boundaries instead of running CWT peak detection.
+
+### How It Works
+
+1. **Merge targets**: Multi-charge consensus targets and reconciliation targets are merged into a single set per file. If a reconciliation action conflicts with a consensus action for the same entry, reconciliation wins (it has more information: refined calibration + consensus RT).
+
+2. **Build boundary overrides**: Each `ReconcileAction` is converted to a `(apex_rt, start_rt, end_rt)` tuple and stored in a `HashMap<u32, (f64, f64, f64)>` keyed by `entry_id`:
+   - `UseCwtPeak` → uses the stored CWT candidate's `(apex_rt, start_rt, end_rt)`
+   - `ForcedIntegration` → `(expected_rt, expected_rt - half_width, expected_rt + half_width)`
+
+3. **Subset library**: Only library entries corresponding to entries needing re-scoring are included (subset by `entry_id`).
+
+4. **Call `run_search()`**: The subset library, loaded spectra, calibration, and `Some(&boundary_overrides)` are passed to `run_search()`. Inside `run_search()`, entries with overrides:
+   - **Skip the pre-filter** (we're told to score here regardless of signal)
+   - **Skip CWT peak detection** (boundaries are already determined)
+   - **Map target RTs to XIC scan indices** via binary search (`partition_point`)
+   - **Compute all 21 PIN features** at the override boundaries via `compute_features_at_peak()`
+
+5. **Update FdrEntry stubs**: Re-scored entries replace the originals. Entries that cannot be scored (no spectral data at the expected RT) are dropped.
+
+### Why `run_search()` Instead of Sequential Re-Scoring
+
+Reconciliation previously used a dedicated sequential re-scoring loop that processed entries one at a time. This was ~50x slower than the first-pass search because it missed the parallelism of `run_search()`:
+
+- **First-pass search**: Isolation windows processed in parallel via `rayon`, spectra grouped by window, XCorr preprocessing done once per window and reused across all candidates
+- **Old reconciliation**: Each entry loaded spectra, extracted XICs, and computed features independently — no window-level parallelism, redundant XCorr preprocessing
+
+By reusing `run_search()` with `boundary_overrides`, reconciliation gets the same performance characteristics as the first pass:
+- **Parallel window processing** via rayon
+- **Per-window XCorr preprocessing** done once and shared across all entries in the window (see [XCorr Scoring](04-xcorr-scoring.md#per-window-preprocessing-optimization))
+- **Shared spectra grouping and indexing** across entries
+
+### Memory: Sequential Per-File Processing
+
+Files are still processed **sequentially** (not in parallel) because each file requires loading spectra (~1–2 GB) and building the window index. Parallel file loading would OOM on large experiments. The sequencing is at the file level; within each file, `run_search()` parallelizes across isolation windows.
 
 ---
 
@@ -204,8 +233,10 @@ If file3 had no CWT candidate near the expected RT (e.g., the peptide was truly 
 | `crates/osprey/src/reconciliation.rs` | `refit_calibration_with_consensus()` | Refit per-run LOESS from consensus points |
 | `crates/osprey/src/reconciliation.rs` | `plan_reconciliation()` | Determine Keep/UseCwtPeak/ForcedIntegration per entry |
 | `crates/osprey/src/reconciliation.rs` | `determine_reconcile_action()` | Single-entry action determination |
+| `crates/osprey/src/pipeline.rs` | `run_search()` | Reused for re-scoring with `boundary_overrides` parameter |
+| `crates/osprey/src/pipeline.rs` | `select_post_fdr_consensus()` | Multi-charge consensus target selection (merged with reconciliation targets) |
 | `crates/osprey/src/pipeline.rs` | `load_cwt_candidates_from_parquet()` | Selective CWT-only Parquet column reader |
-| `crates/osprey/src/pipeline.rs` | reconciliation orchestration | Load data from Parquet, re-score, second-pass FDR |
+| `crates/osprey/src/pipeline.rs` | reconciliation orchestration | Build overrides, load spectra, call `run_search()`, second-pass FDR |
 
 ### Tests
 
