@@ -2109,6 +2109,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 rt_cal.as_ref(),
                 &config,
                 &file_name,
+                None,
             )?;
 
             log::info!(
@@ -2420,11 +2421,44 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 all_targets.len(),
             );
 
-            let ctx = match FileRescoreContext::load(input_file, &config) {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    log::warn!("Failed to load spectra for {}: {}", file_name, e);
-                    continue;
+            // Build boundary overrides keyed by entry_id and track idx mapping
+            let mut boundary_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
+            let mut entry_id_to_idx: HashMap<u32, usize> = HashMap::new();
+            let mut subset_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for &(idx, apex, start, end) in &all_targets {
+                let entry_id = fdr_entries[idx].entry_id;
+                boundary_overrides.insert(entry_id, (apex, start, end));
+                entry_id_to_idx.insert(entry_id, idx);
+                subset_ids.insert(entry_id);
+            }
+
+            // Build subset library containing only entries that need re-scoring
+            let subset_library: Vec<LibraryEntry> = library
+                .iter()
+                .filter(|e| subset_ids.contains(&e.id))
+                .cloned()
+                .collect();
+
+            // Load spectra and calibration for this file
+            let (spectra, ms1_index) = {
+                let cache_path = spectra_cache_path(input_file);
+                if cache_path.exists() {
+                    match load_spectra_cache(&cache_path) {
+                        Ok(result) => {
+                            log::info!(
+                                "Loaded {} MS2 spectra from cache '{}'",
+                                result.0.len(),
+                                cache_path.display()
+                            );
+                            result
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
+                            load_all_spectra(input_file)?
+                        }
+                    }
+                } else {
+                    load_all_spectra(input_file)?
                 }
             };
 
@@ -2433,25 +2467,36 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 .get(file_name.as_str())
                 .or_else(|| per_file_calibrations.get(file_name.as_str()));
 
-            let overlay = rescore_for_reconciliation(
-                fdr_entries,
-                &all_targets,
-                &library,
-                ctx.spectra_ref(),
-                &ctx.window_groups,
-                &ctx.ms1_index,
-                ctx.cal_params.as_ref(),
+            let cal_params: Option<CalibrationParams> = input_file.parent().and_then(|input_dir| {
+                let cal_path = calibration_path_for_input(input_file, input_dir);
+                if cal_path.exists() {
+                    load_calibration(&cal_path).ok()
+                } else {
+                    None
+                }
+            });
+
+            let rescored = run_search(
+                &subset_library,
+                &spectra,
+                &ms1_index,
+                cal_params.as_ref(),
                 rt_cal,
-                &ctx.scorer,
-                ctx.tol_da,
-                ctx.tol_ppm,
-                ctx.rt_tolerance,
-                ctx.is_hram,
+                &config,
                 file_name,
-            );
+                Some(&boundary_overrides),
+            )?;
 
             // Drop spectra before updating stubs to free ~1.5-3 GB
-            drop(ctx);
+            drop(spectra);
+
+            // Map results back to entry indices for the overlay
+            let mut overlay: HashMap<usize, CoelutionScoredEntry> = HashMap::new();
+            for entry in rescored {
+                if let Some(&idx) = entry_id_to_idx.get(&entry.entry_id) {
+                    overlay.insert(idx, entry);
+                }
+            }
 
             let n_rescored = overlay.len();
             total_rescored += n_rescored;
@@ -4444,463 +4489,17 @@ fn select_post_fdr_consensus(
     targets
 }
 
-/// Context for re-scoring entries in a file.
-///
-/// Loads spectra, calibration, sets up fragment tolerance and scorer —
-/// shared setup needed by both multi-charge consensus and inter-replicate reconciliation.
-struct FileRescoreContext {
-    spectra: Vec<Spectrum>,
-    calibrated_spectra: Option<Vec<Spectrum>>,
-    ms1_index: MS1Index,
-    cal_params: Option<CalibrationParams>,
-    window_groups: Vec<((f64, f64), Vec<usize>)>,
-    scorer: SpectralScorer,
-    tol_da: f64,
-    tol_ppm: f64,
-    rt_tolerance: f64,
-    is_hram: bool,
-}
-
-impl FileRescoreContext {
-    /// Load spectra and calibration for a file, set up scoring context.
-    /// Tries binary spectra cache first for fast reload (~seconds vs ~minutes for mzML).
-    fn load(input_file: &std::path::Path, config: &OspreyConfig) -> Result<Self> {
-        use osprey_scoring::batch::group_spectra_by_isolation_window;
-
-        let cache_path = spectra_cache_path(input_file);
-        let (spectra, ms1_index) = if cache_path.exists() {
-            match load_spectra_cache(&cache_path) {
-                Ok(result) => {
-                    log::info!(
-                        "Loaded {} MS2 spectra from cache '{}'",
-                        result.0.len(),
-                        cache_path.display()
-                    );
-                    result
-                }
-                Err(e) => {
-                    log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
-                    load_all_spectra(input_file)?
-                }
-            }
-        } else {
-            load_all_spectra(input_file)?
-        };
-        if spectra.is_empty() {
-            return Err(OspreyError::MzmlParseError("No spectra found".into()));
-        }
-
-        // Load calibration from cached JSON
-        let cal_params: Option<CalibrationParams> = input_file.parent().and_then(|input_dir| {
-            let cal_path = calibration_path_for_input(input_file, input_dir);
-            if cal_path.exists() {
-                load_calibration(&cal_path).ok()
-            } else {
-                None
-            }
-        });
-
-        // Apply MS2 calibration to spectra
-        let calibrated_spectra: Option<Vec<Spectrum>> = cal_params.as_ref().and_then(|cal| {
-            if cal.ms2_calibration.calibrated {
-                Some(
-                    spectra
-                        .iter()
-                        .map(|s| {
-                            osprey_chromatography::apply_spectrum_calibration(
-                                s,
-                                &cal.ms2_calibration,
-                            )
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            }
-        });
-
-        // Fragment tolerance (calibrated if available)
-        let fragment_tolerance = if let Some(ref cal) = cal_params {
-            let (tol_val, tol_unit) = osprey_chromatography::calibrated_tolerance(
-                &cal.ms2_calibration,
-                config.fragment_tolerance.tolerance,
-                config.fragment_tolerance.unit,
-            );
-            FragmentToleranceConfig {
-                tolerance: tol_val,
-                unit: tol_unit,
-            }
-        } else {
-            config.fragment_tolerance
-        };
-
-        let tol_da = match fragment_tolerance.unit {
-            ToleranceUnit::Mz => fragment_tolerance.tolerance,
-            ToleranceUnit::Ppm => 0.0,
-        };
-        let tol_ppm = match fragment_tolerance.unit {
-            ToleranceUnit::Ppm => fragment_tolerance.tolerance,
-            ToleranceUnit::Mz => 0.0,
-        };
-
-        let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
-        let scorer = if is_hram {
-            SpectralScorer::hram().with_tolerance_ppm(fragment_tolerance.tolerance)
-        } else {
-            SpectralScorer::new().with_tolerance_da(fragment_tolerance.tolerance)
-        };
-
-        // RT tolerance from calibration
-        let rt_tolerance = cal_params
-            .as_ref()
-            .map(|cal| {
-                let raw_tol = if let Some(mad) = cal.rt_calibration.mad {
-                    3.0 * mad * 1.4826
-                } else {
-                    cal.rt_calibration.residual_sd * config.rt_calibration.rt_tolerance_factor
-                };
-                raw_tol
-                    .max(config.rt_calibration.min_rt_tolerance)
-                    .min(config.rt_calibration.max_rt_tolerance)
-            })
-            .unwrap_or(config.rt_calibration.max_rt_tolerance);
-
-        // Group spectra by isolation window
-        let spectra_ref = calibrated_spectra.as_deref().unwrap_or(&spectra);
-        let window_groups = group_spectra_by_isolation_window(spectra_ref);
-
-        Ok(FileRescoreContext {
-            spectra,
-            calibrated_spectra,
-            ms1_index,
-            cal_params,
-            window_groups,
-            scorer,
-            tol_da,
-            tol_ppm,
-            rt_tolerance,
-            is_hram,
-        })
-    }
-
-    /// Get a reference to the (possibly calibrated) spectra.
-    fn spectra_ref(&self) -> &[Spectrum] {
-        self.calibrated_spectra.as_deref().unwrap_or(&self.spectra)
-    }
-}
-
-/// Re-score a single entry in a single isolation window at specified RT boundaries.
-///
-/// Extracted from the former `rescore_entry_at_boundaries` to enable per-window processing.
-/// When `window_xcorr` is provided, XCorr scoring uses pre-preprocessed spectrum
-/// data, eliminating redundant per-entry binning/normalization.
-#[allow(clippy::too_many_arguments)]
-fn rescore_entry_in_window(
-    lib_entry: &LibraryEntry,
-    target_apex: f64,
-    target_start: f64,
-    target_end: f64,
-    expected_rt: f64,
-    spectra: &[Spectrum],
-    spec_indices: &[usize],
-    window_xcorr: Option<&[Vec<f32>]>,
-    scorer: &SpectralScorer,
-    ms1_index: &MS1Index,
-    calibration: Option<&CalibrationParams>,
-    tol_da: f64,
-    tol_ppm: f64,
-    is_hram: bool,
-    file_name: &str,
-) -> Option<CoelutionScoredEntry> {
-    use osprey_chromatography::compute_snr;
-    use osprey_scoring::extract_fragment_xics;
-
-    // RT window: peak region + 1× peak width margin on each side for SNR context
-    let peak_width = (target_end - target_start).max(0.1);
-    let margin = peak_width.max(0.2); // At least 0.2 min margin
-    let rt_lo = target_start - margin;
-    let rt_hi = target_end + margin;
-
-    // Binary search for RT range — spec_indices are in mzML acquisition
-    // order which is chronological (RT-sorted) within each isolation window.
-    let lo = spec_indices.partition_point(|&idx| spectra[idx].retention_time < rt_lo);
-    let hi = spec_indices.partition_point(|&idx| spectra[idx].retention_time <= rt_hi);
-
-    let range = &spec_indices[lo..hi];
-    if range.len() < 3 {
-        return None;
-    }
-
-    // Already in RT order — no sort needed
-    let cand_spectra: Vec<&Spectrum> = range.iter().map(|&idx| &spectra[idx]).collect();
-    let cand_global: Vec<usize> = range.to_vec();
-
-    // Extract fragment XICs
-    let xics = extract_fragment_xics(&lib_entry.fragments, &cand_spectra, tol_da, tol_ppm, 6);
-
-    if xics.len() < 2 {
-        return None;
-    }
-
-    // Reference XIC (highest total intensity fragment)
-    let ref_idx = xics
-        .iter()
-        .enumerate()
-        .max_by(|a, b| {
-            let sum_a: f64 = a.1 .1.iter().map(|(_, v)| *v).sum();
-            let sum_b: f64 = b.1 .1.iter().map(|(_, v)| *v).sum();
-            sum_a.total_cmp(&sum_b)
-        })
-        .map(|(i, _)| i)?;
-
-    let ref_xic = &xics[ref_idx].1;
-
-    if ref_xic.len() < 3 {
-        return None;
-    }
-
-    // Map target RT boundaries to XIC scan indices (binary search on sorted XIC)
-    let start_index = ref_xic
-        .partition_point(|(rt, _)| *rt < target_start)
-        .saturating_sub(1)
-        .min(ref_xic.len() - 1);
-
-    let end_index = ref_xic
-        .partition_point(|(rt, _)| *rt < target_end)
-        .min(ref_xic.len() - 1);
-
-    let apex_index = ref_xic
-        .partition_point(|(rt, _)| *rt < target_apex)
-        .min(ref_xic.len() - 1);
-    // Check if the point before apex_index is actually closer
-    let apex_index = if apex_index > 0
-        && (ref_xic[apex_index - 1].0 - target_apex).abs()
-            < (ref_xic[apex_index].0 - target_apex).abs()
-    {
-        apex_index - 1
-    } else {
-        apex_index
-    };
-    // Clamp apex to within peak boundaries so ID line is always inside
-    // the integration window written to blib
-    let apex_index = apex_index.clamp(start_index, end_index);
-
-    if end_index <= start_index + 1 {
-        return None;
-    }
-
-    // Compute area and SNR from reference signal at target boundaries
-    let area = osprey_chromatography::trapezoidal_area(&ref_xic[start_index..=end_index]);
-    let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
-    let snr = compute_snr(&raw_ints, apex_index, start_index, end_index);
-
-    let peak = XICPeakBounds {
-        apex_rt: ref_xic[apex_index].0,
-        apex_intensity: ref_xic[apex_index].1,
-        apex_index,
-        start_rt: ref_xic[start_index].0,
-        end_rt: ref_xic[end_index].0,
-        start_index,
-        end_index,
-        area,
-        signal_to_noise: snr,
-    };
-
-    // Build window-local index mapping for pre-preprocessed XCorr lookup
-    let cand_win_local;
-    let (pp_xcorr, pp_local): (Option<&[Vec<f32>]>, Option<&[usize]>) =
-        if let Some(win_xcorr) = window_xcorr {
-            cand_win_local = (lo..lo + range.len()).collect::<Vec<usize>>();
-            (Some(win_xcorr), Some(cand_win_local.as_slice()))
-        } else {
-            (None, None)
-        };
-
-    let ctx = FeatureComputeContext {
-        entry: lib_entry,
-        xics: &xics,
-        ref_xic,
-        cand_spectra: &cand_spectra,
-        cand_global: &cand_global,
-        scorer,
-        ms1_index,
-        calibration,
-        tol_da,
-        tol_ppm,
-        expected_rt,
-        is_hram,
-        file_name,
-        preprocessed_xcorr: pp_xcorr,
-        cand_window_local: pp_local,
-    };
-
-    compute_features_at_peak(&ctx, peak)
-}
-
-/// Re-score entries at inter-replicate reconciled peak boundaries.
-///
-/// For each entry with a reconciliation action (`UseCwtPeak` or `ForcedIntegration`),
-/// extracts XICs from the appropriate isolation window and computes all features
-/// at the specified reconciled boundaries.
-///
-/// Processes one isolation window at a time: preprocesses XCorr for that window's
-/// spectra, parallel-rescores all matching entries, then drops the preprocessed
-/// data before moving to the next window. This bounds peak memory to ~one window's
-/// worth of XCorr vectors (~480 MB for HRAM) instead of all windows at once
-/// (~80 GB for HRAM with 200K spectra).
-///
-/// Uses lightweight `FdrEntry` stubs for entry_id lookup (no full parquet load).
-/// Returns a HashMap of (entry_index → re-scored entry) as an in-memory overlay.
-/// The overlay is later merged at read time for FDR scoring and blib output.
-#[allow(clippy::too_many_arguments)]
-fn rescore_for_reconciliation(
-    fdr_entries: &[FdrEntry],
-    actions: &[(usize, f64, f64, f64)], // (entry_idx, target_apex, target_start, target_end)
-    library: &[LibraryEntry],
-    spectra: &[Spectrum],
-    window_groups: &[((f64, f64), Vec<usize>)],
-    ms1_index: &MS1Index,
-    calibration: Option<&CalibrationParams>,
-    rt_calibration: Option<&RTCalibration>,
-    scorer: &SpectralScorer,
-    tol_da: f64,
-    tol_ppm: f64,
-    _rt_tolerance: f64,
-    is_hram: bool,
-    file_name: &str,
-) -> HashMap<usize, CoelutionScoredEntry> {
-    // Log memory estimate for the per-window approach
-    let max_spectra_per_window = window_groups
-        .iter()
-        .map(|(_, s)| s.len())
-        .max()
-        .unwrap_or(0);
-    let bytes_per_vec = scorer.num_bins() * std::mem::size_of::<f32>();
-    let peak_mb = (max_spectra_per_window * bytes_per_vec) / (1024 * 1024);
-    log::debug!(
-        "Reconciliation XCorr: processing {} windows sequentially, \
-         largest window = {} spectra × {} bins = ~{} MB peak",
-        window_groups.len(),
-        max_spectra_per_window,
-        scorer.num_bins(),
-        peak_mb,
-    );
-
-    // Pre-map each action to its library entry for window assignment
-    let action_lib: Vec<Option<&LibraryEntry>> = actions
-        .iter()
-        .map(|&(entry_idx, _, _, _)| {
-            let stub = &fdr_entries[entry_idx];
-            if (stub.entry_id as usize) < library.len()
-                && library[stub.entry_id as usize].id == stub.entry_id
-            {
-                Some(&library[stub.entry_id as usize])
-            } else {
-                library.iter().find(|e| e.id == stub.entry_id)
-            }
-        })
-        .collect();
-
-    // Pre-compute expected RTs for each action
-    let action_expected_rt: Vec<f64> = action_lib
-        .iter()
-        .map(|lib_entry| {
-            lib_entry
-                .map(|e| {
-                    rt_calibration
-                        .map(|cal| cal.predict(e.retention_time))
-                        .unwrap_or(e.retention_time)
-                })
-                .unwrap_or(0.0)
-        })
-        .collect();
-
-    // Group action indices by window (an action may appear in multiple windows
-    // if overlapping isolation windows contain its precursor m/z)
-    let mut actions_by_window: Vec<Vec<usize>> = vec![Vec::new(); window_groups.len()];
-    for (action_idx, lib_entry) in action_lib.iter().enumerate() {
-        if let Some(entry) = lib_entry {
-            for (win_idx, &((lower, upper), _)) in window_groups.iter().enumerate() {
-                if entry.precursor_mz >= lower && entry.precursor_mz <= upper {
-                    actions_by_window[win_idx].push(action_idx);
-                }
-            }
-        }
-    }
-
-    let mut overlay: HashMap<usize, CoelutionScoredEntry> = HashMap::new();
-
-    // Process one window at a time to bound memory
-    for (win_idx, action_indices) in actions_by_window.iter().enumerate() {
-        if action_indices.is_empty() {
-            continue;
-        }
-
-        let (_, ref spec_indices) = window_groups[win_idx];
-
-        // Preprocess XCorr for this window only — dropped after this iteration.
-        // Parallelized across spectra so all cores contribute to preprocessing
-        // (matches first-pass parallelism where windows run in parallel).
-        let window_xcorr: Vec<Vec<f32>> = spec_indices
-            .par_iter()
-            .map(|&idx| scorer.preprocess_spectrum_for_xcorr(&spectra[idx]))
-            .collect();
-
-        // Parallel rescore all actions assigned to this window
-        let results: Vec<(usize, Option<CoelutionScoredEntry>)> = action_indices
-            .par_iter()
-            .map(|&action_idx| {
-                let &(entry_idx, target_apex, target_start, target_end) = &actions[action_idx];
-                // Safety: action_idx is only in actions_by_window if action_lib[action_idx].is_some()
-                let lib_entry = action_lib[action_idx].unwrap();
-                let expected_rt = action_expected_rt[action_idx];
-
-                let result = rescore_entry_in_window(
-                    lib_entry,
-                    target_apex,
-                    target_start,
-                    target_end,
-                    expected_rt,
-                    spectra,
-                    spec_indices,
-                    Some(&window_xcorr),
-                    scorer,
-                    ms1_index,
-                    calibration,
-                    tol_da,
-                    tol_ppm,
-                    is_hram,
-                    file_name,
-                );
-
-                (entry_idx, result)
-            })
-            .collect();
-
-        // Merge into overlay, keeping best coelution_sum per entry
-        // (an entry in overlapping windows is scored in each and the best wins)
-        for (entry_idx, new_entry) in results {
-            if let Some(e) = new_entry {
-                let dominated = overlay.get(&entry_idx).is_some_and(|existing| {
-                    existing.features.coelution_sum >= e.features.coelution_sum
-                });
-                if !dominated {
-                    overlay.insert(entry_idx, e);
-                }
-            }
-        }
-        // window_xcorr is dropped here — memory freed before next window
-    }
-
-    overlay
-}
-
 /// For each precursor candidate in each isolation window:
 /// 1. Extract top-6 fragment XICs
 /// 2. Detect peak on reference XIC (DIA-NN-style valley detection)
 /// 3. Compute pairwise fragment correlations within peak boundaries
 /// 4. Score spectrum at apex (spectral similarity, mass accuracy)
 /// 5. Compute peak shape, RT deviation, MS1, and median polish features
+///
+/// When `boundary_overrides` contains an entry's ID, peak detection is skipped
+/// and the given (apex_rt, start_rt, end_rt) boundaries are used directly.
+/// This is used for multi-charge consensus (forced boundaries from best charge state)
+/// and inter-replicate reconciliation (CWT or imputed boundaries).
 ///
 /// Returns `CoelutionScoredEntry` for each detected precursor (targets + decoys).
 #[allow(clippy::too_many_arguments)]
@@ -4912,6 +4511,7 @@ fn run_search(
     rt_calibration: Option<&RTCalibration>,
     config: &OspreyConfig,
     file_name: &str,
+    boundary_overrides: Option<&HashMap<u32, (f64, f64, f64)>>,
 ) -> Result<Vec<CoelutionScoredEntry>> {
     use osprey_chromatography::{compute_snr, detect_all_xic_peaks, detect_cwt_consensus_peaks};
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
@@ -5161,32 +4761,52 @@ fn run_search(
                     .iter()
                     .filter_map(|&lib_idx| {
                         let entry = &library[lib_idx];
+                        let has_override =
+                            boundary_overrides.and_then(|m| m.get(&entry.id)).copied();
 
                         // Expected RT for this entry
                         let expected_rt = rt_calibration
                             .map(|cal| cal.predict(entry.retention_time))
                             .unwrap_or(entry.retention_time);
 
-                        // Filter spectra within RT tolerance of expected RT,
-                        // tracking window-local indices for pre-preprocessed XCorr lookup.
-                        let rt_spec_triples: Vec<(usize, usize, &Spectrum)> = window_pairs
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, (_, spec))| {
-                                (spec.retention_time - expected_rt).abs() <= rt_tolerance
-                            })
-                            .map(|(win_idx, (global_idx, spec))| (win_idx, *global_idx, *spec))
-                            .collect();
+                        // Filter spectra within RT range.
+                        // For boundary overrides: use the given boundaries + margin for SNR context.
+                        // For normal search: use expected_rt ± rt_tolerance.
+                        let rt_spec_triples: Vec<(usize, usize, &Spectrum)> =
+                            if let Some((_, target_start, target_end)) = has_override {
+                                let peak_width = (target_end - target_start).max(0.1);
+                                let margin = peak_width.max(0.2);
+                                let rt_lo = target_start - margin;
+                                let rt_hi = target_end + margin;
+                                window_pairs
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, (_, spec))| {
+                                        spec.retention_time >= rt_lo && spec.retention_time <= rt_hi
+                                    })
+                                    .map(|(win_idx, (global_idx, spec))| {
+                                        (win_idx, *global_idx, *spec)
+                                    })
+                                    .collect()
+                            } else {
+                                window_pairs
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, (_, spec))| {
+                                        (spec.retention_time - expected_rt).abs() <= rt_tolerance
+                                    })
+                                    .map(|(win_idx, (global_idx, spec))| {
+                                        (win_idx, *global_idx, *spec)
+                                    })
+                                    .collect()
+                            };
 
                         if rt_spec_triples.len() < MIN_COELUTION_SPECTRA {
                             return None;
                         }
 
-                        // Signal pre-filter: sliding window of 4 consecutive scans
-                        // (in RT order), requiring ≥3 of the 4 to have ≥2 of the
-                        // top-6 fragments matching. Disabled for unit-resolution data
-                        // (lower fragment specificity) or via --no-prefilter.
-                        if config.prefilter_enabled {
+                        // Signal pre-filter (skipped for boundary overrides — we're told to score here)
+                        if has_override.is_none() && config.prefilter_enabled {
                             let tol = if tol_ppm > 0.0 { tol_ppm } else { tol_da };
                             let tol_unit = if tol_ppm > 0.0 {
                                 ToleranceUnit::Ppm
@@ -5232,7 +4852,7 @@ fn run_search(
                             .map(|(win_idx, _, _)| *win_idx)
                             .collect();
 
-                        // 1. Extract top-6 fragment XICs
+                        // Extract top-6 fragment XICs
                         let xics = extract_fragment_xics(
                             &entry.fragments,
                             &cand_spectra,
@@ -5245,7 +4865,7 @@ fn run_search(
                             return None;
                         }
 
-                        // 2. Find reference XIC (highest total intensity) for scoring
+                        // Find reference XIC (highest total intensity) for scoring
                         let ref_idx = xics
                             .iter()
                             .enumerate()
@@ -5258,16 +4878,86 @@ fn run_search(
 
                         let ref_xic = &xics[ref_idx].1;
 
-                        // 3. Detect candidate peaks using CWT consensus across all transitions.
-                        // The Mexican Hat wavelet convolution of each fragment XIC, followed by
-                        // pointwise median, produces a consensus signal that is only high where
-                        // the majority of transitions exhibit peak-like shapes simultaneously.
-                        // Falls back to median polish profile or reference XIC if CWT finds nothing.
+                        // --- Peak selection ---
+                        // For boundary overrides (forced/imputed): map given RTs to XIC indices.
+                        // For normal search: CWT consensus peak detection with fallbacks.
+                        if let Some((target_apex, target_start, target_end)) = has_override {
+                            if ref_xic.len() < 3 {
+                                return None;
+                            }
+
+                            // Map target RT boundaries to XIC scan indices
+                            let start_index = ref_xic
+                                .partition_point(|(rt, _)| *rt < target_start)
+                                .saturating_sub(1)
+                                .min(ref_xic.len() - 1);
+
+                            let end_index = ref_xic
+                                .partition_point(|(rt, _)| *rt < target_end)
+                                .min(ref_xic.len() - 1);
+
+                            let apex_index = ref_xic
+                                .partition_point(|(rt, _)| *rt < target_apex)
+                                .min(ref_xic.len() - 1);
+                            // Pick closer neighbor for apex
+                            let apex_index = if apex_index > 0
+                                && (ref_xic[apex_index - 1].0 - target_apex).abs()
+                                    < (ref_xic[apex_index].0 - target_apex).abs()
+                            {
+                                apex_index - 1
+                            } else {
+                                apex_index
+                            };
+                            let apex_index = apex_index.clamp(start_index, end_index);
+
+                            if end_index <= start_index + 1 {
+                                return None;
+                            }
+
+                            let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+                            let area = trapezoidal_area(&ref_xic[start_index..=end_index]);
+                            let snr = compute_snr(&raw_ints, apex_index, start_index, end_index);
+
+                            let peak = XICPeakBounds {
+                                apex_rt: ref_xic[apex_index].0,
+                                apex_intensity: ref_xic[apex_index].1,
+                                apex_index,
+                                start_rt: ref_xic[start_index].0,
+                                end_rt: ref_xic[end_index].0,
+                                start_index,
+                                end_index,
+                                area,
+                                signal_to_noise: snr,
+                            };
+
+                            let ctx = FeatureComputeContext {
+                                entry,
+                                xics: &xics,
+                                ref_xic,
+                                cand_spectra: &cand_spectra,
+                                cand_global: &cand_global,
+                                scorer: &scorer,
+                                ms1_index,
+                                calibration,
+                                tol_da,
+                                tol_ppm,
+                                expected_rt,
+                                is_hram,
+                                file_name,
+                                preprocessed_xcorr: Some(&preprocessed_xcorr),
+                                cand_window_local: Some(&cand_window_local),
+                            };
+
+                            return compute_features_at_peak(&ctx, peak);
+                        }
+
+                        // --- Normal CWT peak detection path ---
+
+                        // Detect candidate peaks using CWT consensus across all transitions.
                         let full_polish = tukey_median_polish(&xics, 10, 0.01);
                         let candidates = {
                             let cwt_candidates = detect_cwt_consensus_peaks(&xics, 0.0);
                             if cwt_candidates.is_empty() {
-                                // Fallback: median polish elution profile, then reference XIC
                                 let mp_candidates = full_polish
                                     .as_ref()
                                     .map(|mp| detect_all_xic_peaks(&mp.elution_profile, 0.01, 5.0))
@@ -5375,8 +5065,6 @@ fn run_search(
                             signal_to_noise: snr,
                         };
 
-                        // CWT zero-crossing boundaries are the final boundaries.
-                        // Compute all 45 features at these boundaries.
                         let ctx = FeatureComputeContext {
                             entry,
                             xics: &xics,
