@@ -2316,6 +2316,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     &per_file_cwt,
                     &refined_calibrations,
                     &per_file_calibrations,
+                    config.experiment_fdr,
                 );
                 // Drop CWT candidates to free memory
                 drop(per_file_cwt);
@@ -2408,14 +2409,14 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             };
             let input_file = &config.input_files[input_idx];
 
-            let n_consensus = consensus_targets.len();
-            let n_reconciliation = reconciliation_targets.len();
+            let n_multi_charge = consensus_targets.len();
+            let n_inter_replicate = reconciliation_targets.len();
             log::info!(
-                "Re-scoring {} entries in {} ({} consensus, {} reconciliation, {} combined)",
+                "Re-scoring {} entries in {} ({} multi-charge consensus, {} inter-replicate reconciliation, {} unique after dedup)",
                 all_targets.len(),
                 file_name,
-                n_consensus,
-                n_reconciliation,
+                n_multi_charge,
+                n_inter_replicate,
                 all_targets.len(),
             );
 
@@ -4837,9 +4838,11 @@ fn rescore_for_reconciliation(
 
         let (_, ref spec_indices) = window_groups[win_idx];
 
-        // Preprocess XCorr for this window only — dropped after this iteration
+        // Preprocess XCorr for this window only — dropped after this iteration.
+        // Parallelized across spectra so all cores contribute to preprocessing
+        // (matches first-pass parallelism where windows run in parallel).
         let window_xcorr: Vec<Vec<f32>> = spec_indices
-            .iter()
+            .par_iter()
             .map(|&idx| scorer.preprocess_spectrum_for_xcorr(&spectra[idx]))
             .collect();
 

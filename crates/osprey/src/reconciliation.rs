@@ -328,6 +328,7 @@ pub fn plan_reconciliation(
     per_file_cwt_candidates: &HashMap<String, Vec<Vec<CwtCandidate>>>,
     per_file_refined_cal: &HashMap<String, RTCalibration>,
     per_file_original_cal: &HashMap<String, RTCalibration>,
+    experiment_fdr: f64,
 ) -> HashMap<(String, usize), ReconcileAction> {
     // Build consensus lookup by (modified_sequence, is_decoy)
     let consensus_map: HashMap<(&str, bool), &PeptideConsensusRT> = consensus
@@ -335,10 +336,25 @@ pub fn plan_reconciliation(
         .map(|c| ((c.modified_sequence.as_str(), c.is_decoy), c))
         .collect();
 
-    let stats_keep = AtomicUsize::new(0);
-    let stats_cwt = AtomicUsize::new(0);
-    let stats_forced = AtomicUsize::new(0);
-    let stats_no_consensus = AtomicUsize::new(0);
+    // Build set of precursors (base_sequence, charge) that passed experiment-level FDR.
+    // Only these precursors (and their paired decoys) will be reconciled.
+    // "base_sequence" strips the DECOY_ prefix so targets and decoys share the same key.
+    let mut passing_precursors: std::collections::HashSet<(&str, u8)> =
+        std::collections::HashSet::new();
+    for (_, entries) in per_file_entries {
+        for entry in entries {
+            if !entry.is_decoy && entry.experiment_qvalue <= experiment_fdr {
+                passing_precursors.insert((&entry.modified_sequence, entry.charge));
+            }
+        }
+    }
+
+    let stats_keep_target = AtomicUsize::new(0);
+    let stats_keep_decoy = AtomicUsize::new(0);
+    let stats_cwt_target = AtomicUsize::new(0);
+    let stats_cwt_decoy = AtomicUsize::new(0);
+    let stats_forced_target = AtomicUsize::new(0);
+    let stats_forced_decoy = AtomicUsize::new(0);
 
     let empty_cwt: Vec<Vec<CwtCandidate>> = Vec::new();
 
@@ -360,14 +376,23 @@ pub fn plan_reconciliation(
 
             let mut file_actions = Vec::new();
             for (entry_idx, entry) in entries.iter().enumerate() {
+                // Check if peptide is in consensus
                 let key = (&*entry.modified_sequence, entry.is_decoy);
                 let consensus_entry = match consensus_map.get(&key) {
                     Some(c) => c,
-                    None => {
-                        stats_no_consensus.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
+                    None => continue,
                 };
+
+                // Only reconcile precursors (peptide+charge) that passed experiment FDR,
+                // or their paired decoys. This avoids wasting time on charge states that
+                // weren't detected and won't appear in output.
+                let base_seq = entry
+                    .modified_sequence
+                    .strip_prefix("DECOY_")
+                    .unwrap_or(&entry.modified_sequence);
+                if !passing_precursors.contains(&(base_seq, entry.charge)) {
+                    continue;
+                }
 
                 let expected_rt = cal.predict(consensus_entry.consensus_library_rt);
                 let cwt = file_cwt.get(entry_idx).map(|v| v.as_slice()).unwrap_or(&[]);
@@ -379,13 +404,27 @@ pub fn plan_reconciliation(
                     consensus_entry.median_peak_width,
                 );
 
-                match &action {
-                    ReconcileAction::Keep => stats_keep.fetch_add(1, Ordering::Relaxed),
-                    ReconcileAction::UseCwtPeak { .. } => stats_cwt.fetch_add(1, Ordering::Relaxed),
-                    ReconcileAction::ForcedIntegration { .. } => {
-                        stats_forced.fetch_add(1, Ordering::Relaxed)
-                    }
-                };
+                if entry.is_decoy {
+                    match &action {
+                        ReconcileAction::Keep => stats_keep_decoy.fetch_add(1, Ordering::Relaxed),
+                        ReconcileAction::UseCwtPeak { .. } => {
+                            stats_cwt_decoy.fetch_add(1, Ordering::Relaxed)
+                        }
+                        ReconcileAction::ForcedIntegration { .. } => {
+                            stats_forced_decoy.fetch_add(1, Ordering::Relaxed)
+                        }
+                    };
+                } else {
+                    match &action {
+                        ReconcileAction::Keep => stats_keep_target.fetch_add(1, Ordering::Relaxed),
+                        ReconcileAction::UseCwtPeak { .. } => {
+                            stats_cwt_target.fetch_add(1, Ordering::Relaxed)
+                        }
+                        ReconcileAction::ForcedIntegration { .. } => {
+                            stats_forced_target.fetch_add(1, Ordering::Relaxed)
+                        }
+                    };
+                }
 
                 // Only store non-Keep actions
                 if !matches!(action, ReconcileAction::Keep) {
@@ -396,12 +435,39 @@ pub fn plan_reconciliation(
         })
         .collect();
 
+    let n_keep_t = stats_keep_target.load(Ordering::Relaxed);
+    let n_keep_d = stats_keep_decoy.load(Ordering::Relaxed);
+    let n_cwt_t = stats_cwt_target.load(Ordering::Relaxed);
+    let n_cwt_d = stats_cwt_decoy.load(Ordering::Relaxed);
+    let n_forced_t = stats_forced_target.load(Ordering::Relaxed);
+    let n_forced_d = stats_forced_decoy.load(Ordering::Relaxed);
+    let n_keep = n_keep_t + n_keep_d;
+    let n_cwt = n_cwt_t + n_cwt_d;
+    let n_forced = n_forced_t + n_forced_d;
+    let n_evaluated = n_keep + n_cwt + n_forced;
+    let n_rescore = n_cwt + n_forced;
+    let n_precursors = passing_precursors.len();
+    let n_files = per_file_entries.len();
     log::info!(
-        "Inter-replicate reconciliation plan: {} keep, {} use alternate CWT peak, {} forced integration, {} not in consensus",
-        stats_keep.load(Ordering::Relaxed),
-        stats_cwt.load(Ordering::Relaxed),
-        stats_forced.load(Ordering::Relaxed),
-        stats_no_consensus.load(Ordering::Relaxed),
+        "Reconciliation: {} passing precursors × {} files = {} entries evaluated (across {} consensus peptides)",
+        n_precursors,
+        n_files,
+        n_evaluated,
+        consensus_map.len() / 2, // /2 because map has both target and decoy keys
+    );
+    log::info!(
+        "Reconciliation plan: {} already correct ({} targets, {} decoys), {} need re-scoring ({} targets, {} decoys)",
+        n_keep,
+        n_keep_t,
+        n_keep_d,
+        n_rescore,
+        n_cwt_t + n_forced_t,
+        n_cwt_d + n_forced_d,
+    );
+    log::info!(
+        "  Re-scoring breakdown: {} use alternate CWT peak, {} forced integration",
+        n_cwt,
+        n_forced,
     );
 
     actions
