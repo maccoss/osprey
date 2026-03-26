@@ -3985,6 +3985,13 @@ struct FeatureComputeContext<'a> {
     expected_rt: f64,
     is_hram: bool,
     file_name: &'a str,
+    /// Pre-preprocessed XCorr vectors for all spectra in the isolation window.
+    /// Indexed by position in window_spectra (same order as window_pairs).
+    /// When Some, enables O(n_frags) XCorr lookup instead of O(n_peaks) preprocessing per call.
+    preprocessed_xcorr: Option<&'a [Vec<f32>]>,
+    /// For each spectrum in cand_spectra, its index into the window_spectra array.
+    /// Used to look up pre-preprocessed XCorr data.
+    cand_window_local: Option<&'a [usize]>,
 }
 
 /// Compute all coelution features and build a `CoelutionScoredEntry` at the
@@ -4081,7 +4088,22 @@ fn compute_features_at_peak(
     let _apex_global_idx = cand_global[apex_local_idx];
     let apex_spectrum = cand_spectra[apex_local_idx];
 
-    let spectral_score = ctx.scorer.xcorr(apex_spectrum, entry);
+    // Spectral scoring: compute LibCosine features + XCorr.
+    // When pre-preprocessed XCorr data is available (main search path), avoid
+    // redundant per-entry spectrum preprocessing (binning + windowing + sliding
+    // window subtraction) by looking up the pre-computed result.
+    let spectral_score = if let (Some(preprocessed), Some(win_indices)) =
+        (ctx.preprocessed_xcorr, ctx.cand_window_local)
+    {
+        let mut score = ctx.scorer.lib_cosine(apex_spectrum, entry);
+        let win_idx = win_indices[apex_local_idx];
+        let lib_preprocessed = ctx.scorer.preprocess_library_for_xcorr(entry);
+        score.xcorr =
+            SpectralScorer::xcorr_from_preprocessed(&preprocessed[win_idx], &lib_preprocessed);
+        score
+    } else {
+        ctx.scorer.xcorr(apex_spectrum, entry)
+    };
 
     // 2b. SG-weighted spectral scores at apex ±2 scans
     let sg_weights: [f64; 5] = [
@@ -4093,11 +4115,28 @@ fn compute_features_at_peak(
     ];
     let mut sg_xcorr = 0.0;
     let mut sg_cosine = 0.0;
+    // Pre-compute library XCorr vector once for SG-weighted lookups
+    let lib_xcorr_preprocessed = if ctx.preprocessed_xcorr.is_some() {
+        Some(ctx.scorer.preprocess_library_for_xcorr(entry))
+    } else {
+        None
+    };
     for (offset, &weight) in [-2i32, -1, 0, 1, 2].iter().zip(&sg_weights) {
         let idx = apex_local_idx as i32 + offset;
         if idx >= 0 && (idx as usize) < cand_spectra.len() {
             let spec = cand_spectra[idx as usize];
-            sg_xcorr += ctx.scorer.xcorr_at_scan(spec, entry) * weight;
+            if let (Some(preprocessed), Some(win_indices), Some(ref lib_pre)) = (
+                ctx.preprocessed_xcorr,
+                ctx.cand_window_local,
+                &lib_xcorr_preprocessed,
+            ) {
+                let win_idx = win_indices[idx as usize];
+                sg_xcorr +=
+                    SpectralScorer::xcorr_from_preprocessed(&preprocessed[win_idx], lib_pre)
+                        * weight;
+            } else {
+                sg_xcorr += ctx.scorer.xcorr_at_scan(spec, entry) * weight;
+            }
             sg_cosine +=
                 compute_cosine_at_scan(&entry.fragments, spec, ctx.tol_da, ctx.tol_ppm) * weight;
         }
@@ -4553,6 +4592,10 @@ impl FileRescoreContext {
 ///
 /// Used by both multi-charge consensus and inter-replicate reconciliation.
 /// Uses binary search on pre-sorted spec_indices for efficient spectra selection.
+///
+/// When `per_window_xcorr` is provided, XCorr scoring uses pre-preprocessed
+/// spectrum data (one Vec<f32> per spectrum in each window group), eliminating
+/// redundant per-entry binning/normalization/sliding-window subtraction.
 #[allow(clippy::too_many_arguments)]
 fn rescore_entry_at_boundaries(
     lib_entry: &LibraryEntry,
@@ -4569,6 +4612,7 @@ fn rescore_entry_at_boundaries(
     tol_ppm: f64,
     is_hram: bool,
     file_name: &str,
+    per_window_xcorr: Option<&[Vec<Vec<f32>>]>,
 ) -> Option<CoelutionScoredEntry> {
     use osprey_chromatography::compute_snr;
     use osprey_scoring::extract_fragment_xics;
@@ -4581,7 +4625,7 @@ fn rescore_entry_at_boundaries(
 
     let mut best_result: Option<CoelutionScoredEntry> = None;
 
-    for &((lower, upper), ref spec_indices) in window_groups {
+    for (win_group_idx, &((lower, upper), ref spec_indices)) in window_groups.iter().enumerate() {
         if lib_entry.precursor_mz < lower || lib_entry.precursor_mz > upper {
             continue;
         }
@@ -4675,6 +4719,21 @@ fn rescore_entry_at_boundaries(
             signal_to_noise: snr,
         };
 
+        // Build window-local index mapping for pre-preprocessed XCorr lookup
+        let win_xcorr_ref;
+        let cand_win_local;
+        let (pp_xcorr, pp_local): (Option<&[Vec<f32>]>, Option<&[usize]>) =
+            if let Some(all_win) = per_window_xcorr {
+                win_xcorr_ref = &all_win[win_group_idx];
+                cand_win_local = (lo..lo + range.len()).collect::<Vec<usize>>();
+                (
+                    Some(win_xcorr_ref.as_slice()),
+                    Some(cand_win_local.as_slice()),
+                )
+            } else {
+                (None, None)
+            };
+
         let ctx = FeatureComputeContext {
             entry: lib_entry,
             xics: &xics,
@@ -4689,6 +4748,8 @@ fn rescore_entry_at_boundaries(
             expected_rt,
             is_hram,
             file_name,
+            preprocessed_xcorr: pp_xcorr,
+            cand_window_local: pp_local,
         };
 
         if let Some(scored_entry) = compute_features_at_peak(&ctx, peak) {
@@ -4710,6 +4771,9 @@ fn rescore_entry_at_boundaries(
 /// extracts XICs from the appropriate isolation window and computes all features
 /// at the specified reconciled boundaries.
 ///
+/// Pre-preprocesses all window spectra for XCorr once (same optimization as the
+/// first-pass search) to avoid redundant per-entry binning/normalization.
+///
 /// Uses lightweight `FdrEntry` stubs for entry_id lookup (no full parquet load).
 /// Returns a HashMap of (entry_index → re-scored entry) as an in-memory overlay.
 /// The overlay is later merged at read time for FDR scoring and blib output.
@@ -4730,6 +4794,18 @@ fn rescore_for_reconciliation(
     is_hram: bool,
     file_name: &str,
 ) -> HashMap<usize, CoelutionScoredEntry> {
+    // Pre-preprocess all window spectra for XCorr (eliminates redundant per-entry
+    // spectrum binning/normalization/sliding-window subtraction).
+    let per_window_xcorr: Vec<Vec<Vec<f32>>> = window_groups
+        .iter()
+        .map(|(_, spec_indices)| {
+            spec_indices
+                .iter()
+                .map(|&idx| scorer.preprocess_spectrum_for_xcorr(&spectra[idx]))
+                .collect()
+        })
+        .collect();
+
     // Parallel phase: compute new scored entries for each action
     let results: Vec<(usize, Option<CoelutionScoredEntry>)> = actions
         .par_iter()
@@ -4767,6 +4843,7 @@ fn rescore_for_reconciliation(
                 tol_ppm,
                 is_hram,
                 file_name,
+                Some(&per_window_xcorr),
             );
 
             (entry_idx, result)
@@ -4992,6 +5069,15 @@ fn run_search(
                 let _global_indices: Vec<usize> =
                     window_pairs.iter().map(|(idx, _)| *idx).collect();
 
+                // Pre-preprocess all window spectra for XCorr to eliminate redundant
+                // per-entry preprocessing (binning + windowing + sliding window subtraction).
+                // Each spectrum is preprocessed once here; per-entry scoring then uses
+                // O(n_frags) dot product lookups instead of O(n_peaks) re-preprocessing.
+                let preprocessed_xcorr: Vec<Vec<f32>> = window_spectra
+                    .iter()
+                    .map(|s| scorer.preprocess_spectrum_for_xcorr(s))
+                    .collect();
+
                 // Find candidate library entries for this window using MzRTIndex
                 // Collect unique library indices whose precursor_mz falls in this window
                 let _window_center = (*lower + *upper) / 2.0;
@@ -5047,16 +5133,18 @@ fn run_search(
                             .map(|cal| cal.predict(entry.retention_time))
                             .unwrap_or(entry.retention_time);
 
-                        // Filter spectra within RT tolerance of expected RT
-                        let rt_spec_pairs: Vec<(usize, &Spectrum)> = window_pairs
+                        // Filter spectra within RT tolerance of expected RT,
+                        // tracking window-local indices for pre-preprocessed XCorr lookup.
+                        let rt_spec_triples: Vec<(usize, usize, &Spectrum)> = window_pairs
                             .iter()
-                            .filter(|(_, spec)| {
+                            .enumerate()
+                            .filter(|(_, (_, spec))| {
                                 (spec.retention_time - expected_rt).abs() <= rt_tolerance
                             })
-                            .map(|(idx, spec)| (*idx, *spec))
+                            .map(|(win_idx, (global_idx, spec))| (win_idx, *global_idx, *spec))
                             .collect();
 
-                        if rt_spec_pairs.len() < MIN_COELUTION_SPECTRA {
+                        if rt_spec_triples.len() < MIN_COELUTION_SPECTRA {
                             return None;
                         }
 
@@ -5076,7 +5164,7 @@ fn run_search(
                             let mut window = [false; WIN];
                             let mut win_sum = 0u32;
                             let mut has_signal = false;
-                            for (i, (_, spec)) in rt_spec_pairs.iter().enumerate() {
+                            for (i, (_, _, spec)) in rt_spec_triples.iter().enumerate() {
                                 let passes = has_topn_fragment_match(
                                     &entry.fragments,
                                     &spec.mzs,
@@ -5102,9 +5190,13 @@ fn run_search(
                         }
 
                         let cand_spectra: Vec<&Spectrum> =
-                            rt_spec_pairs.iter().map(|(_, s)| *s).collect();
+                            rt_spec_triples.iter().map(|(_, _, s)| *s).collect();
                         let cand_global: Vec<usize> =
-                            rt_spec_pairs.iter().map(|(idx, _)| *idx).collect();
+                            rt_spec_triples.iter().map(|(_, idx, _)| *idx).collect();
+                        let cand_window_local: Vec<usize> = rt_spec_triples
+                            .iter()
+                            .map(|(win_idx, _, _)| *win_idx)
+                            .collect();
 
                         // 1. Extract top-6 fragment XICs
                         let xics = extract_fragment_xics(
@@ -5265,6 +5357,8 @@ fn run_search(
                             expected_rt,
                             is_hram,
                             file_name,
+                            preprocessed_xcorr: Some(&preprocessed_xcorr),
+                            cand_window_local: Some(&cand_window_local),
                         };
 
                         let mut result = compute_features_at_peak(&ctx, peak);
