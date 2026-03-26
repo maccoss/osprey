@@ -4590,7 +4590,7 @@ impl FileRescoreContext {
 
 /// Re-score a single entry in a single isolation window at specified RT boundaries.
 ///
-/// Extracted from `rescore_entry_at_boundaries` to enable per-window processing.
+/// Extracted from the former `rescore_entry_at_boundaries` to enable per-window processing.
 /// When `window_xcorr` is provided, XCorr scoring uses pre-preprocessed spectrum
 /// data, eliminating redundant per-entry binning/normalization.
 #[allow(clippy::too_many_arguments)]
@@ -4734,70 +4734,6 @@ fn rescore_entry_in_window(
     };
 
     compute_features_at_peak(&ctx, peak)
-}
-
-/// Re-score a single entry at specified RT boundaries across all matching windows.
-///
-/// Iterates over all isolation windows, scoring in each window whose m/z range
-/// contains the precursor, and returns the best result by coelution_sum.
-///
-/// When `per_window_xcorr` is provided, XCorr scoring uses pre-preprocessed
-/// spectrum data (one Vec<f32> per spectrum in each window group), eliminating
-/// redundant per-entry binning/normalization/sliding-window subtraction.
-#[allow(clippy::too_many_arguments)]
-fn rescore_entry_at_boundaries(
-    lib_entry: &LibraryEntry,
-    target_apex: f64,
-    target_start: f64,
-    target_end: f64,
-    expected_rt: f64,
-    spectra: &[Spectrum],
-    window_groups: &[((f64, f64), Vec<usize>)],
-    scorer: &SpectralScorer,
-    ms1_index: &MS1Index,
-    calibration: Option<&CalibrationParams>,
-    tol_da: f64,
-    tol_ppm: f64,
-    is_hram: bool,
-    file_name: &str,
-    per_window_xcorr: Option<&[Vec<Vec<f32>>]>,
-) -> Option<CoelutionScoredEntry> {
-    let mut best_result: Option<CoelutionScoredEntry> = None;
-
-    for (win_group_idx, &((lower, upper), ref spec_indices)) in window_groups.iter().enumerate() {
-        if lib_entry.precursor_mz < lower || lib_entry.precursor_mz > upper {
-            continue;
-        }
-
-        let window_xcorr = per_window_xcorr.map(|all_win| all_win[win_group_idx].as_slice());
-
-        if let Some(scored_entry) = rescore_entry_in_window(
-            lib_entry,
-            target_apex,
-            target_start,
-            target_end,
-            expected_rt,
-            spectra,
-            spec_indices,
-            window_xcorr,
-            scorer,
-            ms1_index,
-            calibration,
-            tol_da,
-            tol_ppm,
-            is_hram,
-            file_name,
-        ) {
-            let dominated = best_result.as_ref().is_some_and(|existing| {
-                existing.features.coelution_sum >= scored_entry.features.coelution_sum
-            });
-            if !dominated {
-                best_result = Some(scored_entry);
-            }
-        }
-    }
-
-    best_result
 }
 
 /// Re-score entries at inter-replicate reconciled peak boundaries.
