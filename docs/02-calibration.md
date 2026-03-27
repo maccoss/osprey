@@ -59,9 +59,9 @@ A Linear Discriminant Analysis model learns optimal feature weights from target-
 | `correlation` | `score / 6.0` | XIC co-elution sum across fragments |
 | `libcosine` | Already 0–1 | Spectral similarity at apex |
 | `top6_matched` | `count / 6.0` | Number of top-6 library fragments matched at apex |
-| `signal_to_noise` | `ln(S/N + 1) / 5.0` | Peak signal-to-noise ratio (log-transformed) |
+| `xcorr` | `score / 3.0` | Comet-style XCorr (unit resolution, BLAS sdot) |
 
-Hyperscore and isotope cosine are intentionally excluded from the LDA — hyperscore dominates target-decoy discrimination but doesn't correlate with RT quality, and isotope cosine shows negative correlation.
+Hyperscore, signal-to-noise, and isotope cosine are intentionally excluded from the LDA — hyperscore dominates target-decoy discrimination but doesn't correlate with RT quality, signal-to-noise and isotope cosine show negative correlation.
 
 **Training procedure:**
 

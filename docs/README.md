@@ -19,7 +19,7 @@ Osprey has a **working prototype** that can:
 |----------|-------------|
 | [01 - Decoy Generation](01-decoy-generation.md) | Enzyme-aware sequence reversal for FDR control |
 | [02 - Calibration](02-calibration.md) | RT, MS1, and MS2 calibration with LDA scoring and LOESS fitting |
-| [03 - Spectral Scoring](03-spectral-scoring.md) | XCorr + E-value scoring (calibration phase) |
+| [03 - Spectral Scoring](03-spectral-scoring.md) | Spectral scoring features for calibration (XCorr, E-value, isotope cosine) |
 | [04 - XCorr Scoring](04-xcorr-scoring.md) | Comet-style XCorr implementation |
 | [05 - Peak Detection](05-peak-detection.md) | CWT consensus peak detection and selection in fragment XIC time series |
 | [06 - Multi-Charge Consensus](06-multi-charge-consensus.md) | Cross-charge-state peak boundary sharing |
@@ -28,12 +28,14 @@ Osprey has a **working prototype** that can:
 | [09 - Determinism](09-determinism.md) | Deterministic analysis: patterns, invariants, and maintenance |
 | [10 - Cross-Run Reconciliation](10-cross-run-reconciliation.md) | Consensus RT computation and peak alignment across replicates |
 | [12 - Intermediate File Formats](12-intermediate-files.md) | Calibration JSON, spectra cache, Parquet scores, blib output |
+| [13 - Boundary Overrides & Forced Integration](13-boundary-overrides.md) | How `run_search()` handles override boundaries for consensus and reconciliation |
+| [14 - RT Alignment & Consensus Library RT](14-rt-alignment.md) | LOWESS calibration, inverse prediction, weighted median consensus RT, peak imputation |
 
 ---
 
 ## Pipeline Overview
 
-Osprey's pipeline has four major phases.
+Osprey's pipeline has five major phases.
 
 ```
 INPUT
@@ -50,11 +52,11 @@ PHASE 1: INITIALIZATION
 PHASE 2: CALIBRATION DISCOVERY (first file only)
   +- Calculate library-to-measured RT mapping
   +- Set wide RT tolerance (20-50% of gradient)
-  +- Score all peptides against all spectra:
-  |     +- XCorr (unit resolution bins, BLAS sdot) -> find best RT per peptide
+  +- Co-elution search with CWT peak detection
+  |     +- Fragment XIC correlation, spectral similarity (libcosine), XCorr
   |     +- Top-3 fragment matching (binary search) -> MS2 mass errors
-  |     +- E-value from XCorr survival function
-  +- Target-decoy competition -> 1% FDR filtering
+  +- LDA scoring (4 features: correlation, libcosine, top6_matched, xcorr)
+  +- Paired target-decoy competition on LDA score -> 1% FDR filtering
   +- Fit LOESS RT calibration from confident targets
   +- Calculate MS1/MS2 mass error statistics
   +- Set tight RT tolerance for main search (3x residual SD)
@@ -68,16 +70,18 @@ PHASE 3: COELUTION SEARCH (per file)
   +- Fallback: median polish profile or reference XIC peak detection
   +- Peak boundaries: zero-crossings ±2σ (valley guard)
   +- Feature extraction (21 PIN features used for scoring, ~47 computed total)
-  +- Multi-charge consensus: all charge states of same peptide share peak boundaries
   +- Write full scored entries to per-file Parquet cache (ZSTD compressed)
   +- Convert to FdrEntry stubs (~80 bytes inline each) — drop features, fragments, CWT
   |
   v
-PHASE 4: FIRST-PASS FDR
+PHASE 4: FIRST-PASS FDR + POST-FDR CONSENSUS
   +- Best-per-precursor subsampling: find best observation per base_id across files
   |    (maximizes peptide diversity for SVM training on multi-file experiments)
   +- Load PIN features on-demand from per-file Parquet caches
   +- FDR control (Percolator SVM or Mokapot) -> run-level q-values
+  +- Multi-charge consensus: charge states of same peptide share peak boundaries
+  |    (post-FDR — uses SVM scores to select best charge state as consensus leader)
+  |    Re-scored via run_search() with boundary_overrides
   |
   v
 PHASE 5: CROSS-RUN RECONCILIATION (multi-file only)
@@ -88,7 +92,9 @@ PHASE 5: CROSS-RUN RECONCILIATION (multi-file only)
   +- Plan reconciliation for each entry:
   |    Keep | UseCwtPeak (alternate stored candidate) | ForcedIntegration
   |    (CWT candidates loaded selectively from Parquet — no full entry reload)
-  +- Re-score reconciled entries at updated peak boundaries
+  +- Merge reconciliation targets with multi-charge consensus targets
+  +- Re-score via run_search() with boundary_overrides per file
+  |    (parallel window processing + shared XCorr preprocessing — same as first pass)
   |    (files processed sequentially to limit memory — each loads ~3 GB)
   +- Second-pass FDR -> final q-values
   |
@@ -275,7 +281,9 @@ The calibration phase is a **fast scoring pass** designed to establish RT and ma
 
 3. **Top-3 fragment matching** (at best XCorr spectrum): Binary search the top-3 most intense library fragments in the best XCorr spectrum. Returns signed mass errors (ppm) for MS2 mass calibration.
 
-4. **E-value** (significance): Calculated from the XCorr survival function (Comet-style) -- fit log-linear regression to survival counts. Used for target-decoy competition.
+4. **E-value** (significance): Calculated from the XCorr survival function (Comet-style) -- fit log-linear regression to survival counts. Computed and stored but not used for FDR -- LDA scoring is used instead.
+
+5. **LDA scoring** (FDR): Linear Discriminant Analysis on 4 features (correlation, libcosine, top6_matched, xcorr). Produces a discriminant score used for paired target-decoy competition. See [Calibration](02-calibration.md).
 
 5. **MS1 isotope envelope** (at best XCorr spectrum): Extract monoisotopic peak from nearest MS1 spectrum. Returns MS1 mass error (ppm) for precursor mass calibration.
 
@@ -310,11 +318,10 @@ For each precursor passing the pre-filter:
 2. **CWT consensus peak detection**: Convolve each fragment XIC with a Mexican Hat wavelet, compute pointwise median across transitions, find peaks in consensus signal. Boundaries via zero-crossings extended to ±2σ with valley guard. See [Peak Detection](05-peak-detection.md).
 3. **Spectral scoring**: At the apex scan, score the observed spectrum against the library (hyperscore, xcorr, dot products)
 4. **Tukey median polish**: Decompose fragment XIC matrix for robust scoring features and blib peak boundaries
-5. **Multi-charge consensus**: After all windows are processed, all charge states of the same peptide are forced to share the same peak RT and integration boundaries. See [Multi-Charge Consensus](06-multi-charge-consensus.md).
 
 ---
 
-## Phase 4: Post-Search Scoring
+## Phase 4: Post-Search Scoring and First-Pass FDR
 
 After the main search, Osprey computes scoring features per precursor from fragment XIC profiles.
 
@@ -343,11 +350,13 @@ All 21 PIN features are computed within or at the peak boundaries:
 - **MS1 features**: Precursor co-elution and isotope cosine (HRAM only)
 - **Peptide properties**: Peptide length, missed cleavages, RT deviation
 
-### Step 4: First-Pass FDR
+### Step 4: First-Pass FDR and Multi-Charge Consensus
 
-All 21 PIN features are combined into an optimal discriminant score via semi-supervised learning (linear SVM). The default native Percolator receives both targets and decoys and performs internal paired competition. For external Mokapot, targets and decoys are pre-competed using the best feature (selected by ROC AUC) and only winners are written to PIN files.
+All 21 PIN features are combined into an optimal discriminant score via semi-supervised learning (linear SVM). The default native Percolator receives both targets and decoys and performs internal paired competition within each fold. For external Mokapot, targets and decoys are pre-competed using the best feature (selected by ROC AUC) and only winners are written to PIN files.
 
-This produces **run-level q-values** for each file, used as input to cross-run reconciliation.
+This produces **run-level q-values** for each file. Then **multi-charge consensus** is applied: all charge states of the same peptide are forced to share the same peak RT and integration boundaries, with the best SVM-scoring FDR-passing charge state as the consensus leader. Disagreeing charge states are re-scored at the consensus boundaries via `run_search()` with boundary overrides. See [Multi-Charge Consensus](06-multi-charge-consensus.md).
+
+The run-level q-values are used as input to cross-run reconciliation.
 
 See: [FDR Control](07-fdr-control.md)
 
@@ -355,10 +364,11 @@ See: [FDR Control](07-fdr-control.md)
 
 For multi-file experiments, cross-run reconciliation aligns peak boundaries across replicates before the final FDR pass:
 
-1. **Consensus RTs**: Peptides passing experiment-level FDR contribute (apex_rt → library_rt) pairs. The consensus library RT is computed as the weighted median across runs (weight = coelution_sum).
+1. **Consensus RTs**: Peptides passing experiment-level FDR contribute (apex_rt → library_rt) pairs. The consensus library RT is computed as the weighted median across runs (weight = coelution_sum). See [RT Alignment & Consensus Library RT](14-rt-alignment.md).
 2. **Calibration refit**: Each run's LOESS calibration is refit using consensus peptides, improving RT prediction accuracy for the second pass.
-3. **Reconciliation plan**: For each entry, the expected measured RT is predicted from the refined calibration. Three outcomes: **Keep** (current peak contains expected RT), **UseCwtPeak** (alternate stored CWT candidate overlaps), or **ForcedIntegration** (no overlapping candidate — integrate at expected RT ± half of median peak width).
-4. **Second-pass FDR**: Reconciled entries are re-scored and FDR is recomputed, producing final experiment-level q-values.
+3. **Reconciliation plan**: For each entry, the expected measured RT is predicted from the refined calibration. Three outcomes: **Keep** (current peak contains expected RT), **UseCwtPeak** (alternate stored CWT candidate overlaps), or **ForcedIntegration** (no overlapping candidate — integrate at expected RT ± half of median peak width). See [Boundary Overrides & Forced Integration](13-boundary-overrides.md).
+4. **Re-scoring via `run_search()`**: Reconciliation targets (merged with any remaining multi-charge consensus targets) are re-scored by calling `run_search()` with `boundary_overrides`. This reuses the same parallel window processing and per-window XCorr preprocessing as the first-pass search.
+5. **Second-pass FDR**: Reconciled entries are re-scored and FDR is recomputed, producing final experiment-level q-values.
 
 **Why this matters**: In low-signal runs or windows with interference, the peak selector may choose a completely wrong chromatographic peak for a peptide. Reconciliation uses the high-confidence runs to establish where the peptide truly elutes, then corrects the other runs — either by switching to an alternate stored CWT candidate or by imputing boundaries at the expected RT.
 
@@ -382,8 +392,8 @@ See: [FDR Control](07-fdr-control.md)
 |--------|----------------------|---------------------------|
 | **Purpose** | Establish RT/mass calibration | Determine peptide detections |
 | **Peak detection** | CWT consensus (with fallback) | CWT consensus (with fallback) |
-| **Method** | XCorr + E-value | Coelution search |
-| **Features** | E-value only | 21 PIN features |
+| **Method** | Co-elution search + LDA | Coelution search |
+| **Features** | 4 LDA features | 21 PIN features |
 | **FDR method** | Target-decoy on LDA score | Semi-supervised SVM (Percolator/Mokapot) |
 | **Scope** | First file only, wide tolerance | All files, tight calibrated tolerance |
 

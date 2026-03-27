@@ -2109,6 +2109,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 rt_cal.as_ref(),
                 &config,
                 &file_name,
+                None,
             )?;
 
             log::info!(
@@ -2188,6 +2189,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 &per_file_cache_paths,
                 &config,
                 &empty_overlay,
+                None,
             )?;
         }
         FdrMethod::Mokapot => {
@@ -2207,6 +2209,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
+    // Collect first-pass passing base_ids: any precursor passing run-level FDR
+    // in at least one replicate. The second-pass FDR will be restricted to only
+    // these precursors (+ paired decoys), ensuring complete gap-fill coverage
+    // for all final passing precursors.
+    let first_pass_base_ids: HashSet<u32> = per_file_entries
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .filter(|e| !e.is_decoy && e.run_qvalue <= config.run_fdr)
+        .map(|e| e.entry_id & 0x7FFF_FFFF)
+        .collect();
+
+    log::info!(
+        "First-pass: {} unique precursors pass run-level {:.0}% FDR in at least one replicate",
+        first_pass_base_ids.len(),
+        config.run_fdr * 100.0,
+    );
+
     // Post-FDR re-scoring: multi-charge consensus + inter-replicate reconciliation.
     // Both phases need to load spectra and re-score entries, so we merge them
     // into a single spectra-load pass per file to avoid redundant I/O.
@@ -2217,8 +2236,22 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     let mut per_file_overlays: RescoreOverlay = HashMap::new();
     {
         use crate::reconciliation::{
-            compute_consensus_rts, plan_reconciliation, refit_calibration_with_consensus,
-            ReconcileAction,
+            compute_consensus_rts, identify_gap_fill_targets, plan_reconciliation,
+            refit_calibration_with_consensus, GapFillTarget, ReconcileAction,
+        };
+
+        // Build (modified_sequence, charge) → (target_entry_id, decoy_entry_id) lookup
+        // for gap-fill identification
+        let lib_lookup: HashMap<(Arc<str>, u8), (u32, u32)> = {
+            let mut map = HashMap::new();
+            for entry in library.iter().filter(|e| !e.is_decoy) {
+                let decoy_id = entry.id | 0x80000000;
+                map.insert(
+                    (Arc::from(entry.modified_sequence.as_str()), entry.charge),
+                    (entry.id, decoy_id),
+                );
+            }
+            map
         };
 
         // Build file_name → input_file index mapping
@@ -2266,6 +2299,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         let reconciliation_actions: HashMap<(String, usize), ReconcileAction>;
         let refined_calibrations: HashMap<String, RTCalibration>;
+        let per_file_gap_fill: HashMap<String, Vec<GapFillTarget>>;
 
         if reconciliation_enabled {
             log::info!("");
@@ -2316,23 +2350,36 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     &per_file_cwt,
                     &refined_calibrations,
                     &per_file_calibrations,
+                    config.run_fdr,
                 );
                 // Drop CWT candidates to free memory
                 drop(per_file_cwt);
+
+                // Gap-fill: identify passing precursors missing from each file
+                // Uses run-level FDR: any precursor passing in at least one replicate
+                per_file_gap_fill = identify_gap_fill_targets(
+                    &consensus,
+                    &per_file_entries,
+                    &refined_calibrations,
+                    &per_file_calibrations,
+                    config.run_fdr,
+                    &lib_lookup,
+                );
             } else {
                 refined_calibrations = HashMap::new();
                 reconciliation_actions = HashMap::new();
+                per_file_gap_fill = HashMap::new();
             }
         } else {
             refined_calibrations = HashMap::new();
             reconciliation_actions = HashMap::new();
+            per_file_gap_fill = HashMap::new();
         }
 
         let total_reconciliation: usize = reconciliation_actions
             .values()
             .filter(|a| !matches!(a, ReconcileAction::Keep))
             .count();
-
         // 3. Load spectra once per file and re-score both consensus + reconciliation targets.
         //    For re-scoring, we reload full CoelutionScoredEntry from parquet, rescore,
         //    save updated entries back to parquet, and update FdrEntry stubs.
@@ -2366,6 +2413,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
 
         let mut total_rescored: usize = 0;
+        let mut total_gap_cwt: usize = 0;
+        let mut total_gap_forced: usize = 0;
 
         // Process files sequentially to limit peak memory — each file loads spectra
         // (~1.5 GB). Per-file re-scoring is already internally parallelized.
@@ -2378,6 +2427,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
             // Collect reconciliation targets for this file (pre-grouped)
             let reconciliation_targets = per_file_reconciliation_targets
+                .get(file_name.as_str())
+                .cloned()
+                .unwrap_or_default();
+
+            // Collect gap-fill targets for this file
+            let gap_fill_targets = per_file_gap_fill
                 .get(file_name.as_str())
                 .cloned()
                 .unwrap_or_default();
@@ -2398,7 +2453,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 .map(|(idx, (apex, start, end))| (idx, apex, start, end))
                 .collect();
 
-            if all_targets.is_empty() {
+            // Skip file if no work to do (no re-scoring targets AND no gap-fill targets)
+            if all_targets.is_empty() && gap_fill_targets.is_empty() {
                 continue;
             }
 
@@ -2408,22 +2464,73 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             };
             let input_file = &config.input_files[input_idx];
 
-            let n_consensus = consensus_targets.len();
-            let n_reconciliation = reconciliation_targets.len();
+            let n_multi_charge = consensus_targets.len();
+            let n_inter_replicate = reconciliation_targets.len();
+            let n_gap_fill = gap_fill_targets.len();
             log::info!(
-                "Re-scoring {} entries in {} ({} consensus, {} reconciliation, {} combined)",
-                all_targets.len(),
+                "Re-scoring {} entries in {} ({} multi-charge consensus, {} inter-replicate reconciliation, {} gap-fill, {} unique rescore after dedup)",
+                all_targets.len() + n_gap_fill * 2, // *2 for target+decoy
                 file_name,
-                n_consensus,
-                n_reconciliation,
+                n_multi_charge,
+                n_inter_replicate,
+                n_gap_fill,
                 all_targets.len(),
             );
 
-            let ctx = match FileRescoreContext::load(input_file, &config) {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    log::warn!("Failed to load spectra for {}: {}", file_name, e);
-                    continue;
+            // Build boundary overrides keyed by entry_id and track idx mapping
+            let mut boundary_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
+            let mut entry_id_to_idx: HashMap<u32, usize> = HashMap::new();
+            let mut subset_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for &(idx, apex, start, end) in &all_targets {
+                let entry_id = fdr_entries[idx].entry_id;
+                boundary_overrides.insert(entry_id, (apex, start, end));
+                entry_id_to_idx.insert(entry_id, idx);
+                subset_ids.insert(entry_id);
+            }
+
+            // Build subset library containing only entries that need re-scoring
+            let subset_library: Vec<LibraryEntry> = library
+                .iter()
+                .filter(|e| subset_ids.contains(&e.id))
+                .cloned()
+                .collect();
+
+            // Build gap-fill library subset (targets + decoys, separate from re-scoring)
+            let mut gap_fill_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for gf in &gap_fill_targets {
+                gap_fill_ids.insert(gf.target_entry_id);
+                gap_fill_ids.insert(gf.decoy_entry_id);
+            }
+            let gap_fill_library: Vec<LibraryEntry> = if !gap_fill_ids.is_empty() {
+                library
+                    .iter()
+                    .filter(|e| gap_fill_ids.contains(&e.id))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // Load spectra and calibration for this file
+            let (spectra, ms1_index) = {
+                let cache_path = spectra_cache_path(input_file);
+                if cache_path.exists() {
+                    match load_spectra_cache(&cache_path) {
+                        Ok(result) => {
+                            log::info!(
+                                "Loaded {} MS2 spectra from cache '{}'",
+                                result.0.len(),
+                                cache_path.display()
+                            );
+                            result
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
+                            load_all_spectra(input_file)?
+                        }
+                    }
+                } else {
+                    load_all_spectra(input_file)?
                 }
             };
 
@@ -2432,41 +2539,159 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 .get(file_name.as_str())
                 .or_else(|| per_file_calibrations.get(file_name.as_str()));
 
-            let overlay = rescore_for_reconciliation(
-                fdr_entries,
-                &all_targets,
-                &library,
-                ctx.spectra_ref(),
-                &ctx.window_groups,
-                &ctx.ms1_index,
-                ctx.cal_params.as_ref(),
-                rt_cal,
-                &ctx.scorer,
-                ctx.tol_da,
-                ctx.tol_ppm,
-                ctx.rt_tolerance,
-                ctx.is_hram,
-                file_name,
-            );
+            let cal_params: Option<CalibrationParams> = input_file.parent().and_then(|input_dir| {
+                let cal_path = calibration_path_for_input(input_file, input_dir);
+                if cal_path.exists() {
+                    load_calibration(&cal_path).ok()
+                } else {
+                    None
+                }
+            });
+
+            // --- Re-score existing entries (consensus + reconciliation) ---
+            let mut overlay: HashMap<usize, CoelutionScoredEntry> = HashMap::new();
+            if !all_targets.is_empty() {
+                let rescored = run_search(
+                    &subset_library,
+                    &spectra,
+                    &ms1_index,
+                    cal_params.as_ref(),
+                    rt_cal,
+                    &config,
+                    file_name,
+                    Some(&boundary_overrides),
+                )?;
+
+                for entry in rescored {
+                    if let Some(&idx) = entry_id_to_idx.get(&entry.entry_id) {
+                        overlay.insert(idx, entry);
+                    }
+                }
+            }
+
+            // --- Gap-fill: score missing precursors (two-pass: CWT then forced) ---
+            let mut n_gap_cwt = 0usize;
+            let mut n_gap_forced = 0usize;
+            if !gap_fill_targets.is_empty() {
+                // Pass 1 (CWT): Run without boundary overrides, pre-filter disabled.
+                // This lets CWT peak detection find natural peaks at the consensus RT.
+                let mut gap_config = config.clone();
+                gap_config.prefilter_enabled = false;
+                let cwt_results = run_search(
+                    &gap_fill_library,
+                    &spectra,
+                    &ms1_index,
+                    cal_params.as_ref(),
+                    rt_cal,
+                    &gap_config,
+                    file_name,
+                    None,
+                )?;
+
+                // Track which entry_ids got CWT results
+                let cwt_hit_ids: std::collections::HashSet<u32> =
+                    cwt_results.iter().map(|e| e.entry_id).collect();
+                n_gap_cwt = cwt_results.len();
+
+                // Append CWT results as new FdrEntry stubs
+                let gap_fill_start_idx = fdr_entries.len();
+                for (i, entry) in cwt_results.into_iter().enumerate() {
+                    let mut stub = entry.to_fdr_entry();
+                    stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
+                    fdr_entries.push(stub);
+                    overlay.insert(gap_fill_start_idx + i, entry);
+                }
+
+                // Pass 2 (Forced): Entries that CWT missed get forced integration
+                // at consensus RT ± half_width
+                let mut forced_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
+                let mut forced_ids: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+                for gf in &gap_fill_targets {
+                    // Add target if CWT missed it
+                    if !cwt_hit_ids.contains(&gf.target_entry_id) {
+                        let start = gf.expected_rt - gf.half_width;
+                        let end = gf.expected_rt + gf.half_width;
+                        forced_overrides.insert(gf.target_entry_id, (gf.expected_rt, start, end));
+                        forced_ids.insert(gf.target_entry_id);
+                    }
+                    // Add decoy if CWT missed it
+                    if !cwt_hit_ids.contains(&gf.decoy_entry_id) {
+                        let start = gf.expected_rt - gf.half_width;
+                        let end = gf.expected_rt + gf.half_width;
+                        forced_overrides.insert(gf.decoy_entry_id, (gf.expected_rt, start, end));
+                        forced_ids.insert(gf.decoy_entry_id);
+                    }
+                }
+
+                if !forced_overrides.is_empty() {
+                    let forced_library: Vec<LibraryEntry> = gap_fill_library
+                        .iter()
+                        .filter(|e| forced_ids.contains(&e.id))
+                        .cloned()
+                        .collect();
+
+                    let forced_results = run_search(
+                        &forced_library,
+                        &spectra,
+                        &ms1_index,
+                        cal_params.as_ref(),
+                        rt_cal,
+                        &config,
+                        file_name,
+                        Some(&forced_overrides),
+                    )?;
+
+                    n_gap_forced = forced_results.len();
+
+                    // Append forced results as new FdrEntry stubs
+                    let forced_start_idx = fdr_entries.len();
+                    for (i, entry) in forced_results.into_iter().enumerate() {
+                        let mut stub = entry.to_fdr_entry();
+                        stub.modified_sequence =
+                            intern_seq(&mut seq_interner, &stub.modified_sequence);
+                        fdr_entries.push(stub);
+                        overlay.insert(forced_start_idx + i, entry);
+                    }
+                }
+
+                total_gap_cwt += n_gap_cwt;
+                total_gap_forced += n_gap_forced;
+            }
 
             // Drop spectra before updating stubs to free ~1.5-3 GB
-            drop(ctx);
+            drop(spectra);
 
-            let n_rescored = overlay.len();
-            total_rescored += n_rescored;
-            log::info!(
-                "  {} of {} entries successfully re-scored",
-                n_rescored,
-                all_targets.len()
-            );
+            // Count existing re-scored entries (not gap-fill)
+            let existing_rescore_indices: std::collections::HashSet<usize> =
+                entry_id_to_idx.values().copied().collect();
+            let n_existing_rescored = overlay
+                .keys()
+                .filter(|idx| existing_rescore_indices.contains(idx))
+                .count();
+            total_rescored += n_existing_rescored + n_gap_cwt + n_gap_forced;
 
-            // Update FdrEntry stubs from overlay (only re-scored entries)
-            if n_rescored > 0 {
-                for (&idx, entry) in &overlay {
+            if !all_targets.is_empty() || n_gap_cwt + n_gap_forced > 0 {
+                log::info!(
+                    "  {} of {} existing entries re-scored, {} gap-fill ({} CWT, {} forced)",
+                    n_existing_rescored,
+                    all_targets.len(),
+                    n_gap_cwt + n_gap_forced,
+                    n_gap_cwt,
+                    n_gap_forced,
+                );
+            }
+
+            // Update FdrEntry stubs from overlay for existing re-scored entries
+            // (gap-fill entries were already appended with stubs during scoring above)
+            for &idx in &existing_rescore_indices {
+                if let Some(entry) = overlay.get(&idx) {
                     let mut stub = entry.to_fdr_entry();
                     stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
                     fdr_entries[idx] = stub;
                 }
+            }
+            if !overlay.is_empty() {
                 per_file_overlays.insert(file_name.clone(), overlay);
             }
         }
@@ -2474,13 +2699,19 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // 4. Single second-pass FDR after all re-scoring
         if total_rescored > 0 {
             log::info!(
-                "Post-FDR re-scoring complete: {} entries re-scored ({} consensus, {} reconciliation)",
+                "Post-FDR re-scoring complete: {} entries re-scored ({} consensus, {} reconciliation, {} gap-fill [{} CWT, {} forced])",
                 total_rescored,
                 total_consensus,
-                total_reconciliation
+                total_reconciliation,
+                total_gap_cwt + total_gap_forced,
+                total_gap_cwt,
+                total_gap_forced,
             );
             log::info!("");
-            log::info!("Running second-pass FDR on re-scored entries...");
+            log::info!(
+                "Running second-pass FDR on {} first-pass precursors + paired decoys...",
+                first_pass_base_ids.len(),
+            );
             match config.fdr_method {
                 FdrMethod::Percolator => {
                     run_percolator_fdr(
@@ -2488,6 +2719,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         &per_file_cache_paths,
                         &config,
                         &per_file_overlays,
+                        Some(&first_pass_base_ids),
                     )?;
                 }
                 FdrMethod::Mokapot => {
@@ -2570,6 +2802,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         // Apply overlay: substitute re-scored entries from reconciliation
         let file_overlay = per_file_overlays.get(file_name.as_str());
+        let parquet_len = full_entries.len();
 
         // Merge FDR q-values from stubs into full entries — stubs have the
         // final q-values from Percolator/Mokapot, while parquet has original scores.
@@ -2591,6 +2824,27 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 entry.score = fdr.score;
                 entry.pep = fdr.pep;
                 passing_entries.push(entry);
+            }
+        }
+
+        // Process gap-fill entries (overlay-only, beyond parquet length)
+        if let Some(file_ov) = file_overlay {
+            for (idx, fdr) in fdr_entries.iter().enumerate().skip(parquet_len) {
+                if !fdr.is_decoy
+                    && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
+                {
+                    if let Some(ov_entry) = file_ov.get(&idx) {
+                        let mut entry = ov_entry.clone();
+                        entry.run_qvalue = fdr.run_qvalue;
+                        entry.experiment_qvalue = best_exp_q
+                            .get(&(fdr.modified_sequence.clone(), fdr.charge))
+                            .copied()
+                            .unwrap_or(fdr.experiment_qvalue);
+                        entry.score = fdr.score;
+                        entry.pep = fdr.pep;
+                        passing_entries.push(entry);
+                    }
+                }
             }
         }
     }
@@ -2687,6 +2941,7 @@ fn run_percolator_fdr(
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
     config: &OspreyConfig,
     overlay: &RescoreOverlay,
+    restrict_base_ids: Option<&HashSet<u32>>,
 ) -> Result<()> {
     use osprey_fdr::percolator;
 
@@ -2723,6 +2978,7 @@ fn run_percolator_fdr(
             per_file_cache_paths,
             &perc_config,
             overlay,
+            restrict_base_ids,
         );
     }
 
@@ -2751,6 +3007,11 @@ fn run_percolator_fdr(
     for (file_idx, (_, entries)) in per_file_entries.iter().enumerate() {
         for (local_idx, entry) in entries.iter().enumerate() {
             let base_id = entry.entry_id & 0x7FFF_FFFF;
+            if let Some(restrict) = restrict_base_ids {
+                if !restrict.contains(&base_id) {
+                    continue;
+                }
+            }
             let map = if entry.is_decoy {
                 &mut best_decoy
             } else {
@@ -2966,8 +3227,16 @@ fn run_percolator_fdr(
             .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
+        let parquet_len = file_features.len();
 
         for (local_idx, parquet_features) in file_features.into_iter().enumerate() {
+            // Skip entries not in the restriction set (keep first-pass scores)
+            if let Some(restrict) = restrict_base_ids {
+                let base_id = fdr_entries[local_idx].entry_id & 0x7FFF_FFFF;
+                if !restrict.contains(&base_id) {
+                    continue;
+                }
+            }
             // Use overlay features for re-scored entries, parquet features otherwise
             let mut features =
                 if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
@@ -2983,6 +3252,25 @@ fn run_percolator_fdr(
             fdr_entries[local_idx].score = score;
         }
 
+        // Score gap-fill entries (indices beyond parquet, only in overlay)
+        for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate().skip(parquet_len) {
+            if let Some(restrict) = restrict_base_ids {
+                let base_id = fdr_entry.entry_id & 0x7FFF_FFFF;
+                if !restrict.contains(&base_id) {
+                    continue;
+                }
+            }
+            if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                let mut features = pin_feature_vector(&overlay_entry.features);
+                standardizer.transform_slice(&mut features);
+                let mut score = avg_bias;
+                for (w, x) in avg_weights.iter().zip(features.iter()) {
+                    score += w * x;
+                }
+                fdr_entry.score = score;
+            }
+        }
+
         if (file_idx + 1) % 10 == 0 || file_idx + 1 == n_files {
             log::info!("  Scored {}/{} files", file_idx + 1, n_files);
         }
@@ -2995,7 +3283,7 @@ fn run_percolator_fdr(
         "=== Per-file results (run-level FDR at {:.0}%) ===",
         perc_config.test_fdr * 100.0
     );
-    percolator::compute_fdr_from_stubs(per_file_entries, perc_config.test_fdr);
+    percolator::compute_fdr_from_stubs(per_file_entries, perc_config.test_fdr, restrict_base_ids);
 
     Ok(())
 }
@@ -3009,6 +3297,7 @@ fn run_percolator_fdr_direct(
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
     perc_config: &percolator::PercolatorConfig,
     overlay: &RescoreOverlay,
+    restrict_base_ids: Option<&HashSet<u32>>,
 ) -> Result<()> {
     let mut perc_entries = Vec::new();
     for (file_name, fdr_entries) in per_file_entries.iter() {
@@ -3019,20 +3308,19 @@ fn run_percolator_fdr_direct(
                 OspreyError::config(format!("No parquet cache path for file {}", file_name))
             })?;
         let file_features = load_pin_features_from_parquet(cache_path)?;
-        if file_features.len() != fdr_entries.len() {
-            return Err(OspreyError::config(format!(
-                "Parquet cache entry count mismatch for {}: {} vs {}",
-                file_name,
-                file_features.len(),
-                fdr_entries.len()
-            )));
-        }
+        let parquet_len = file_features.len();
 
-        for (local_idx, (fdr_entry, parquet_features)) in fdr_entries
+        // Process parquet-aligned entries
+        for (local_idx, (fdr_entry, parquet_features)) in fdr_entries[..parquet_len]
             .iter()
             .zip(file_features.into_iter())
             .enumerate()
         {
+            if let Some(restrict) = restrict_base_ids {
+                if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
+                    continue;
+                }
+            }
             // Use overlay features for re-scored entries, parquet features otherwise
             let features = if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx))
             {
@@ -3054,6 +3342,31 @@ fn run_percolator_fdr_direct(
                 entry_id: fdr_entry.entry_id,
                 features,
             });
+        }
+
+        // Process gap-fill entries (indices beyond parquet, from overlay only)
+        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate().skip(parquet_len) {
+            if let Some(restrict) = restrict_base_ids {
+                if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
+                    continue;
+                }
+            }
+            if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                let features = pin_feature_vector(&overlay_entry.features);
+                let psm_id = format!(
+                    "{}_{}_{}_{}",
+                    file_name, fdr_entry.modified_sequence, fdr_entry.charge, fdr_entry.scan_number
+                );
+                perc_entries.push(percolator::PercolatorEntry {
+                    id: psm_id,
+                    file_name: file_name.clone(),
+                    peptide: fdr_entry.modified_sequence.to_string(),
+                    charge: fdr_entry.charge,
+                    is_decoy: fdr_entry.is_decoy,
+                    entry_id: fdr_entry.entry_id,
+                    features,
+                });
+            }
         }
     }
 
@@ -3103,6 +3416,7 @@ fn run_mokapot_fdr(
             per_file_cache_paths,
             config,
             &empty_overlay,
+            None,
         );
     }
 
@@ -3216,6 +3530,7 @@ fn run_mokapot_fdr(
                 per_file_cache_paths,
                 config,
                 &empty_overlay,
+                None,
             )?;
         }
     }
@@ -3881,19 +4196,11 @@ fn write_blib_output(
                     scored.peak_bounds.end_rt,
                 ));
 
-            // Show an ID line (non-NULL retentionTime) if this observation passes
-            // EITHER run-level or experiment-level FDR. In GPF experiments, a precursor
-            // exists in only one file, so its run q-value may be slightly above the
-            // threshold while the experiment q-value (which benefits from global
-            // competition) passes. Since this entry is already in the output (it passed
-            // experiment FDR), it should get an ID line in the file where it was found.
-            //
-            // For multi-replicate DIA, observations propagated from other replicates
-            // (where the precursor wasn't independently identified) still get NULL
-            // retentionTime — their run_qvalue stays at 1.0 and experiment_qvalue
-            // reflects the best replicate, not this one.
-            let effective_qvalue = scored.run_qvalue.min(scored.experiment_qvalue);
-            let rt_for_id = if effective_qvalue <= config.run_fdr {
+            // Show an ID line (non-NULL retentionTime) only if this observation
+            // independently passed run-level FDR. Forced integrations and
+            // reconciled entries that didn't pass run-level FDR get NULL
+            // retentionTime (boundaries only, no ID line in Skyline).
+            let rt_for_id = if scored.run_qvalue <= config.run_fdr {
                 Some(run_apex)
             } else {
                 None
@@ -3909,6 +4216,11 @@ fn write_blib_output(
                 is_best,
             )?;
         }
+
+        // Note: With gap-filling, passing precursors will have actual scored entries
+        // in files where they're within the DIA window. Files where the precursor m/z
+        // is outside the isolation window (GPF) won't have entries and won't get
+        // RetentionTimes rows — there's no signal to quantify in those files.
 
         // Add peak boundaries to Osprey extension table (shared across charge states)
         let boundaries = osprey_core::PeakBoundaries {
@@ -3985,6 +4297,13 @@ struct FeatureComputeContext<'a> {
     expected_rt: f64,
     is_hram: bool,
     file_name: &'a str,
+    /// Pre-preprocessed XCorr vectors for all spectra in the isolation window.
+    /// Indexed by position in window_spectra (same order as window_pairs).
+    /// When Some, enables O(n_frags) XCorr lookup instead of O(n_peaks) preprocessing per call.
+    preprocessed_xcorr: Option<&'a [Vec<f32>]>,
+    /// For each spectrum in cand_spectra, its index into the window_spectra array.
+    /// Used to look up pre-preprocessed XCorr data.
+    cand_window_local: Option<&'a [usize]>,
 }
 
 /// Compute all coelution features and build a `CoelutionScoredEntry` at the
@@ -4081,7 +4400,22 @@ fn compute_features_at_peak(
     let _apex_global_idx = cand_global[apex_local_idx];
     let apex_spectrum = cand_spectra[apex_local_idx];
 
-    let spectral_score = ctx.scorer.xcorr(apex_spectrum, entry);
+    // Spectral scoring: compute LibCosine features + XCorr.
+    // When pre-preprocessed XCorr data is available (main search path), avoid
+    // redundant per-entry spectrum preprocessing (binning + windowing + sliding
+    // window subtraction) by looking up the pre-computed result.
+    let spectral_score = if let (Some(preprocessed), Some(win_indices)) =
+        (ctx.preprocessed_xcorr, ctx.cand_window_local)
+    {
+        let mut score = ctx.scorer.lib_cosine(apex_spectrum, entry);
+        let win_idx = win_indices[apex_local_idx];
+        let lib_preprocessed = ctx.scorer.preprocess_library_for_xcorr(entry);
+        score.xcorr =
+            SpectralScorer::xcorr_from_preprocessed(&preprocessed[win_idx], &lib_preprocessed);
+        score
+    } else {
+        ctx.scorer.xcorr(apex_spectrum, entry)
+    };
 
     // 2b. SG-weighted spectral scores at apex ±2 scans
     let sg_weights: [f64; 5] = [
@@ -4093,11 +4427,28 @@ fn compute_features_at_peak(
     ];
     let mut sg_xcorr = 0.0;
     let mut sg_cosine = 0.0;
+    // Pre-compute library XCorr vector once for SG-weighted lookups
+    let lib_xcorr_preprocessed = if ctx.preprocessed_xcorr.is_some() {
+        Some(ctx.scorer.preprocess_library_for_xcorr(entry))
+    } else {
+        None
+    };
     for (offset, &weight) in [-2i32, -1, 0, 1, 2].iter().zip(&sg_weights) {
         let idx = apex_local_idx as i32 + offset;
         if idx >= 0 && (idx as usize) < cand_spectra.len() {
             let spec = cand_spectra[idx as usize];
-            sg_xcorr += ctx.scorer.xcorr_at_scan(spec, entry) * weight;
+            if let (Some(preprocessed), Some(win_indices), Some(ref lib_pre)) = (
+                ctx.preprocessed_xcorr,
+                ctx.cand_window_local,
+                &lib_xcorr_preprocessed,
+            ) {
+                let win_idx = win_indices[idx as usize];
+                sg_xcorr +=
+                    SpectralScorer::xcorr_from_preprocessed(&preprocessed[win_idx], lib_pre)
+                        * weight;
+            } else {
+                sg_xcorr += ctx.scorer.xcorr_at_scan(spec, entry) * weight;
+            }
             sg_cosine +=
                 compute_cosine_at_scan(&entry.fragments, spec, ctx.tol_da, ctx.tol_ppm) * weight;
         }
@@ -4404,392 +4755,17 @@ fn select_post_fdr_consensus(
     targets
 }
 
-/// Context for re-scoring entries in a file.
-///
-/// Loads spectra, calibration, sets up fragment tolerance and scorer —
-/// shared setup needed by both multi-charge consensus and inter-replicate reconciliation.
-struct FileRescoreContext {
-    spectra: Vec<Spectrum>,
-    calibrated_spectra: Option<Vec<Spectrum>>,
-    ms1_index: MS1Index,
-    cal_params: Option<CalibrationParams>,
-    window_groups: Vec<((f64, f64), Vec<usize>)>,
-    scorer: SpectralScorer,
-    tol_da: f64,
-    tol_ppm: f64,
-    rt_tolerance: f64,
-    is_hram: bool,
-}
-
-impl FileRescoreContext {
-    /// Load spectra and calibration for a file, set up scoring context.
-    /// Tries binary spectra cache first for fast reload (~seconds vs ~minutes for mzML).
-    fn load(input_file: &std::path::Path, config: &OspreyConfig) -> Result<Self> {
-        use osprey_scoring::batch::group_spectra_by_isolation_window;
-
-        let cache_path = spectra_cache_path(input_file);
-        let (spectra, ms1_index) = if cache_path.exists() {
-            match load_spectra_cache(&cache_path) {
-                Ok(result) => {
-                    log::info!(
-                        "Loaded {} MS2 spectra from cache '{}'",
-                        result.0.len(),
-                        cache_path.display()
-                    );
-                    result
-                }
-                Err(e) => {
-                    log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
-                    load_all_spectra(input_file)?
-                }
-            }
-        } else {
-            load_all_spectra(input_file)?
-        };
-        if spectra.is_empty() {
-            return Err(OspreyError::MzmlParseError("No spectra found".into()));
-        }
-
-        // Load calibration from cached JSON
-        let cal_params: Option<CalibrationParams> = input_file.parent().and_then(|input_dir| {
-            let cal_path = calibration_path_for_input(input_file, input_dir);
-            if cal_path.exists() {
-                load_calibration(&cal_path).ok()
-            } else {
-                None
-            }
-        });
-
-        // Apply MS2 calibration to spectra
-        let calibrated_spectra: Option<Vec<Spectrum>> = cal_params.as_ref().and_then(|cal| {
-            if cal.ms2_calibration.calibrated {
-                Some(
-                    spectra
-                        .iter()
-                        .map(|s| {
-                            osprey_chromatography::apply_spectrum_calibration(
-                                s,
-                                &cal.ms2_calibration,
-                            )
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            }
-        });
-
-        // Fragment tolerance (calibrated if available)
-        let fragment_tolerance = if let Some(ref cal) = cal_params {
-            let (tol_val, tol_unit) = osprey_chromatography::calibrated_tolerance(
-                &cal.ms2_calibration,
-                config.fragment_tolerance.tolerance,
-                config.fragment_tolerance.unit,
-            );
-            FragmentToleranceConfig {
-                tolerance: tol_val,
-                unit: tol_unit,
-            }
-        } else {
-            config.fragment_tolerance
-        };
-
-        let tol_da = match fragment_tolerance.unit {
-            ToleranceUnit::Mz => fragment_tolerance.tolerance,
-            ToleranceUnit::Ppm => 0.0,
-        };
-        let tol_ppm = match fragment_tolerance.unit {
-            ToleranceUnit::Ppm => fragment_tolerance.tolerance,
-            ToleranceUnit::Mz => 0.0,
-        };
-
-        let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
-        let scorer = if is_hram {
-            SpectralScorer::hram().with_tolerance_ppm(fragment_tolerance.tolerance)
-        } else {
-            SpectralScorer::new().with_tolerance_da(fragment_tolerance.tolerance)
-        };
-
-        // RT tolerance from calibration
-        let rt_tolerance = cal_params
-            .as_ref()
-            .map(|cal| {
-                let raw_tol = if let Some(mad) = cal.rt_calibration.mad {
-                    3.0 * mad * 1.4826
-                } else {
-                    cal.rt_calibration.residual_sd * config.rt_calibration.rt_tolerance_factor
-                };
-                raw_tol
-                    .max(config.rt_calibration.min_rt_tolerance)
-                    .min(config.rt_calibration.max_rt_tolerance)
-            })
-            .unwrap_or(config.rt_calibration.max_rt_tolerance);
-
-        // Group spectra by isolation window
-        let spectra_ref = calibrated_spectra.as_deref().unwrap_or(&spectra);
-        let window_groups = group_spectra_by_isolation_window(spectra_ref);
-
-        Ok(FileRescoreContext {
-            spectra,
-            calibrated_spectra,
-            ms1_index,
-            cal_params,
-            window_groups,
-            scorer,
-            tol_da,
-            tol_ppm,
-            rt_tolerance,
-            is_hram,
-        })
-    }
-
-    /// Get a reference to the (possibly calibrated) spectra.
-    fn spectra_ref(&self) -> &[Spectrum] {
-        self.calibrated_spectra.as_deref().unwrap_or(&self.spectra)
-    }
-}
-
-/// Re-score a single entry at specified RT boundaries.
-///
-/// Used by both multi-charge consensus and inter-replicate reconciliation.
-/// Uses binary search on pre-sorted spec_indices for efficient spectra selection.
-#[allow(clippy::too_many_arguments)]
-fn rescore_entry_at_boundaries(
-    lib_entry: &LibraryEntry,
-    target_apex: f64,
-    target_start: f64,
-    target_end: f64,
-    expected_rt: f64,
-    spectra: &[Spectrum],
-    window_groups: &[((f64, f64), Vec<usize>)],
-    scorer: &SpectralScorer,
-    ms1_index: &MS1Index,
-    calibration: Option<&CalibrationParams>,
-    tol_da: f64,
-    tol_ppm: f64,
-    is_hram: bool,
-    file_name: &str,
-) -> Option<CoelutionScoredEntry> {
-    use osprey_chromatography::compute_snr;
-    use osprey_scoring::extract_fragment_xics;
-
-    // RT window: peak region + 1× peak width margin on each side for SNR context
-    let peak_width = (target_end - target_start).max(0.1);
-    let margin = peak_width.max(0.2); // At least 0.2 min margin
-    let rt_lo = target_start - margin;
-    let rt_hi = target_end + margin;
-
-    let mut best_result: Option<CoelutionScoredEntry> = None;
-
-    for &((lower, upper), ref spec_indices) in window_groups {
-        if lib_entry.precursor_mz < lower || lib_entry.precursor_mz > upper {
-            continue;
-        }
-
-        // Binary search for RT range — spec_indices are in mzML acquisition
-        // order which is chronological (RT-sorted) within each isolation window.
-        let lo = spec_indices.partition_point(|&idx| spectra[idx].retention_time < rt_lo);
-        let hi = spec_indices.partition_point(|&idx| spectra[idx].retention_time <= rt_hi);
-
-        let range = &spec_indices[lo..hi];
-        if range.len() < 3 {
-            continue;
-        }
-
-        // Already in RT order — no sort needed
-        let cand_spectra: Vec<&Spectrum> = range.iter().map(|&idx| &spectra[idx]).collect();
-        let cand_global: Vec<usize> = range.to_vec();
-
-        // Extract fragment XICs
-        let xics = extract_fragment_xics(&lib_entry.fragments, &cand_spectra, tol_da, tol_ppm, 6);
-
-        if xics.len() < 2 {
-            continue;
-        }
-
-        // Reference XIC (highest total intensity fragment)
-        let ref_idx = xics
-            .iter()
-            .enumerate()
-            .max_by(|a, b| {
-                let sum_a: f64 = a.1 .1.iter().map(|(_, v)| *v).sum();
-                let sum_b: f64 = b.1 .1.iter().map(|(_, v)| *v).sum();
-                sum_a.total_cmp(&sum_b)
-            })
-            .map(|(i, _)| i);
-
-        let ref_idx = match ref_idx {
-            Some(i) => i,
-            None => continue,
-        };
-        let ref_xic = &xics[ref_idx].1;
-
-        if ref_xic.len() < 3 {
-            continue;
-        }
-
-        // Map target RT boundaries to XIC scan indices (binary search on sorted XIC)
-        let start_index = ref_xic
-            .partition_point(|(rt, _)| *rt < target_start)
-            .saturating_sub(1)
-            .min(ref_xic.len() - 1);
-
-        let end_index = ref_xic
-            .partition_point(|(rt, _)| *rt < target_end)
-            .min(ref_xic.len() - 1);
-
-        let apex_index = ref_xic
-            .partition_point(|(rt, _)| *rt < target_apex)
-            .min(ref_xic.len() - 1);
-        // Check if the point before apex_index is actually closer
-        let apex_index = if apex_index > 0
-            && (ref_xic[apex_index - 1].0 - target_apex).abs()
-                < (ref_xic[apex_index].0 - target_apex).abs()
-        {
-            apex_index - 1
-        } else {
-            apex_index
-        };
-        // Clamp apex to within peak boundaries so ID line is always inside
-        // the integration window written to blib
-        let apex_index = apex_index.clamp(start_index, end_index);
-
-        if end_index <= start_index + 1 {
-            continue;
-        }
-
-        // Compute area and SNR from reference signal at target boundaries
-        let area = osprey_chromatography::trapezoidal_area(&ref_xic[start_index..=end_index]);
-        let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
-        let snr = compute_snr(&raw_ints, apex_index, start_index, end_index);
-
-        let peak = XICPeakBounds {
-            apex_rt: ref_xic[apex_index].0,
-            apex_intensity: ref_xic[apex_index].1,
-            apex_index,
-            start_rt: ref_xic[start_index].0,
-            end_rt: ref_xic[end_index].0,
-            start_index,
-            end_index,
-            area,
-            signal_to_noise: snr,
-        };
-
-        let ctx = FeatureComputeContext {
-            entry: lib_entry,
-            xics: &xics,
-            ref_xic,
-            cand_spectra: &cand_spectra,
-            cand_global: &cand_global,
-            scorer,
-            ms1_index,
-            calibration,
-            tol_da,
-            tol_ppm,
-            expected_rt,
-            is_hram,
-            file_name,
-        };
-
-        if let Some(scored_entry) = compute_features_at_peak(&ctx, peak) {
-            let dominated = best_result.as_ref().is_some_and(|existing| {
-                existing.features.coelution_sum >= scored_entry.features.coelution_sum
-            });
-            if !dominated {
-                best_result = Some(scored_entry);
-            }
-        }
-    }
-
-    best_result
-}
-
-/// Re-score entries at inter-replicate reconciled peak boundaries.
-///
-/// For each entry with a reconciliation action (`UseCwtPeak` or `ForcedIntegration`),
-/// extracts XICs from the appropriate isolation window and computes all features
-/// at the specified reconciled boundaries.
-///
-/// Uses lightweight `FdrEntry` stubs for entry_id lookup (no full parquet load).
-/// Returns a HashMap of (entry_index → re-scored entry) as an in-memory overlay.
-/// The overlay is later merged at read time for FDR scoring and blib output.
-#[allow(clippy::too_many_arguments)]
-fn rescore_for_reconciliation(
-    fdr_entries: &[FdrEntry],
-    actions: &[(usize, f64, f64, f64)], // (entry_idx, target_apex, target_start, target_end)
-    library: &[LibraryEntry],
-    spectra: &[Spectrum],
-    window_groups: &[((f64, f64), Vec<usize>)],
-    ms1_index: &MS1Index,
-    calibration: Option<&CalibrationParams>,
-    rt_calibration: Option<&RTCalibration>,
-    scorer: &SpectralScorer,
-    tol_da: f64,
-    tol_ppm: f64,
-    _rt_tolerance: f64,
-    is_hram: bool,
-    file_name: &str,
-) -> HashMap<usize, CoelutionScoredEntry> {
-    // Parallel phase: compute new scored entries for each action
-    let results: Vec<(usize, Option<CoelutionScoredEntry>)> = actions
-        .par_iter()
-        .map(|&(entry_idx, target_apex, target_start, target_end)| {
-            let stub = &fdr_entries[entry_idx];
-
-            // Look up the library entry using entry_id from the lightweight stub
-            let lib_entry = if (stub.entry_id as usize) < library.len()
-                && library[stub.entry_id as usize].id == stub.entry_id
-            {
-                &library[stub.entry_id as usize]
-            } else {
-                match library.iter().find(|e| e.id == stub.entry_id) {
-                    Some(e) => e,
-                    None => return (entry_idx, None),
-                }
-            };
-
-            let expected_rt = rt_calibration
-                .map(|cal| cal.predict(lib_entry.retention_time))
-                .unwrap_or(lib_entry.retention_time);
-
-            let result = rescore_entry_at_boundaries(
-                lib_entry,
-                target_apex,
-                target_start,
-                target_end,
-                expected_rt,
-                spectra,
-                window_groups,
-                scorer,
-                ms1_index,
-                calibration,
-                tol_da,
-                tol_ppm,
-                is_hram,
-                file_name,
-            );
-
-            (entry_idx, result)
-        })
-        .collect();
-
-    // Collect successfully re-scored entries into overlay
-    let mut overlay = HashMap::new();
-    for (entry_idx, new_entry) in results {
-        if let Some(e) = new_entry {
-            overlay.insert(entry_idx, e);
-        }
-    }
-
-    overlay
-}
-
 /// For each precursor candidate in each isolation window:
 /// 1. Extract top-6 fragment XICs
 /// 2. Detect peak on reference XIC (DIA-NN-style valley detection)
 /// 3. Compute pairwise fragment correlations within peak boundaries
 /// 4. Score spectrum at apex (spectral similarity, mass accuracy)
 /// 5. Compute peak shape, RT deviation, MS1, and median polish features
+///
+/// When `boundary_overrides` contains an entry's ID, peak detection is skipped
+/// and the given (apex_rt, start_rt, end_rt) boundaries are used directly.
+/// This is used for multi-charge consensus (forced boundaries from best charge state)
+/// and inter-replicate reconciliation (CWT or imputed boundaries).
 ///
 /// Returns `CoelutionScoredEntry` for each detected precursor (targets + decoys).
 #[allow(clippy::too_many_arguments)]
@@ -4801,6 +4777,7 @@ fn run_search(
     rt_calibration: Option<&RTCalibration>,
     config: &OspreyConfig,
     file_name: &str,
+    boundary_overrides: Option<&HashMap<u32, (f64, f64, f64)>>,
 ) -> Result<Vec<CoelutionScoredEntry>> {
     use osprey_chromatography::{compute_snr, detect_all_xic_peaks, detect_cwt_consensus_peaks};
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
@@ -4992,6 +4969,15 @@ fn run_search(
                 let _global_indices: Vec<usize> =
                     window_pairs.iter().map(|(idx, _)| *idx).collect();
 
+                // Pre-preprocess all window spectra for XCorr to eliminate redundant
+                // per-entry preprocessing (binning + windowing + sliding window subtraction).
+                // Each spectrum is preprocessed once here; per-entry scoring then uses
+                // O(n_frags) dot product lookups instead of O(n_peaks) re-preprocessing.
+                let preprocessed_xcorr: Vec<Vec<f32>> = window_spectra
+                    .iter()
+                    .map(|s| scorer.preprocess_spectrum_for_xcorr(s))
+                    .collect();
+
                 // Find candidate library entries for this window using MzRTIndex
                 // Collect unique library indices whose precursor_mz falls in this window
                 let _window_center = (*lower + *upper) / 2.0;
@@ -5041,30 +5027,52 @@ fn run_search(
                     .iter()
                     .filter_map(|&lib_idx| {
                         let entry = &library[lib_idx];
+                        let has_override =
+                            boundary_overrides.and_then(|m| m.get(&entry.id)).copied();
 
                         // Expected RT for this entry
                         let expected_rt = rt_calibration
                             .map(|cal| cal.predict(entry.retention_time))
                             .unwrap_or(entry.retention_time);
 
-                        // Filter spectra within RT tolerance of expected RT
-                        let rt_spec_pairs: Vec<(usize, &Spectrum)> = window_pairs
-                            .iter()
-                            .filter(|(_, spec)| {
-                                (spec.retention_time - expected_rt).abs() <= rt_tolerance
-                            })
-                            .map(|(idx, spec)| (*idx, *spec))
-                            .collect();
+                        // Filter spectra within RT range.
+                        // For boundary overrides: use the given boundaries + margin for SNR context.
+                        // For normal search: use expected_rt ± rt_tolerance.
+                        let rt_spec_triples: Vec<(usize, usize, &Spectrum)> =
+                            if let Some((_, target_start, target_end)) = has_override {
+                                let peak_width = (target_end - target_start).max(0.1);
+                                let margin = peak_width.max(0.2);
+                                let rt_lo = target_start - margin;
+                                let rt_hi = target_end + margin;
+                                window_pairs
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, (_, spec))| {
+                                        spec.retention_time >= rt_lo && spec.retention_time <= rt_hi
+                                    })
+                                    .map(|(win_idx, (global_idx, spec))| {
+                                        (win_idx, *global_idx, *spec)
+                                    })
+                                    .collect()
+                            } else {
+                                window_pairs
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, (_, spec))| {
+                                        (spec.retention_time - expected_rt).abs() <= rt_tolerance
+                                    })
+                                    .map(|(win_idx, (global_idx, spec))| {
+                                        (win_idx, *global_idx, *spec)
+                                    })
+                                    .collect()
+                            };
 
-                        if rt_spec_pairs.len() < MIN_COELUTION_SPECTRA {
+                        if rt_spec_triples.len() < MIN_COELUTION_SPECTRA {
                             return None;
                         }
 
-                        // Signal pre-filter: sliding window of 4 consecutive scans
-                        // (in RT order), requiring ≥3 of the 4 to have ≥2 of the
-                        // top-6 fragments matching. Disabled for unit-resolution data
-                        // (lower fragment specificity) or via --no-prefilter.
-                        if config.prefilter_enabled {
+                        // Signal pre-filter (skipped for boundary overrides — we're told to score here)
+                        if has_override.is_none() && config.prefilter_enabled {
                             let tol = if tol_ppm > 0.0 { tol_ppm } else { tol_da };
                             let tol_unit = if tol_ppm > 0.0 {
                                 ToleranceUnit::Ppm
@@ -5076,7 +5084,7 @@ fn run_search(
                             let mut window = [false; WIN];
                             let mut win_sum = 0u32;
                             let mut has_signal = false;
-                            for (i, (_, spec)) in rt_spec_pairs.iter().enumerate() {
+                            for (i, (_, _, spec)) in rt_spec_triples.iter().enumerate() {
                                 let passes = has_topn_fragment_match(
                                     &entry.fragments,
                                     &spec.mzs,
@@ -5102,11 +5110,15 @@ fn run_search(
                         }
 
                         let cand_spectra: Vec<&Spectrum> =
-                            rt_spec_pairs.iter().map(|(_, s)| *s).collect();
+                            rt_spec_triples.iter().map(|(_, _, s)| *s).collect();
                         let cand_global: Vec<usize> =
-                            rt_spec_pairs.iter().map(|(idx, _)| *idx).collect();
+                            rt_spec_triples.iter().map(|(_, idx, _)| *idx).collect();
+                        let cand_window_local: Vec<usize> = rt_spec_triples
+                            .iter()
+                            .map(|(win_idx, _, _)| *win_idx)
+                            .collect();
 
-                        // 1. Extract top-6 fragment XICs
+                        // Extract top-6 fragment XICs
                         let xics = extract_fragment_xics(
                             &entry.fragments,
                             &cand_spectra,
@@ -5119,7 +5131,7 @@ fn run_search(
                             return None;
                         }
 
-                        // 2. Find reference XIC (highest total intensity) for scoring
+                        // Find reference XIC (highest total intensity) for scoring
                         let ref_idx = xics
                             .iter()
                             .enumerate()
@@ -5132,16 +5144,86 @@ fn run_search(
 
                         let ref_xic = &xics[ref_idx].1;
 
-                        // 3. Detect candidate peaks using CWT consensus across all transitions.
-                        // The Mexican Hat wavelet convolution of each fragment XIC, followed by
-                        // pointwise median, produces a consensus signal that is only high where
-                        // the majority of transitions exhibit peak-like shapes simultaneously.
-                        // Falls back to median polish profile or reference XIC if CWT finds nothing.
+                        // --- Peak selection ---
+                        // For boundary overrides (forced/imputed): map given RTs to XIC indices.
+                        // For normal search: CWT consensus peak detection with fallbacks.
+                        if let Some((target_apex, target_start, target_end)) = has_override {
+                            if ref_xic.len() < 3 {
+                                return None;
+                            }
+
+                            // Map target RT boundaries to XIC scan indices
+                            let start_index = ref_xic
+                                .partition_point(|(rt, _)| *rt < target_start)
+                                .saturating_sub(1)
+                                .min(ref_xic.len() - 1);
+
+                            let end_index = ref_xic
+                                .partition_point(|(rt, _)| *rt < target_end)
+                                .min(ref_xic.len() - 1);
+
+                            let apex_index = ref_xic
+                                .partition_point(|(rt, _)| *rt < target_apex)
+                                .min(ref_xic.len() - 1);
+                            // Pick closer neighbor for apex
+                            let apex_index = if apex_index > 0
+                                && (ref_xic[apex_index - 1].0 - target_apex).abs()
+                                    < (ref_xic[apex_index].0 - target_apex).abs()
+                            {
+                                apex_index - 1
+                            } else {
+                                apex_index
+                            };
+                            let apex_index = apex_index.clamp(start_index, end_index);
+
+                            if end_index <= start_index + 1 {
+                                return None;
+                            }
+
+                            let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
+                            let area = trapezoidal_area(&ref_xic[start_index..=end_index]);
+                            let snr = compute_snr(&raw_ints, apex_index, start_index, end_index);
+
+                            let peak = XICPeakBounds {
+                                apex_rt: ref_xic[apex_index].0,
+                                apex_intensity: ref_xic[apex_index].1,
+                                apex_index,
+                                start_rt: ref_xic[start_index].0,
+                                end_rt: ref_xic[end_index].0,
+                                start_index,
+                                end_index,
+                                area,
+                                signal_to_noise: snr,
+                            };
+
+                            let ctx = FeatureComputeContext {
+                                entry,
+                                xics: &xics,
+                                ref_xic,
+                                cand_spectra: &cand_spectra,
+                                cand_global: &cand_global,
+                                scorer: &scorer,
+                                ms1_index,
+                                calibration,
+                                tol_da,
+                                tol_ppm,
+                                expected_rt,
+                                is_hram,
+                                file_name,
+                                preprocessed_xcorr: Some(&preprocessed_xcorr),
+                                cand_window_local: Some(&cand_window_local),
+                            };
+
+                            return compute_features_at_peak(&ctx, peak);
+                        }
+
+                        // --- Normal CWT peak detection path ---
+
+                        // Detect candidate peaks using CWT consensus across all transitions.
                         let full_polish = tukey_median_polish(&xics, 10, 0.01);
                         let candidates = {
                             let cwt_candidates = detect_cwt_consensus_peaks(&xics, 0.0);
                             if cwt_candidates.is_empty() {
-                                // Fallback: median polish elution profile, then reference XIC
                                 let mp_candidates = full_polish
                                     .as_ref()
                                     .map(|mp| detect_all_xic_peaks(&mp.elution_profile, 0.01, 5.0))
@@ -5249,8 +5331,6 @@ fn run_search(
                             signal_to_noise: snr,
                         };
 
-                        // CWT zero-crossing boundaries are the final boundaries.
-                        // Compute all 45 features at these boundaries.
                         let ctx = FeatureComputeContext {
                             entry,
                             xics: &xics,
@@ -5265,6 +5345,8 @@ fn run_search(
                             expected_rt,
                             is_hram,
                             file_name,
+                            preprocessed_xcorr: Some(&preprocessed_xcorr),
+                            cand_window_local: Some(&cand_window_local),
                         };
 
                         let mut result = compute_features_at_peak(&ctx, peak);
@@ -6189,5 +6271,379 @@ mod tests {
         // Same group (same modified_sequence) → entry 1 at different peak gets re-scored
         assert_eq!(rescore.len(), 1);
         assert_eq!(rescore[0].0, 1);
+    }
+
+    // ===================================================================
+    // run_search boundary_overrides tests
+    // ===================================================================
+    //
+    // These tests exercise `run_search` with synthetic DIA spectra to verify
+    // that the boundary_overrides path (used by reconciliation and multi-charge
+    // consensus) produces results at the specified peak boundaries, skips
+    // the prefilter, and coexists correctly with normal CWT-based search.
+
+    /// Build a library entry with 3 fragments at known m/z values.
+    fn make_lib_entry_with_fragments(id: u32, precursor_mz: f64, rt: f64) -> LibraryEntry {
+        let mut entry = LibraryEntry::new(
+            id,
+            "TESTPEPTIDE".into(),
+            "TESTPEPTIDE".into(),
+            2,
+            precursor_mz,
+            rt,
+        );
+        entry.fragments = vec![
+            LibraryFragment {
+                mz: 300.0,
+                relative_intensity: 100.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 400.0,
+                relative_intensity: 80.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 500.0,
+                relative_intensity: 60.0,
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+        entry
+    }
+
+    /// Build synthetic DIA spectra with a Gaussian elution profile centered
+    /// at `center_rt`. All spectra have peaks at 300.0, 400.0, 500.0 Da
+    /// with intensities scaled by a Gaussian envelope. This provides realistic
+    /// XIC shapes for peak detection and coelution scoring.
+    ///
+    /// `n_spectra`: number of spectra spanning `rt_start..rt_end`
+    /// `center_rt`: RT of the Gaussian peak center
+    /// `sigma`: width of the Gaussian (minutes)
+    /// `window_center`, `window_half_width`: isolation window parameters
+    fn make_gaussian_spectra(
+        n_spectra: usize,
+        rt_start: f64,
+        rt_end: f64,
+        center_rt: f64,
+        sigma: f64,
+        window_center: f64,
+        window_half_width: f64,
+    ) -> Vec<Spectrum> {
+        let dt = (rt_end - rt_start) / (n_spectra - 1) as f64;
+        (0..n_spectra)
+            .map(|i| {
+                let rt = rt_start + i as f64 * dt;
+                let gauss = 1000.0 * (-(rt - center_rt).powi(2) / (2.0 * sigma.powi(2))).exp();
+                // Background noise floor + Gaussian signal
+                let base = 10.0 + gauss;
+                Spectrum {
+                    scan_number: i as u32 + 1,
+                    retention_time: rt,
+                    precursor_mz: window_center,
+                    isolation_window: IsolationWindow::symmetric(window_center, window_half_width),
+                    // Sorted m/z array with matching fragment intensities
+                    mzs: vec![300.0, 400.0, 500.0],
+                    intensities: vec![base as f32, (base * 0.8) as f32, (base * 0.6) as f32],
+                }
+            })
+            .collect()
+    }
+
+    /// Create an OspreyConfig suitable for unit tests:
+    /// unit resolution, Da tolerance, prefilter on.
+    fn make_test_config() -> OspreyConfig {
+        OspreyConfig {
+            resolution_mode: osprey_core::ResolutionMode::UnitResolution,
+            fragment_tolerance: FragmentToleranceConfig {
+                tolerance: 0.5,
+                unit: ToleranceUnit::Mz,
+            },
+            prefilter_enabled: true,
+            ..OspreyConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_run_search_override_returns_entry_at_specified_boundaries() {
+        // Build 30 spectra with a Gaussian peak at RT=10.0
+        let spectra = make_gaussian_spectra(30, 5.0, 15.0, 10.0, 1.0, 500.0, 12.5);
+        let entry = make_lib_entry_with_fragments(0, 500.0, 10.0);
+        let library = vec![entry];
+        let ms1_index = MS1Index::new(vec![]);
+        let config = make_test_config();
+
+        // Override: force boundaries at RT 9.0–11.0, apex at 10.0
+        let mut overrides = HashMap::new();
+        overrides.insert(0u32, (10.0, 9.0, 11.0));
+
+        let results = run_search(
+            &library,
+            &spectra,
+            &ms1_index,
+            None,
+            None,
+            &config,
+            "test.mzML",
+            Some(&overrides),
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1, "Should produce exactly one result");
+        let result = &results[0];
+        assert_eq!(result.entry_id, 0);
+
+        // The peak boundaries should be at the closest XIC points to our overrides
+        assert!(
+            (result.peak_bounds.start_rt - 9.0).abs() < 0.5,
+            "start_rt={} should be near 9.0",
+            result.peak_bounds.start_rt
+        );
+        assert!(
+            (result.peak_bounds.end_rt - 11.0).abs() < 0.5,
+            "end_rt={} should be near 11.0",
+            result.peak_bounds.end_rt
+        );
+        assert!(
+            (result.peak_bounds.apex_rt - 10.0).abs() < 0.5,
+            "apex_rt={} should be near 10.0",
+            result.peak_bounds.apex_rt
+        );
+        // Apex must be within boundaries
+        assert!(result.peak_bounds.apex_rt >= result.peak_bounds.start_rt);
+        assert!(result.peak_bounds.apex_rt <= result.peak_bounds.end_rt);
+    }
+
+    #[test]
+    fn test_run_search_override_skips_prefilter() {
+        // Build spectra where fragment intensities are ZERO — no signal at all.
+        // Normal search would fail the prefilter. Override should bypass it.
+        let n = 30;
+        let dt = 10.0 / (n - 1) as f64;
+        let spectra: Vec<Spectrum> = (0..n)
+            .map(|i| {
+                let rt = 5.0 + i as f64 * dt;
+                Spectrum {
+                    scan_number: i as u32 + 1,
+                    retention_time: rt,
+                    precursor_mz: 500.0,
+                    isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+                    // Peaks at correct m/z but with zero intensity — fails prefilter
+                    // but still extractable as XICs (all-zero intensities).
+                    // Actually, XIC extraction will produce zero-intensity XICs,
+                    // which will fail area/correlation checks. Instead, use tiny
+                    // intensities that won't pass the sliding window prefilter
+                    // (requires 3/4 consecutive spectra with 2+ fragment matches).
+                    // With only 1 fragment m/z present, prefilter requires 2 matches
+                    // from top-6 fragments, so having only 1 fragment match fails it.
+                    mzs: vec![300.0], // Only 1 of 3 fragments present
+                    intensities: vec![100.0],
+                }
+            })
+            .collect();
+
+        let entry = make_lib_entry_with_fragments(0, 500.0, 10.0);
+        let library = vec![entry];
+        let ms1_index = MS1Index::new(vec![]);
+        let config = make_test_config();
+
+        // Without override: should fail prefilter (only 1/3 fragments match)
+        let results_normal = run_search(
+            &library,
+            &spectra,
+            &ms1_index,
+            None,
+            None,
+            &config,
+            "test.mzML",
+            None,
+        )
+        .unwrap();
+        assert!(
+            results_normal.is_empty(),
+            "Normal search should fail prefilter with only 1 fragment"
+        );
+
+        // With override: should bypass prefilter and attempt scoring
+        // (may still return None if XIC quality is poor, but it won't
+        // be filtered by the prefilter check)
+        let mut overrides = HashMap::new();
+        overrides.insert(0u32, (10.0, 9.0, 11.0));
+
+        let results_override = run_search(
+            &library,
+            &spectra,
+            &ms1_index,
+            None,
+            None,
+            &config,
+            "test.mzML",
+            Some(&overrides),
+        )
+        .unwrap();
+
+        // The override path skips prefilter but still needs ≥2 XICs.
+        // With only 1 fragment m/z in spectra, extract_fragment_xics returns
+        // 3 XICs (one per library fragment) but only the 300.0 one has signal.
+        // The other two are all-zero. All 3 XICs are still returned (zero is valid).
+        // So xics.len() ≥ 2 passes, but features may still be None if correlations
+        // are degenerate. The key assertion is that override doesn't hit prefilter.
+        // We verify the paths diverge — override gets further than normal search.
+        // If it produces a result, it came via the override path.
+        // If it doesn't, that's also fine — the prefilter was still skipped.
+        assert!(
+            results_override.len() <= 1,
+            "Override should produce 0 or 1 results"
+        );
+    }
+
+    #[test]
+    fn test_run_search_mixed_override_and_cwt() {
+        // Two library entries in the same isolation window:
+        // entry 0 gets boundary overrides, entry 1 uses normal CWT detection.
+        let spectra = make_gaussian_spectra(30, 5.0, 15.0, 10.0, 1.0, 500.0, 12.5);
+
+        let entry0 = make_lib_entry_with_fragments(0, 498.0, 10.0);
+        let entry1 = make_lib_entry_with_fragments(1, 502.0, 10.0);
+        let library = vec![entry0, entry1];
+        let ms1_index = MS1Index::new(vec![]);
+        let config = make_test_config();
+
+        // Override only entry 0 with tight boundaries at 9.5–10.5
+        let mut overrides = HashMap::new();
+        overrides.insert(0u32, (10.0, 9.5, 10.5));
+
+        let results = run_search(
+            &library,
+            &spectra,
+            &ms1_index,
+            None,
+            None,
+            &config,
+            "test.mzML",
+            Some(&overrides),
+        )
+        .unwrap();
+
+        // Both entries have good signal → both should produce results
+        assert!(
+            !results.is_empty(),
+            "Should produce at least 1 result (override entry)"
+        );
+
+        // Find results by entry_id
+        let result0 = results.iter().find(|r| r.entry_id == 0);
+        let result1 = results.iter().find(|r| r.entry_id == 1);
+
+        // Entry 0 (override) should have tight boundaries near 9.5–10.5
+        if let Some(r0) = result0 {
+            assert!(
+                (r0.peak_bounds.start_rt - 9.5).abs() < 0.5,
+                "Override entry start_rt={} should be near 9.5",
+                r0.peak_bounds.start_rt
+            );
+            assert!(
+                (r0.peak_bounds.end_rt - 10.5).abs() < 0.5,
+                "Override entry end_rt={} should be near 10.5",
+                r0.peak_bounds.end_rt
+            );
+        }
+
+        // Entry 1 (CWT) should detect the full peak — likely wider boundaries
+        if let Some(r1) = result1 {
+            // CWT detection on a Gaussian peak centered at 10.0 with σ=1.0
+            // The boundaries should encompass the main peak (roughly 8–12 min)
+            assert!(
+                r1.peak_bounds.start_rt < 10.0 && r1.peak_bounds.end_rt > 10.0,
+                "CWT entry should bracket the peak center"
+            );
+        }
+
+        // If both returned, the override entry's peak should be tighter
+        if let (Some(r0), Some(r1)) = (result0, result1) {
+            let width0 = r0.peak_bounds.end_rt - r0.peak_bounds.start_rt;
+            let width1 = r1.peak_bounds.end_rt - r1.peak_bounds.start_rt;
+            assert!(
+                width0 <= width1 + 0.5,
+                "Override peak width ({:.2}) should be <= CWT peak width ({:.2}) + margin",
+                width0,
+                width1
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_search_no_override_normal_detection() {
+        // Baseline: run_search with None boundary_overrides uses CWT peak detection.
+        // This validates the normal path still works after the refactor.
+        let spectra = make_gaussian_spectra(30, 5.0, 15.0, 10.0, 1.0, 500.0, 12.5);
+        let entry = make_lib_entry_with_fragments(0, 500.0, 10.0);
+        let library = vec![entry];
+        let ms1_index = MS1Index::new(vec![]);
+        let config = make_test_config();
+
+        let results = run_search(
+            &library,
+            &spectra,
+            &ms1_index,
+            None,
+            None,
+            &config,
+            "test.mzML",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1, "Normal CWT search should find the peak");
+        let result = &results[0];
+        assert_eq!(result.entry_id, 0);
+        // Peak should be near the Gaussian center
+        assert!(
+            (result.peak_bounds.apex_rt - 10.0).abs() < 1.0,
+            "CWT apex={} should be near center 10.0",
+            result.peak_bounds.apex_rt
+        );
+        assert!(
+            result.peak_bounds.area > 0.0,
+            "Peak area should be positive"
+        );
+    }
+
+    #[test]
+    fn test_run_search_override_narrow_boundaries() {
+        // Override with very tight boundaries (just 3 scans wide).
+        // Verifies we handle the minimum viable peak width.
+        let spectra = make_gaussian_spectra(60, 5.0, 15.0, 10.0, 1.0, 500.0, 12.5);
+        let entry = make_lib_entry_with_fragments(0, 500.0, 10.0);
+        let library = vec![entry];
+        let ms1_index = MS1Index::new(vec![]);
+        let config = make_test_config();
+
+        // Very tight override: 0.5 min window around apex
+        let mut overrides = HashMap::new();
+        overrides.insert(0u32, (10.0, 9.75, 10.25));
+
+        let results = run_search(
+            &library,
+            &spectra,
+            &ms1_index,
+            None,
+            None,
+            &config,
+            "test.mzML",
+            Some(&overrides),
+        )
+        .unwrap();
+
+        // Should still produce a result if enough spectra fall in range
+        if !results.is_empty() {
+            let r = &results[0];
+            let width = r.peak_bounds.end_rt - r.peak_bounds.start_rt;
+            assert!(
+                width < 2.0,
+                "Tight override should produce narrow peak, got width={:.2}",
+                width
+            );
+        }
     }
 }

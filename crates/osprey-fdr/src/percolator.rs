@@ -1617,7 +1617,11 @@ pub fn compute_fdr_from_scores(
 /// - `entry.run_qvalue = max(run_precursor_q, run_peptide_q)`
 /// - `entry.experiment_qvalue = max(exp_precursor_q, exp_peptide_q)`
 /// - `entry.pep` = posterior error probability (1.0 for non-competition-winners)
-pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], test_fdr: f64) {
+pub fn compute_fdr_from_stubs(
+    per_file_entries: &mut [(String, Vec<FdrEntry>)],
+    test_fdr: f64,
+    restrict_base_ids: Option<&HashSet<u32>>,
+) {
     let n_files = per_file_entries.len();
     let is_single_file = n_files <= 1;
 
@@ -1629,6 +1633,11 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
     for (file_idx, (_, entries)) in per_file_entries.iter().enumerate() {
         for (local_idx, entry) in entries.iter().enumerate() {
             let base_id = entry.entry_id & 0x7FFF_FFFF;
+            if let Some(restrict) = restrict_base_ids {
+                if !restrict.contains(&base_id) {
+                    continue;
+                }
+            }
             let map = if entry.is_decoy {
                 &mut decoys
             } else {
@@ -1697,43 +1706,63 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
             continue;
         }
 
-        // Build per-file flat arrays (temporary)
-        let scores: Vec<f64> = entries.iter().map(|e| e.score).collect();
-        let labels: Vec<bool> = entries.iter().map(|e| e.is_decoy).collect();
-        let eids: Vec<u32> = entries.iter().map(|e| e.entry_id).collect();
-        let all_indices: Vec<usize> = (0..n).collect();
+        // Build per-file flat arrays, restricted to matching base_ids if specified
+        let active_indices: Vec<usize> = if let Some(restrict) = restrict_base_ids {
+            (0..n)
+                .filter(|&i| restrict.contains(&(entries[i].entry_id & 0x7FFF_FFFF)))
+                .collect()
+        } else {
+            (0..n).collect()
+        };
 
-        // Precursor-level q-values
+        if active_indices.is_empty() {
+            continue;
+        }
+
+        let scores: Vec<f64> = active_indices.iter().map(|&i| entries[i].score).collect();
+        let labels: Vec<bool> = active_indices
+            .iter()
+            .map(|&i| entries[i].is_decoy)
+            .collect();
+        let eids: Vec<u32> = active_indices
+            .iter()
+            .map(|&i| entries[i].entry_id)
+            .collect();
+        let all_indices: Vec<usize> = (0..active_indices.len()).collect();
+
+        // Precursor-level q-values (on active entries only)
         let (prec_winner_local, _, prec_winner_is_decoy) =
             compete_from_indices(&scores, &labels, &eids, &all_indices);
         let mut prec_q = vec![1.0; prec_winner_local.len()];
         let prec_ws: Vec<f64> = prec_winner_local.iter().map(|&i| scores[i]).collect();
         compute_conservative_qvalues(&prec_ws, &prec_winner_is_decoy, &mut prec_q);
 
-        let mut entry_prec_qvalue = vec![1.0; n];
-        for (rank, &local_idx) in prec_winner_local.iter().enumerate() {
-            entry_prec_qvalue[local_idx] = prec_q[rank];
+        // Map active-local index → precursor q-value
+        let mut active_prec_qvalue = vec![1.0; active_indices.len()];
+        for (rank, &idx) in prec_winner_local.iter().enumerate() {
+            active_prec_qvalue[idx] = prec_q[rank];
         }
 
-        // Peptide-level q-values
+        // Peptide-level q-values (on active entries only)
         let mut best_per_pept: HashMap<&str, (usize, f64)> = HashMap::new();
-        for (i, entry) in entries.iter().enumerate() {
+        for (ai, &orig_idx) in active_indices.iter().enumerate() {
+            let entry = &entries[orig_idx];
             best_per_pept
                 .entry(&*entry.modified_sequence)
-                .and_modify(|(best_idx, best_score)| {
-                    if scores[i] > *best_score {
-                        *best_idx = i;
-                        *best_score = scores[i];
+                .and_modify(|(best_ai, best_score)| {
+                    if scores[ai] > *best_score {
+                        *best_ai = ai;
+                        *best_score = scores[ai];
                     }
                 })
-                .or_insert((i, scores[i]));
+                .or_insert((ai, scores[ai]));
         }
-        let mut pept_reps: Vec<usize> = best_per_pept.values().map(|&(idx, _)| idx).collect();
+        let mut pept_reps: Vec<usize> = best_per_pept.values().map(|&(ai, _)| ai).collect();
         pept_reps.sort();
 
-        let pept_scores: Vec<f64> = pept_reps.iter().map(|&i| scores[i]).collect();
-        let pept_labels: Vec<bool> = pept_reps.iter().map(|&i| labels[i]).collect();
-        let pept_eids: Vec<u32> = pept_reps.iter().map(|&i| eids[i]).collect();
+        let pept_scores: Vec<f64> = pept_reps.iter().map(|&ai| scores[ai]).collect();
+        let pept_labels: Vec<bool> = pept_reps.iter().map(|&ai| labels[ai]).collect();
+        let pept_eids: Vec<u32> = pept_reps.iter().map(|&ai| eids[ai]).collect();
 
         let (pept_winner_local, _, pept_winner_is_decoy) = compete_from_indices(
             &pept_scores,
@@ -1748,20 +1777,21 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
         // Map peptide q-values back via peptide string (owned keys to avoid borrow conflict)
         let mut peptide_qvalue: HashMap<String, f64> = HashMap::new();
         for (rank, &local_idx) in pept_winner_local.iter().enumerate() {
-            let global_idx = pept_reps[local_idx];
+            let orig_idx = active_indices[pept_reps[local_idx]];
             peptide_qvalue.insert(
-                entries[global_idx].modified_sequence.to_string(),
+                entries[orig_idx].modified_sequence.to_string(),
                 pept_q[rank],
             );
         }
 
-        // Write run_qvalue = max(precursor, peptide)
-        for (i, entry) in entries.iter_mut().enumerate() {
+        // Write run_qvalue = max(precursor, peptide) for active entries only
+        for (ai, &orig_idx) in active_indices.iter().enumerate() {
+            let entry = &mut entries[orig_idx];
             let pept_qv = peptide_qvalue
                 .get(&*entry.modified_sequence)
                 .copied()
                 .unwrap_or(1.0);
-            entry.run_qvalue = entry_prec_qvalue[i].max(pept_qv);
+            entry.run_qvalue = active_prec_qvalue[ai].max(pept_qv);
         }
 
         // Log per-file stats
@@ -1803,6 +1833,11 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
         for (file_idx, (_, entries)) in per_file_entries.iter().enumerate() {
             for (local_idx, entry) in entries.iter().enumerate() {
                 let base_id = entry.entry_id & 0x7FFF_FFFF;
+                if let Some(restrict) = restrict_base_ids {
+                    if !restrict.contains(&base_id) {
+                        continue;
+                    }
+                }
                 let map = if entry.is_decoy {
                     &mut best_decoy
                 } else {
@@ -1862,6 +1897,11 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
         let mut best_per_pept: HashMap<String, (f64, bool, u32)> = HashMap::new();
         for (_, entries) in per_file_entries.iter() {
             for entry in entries.iter() {
+                if let Some(restrict) = restrict_base_ids {
+                    if !restrict.contains(&(entry.entry_id & 0x7FFF_FFFF)) {
+                        continue;
+                    }
+                }
                 best_per_pept
                     .entry(entry.modified_sequence.to_string())
                     .and_modify(|(best_score, best_decoy, best_eid)| {
@@ -1908,6 +1948,11 @@ pub fn compute_fdr_from_stubs(per_file_entries: &mut [(String, Vec<FdrEntry>)], 
         for (_, entries) in per_file_entries.iter_mut() {
             for entry in entries.iter_mut() {
                 let base_id = entry.entry_id & 0x7FFF_FFFF;
+                if let Some(restrict) = restrict_base_ids {
+                    if !restrict.contains(&base_id) {
+                        continue;
+                    }
+                }
                 let prec_q = base_id_exp_prec_q.get(&base_id).copied().unwrap_or(1.0);
                 let pept_q = peptide_exp_q
                     .get(&*entry.modified_sequence)
