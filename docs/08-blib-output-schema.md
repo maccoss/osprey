@@ -203,9 +203,12 @@ Per-run retention times and peak boundaries for multi-file experiments. Each pre
 
 **Nullable retentionTime for Skyline ID lines**: The `retentionTime` column controls whether Skyline shows an ID line (vertical marker) for the precursor in that run:
 - **`retentionTime` = apex RT**: The precursor passed run-level FDR (`run_qvalue <= 0.01`) in this file. Skyline shows an ID line at the apex and uses `startTime`/`endTime` for peak integration boundaries.
-- **`retentionTime` = NULL**: The precursor did NOT pass run-level FDR in this file, but passed experiment-level FDR (it was confidently detected in another replicate). Skyline uses `startTime`/`endTime` for quantification boundaries **without** showing an ID line. This correctly indicates "we have boundaries for quantification, but this is not an independent identification."
+- **`retentionTime` = NULL**: The precursor did NOT pass run-level FDR in this file. Skyline uses `startTime`/`endTime` for quantification boundaries **without** showing an ID line. This correctly indicates "we have boundaries for quantification, but this is not an independent identification."
 
-This distinction matters for multi-file experiments where a precursor may pass FDR in some replicates but not others. Peak boundaries are still provided for all files (from cross-run reconciliation) to enable consistent quantification across replicates.
+**Every passing precursor gets a row in every file**: Even when a precursor was not searched in a particular file (e.g., the precursor m/z falls outside the DIA isolation scheme), it still gets a RetentionTimes row with NULL `retentionTime` and boundaries from the best run. This ensures Skyline always has integration boundaries for every precursor in every replicate. The three sources of boundaries are:
+1. **Direct detection**: The precursor was searched and scored in this file. Boundaries come from CWT peak detection.
+2. **Reconciliation**: The precursor was searched but the first-pass picked the wrong peak or a weak peak. Boundaries come from an alternate CWT candidate or forced integration at the consensus expected RT.
+3. **Imputed from best run**: The precursor was not searched in this file (outside DIA windows). Boundaries are copied from the best-scoring run.
 
 ---
 
@@ -424,5 +427,5 @@ How data flows from library through search to blib output:
    - **RefSpectraPeaks**: Library theoretical fragment m/z and intensities (not observed DIA peaks)
    - **Modifications**: From library entry (UniMod converted to mass notation)
    - **Proteins**: From library entry protein accessions
-   - **RetentionTimes**: Per-run peak boundaries for multi-file experiments. `retentionTime` is set for runs passing FDR (Skyline ID line), NULL otherwise (boundaries only, no ID line).
+   - **RetentionTimes**: Per-run peak boundaries for ALL input files. `retentionTime` is set for runs passing run-level FDR (Skyline ID line), NULL otherwise (boundaries only, no ID line). Every passing precursor gets a row in every file.
    - **Osprey tables**: Run/experiment q-values, peak boundaries

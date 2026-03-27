@@ -2218,8 +2218,22 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     let mut per_file_overlays: RescoreOverlay = HashMap::new();
     {
         use crate::reconciliation::{
-            compute_consensus_rts, plan_reconciliation, refit_calibration_with_consensus,
-            ReconcileAction,
+            compute_consensus_rts, identify_gap_fill_targets, plan_reconciliation,
+            refit_calibration_with_consensus, GapFillTarget, ReconcileAction,
+        };
+
+        // Build (modified_sequence, charge) → (target_entry_id, decoy_entry_id) lookup
+        // for gap-fill identification
+        let lib_lookup: HashMap<(Arc<str>, u8), (u32, u32)> = {
+            let mut map = HashMap::new();
+            for entry in library.iter().filter(|e| !e.is_decoy) {
+                let decoy_id = entry.id | 0x80000000;
+                map.insert(
+                    (Arc::from(entry.modified_sequence.as_str()), entry.charge),
+                    (entry.id, decoy_id),
+                );
+            }
+            map
         };
 
         // Build file_name → input_file index mapping
@@ -2267,6 +2281,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         let reconciliation_actions: HashMap<(String, usize), ReconcileAction>;
         let refined_calibrations: HashMap<String, RTCalibration>;
+        let per_file_gap_fill: HashMap<String, Vec<GapFillTarget>>;
 
         if reconciliation_enabled {
             log::info!("");
@@ -2321,20 +2336,31 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 );
                 // Drop CWT candidates to free memory
                 drop(per_file_cwt);
+
+                // Gap-fill: identify passing precursors missing from each file
+                per_file_gap_fill = identify_gap_fill_targets(
+                    &consensus,
+                    &per_file_entries,
+                    &refined_calibrations,
+                    &per_file_calibrations,
+                    config.experiment_fdr,
+                    &lib_lookup,
+                );
             } else {
                 refined_calibrations = HashMap::new();
                 reconciliation_actions = HashMap::new();
+                per_file_gap_fill = HashMap::new();
             }
         } else {
             refined_calibrations = HashMap::new();
             reconciliation_actions = HashMap::new();
+            per_file_gap_fill = HashMap::new();
         }
 
         let total_reconciliation: usize = reconciliation_actions
             .values()
             .filter(|a| !matches!(a, ReconcileAction::Keep))
             .count();
-
         // 3. Load spectra once per file and re-score both consensus + reconciliation targets.
         //    For re-scoring, we reload full CoelutionScoredEntry from parquet, rescore,
         //    save updated entries back to parquet, and update FdrEntry stubs.
@@ -2368,6 +2394,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
 
         let mut total_rescored: usize = 0;
+        let mut total_gap_cwt: usize = 0;
+        let mut total_gap_forced: usize = 0;
 
         // Process files sequentially to limit peak memory — each file loads spectra
         // (~1.5 GB). Per-file re-scoring is already internally parallelized.
@@ -2380,6 +2408,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
             // Collect reconciliation targets for this file (pre-grouped)
             let reconciliation_targets = per_file_reconciliation_targets
+                .get(file_name.as_str())
+                .cloned()
+                .unwrap_or_default();
+
+            // Collect gap-fill targets for this file
+            let gap_fill_targets = per_file_gap_fill
                 .get(file_name.as_str())
                 .cloned()
                 .unwrap_or_default();
@@ -2400,7 +2434,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 .map(|(idx, (apex, start, end))| (idx, apex, start, end))
                 .collect();
 
-            if all_targets.is_empty() {
+            // Skip file if no work to do (no re-scoring targets AND no gap-fill targets)
+            if all_targets.is_empty() && gap_fill_targets.is_empty() {
                 continue;
             }
 
@@ -2412,12 +2447,14 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
             let n_multi_charge = consensus_targets.len();
             let n_inter_replicate = reconciliation_targets.len();
+            let n_gap_fill = gap_fill_targets.len();
             log::info!(
-                "Re-scoring {} entries in {} ({} multi-charge consensus, {} inter-replicate reconciliation, {} unique after dedup)",
-                all_targets.len(),
+                "Re-scoring {} entries in {} ({} multi-charge consensus, {} inter-replicate reconciliation, {} gap-fill, {} unique rescore after dedup)",
+                all_targets.len() + n_gap_fill * 2, // *2 for target+decoy
                 file_name,
                 n_multi_charge,
                 n_inter_replicate,
+                n_gap_fill,
                 all_targets.len(),
             );
 
@@ -2439,6 +2476,22 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 .cloned()
                 .collect();
 
+            // Build gap-fill library subset (targets + decoys, separate from re-scoring)
+            let mut gap_fill_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for gf in &gap_fill_targets {
+                gap_fill_ids.insert(gf.target_entry_id);
+                gap_fill_ids.insert(gf.decoy_entry_id);
+            }
+            let gap_fill_library: Vec<LibraryEntry> = if !gap_fill_ids.is_empty() {
+                library
+                    .iter()
+                    .filter(|e| gap_fill_ids.contains(&e.id))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
             // Load spectra and calibration for this file
             let (spectra, ms1_index) = {
                 let cache_path = spectra_cache_path(input_file);
@@ -2453,10 +2506,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                             result
                         }
                         Err(e) => {
-                            log::warn!(
-                                "Failed to load spectra cache, falling back to mzML: {}",
-                                e
-                            );
+                            log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
                             load_all_spectra(input_file)?
                         }
                     }
@@ -2470,53 +2520,159 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 .get(file_name.as_str())
                 .or_else(|| per_file_calibrations.get(file_name.as_str()));
 
-            let cal_params: Option<CalibrationParams> =
-                input_file.parent().and_then(|input_dir| {
-                    let cal_path = calibration_path_for_input(input_file, input_dir);
-                    if cal_path.exists() {
-                        load_calibration(&cal_path).ok()
-                    } else {
-                        None
-                    }
-                });
+            let cal_params: Option<CalibrationParams> = input_file.parent().and_then(|input_dir| {
+                let cal_path = calibration_path_for_input(input_file, input_dir);
+                if cal_path.exists() {
+                    load_calibration(&cal_path).ok()
+                } else {
+                    None
+                }
+            });
 
-            let rescored = run_search(
-                &subset_library,
-                &spectra,
-                &ms1_index,
-                cal_params.as_ref(),
-                rt_cal,
-                &config,
-                file_name,
-                Some(&boundary_overrides),
-            )?;
+            // --- Re-score existing entries (consensus + reconciliation) ---
+            let mut overlay: HashMap<usize, CoelutionScoredEntry> = HashMap::new();
+            if !all_targets.is_empty() {
+                let rescored = run_search(
+                    &subset_library,
+                    &spectra,
+                    &ms1_index,
+                    cal_params.as_ref(),
+                    rt_cal,
+                    &config,
+                    file_name,
+                    Some(&boundary_overrides),
+                )?;
+
+                for entry in rescored {
+                    if let Some(&idx) = entry_id_to_idx.get(&entry.entry_id) {
+                        overlay.insert(idx, entry);
+                    }
+                }
+            }
+
+            // --- Gap-fill: score missing precursors (two-pass: CWT then forced) ---
+            let mut n_gap_cwt = 0usize;
+            let mut n_gap_forced = 0usize;
+            if !gap_fill_targets.is_empty() {
+                // Pass 1 (CWT): Run without boundary overrides, pre-filter disabled.
+                // This lets CWT peak detection find natural peaks at the consensus RT.
+                let mut gap_config = config.clone();
+                gap_config.prefilter_enabled = false;
+                let cwt_results = run_search(
+                    &gap_fill_library,
+                    &spectra,
+                    &ms1_index,
+                    cal_params.as_ref(),
+                    rt_cal,
+                    &gap_config,
+                    file_name,
+                    None,
+                )?;
+
+                // Track which entry_ids got CWT results
+                let cwt_hit_ids: std::collections::HashSet<u32> =
+                    cwt_results.iter().map(|e| e.entry_id).collect();
+                n_gap_cwt = cwt_results.len();
+
+                // Append CWT results as new FdrEntry stubs
+                let gap_fill_start_idx = fdr_entries.len();
+                for (i, entry) in cwt_results.into_iter().enumerate() {
+                    let mut stub = entry.to_fdr_entry();
+                    stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
+                    fdr_entries.push(stub);
+                    overlay.insert(gap_fill_start_idx + i, entry);
+                }
+
+                // Pass 2 (Forced): Entries that CWT missed get forced integration
+                // at consensus RT ± half_width
+                let mut forced_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
+                let mut forced_ids: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+                for gf in &gap_fill_targets {
+                    // Add target if CWT missed it
+                    if !cwt_hit_ids.contains(&gf.target_entry_id) {
+                        let start = gf.expected_rt - gf.half_width;
+                        let end = gf.expected_rt + gf.half_width;
+                        forced_overrides.insert(gf.target_entry_id, (gf.expected_rt, start, end));
+                        forced_ids.insert(gf.target_entry_id);
+                    }
+                    // Add decoy if CWT missed it
+                    if !cwt_hit_ids.contains(&gf.decoy_entry_id) {
+                        let start = gf.expected_rt - gf.half_width;
+                        let end = gf.expected_rt + gf.half_width;
+                        forced_overrides.insert(gf.decoy_entry_id, (gf.expected_rt, start, end));
+                        forced_ids.insert(gf.decoy_entry_id);
+                    }
+                }
+
+                if !forced_overrides.is_empty() {
+                    let forced_library: Vec<LibraryEntry> = gap_fill_library
+                        .iter()
+                        .filter(|e| forced_ids.contains(&e.id))
+                        .cloned()
+                        .collect();
+
+                    let forced_results = run_search(
+                        &forced_library,
+                        &spectra,
+                        &ms1_index,
+                        cal_params.as_ref(),
+                        rt_cal,
+                        &config,
+                        file_name,
+                        Some(&forced_overrides),
+                    )?;
+
+                    n_gap_forced = forced_results.len();
+
+                    // Append forced results as new FdrEntry stubs
+                    let forced_start_idx = fdr_entries.len();
+                    for (i, entry) in forced_results.into_iter().enumerate() {
+                        let mut stub = entry.to_fdr_entry();
+                        stub.modified_sequence =
+                            intern_seq(&mut seq_interner, &stub.modified_sequence);
+                        fdr_entries.push(stub);
+                        overlay.insert(forced_start_idx + i, entry);
+                    }
+                }
+
+                total_gap_cwt += n_gap_cwt;
+                total_gap_forced += n_gap_forced;
+            }
 
             // Drop spectra before updating stubs to free ~1.5-3 GB
             drop(spectra);
 
-            // Map results back to entry indices for the overlay
-            let mut overlay: HashMap<usize, CoelutionScoredEntry> = HashMap::new();
-            for entry in rescored {
-                if let Some(&idx) = entry_id_to_idx.get(&entry.entry_id) {
-                    overlay.insert(idx, entry);
-                }
+            // Count existing re-scored entries (not gap-fill)
+            let existing_rescore_indices: std::collections::HashSet<usize> =
+                entry_id_to_idx.values().copied().collect();
+            let n_existing_rescored = overlay
+                .keys()
+                .filter(|idx| existing_rescore_indices.contains(idx))
+                .count();
+            total_rescored += n_existing_rescored + n_gap_cwt + n_gap_forced;
+
+            if !all_targets.is_empty() || n_gap_cwt + n_gap_forced > 0 {
+                log::info!(
+                    "  {} of {} existing entries re-scored, {} gap-fill ({} CWT, {} forced)",
+                    n_existing_rescored,
+                    all_targets.len(),
+                    n_gap_cwt + n_gap_forced,
+                    n_gap_cwt,
+                    n_gap_forced,
+                );
             }
 
-            let n_rescored = overlay.len();
-            total_rescored += n_rescored;
-            log::info!(
-                "  {} of {} entries successfully re-scored",
-                n_rescored,
-                all_targets.len()
-            );
-
-            // Update FdrEntry stubs from overlay (only re-scored entries)
-            if n_rescored > 0 {
-                for (&idx, entry) in &overlay {
+            // Update FdrEntry stubs from overlay for existing re-scored entries
+            // (gap-fill entries were already appended with stubs during scoring above)
+            for &idx in &existing_rescore_indices {
+                if let Some(entry) = overlay.get(&idx) {
                     let mut stub = entry.to_fdr_entry();
                     stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
                     fdr_entries[idx] = stub;
                 }
+            }
+            if !overlay.is_empty() {
                 per_file_overlays.insert(file_name.clone(), overlay);
             }
         }
@@ -2524,10 +2680,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // 4. Single second-pass FDR after all re-scoring
         if total_rescored > 0 {
             log::info!(
-                "Post-FDR re-scoring complete: {} entries re-scored ({} consensus, {} reconciliation)",
+                "Post-FDR re-scoring complete: {} entries re-scored ({} consensus, {} reconciliation, {} gap-fill [{} CWT, {} forced])",
                 total_rescored,
                 total_consensus,
-                total_reconciliation
+                total_reconciliation,
+                total_gap_cwt + total_gap_forced,
+                total_gap_cwt,
+                total_gap_forced,
             );
             log::info!("");
             log::info!("Running second-pass FDR on re-scored entries...");
@@ -2620,6 +2779,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         // Apply overlay: substitute re-scored entries from reconciliation
         let file_overlay = per_file_overlays.get(file_name.as_str());
+        let parquet_len = full_entries.len();
 
         // Merge FDR q-values from stubs into full entries — stubs have the
         // final q-values from Percolator/Mokapot, while parquet has original scores.
@@ -2641,6 +2801,27 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 entry.score = fdr.score;
                 entry.pep = fdr.pep;
                 passing_entries.push(entry);
+            }
+        }
+
+        // Process gap-fill entries (overlay-only, beyond parquet length)
+        if let Some(file_ov) = file_overlay {
+            for (idx, fdr) in fdr_entries.iter().enumerate().skip(parquet_len) {
+                if !fdr.is_decoy
+                    && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
+                {
+                    if let Some(ov_entry) = file_ov.get(&idx) {
+                        let mut entry = ov_entry.clone();
+                        entry.run_qvalue = fdr.run_qvalue;
+                        entry.experiment_qvalue = best_exp_q
+                            .get(&(fdr.modified_sequence.clone(), fdr.charge))
+                            .copied()
+                            .unwrap_or(fdr.experiment_qvalue);
+                        entry.score = fdr.score;
+                        entry.pep = fdr.pep;
+                        passing_entries.push(entry);
+                    }
+                }
             }
         }
     }
@@ -3016,6 +3197,7 @@ fn run_percolator_fdr(
             .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
 
         let file_features = load_pin_features_from_parquet(cache_path)?;
+        let parquet_len = file_features.len();
 
         for (local_idx, parquet_features) in file_features.into_iter().enumerate() {
             // Use overlay features for re-scored entries, parquet features otherwise
@@ -3031,6 +3213,19 @@ fn run_percolator_fdr(
                 score += w * x;
             }
             fdr_entries[local_idx].score = score;
+        }
+
+        // Score gap-fill entries (indices beyond parquet, only in overlay)
+        for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate().skip(parquet_len) {
+            if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                let mut features = pin_feature_vector(&overlay_entry.features);
+                standardizer.transform_slice(&mut features);
+                let mut score = avg_bias;
+                for (w, x) in avg_weights.iter().zip(features.iter()) {
+                    score += w * x;
+                }
+                fdr_entry.score = score;
+            }
         }
 
         if (file_idx + 1) % 10 == 0 || file_idx + 1 == n_files {
@@ -3069,16 +3264,10 @@ fn run_percolator_fdr_direct(
                 OspreyError::config(format!("No parquet cache path for file {}", file_name))
             })?;
         let file_features = load_pin_features_from_parquet(cache_path)?;
-        if file_features.len() != fdr_entries.len() {
-            return Err(OspreyError::config(format!(
-                "Parquet cache entry count mismatch for {}: {} vs {}",
-                file_name,
-                file_features.len(),
-                fdr_entries.len()
-            )));
-        }
+        let parquet_len = file_features.len();
 
-        for (local_idx, (fdr_entry, parquet_features)) in fdr_entries
+        // Process parquet-aligned entries
+        for (local_idx, (fdr_entry, parquet_features)) in fdr_entries[..parquet_len]
             .iter()
             .zip(file_features.into_iter())
             .enumerate()
@@ -3104,6 +3293,26 @@ fn run_percolator_fdr_direct(
                 entry_id: fdr_entry.entry_id,
                 features,
             });
+        }
+
+        // Process gap-fill entries (indices beyond parquet, from overlay only)
+        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate().skip(parquet_len) {
+            if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                let features = pin_feature_vector(&overlay_entry.features);
+                let psm_id = format!(
+                    "{}_{}_{}_{}",
+                    file_name, fdr_entry.modified_sequence, fdr_entry.charge, fdr_entry.scan_number
+                );
+                perc_entries.push(percolator::PercolatorEntry {
+                    id: psm_id,
+                    file_name: file_name.clone(),
+                    peptide: fdr_entry.modified_sequence.to_string(),
+                    charge: fdr_entry.charge,
+                    is_decoy: fdr_entry.is_decoy,
+                    entry_id: fdr_entry.entry_id,
+                    features,
+                });
+            }
         }
     }
 
@@ -3931,19 +4140,11 @@ fn write_blib_output(
                     scored.peak_bounds.end_rt,
                 ));
 
-            // Show an ID line (non-NULL retentionTime) if this observation passes
-            // EITHER run-level or experiment-level FDR. In GPF experiments, a precursor
-            // exists in only one file, so its run q-value may be slightly above the
-            // threshold while the experiment q-value (which benefits from global
-            // competition) passes. Since this entry is already in the output (it passed
-            // experiment FDR), it should get an ID line in the file where it was found.
-            //
-            // For multi-replicate DIA, observations propagated from other replicates
-            // (where the precursor wasn't independently identified) still get NULL
-            // retentionTime — their run_qvalue stays at 1.0 and experiment_qvalue
-            // reflects the best replicate, not this one.
-            let effective_qvalue = scored.run_qvalue.min(scored.experiment_qvalue);
-            let rt_for_id = if effective_qvalue <= config.run_fdr {
+            // Show an ID line (non-NULL retentionTime) only if this observation
+            // independently passed run-level FDR. Forced integrations and
+            // reconciled entries that didn't pass run-level FDR get NULL
+            // retentionTime (boundaries only, no ID line in Skyline).
+            let rt_for_id = if scored.run_qvalue <= config.run_fdr {
                 Some(run_apex)
             } else {
                 None
@@ -3959,6 +4160,11 @@ fn write_blib_output(
                 is_best,
             )?;
         }
+
+        // Note: With gap-filling, passing precursors will have actual scored entries
+        // in files where they're within the DIA window. Files where the precursor m/z
+        // is outside the isolation window (GPF) won't have entries and won't get
+        // RetentionTimes rows — there's no signal to quantify in those files.
 
         // Add peak boundaries to Osprey extension table (shared across charge states)
         let boundaries = osprey_core::PeakBoundaries {
@@ -4765,9 +4971,8 @@ fn run_search(
                     .iter()
                     .filter_map(|&lib_idx| {
                         let entry = &library[lib_idx];
-                        let has_override = boundary_overrides
-                            .and_then(|m| m.get(&entry.id))
-                            .copied();
+                        let has_override =
+                            boundary_overrides.and_then(|m| m.get(&entry.id)).copied();
 
                         // Expected RT for this entry
                         let expected_rt = rt_calibration
@@ -4787,8 +4992,7 @@ fn run_search(
                                     .iter()
                                     .enumerate()
                                     .filter(|(_, (_, spec))| {
-                                        spec.retention_time >= rt_lo
-                                            && spec.retention_time <= rt_hi
+                                        spec.retention_time >= rt_lo && spec.retention_time <= rt_hi
                                     })
                                     .map(|(win_idx, (global_idx, spec))| {
                                         (win_idx, *global_idx, *spec)
@@ -4920,8 +5124,7 @@ fn run_search(
                                 return None;
                             }
 
-                            let raw_ints: Vec<f64> =
-                                ref_xic.iter().map(|(_, v)| *v).collect();
+                            let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
                             let area = trapezoidal_area(&ref_xic[start_index..=end_index]);
                             let snr = compute_snr(&raw_ints, apex_index, start_index, end_index);
 
@@ -6075,25 +6278,17 @@ mod tests {
         (0..n_spectra)
             .map(|i| {
                 let rt = rt_start + i as f64 * dt;
-                let gauss =
-                    1000.0 * (-(rt - center_rt).powi(2) / (2.0 * sigma.powi(2))).exp();
+                let gauss = 1000.0 * (-(rt - center_rt).powi(2) / (2.0 * sigma.powi(2))).exp();
                 // Background noise floor + Gaussian signal
                 let base = 10.0 + gauss;
                 Spectrum {
                     scan_number: i as u32 + 1,
                     retention_time: rt,
                     precursor_mz: window_center,
-                    isolation_window: IsolationWindow::symmetric(
-                        window_center,
-                        window_half_width,
-                    ),
+                    isolation_window: IsolationWindow::symmetric(window_center, window_half_width),
                     // Sorted m/z array with matching fragment intensities
                     mzs: vec![300.0, 400.0, 500.0],
-                    intensities: vec![
-                        base as f32,
-                        (base * 0.8) as f32,
-                        (base * 0.6) as f32,
-                    ],
+                    intensities: vec![base as f32, (base * 0.8) as f32, (base * 0.6) as f32],
                 }
             })
             .collect()
@@ -6352,7 +6547,10 @@ mod tests {
             "CWT apex={} should be near center 10.0",
             result.peak_bounds.apex_rt
         );
-        assert!(result.peak_bounds.area > 0.0, "Peak area should be positive");
+        assert!(
+            result.peak_bounds.area > 0.0,
+            "Peak area should be positive"
+        );
     }
 
     #[test]
