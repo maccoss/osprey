@@ -2189,6 +2189,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 &per_file_cache_paths,
                 &config,
                 &empty_overlay,
+                None,
             )?;
         }
         FdrMethod::Mokapot => {
@@ -2207,6 +2208,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             }
         }
     }
+
+    // Collect first-pass passing base_ids: any precursor passing run-level FDR
+    // in at least one replicate. The second-pass FDR will be restricted to only
+    // these precursors (+ paired decoys), ensuring complete gap-fill coverage
+    // for all final passing precursors.
+    let first_pass_base_ids: HashSet<u32> = per_file_entries
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .filter(|e| !e.is_decoy && e.run_qvalue <= config.run_fdr)
+        .map(|e| e.entry_id & 0x7FFF_FFFF)
+        .collect();
+
+    log::info!(
+        "First-pass: {} unique precursors pass run-level {:.0}% FDR in at least one replicate",
+        first_pass_base_ids.len(),
+        config.run_fdr * 100.0,
+    );
 
     // Post-FDR re-scoring: multi-charge consensus + inter-replicate reconciliation.
     // Both phases need to load spectra and re-score entries, so we merge them
@@ -2332,18 +2350,19 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     &per_file_cwt,
                     &refined_calibrations,
                     &per_file_calibrations,
-                    config.experiment_fdr,
+                    config.run_fdr,
                 );
                 // Drop CWT candidates to free memory
                 drop(per_file_cwt);
 
                 // Gap-fill: identify passing precursors missing from each file
+                // Uses run-level FDR: any precursor passing in at least one replicate
                 per_file_gap_fill = identify_gap_fill_targets(
                     &consensus,
                     &per_file_entries,
                     &refined_calibrations,
                     &per_file_calibrations,
-                    config.experiment_fdr,
+                    config.run_fdr,
                     &lib_lookup,
                 );
             } else {
@@ -2689,7 +2708,10 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 total_gap_forced,
             );
             log::info!("");
-            log::info!("Running second-pass FDR on re-scored entries...");
+            log::info!(
+                "Running second-pass FDR on {} first-pass precursors + paired decoys...",
+                first_pass_base_ids.len(),
+            );
             match config.fdr_method {
                 FdrMethod::Percolator => {
                     run_percolator_fdr(
@@ -2697,6 +2719,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         &per_file_cache_paths,
                         &config,
                         &per_file_overlays,
+                        Some(&first_pass_base_ids),
                     )?;
                 }
                 FdrMethod::Mokapot => {
@@ -2918,6 +2941,7 @@ fn run_percolator_fdr(
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
     config: &OspreyConfig,
     overlay: &RescoreOverlay,
+    restrict_base_ids: Option<&HashSet<u32>>,
 ) -> Result<()> {
     use osprey_fdr::percolator;
 
@@ -2954,6 +2978,7 @@ fn run_percolator_fdr(
             per_file_cache_paths,
             &perc_config,
             overlay,
+            restrict_base_ids,
         );
     }
 
@@ -2982,6 +3007,11 @@ fn run_percolator_fdr(
     for (file_idx, (_, entries)) in per_file_entries.iter().enumerate() {
         for (local_idx, entry) in entries.iter().enumerate() {
             let base_id = entry.entry_id & 0x7FFF_FFFF;
+            if let Some(restrict) = restrict_base_ids {
+                if !restrict.contains(&base_id) {
+                    continue;
+                }
+            }
             let map = if entry.is_decoy {
                 &mut best_decoy
             } else {
@@ -3200,6 +3230,13 @@ fn run_percolator_fdr(
         let parquet_len = file_features.len();
 
         for (local_idx, parquet_features) in file_features.into_iter().enumerate() {
+            // Skip entries not in the restriction set (keep first-pass scores)
+            if let Some(restrict) = restrict_base_ids {
+                let base_id = fdr_entries[local_idx].entry_id & 0x7FFF_FFFF;
+                if !restrict.contains(&base_id) {
+                    continue;
+                }
+            }
             // Use overlay features for re-scored entries, parquet features otherwise
             let mut features =
                 if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
@@ -3217,6 +3254,12 @@ fn run_percolator_fdr(
 
         // Score gap-fill entries (indices beyond parquet, only in overlay)
         for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate().skip(parquet_len) {
+            if let Some(restrict) = restrict_base_ids {
+                let base_id = fdr_entry.entry_id & 0x7FFF_FFFF;
+                if !restrict.contains(&base_id) {
+                    continue;
+                }
+            }
             if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
                 let mut features = pin_feature_vector(&overlay_entry.features);
                 standardizer.transform_slice(&mut features);
@@ -3240,7 +3283,7 @@ fn run_percolator_fdr(
         "=== Per-file results (run-level FDR at {:.0}%) ===",
         perc_config.test_fdr * 100.0
     );
-    percolator::compute_fdr_from_stubs(per_file_entries, perc_config.test_fdr);
+    percolator::compute_fdr_from_stubs(per_file_entries, perc_config.test_fdr, restrict_base_ids);
 
     Ok(())
 }
@@ -3254,6 +3297,7 @@ fn run_percolator_fdr_direct(
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
     perc_config: &percolator::PercolatorConfig,
     overlay: &RescoreOverlay,
+    restrict_base_ids: Option<&HashSet<u32>>,
 ) -> Result<()> {
     let mut perc_entries = Vec::new();
     for (file_name, fdr_entries) in per_file_entries.iter() {
@@ -3272,6 +3316,11 @@ fn run_percolator_fdr_direct(
             .zip(file_features.into_iter())
             .enumerate()
         {
+            if let Some(restrict) = restrict_base_ids {
+                if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
+                    continue;
+                }
+            }
             // Use overlay features for re-scored entries, parquet features otherwise
             let features = if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx))
             {
@@ -3297,6 +3346,11 @@ fn run_percolator_fdr_direct(
 
         // Process gap-fill entries (indices beyond parquet, from overlay only)
         for (local_idx, fdr_entry) in fdr_entries.iter().enumerate().skip(parquet_len) {
+            if let Some(restrict) = restrict_base_ids {
+                if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
+                    continue;
+                }
+            }
             if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
                 let features = pin_feature_vector(&overlay_entry.features);
                 let psm_id = format!(
@@ -3362,6 +3416,7 @@ fn run_mokapot_fdr(
             per_file_cache_paths,
             config,
             &empty_overlay,
+            None,
         );
     }
 
@@ -3475,6 +3530,7 @@ fn run_mokapot_fdr(
                 per_file_cache_paths,
                 config,
                 &empty_overlay,
+                None,
             )?;
         }
     }

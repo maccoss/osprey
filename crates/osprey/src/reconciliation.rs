@@ -49,11 +49,11 @@ pub fn compute_consensus_rts(
     per_file_calibrations: &HashMap<String, RTCalibration>,
     consensus_fdr: f64,
 ) -> Vec<PeptideConsensusRT> {
-    // 1. Collect target peptides passing experiment-level FDR
+    // 1. Collect target peptides passing run-level FDR in at least one replicate
     let mut target_peptides: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.experiment_qvalue <= consensus_fdr {
+            if !entry.is_decoy && entry.run_qvalue <= consensus_fdr {
                 target_peptides.insert(entry.modified_sequence.clone());
             }
         }
@@ -64,7 +64,7 @@ pub fn compute_consensus_rts(
     }
 
     log::info!(
-        "Inter-replicate reconciliation: {} target peptides pass {:.1}% experiment-level FDR",
+        "Inter-replicate reconciliation: {} target peptides pass {:.1}% run-level FDR in at least one replicate",
         target_peptides.len(),
         consensus_fdr * 100.0
     );
@@ -336,14 +336,14 @@ pub fn plan_reconciliation(
         .map(|c| ((c.modified_sequence.as_str(), c.is_decoy), c))
         .collect();
 
-    // Build set of precursors (base_sequence, charge) that passed experiment-level FDR.
+    // Build set of precursors (base_sequence, charge) that passed run-level FDR in any replicate.
     // Only these precursors (and their paired decoys) will be reconciled.
     // "base_sequence" strips the DECOY_ prefix so targets and decoys share the same key.
     let mut passing_precursors: std::collections::HashSet<(&str, u8)> =
         std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.experiment_qvalue <= experiment_fdr {
+            if !entry.is_decoy && entry.run_qvalue <= experiment_fdr {
                 passing_precursors.insert((&entry.modified_sequence, entry.charge));
             }
         }
@@ -475,8 +475,8 @@ pub fn plan_reconciliation(
 
 /// A precursor that needs gap-filling in a specific file.
 ///
-/// Gap-fill targets are precursors that passed experiment-level FDR but were
-/// not detected in the initial search for a particular file. Both the target
+/// Gap-fill targets are precursors that passed run-level FDR in at least one
+/// replicate but were not detected in the initial search for a particular file. Both the target
 /// and its paired decoy are included to maintain fair target-decoy competition.
 #[derive(Debug, Clone)]
 pub struct GapFillTarget {
@@ -494,7 +494,7 @@ pub struct GapFillTarget {
     pub charge: u8,
 }
 
-/// Identify precursors that passed experiment-level FDR but are missing from specific files.
+/// Identify precursors that passed run-level FDR in any replicate but are missing from specific files.
 ///
 /// For each file, finds passing precursors (target + paired decoy) that have no
 /// entry in that file's `per_file_entries`. Returns gap-fill targets grouped by file,
@@ -516,11 +516,13 @@ pub fn identify_gap_fill_targets(
     experiment_fdr: f64,
     lib_lookup: &HashMap<(Arc<str>, u8), (u32, u32)>,
 ) -> HashMap<String, Vec<GapFillTarget>> {
-    // 1. Build passing precursors: (modified_sequence, charge) for targets passing experiment FDR
+    // 1. Build passing precursors: (modified_sequence, charge) for targets passing run-level
+    //    FDR in at least one replicate. This ensures gap-fill covers all precursors that
+    //    will be eligible for the second-pass experiment-level FDR.
     let mut passing_precursors: HashSet<(Arc<str>, u8)> = HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.experiment_qvalue <= experiment_fdr {
+            if !entry.is_decoy && entry.run_qvalue <= experiment_fdr {
                 passing_precursors.insert((entry.modified_sequence.clone(), entry.charge));
             }
         }
