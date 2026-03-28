@@ -4317,8 +4317,8 @@ fn compute_features_at_peak(
 ) -> Option<CoelutionScoredEntry> {
     use osprey_chromatography::calibration::calibrated_tolerance_ppm;
     use osprey_scoring::{
-        compute_cosine_at_scan, compute_elution_weighted_cosine, compute_mass_accuracy,
-        median_polish_libcosine, median_polish_min_fragment_r2, median_polish_residual_correlation,
+        compute_cosine_at_scan, compute_mass_accuracy, median_polish_libcosine,
+        median_polish_min_fragment_r2, median_polish_residual_correlation,
         median_polish_residual_ratio, median_polish_rsquared, pearson_correlation_raw,
         tukey_median_polish,
     };
@@ -4453,17 +4453,6 @@ fn compute_features_at_peak(
                 compute_cosine_at_scan(&entry.fragments, spec, ctx.tol_da, ctx.tol_ppm) * weight;
         }
     }
-
-    // 3. Elution-weighted cosine
-    let elution_weighted_cosine = compute_elution_weighted_cosine(
-        &entry.fragments,
-        ref_xic,
-        cand_spectra,
-        ctx.tol_da,
-        ctx.tol_ppm,
-        peak.start_rt,
-        peak.end_rt,
-    );
 
     // 4. Mass accuracy at apex
     let frag_matches = ctx.scorer.match_fragments(apex_spectrum, entry);
@@ -4647,7 +4636,7 @@ fn compute_features_at_peak(
         base_peak_rank: spectral_score.base_peak_rank as u8,
         top6_matches: spectral_score.top6_matches as u8,
         explained_intensity: spectral_score.explained_intensity,
-        elution_weighted_cosine,
+        elution_weighted_cosine: 0.0, // removed: expensive per-scan ppm matching, not in PIN
         mass_accuracy_mean: mass_mean,
         abs_mass_accuracy_mean: mass_abs_mean,
         mass_accuracy_std: mass_std,

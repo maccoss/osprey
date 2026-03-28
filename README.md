@@ -320,31 +320,19 @@ Optional human-readable report with peptide detections, scores, and peak boundar
 
 ## Algorithm Overview
 
-### Multi-File RT Calibration
+### Per-File RT Calibration
 
-When processing multiple files, Osprey uses a **multi-file calibration strategy**:
+Each file gets **independent calibration** because LC conditions may vary between files:
 
-#### File 1: Calibration Discovery
-
-1. Use **all library peptides** (no sampling)
+1. Sample library peptides (default 100K targets, 2D stratified by RT × m/z)
 2. Assume linear relationship: library RT range ≈ mzML RT range
 3. Wide initial tolerance (20-30% of gradient range)
-4. Score peptides and detect peaks
+4. Score peptides and detect peaks via co-elution search
 5. Record (library_RT, measured_apex_RT) pairs
 6. Fit LOESS calibration curve
-7. Calculate residual standard deviation
+7. Calculate residual standard deviation → tight RT tolerance (3× residual SD)
 
-**Why all peptides?** For the first file, we don't know the RT shift, so we use all peptides with wide tolerance to maximize calibration points. The assumption is that library RTs span roughly the same range as the measured gradient.
-
-#### Files 2-N: Calibrated Search
-
-1. **Reuse calibration** from File 1 (same experiment → similar LC conditions)
-2. Use tight RT tolerance (3× residual SD from File 1)
-3. Apply LOESS to convert library RTs to predicted measured RTs
-4. Run full search with calibrated candidate selection
-5. Extract fragment XICs and detect peaks
-
-**Why reuse calibration?** Files within the same experiment have similar LC conditions (same column, gradient, mobile phases). The calibration from File 1 is directly applicable to subsequent files.
+Calibration results are saved to JSON per file for reuse on subsequent runs.
 
 ### Candidate Selection
 
