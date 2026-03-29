@@ -49,7 +49,7 @@ PHASE 1: INITIALIZATION
   +- Build m/z index for candidate lookup
   |
   v
-PHASE 2: CALIBRATION DISCOVERY (first file only)
+PHASE 2: CALIBRATION DISCOVERY (per file)
   +- Calculate library-to-measured RT mapping
   +- Set wide RT tolerance (20-50% of gradient)
   +- Co-elution search with CWT peak detection
@@ -300,9 +300,8 @@ See: [Calibration](02-calibration.md)
 
 ### Multi-File Strategy
 
-- **First file**: Full calibration discovery (all peptides, wide tolerance)
-- **Subsequent files**: Reuse calibration from first file (same LC column)
-- Calibration saved to JSON for reuse on reruns
+- **Each file**: Independent calibration discovery (each file may have different LC conditions)
+- Calibration saved to JSON per file for reuse on reruns
 
 ---
 

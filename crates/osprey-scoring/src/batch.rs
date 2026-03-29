@@ -382,9 +382,9 @@ impl PreprocessedLibrary {
         }
     }
 
-    /// Preprocess a single library entry (for internal use)
+    /// Preprocess a single library entry into a binned, sqrt, L2-normalized vector.
     /// Uses f32 for memory efficiency - source intensities are already f32.
-    fn preprocess_library_entry(
+    pub fn preprocess_library_entry(
         entry: &LibraryEntry,
         num_bins: usize,
         min_mz: f64,
@@ -557,9 +557,9 @@ impl PreprocessedSpectra {
         }
     }
 
-    /// Preprocess a single spectrum with SMZ transformation and L2 normalization
+    /// Preprocess a single spectrum with sqrt transformation and L2 normalization.
     /// Uses f32 for memory efficiency - source intensities are already f32.
-    fn preprocess_spectrum(
+    pub fn preprocess_spectrum(
         spectrum: &Spectrum,
         num_bins: usize,
         min_mz: f64,
@@ -631,11 +631,6 @@ impl PreprocessedSpectra {
     }
 }
 
-/// Batch scorer using BLAS-accelerated matrix operations
-///
-/// Computes LibCosine scores for all library-spectrum pairs in a single
-/// matrix multiplication, providing 10-20× speedup over one-at-a-time scoring.
-#[derive(Debug, Clone)]
 pub struct BatchScorer {
     /// Number of bins for scoring
     num_bins: usize,
