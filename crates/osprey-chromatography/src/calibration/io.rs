@@ -27,14 +27,10 @@ use std::path::Path;
 ///     .expect("Failed to save calibration");
 /// ```
 pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> Result<()> {
-    // Write to a LOCAL temp file first, then move to final destination.
-    // This avoids corrupt/0-byte files on network filesystems (NAS).
-    let tmp_path =
-        std::env::temp_dir().join(format!("osprey_calibration_{}.json", std::process::id()));
-    let file = File::create(&tmp_path).map_err(|e| {
+    let file = File::create(output_path).map_err(|e| {
         osprey_core::OspreyError::OutputError(format!(
             "Failed to create calibration file {}: {}",
-            tmp_path.display(),
+            output_path.display(),
             e
         ))
     })?;
@@ -48,7 +44,6 @@ pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> 
         ))
     })?;
 
-    osprey_core::move_file_safe(&tmp_path, output_path)?;
     log::info!("Saved calibration to: {}", output_path.display());
 
     Ok(())

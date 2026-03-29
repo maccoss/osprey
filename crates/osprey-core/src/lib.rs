@@ -24,12 +24,22 @@ pub use types::*;
 ///
 /// After a successful copy, the source file is deleted.
 pub fn move_file_safe(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    // Try atomic rename first (works on same filesystem)
-    if std::fs::rename(src, dst).is_ok() {
+    // Check if src and dst are on the same filesystem before attempting rename.
+    // On CIFS/NFS, rename from local to network can silently produce 0-byte files.
+    let same_fs = src
+        .parent()
+        .zip(dst.parent())
+        .map(|(sp, dp)| {
+            // Simple heuristic: same parent directory means same filesystem
+            sp == dp
+        })
+        .unwrap_or(false);
+
+    if same_fs && std::fs::rename(src, dst).is_ok() {
         return Ok(());
     }
 
-    // Cross-filesystem: manual buffered copy (avoids CIFS copy_file_range bugs)
+    // Cross-filesystem: manual buffered copy with verification
     let mut reader = std::io::BufReader::new(std::fs::File::open(src).map_err(|e| {
         OspreyError::OutputError(format!(
             "Failed to open '{}' for copy: {}",
