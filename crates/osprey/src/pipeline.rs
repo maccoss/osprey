@@ -1025,11 +1025,15 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         columns.push(std::sync::Arc::new(builder.finish()));
     }
 
-    // Write to a LOCAL temp file first, then move to final destination.
-    // This avoids corrupt/0-byte files on network filesystems (NAS) if the
-    // process is killed mid-write or if NAS write buffering causes issues.
-    let tmp_path =
-        std::env::temp_dir().join(format!("osprey_scores_{}.parquet", std::process::id()));
+    // Write to local temp dir first, then copy to final destination.
+    // Direct writes to NAS can produce corrupt files.
+    let tmp_path = std::env::temp_dir().join(format!(
+        "osprey_{}_{}",
+        std::process::id(),
+        path.file_name()
+            .unwrap_or(std::ffi::OsStr::new("scores.parquet"))
+            .to_string_lossy()
+    ));
     let file = std::fs::File::create(&tmp_path).map_err(|e| {
         OspreyError::OutputError(format!(
             "Failed to create temp scores file {}: {}",
@@ -1051,7 +1055,7 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         .close()
         .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
 
-    osprey_core::move_file_safe(&tmp_path, path)?;
+    osprey_core::copy_and_verify(&tmp_path, path)?;
     log::info!("Wrote {} scores to {}", n, path.display());
 
     Ok(())
@@ -2881,7 +2885,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         write_blib_output(&temp_config, &library, &passing_entries)?;
 
         // Move to final destination (safe copy for network filesystems)
-        osprey_core::move_file_safe(&temp_path, final_path)?;
+        osprey_core::copy_and_verify(&temp_path, final_path)?;
     } else {
         log::warn!("No peptides passed FDR threshold, skipping blib output");
     }

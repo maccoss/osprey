@@ -15,63 +15,39 @@ pub use isotope::*;
 pub use traits::*;
 pub use types::*;
 
-/// Move a file from `src` to `dst` safely across filesystems.
+/// Copy a local temp file to its final destination, verify, and delete the local copy.
 ///
-/// Tries `rename` first (instant on same filesystem). Falls back to a manual
-/// buffered copy using `std::io::copy` (not `std::fs::copy`) because the
-/// kernel-level `copy_file_range`/`sendfile` used by `std::fs::copy` can
-/// silently produce 0-byte files on CIFS/NFS network mounts.
-///
-/// After a successful copy, the source file is deleted.
-pub fn move_file_safe(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    // Check if src and dst are on the same filesystem before attempting rename.
-    // On CIFS/NFS, rename from local to network can silently produce 0-byte files.
-    let same_fs = src
-        .parent()
-        .zip(dst.parent())
-        .map(|(sp, dp)| {
-            // Simple heuristic: same parent directory means same filesystem
-            sp == dp
-        })
-        .unwrap_or(false);
+/// Writes to network filesystems (NAS/CIFS) should first write to a local temp
+/// directory, then call this to copy to the final path. This avoids corrupt files
+/// from network write issues. Uses `std::fs::copy` and verifies file size matches.
+pub fn copy_and_verify(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    let src_size = std::fs::metadata(src)
+        .map(|m| m.len())
+        .map_err(|e| OspreyError::OutputError(format!("Cannot stat '{}': {}", src.display(), e)))?;
 
-    if same_fs && std::fs::rename(src, dst).is_ok() {
-        return Ok(());
+    if src_size == 0 {
+        return Err(OspreyError::OutputError(format!(
+            "Source file '{}' is 0 bytes — refusing to copy",
+            src.display()
+        )));
     }
 
-    // Cross-filesystem: manual buffered copy with verification
-    let mut reader = std::io::BufReader::new(std::fs::File::open(src).map_err(|e| {
+    std::fs::copy(src, dst).map_err(|e| {
         OspreyError::OutputError(format!(
-            "Failed to open '{}' for copy: {}",
+            "Failed to copy '{}' ({} bytes) to '{}': {}",
             src.display(),
-            e
-        ))
-    })?);
-    let mut writer = std::io::BufWriter::new(std::fs::File::create(dst).map_err(|e| {
-        OspreyError::OutputError(format!("Failed to create '{}': {}", dst.display(), e))
-    })?);
-    std::io::copy(&mut reader, &mut writer).map_err(|e| {
-        OspreyError::OutputError(format!(
-            "Failed to copy '{}' to '{}': {}",
-            src.display(),
+            src_size,
             dst.display(),
             e
         ))
     })?;
-    // Flush to ensure all data is written to the network filesystem
-    use std::io::Write;
-    writer.flush().map_err(|e| {
-        OspreyError::OutputError(format!("Failed to flush '{}': {}", dst.display(), e))
-    })?;
-    drop(writer);
 
-    // Verify the copy succeeded (file size matches)
-    let src_size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    // Verify destination size matches source
     let dst_size = std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0);
     if dst_size != src_size {
         let _ = std::fs::remove_file(dst);
         return Err(OspreyError::OutputError(format!(
-            "Copy verification failed: '{}' is {} bytes but '{}' is {} bytes",
+            "Copy verification failed: source '{}' is {} bytes but destination '{}' is {} bytes",
             src.display(),
             src_size,
             dst.display(),
@@ -79,7 +55,7 @@ pub fn move_file_safe(src: &std::path::Path, dst: &std::path::Path) -> Result<()
         )));
     }
 
-    // Delete source
+    // Clean up local temp file
     let _ = std::fs::remove_file(src);
     Ok(())
 }

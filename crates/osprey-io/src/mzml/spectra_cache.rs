@@ -31,10 +31,18 @@ const VERSION: u32 = 1;
 
 /// Save spectra to a binary cache file for fast reload.
 pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Index) -> Result<()> {
-    let file = File::create(path).map_err(|e| {
+    // Write to local temp dir first, then copy to final destination.
+    let tmp_path = std::env::temp_dir().join(format!(
+        "osprey_{}_{}",
+        std::process::id(),
+        path.file_name()
+            .unwrap_or(std::ffi::OsStr::new("spectra.bin"))
+            .to_string_lossy()
+    ));
+    let file = File::create(&tmp_path).map_err(|e| {
         OspreyError::IoError(std::io::Error::other(format!(
             "Failed to create spectra cache '{}': {}",
-            path.display(),
+            tmp_path.display(),
             e
         )))
     })?;
@@ -95,6 +103,9 @@ pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Inde
     }
 
     w.flush().map_err(write_err)?;
+    drop(w);
+
+    osprey_core::copy_and_verify(&tmp_path, path)?;
     Ok(())
 }
 
