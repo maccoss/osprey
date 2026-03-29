@@ -875,6 +875,8 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
     use parquet::file::properties::WriterProperties;
 
     if entries.is_empty() {
+        // Don't create an empty file — downstream code checks existence + size > 0
+        log::debug!("No entries to write to {}", path.display());
         return Ok(());
     }
 
@@ -1023,11 +1025,13 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         columns.push(std::sync::Arc::new(builder.finish()));
     }
 
-    // Write with ZSTD compression
-    let file = std::fs::File::create(path).map_err(|e| {
+    // Write to a temp file first, then rename atomically.
+    // This prevents 0-byte files if the process is killed mid-write.
+    let tmp_path = path.with_extension("parquet.tmp");
+    let file = std::fs::File::create(&tmp_path).map_err(|e| {
         OspreyError::OutputError(format!(
-            "Failed to create scores file {}: {}",
-            path.display(),
+            "Failed to create temp scores file {}: {}",
+            tmp_path.display(),
             e
         ))
     })?;
@@ -1044,6 +1048,16 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
     writer
         .close()
         .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
+
+    // Atomic rename: old file is replaced only after new file is fully written
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        OspreyError::OutputError(format!(
+            "Failed to rename {} to {}: {}",
+            tmp_path.display(),
+            path.display(),
+            e
+        ))
+    })?;
 
     log::info!("Wrote {} scores to {}", n, path.display());
 
@@ -1425,6 +1439,15 @@ fn load_pin_features_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<f64>
     use parquet::arrow::ProjectionMask;
 
     let feature_names = get_pin_feature_names();
+
+    // Guard against 0-byte files from interrupted runs
+    let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_size == 0 {
+        return Err(OspreyError::config(format!(
+            "Scores cache {} is empty (0 bytes). Delete it and re-run.",
+            path.display()
+        )));
+    }
 
     let file = std::fs::File::open(path).map_err(|e| {
         OspreyError::config(format!("Failed to open parquet {}: {}", path.display(), e))
@@ -1962,7 +1985,9 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         // Check for cached scores parquet (skip search if already scored)
         let scores_path = scores_path_for_input(input_file);
-        let cached_stubs = if scores_path.exists() {
+        let scores_file_valid =
+            scores_path.exists() && scores_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+        let cached_stubs = if scores_file_valid {
             match load_fdr_stubs_from_parquet(&scores_path, &mut seq_interner) {
                 Ok(stubs) => {
                     log::info!(
