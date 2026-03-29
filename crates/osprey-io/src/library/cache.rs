@@ -103,17 +103,7 @@ pub fn save_library_cache(entries: &[LibraryEntry], path: &Path) -> Result<()> {
     w.flush().map_err(write_err)?;
     drop(w); // close file before move
 
-    // Move to final destination (try rename first, fall back to copy+delete for cross-filesystem)
-    if std::fs::rename(&tmp_path, path).is_err() {
-        std::fs::copy(&tmp_path, path).map_err(|e| {
-            OspreyError::LibraryLoadError(format!(
-                "Failed to copy library cache to '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
-        let _ = std::fs::remove_file(&tmp_path);
-    }
+    osprey_core::move_file_safe(&tmp_path, path)?;
     Ok(())
 }
 

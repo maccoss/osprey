@@ -1051,18 +1051,7 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         .close()
         .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
 
-    // Move to final destination (try rename first, fall back to copy+delete for cross-filesystem)
-    if std::fs::rename(&tmp_path, path).is_err() {
-        std::fs::copy(&tmp_path, path).map_err(|e| {
-            OspreyError::OutputError(format!(
-                "Failed to copy scores to {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-
+    osprey_core::move_file_safe(&tmp_path, path)?;
     log::info!("Wrote {} scores to {}", n, path.display());
 
     Ok(())
@@ -2891,17 +2880,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         temp_config.output_blib = temp_path.clone();
         write_blib_output(&temp_config, &library, &passing_entries)?;
 
-        // Move to final destination (try rename first, fall back to copy+delete)
-        if std::fs::rename(&temp_path, final_path).is_err() {
-            std::fs::copy(&temp_path, final_path).map_err(|e| {
-                std::io::Error::other(format!(
-                    "Failed to copy blib to {}: {}",
-                    final_path.display(),
-                    e
-                ))
-            })?;
-            let _ = std::fs::remove_file(&temp_path);
-        }
+        // Move to final destination (safe copy for network filesystems)
+        osprey_core::move_file_safe(&temp_path, final_path)?;
     } else {
         log::warn!("No peptides passed FDR threshold, skipping blib output");
     }

@@ -48,18 +48,7 @@ pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> 
         ))
     })?;
 
-    // Move to final destination (try rename first, fall back to copy+delete for cross-filesystem)
-    if std::fs::rename(&tmp_path, output_path).is_err() {
-        std::fs::copy(&tmp_path, output_path).map_err(|e| {
-            osprey_core::OspreyError::OutputError(format!(
-                "Failed to copy calibration to {}: {}",
-                output_path.display(),
-                e
-            ))
-        })?;
-        let _ = std::fs::remove_file(&tmp_path);
-    }
-
+    osprey_core::move_file_safe(&tmp_path, output_path)?;
     log::info!("Saved calibration to: {}", output_path.display());
 
     Ok(())
