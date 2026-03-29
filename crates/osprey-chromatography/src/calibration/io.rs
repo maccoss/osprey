@@ -27,10 +27,13 @@ use std::path::Path;
 ///     .expect("Failed to save calibration");
 /// ```
 pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> Result<()> {
-    let file = File::create(output_path).map_err(|e| {
+    // Write to temp file first, then rename atomically to prevent
+    // 0-byte/corrupt files if the process is killed mid-write.
+    let tmp_path = output_path.with_extension("json.tmp");
+    let file = File::create(&tmp_path).map_err(|e| {
         osprey_core::OspreyError::OutputError(format!(
             "Failed to create calibration file {}: {}",
-            output_path.display(),
+            tmp_path.display(),
             e
         ))
     })?;
@@ -40,6 +43,15 @@ pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> 
     serde_json::to_writer_pretty(writer, calibration).map_err(|e| {
         osprey_core::OspreyError::OutputError(format!(
             "Failed to serialize calibration parameters: {}",
+            e
+        ))
+    })?;
+
+    std::fs::rename(&tmp_path, output_path).map_err(|e| {
+        osprey_core::OspreyError::OutputError(format!(
+            "Failed to rename '{}' to '{}': {}",
+            tmp_path.display(),
+            output_path.display(),
             e
         ))
     })?;
