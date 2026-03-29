@@ -26,16 +26,10 @@ pub struct OspreyConfig {
     // Resolution settings
     /// Resolution mode for binning
     pub resolution_mode: ResolutionMode,
-    /// Custom bin width override
-    pub custom_bin_width: Option<f64>,
     /// Fragment tolerance for LibCosine scoring (ppm-based matching, no binning)
     pub fragment_tolerance: FragmentToleranceConfig,
     /// Precursor tolerance for MS1 matching
     pub precursor_tolerance: FragmentToleranceConfig,
-
-    // Candidate selection
-    /// Maximum candidates per spectrum
-    pub max_candidates_per_spectrum: usize,
 
     // RT Calibration
     /// RT calibration configuration
@@ -74,8 +68,6 @@ pub struct OspreyConfig {
     // Performance
     /// Number of threads to use
     pub n_threads: usize,
-    /// Memory limit in GB
-    pub memory_limit_gb: Option<f64>,
 }
 
 impl Default for OspreyConfig {
@@ -86,10 +78,8 @@ impl Default for OspreyConfig {
             output_blib: PathBuf::from("results.blib"),
             output_report: None,
             resolution_mode: ResolutionMode::Auto,
-            custom_bin_width: None,
             fragment_tolerance: FragmentToleranceConfig::default(), // 10 ppm for HRAM
             precursor_tolerance: FragmentToleranceConfig::hram(10.0), // 10 ppm for precursor
-            max_candidates_per_spectrum: 5250,
             rt_calibration: RTCalibrationConfig::default(),
             fdr_method: FdrMethod::default(),
             write_pin: false,
@@ -100,7 +90,6 @@ impl Default for OspreyConfig {
             reconciliation: ReconciliationConfig::default(),
             prefilter_enabled: true,
             n_threads: num_cpus(),
-            memory_limit_gb: None,
         }
     }
 }
@@ -207,17 +196,13 @@ precursor_tolerance:
   tolerance: 10.0
   unit: Ppm
 
-# Candidate selection (precursor filtering uses isolation window from mzML)
-max_candidates_per_spectrum: 500
-
 # RT Calibration
-# Samples a subset of peptides for fast calibration
+# Per-file independent calibration with stratified peptide sampling
 rt_calibration:
   enabled: true
   loess_bandwidth: 0.3            # Fraction of data for local fits (0.2-0.5)
   min_calibration_points: 200     # Minimum detections required for robust LOESS fit
   rt_tolerance_factor: 3.0        # Multiplier for residual SD (for calibrated search)
-  initial_tolerance_fraction: 1.0   # Initial tolerance as fraction of RT range (1.0 = no RT filtering during calibration)
   calibration_sample_size: 100000 # Target peptides to sample for calibration (0 = all)
   calibration_retry_factor: 2.0   # Multiply sample size on retry if too few calibration points
 
@@ -231,7 +216,6 @@ write_pin: false  # Write PIN files for external tools
 
 # Performance
 n_threads: 0  # 0 = auto-detect
-# memory_limit_gb: 16.0  # Optional memory limit
 
 "#;
 
@@ -331,8 +315,7 @@ pub struct ConfigOverrides {
 ///
 /// ## Multi-File Strategy
 ///
-/// - **First file**: Sample peptides with wide RT tolerance (initial_tolerance_fraction × RT range)
-/// - **Subsequent files**: Reuse calibration from first file with tight tolerance (residual SD × factor)
+/// Each file gets independent calibration (per-file LOESS fit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RTCalibrationConfig {
     /// Enable RT calibration
@@ -349,9 +332,6 @@ pub struct RTCalibrationConfig {
     /// This prevents over-filtering in regions with very tight calibration
     #[serde(default = "default_min_rt_tolerance")]
     pub min_rt_tolerance: f64,
-    /// Initial tolerance as fraction of library RT range for first file calibration (default: 1.0 = 100%)
-    /// Set to 1.0 to match pyXcorrDIA's approach of no RT filtering during calibration
-    pub initial_tolerance_fraction: f64,
     /// Number of target peptides to sample for calibration (0 = use all). Default: 100,000.
     /// Sampling uses 2D stratification across RT and m/z for uniform coverage.
     #[serde(default = "default_calibration_sample_size")]
@@ -364,11 +344,6 @@ pub struct RTCalibrationConfig {
     /// when calibration is poor. Default: 3.0 min.
     #[serde(default = "default_max_rt_tolerance")]
     pub max_rt_tolerance: f64,
-    /// Use percentile-based RT tolerance instead of SD-based (DIA-NN approach).
-    /// When true: tolerance = max(2 × P20_abs_error, RT_range / 40)
-    /// When false: tolerance = rt_tolerance_factor × residual_SD
-    #[serde(default = "default_use_percentile_tolerance")]
-    pub use_percentile_tolerance: bool,
 }
 
 fn default_min_rt_tolerance() -> f64 {
@@ -387,10 +362,6 @@ fn default_max_rt_tolerance() -> f64 {
     3.0
 }
 
-fn default_use_percentile_tolerance() -> bool {
-    false
-}
-
 impl Default for RTCalibrationConfig {
     fn default() -> Self {
         Self {
@@ -399,12 +370,10 @@ impl Default for RTCalibrationConfig {
             min_calibration_points: 200,
             rt_tolerance_factor: 3.0,
             fallback_rt_tolerance: 2.0,
-            min_rt_tolerance: 0.5,           // 0.5 minute minimum
-            initial_tolerance_fraction: 1.0, // 100% of RT range (no RT filtering, like pyXcorrDIA)
+            min_rt_tolerance: 0.5, // 0.5 minute minimum
             calibration_sample_size: 100000,
             calibration_retry_factor: 2.0,
-            max_rt_tolerance: 3.0,           // Hard cap at 3 minutes
-            use_percentile_tolerance: false, // Use 3×SD tolerance (covers >99% of peptides)
+            max_rt_tolerance: 3.0, // Hard cap at 3 minutes
         }
     }
 }
@@ -812,7 +781,6 @@ mod tests {
         let config = RTCalibrationConfig::default();
         assert!(config.enabled);
         assert_eq!(config.loess_bandwidth, 0.3);
-        assert_eq!(config.initial_tolerance_fraction, 1.0);
 
         let disabled = RTCalibrationConfig::disabled();
         assert!(!disabled.enabled);
