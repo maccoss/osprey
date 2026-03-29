@@ -27,9 +27,10 @@ use std::path::Path;
 ///     .expect("Failed to save calibration");
 /// ```
 pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> Result<()> {
-    // Write to temp file first, then rename atomically to prevent
-    // 0-byte/corrupt files if the process is killed mid-write.
-    let tmp_path = output_path.with_extension("json.tmp");
+    // Write to a LOCAL temp file first, then move to final destination.
+    // This avoids corrupt/0-byte files on network filesystems (NAS).
+    let tmp_path =
+        std::env::temp_dir().join(format!("osprey_calibration_{}.json", std::process::id()));
     let file = File::create(&tmp_path).map_err(|e| {
         osprey_core::OspreyError::OutputError(format!(
             "Failed to create calibration file {}: {}",
@@ -47,14 +48,17 @@ pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> 
         ))
     })?;
 
-    std::fs::rename(&tmp_path, output_path).map_err(|e| {
-        osprey_core::OspreyError::OutputError(format!(
-            "Failed to rename '{}' to '{}': {}",
-            tmp_path.display(),
-            output_path.display(),
-            e
-        ))
-    })?;
+    // Move to final destination (try rename first, fall back to copy+delete for cross-filesystem)
+    if std::fs::rename(&tmp_path, output_path).is_err() {
+        std::fs::copy(&tmp_path, output_path).map_err(|e| {
+            osprey_core::OspreyError::OutputError(format!(
+                "Failed to copy calibration to {}: {}",
+                output_path.display(),
+                e
+            ))
+        })?;
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 
     log::info!("Saved calibration to: {}", output_path.display());
 

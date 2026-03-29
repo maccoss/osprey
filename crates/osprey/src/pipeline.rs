@@ -1025,9 +1025,11 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         columns.push(std::sync::Arc::new(builder.finish()));
     }
 
-    // Write to a temp file first, then rename atomically.
-    // This prevents 0-byte files if the process is killed mid-write.
-    let tmp_path = path.with_extension("parquet.tmp");
+    // Write to a LOCAL temp file first, then move to final destination.
+    // This avoids corrupt/0-byte files on network filesystems (NAS) if the
+    // process is killed mid-write or if NAS write buffering causes issues.
+    let tmp_path =
+        std::env::temp_dir().join(format!("osprey_scores_{}.parquet", std::process::id()));
     let file = std::fs::File::create(&tmp_path).map_err(|e| {
         OspreyError::OutputError(format!(
             "Failed to create temp scores file {}: {}",
@@ -1049,15 +1051,17 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         .close()
         .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
 
-    // Atomic rename: old file is replaced only after new file is fully written
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        OspreyError::OutputError(format!(
-            "Failed to rename {} to {}: {}",
-            tmp_path.display(),
-            path.display(),
-            e
-        ))
-    })?;
+    // Move to final destination (try rename first, fall back to copy+delete for cross-filesystem)
+    if std::fs::rename(&tmp_path, path).is_err() {
+        std::fs::copy(&tmp_path, path).map_err(|e| {
+            OspreyError::OutputError(format!(
+                "Failed to copy scores to {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 
     log::info!("Wrote {} scores to {}", n, path.display());
 

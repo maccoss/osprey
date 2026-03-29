@@ -31,9 +31,9 @@ const VERSION: u32 = 1;
 
 /// Save spectra to a binary cache file for fast reload.
 pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Index) -> Result<()> {
-    // Write to temp file first, then rename atomically to prevent
-    // 0-byte/corrupt files if the process is killed mid-write.
-    let tmp_path = path.with_extension("bin.tmp");
+    // Write to a LOCAL temp file first, then move to final destination.
+    // This avoids corrupt/0-byte files on network filesystems (NAS).
+    let tmp_path = std::env::temp_dir().join(format!("osprey_spectra_{}.bin", std::process::id()));
     let file = File::create(&tmp_path).map_err(|e| {
         OspreyError::IoError(std::io::Error::other(format!(
             "Failed to create spectra cache '{}': {}",
@@ -98,16 +98,19 @@ pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Inde
     }
 
     w.flush().map_err(write_err)?;
-    drop(w); // close file before rename
+    drop(w); // close file before move
 
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        OspreyError::IoError(std::io::Error::other(format!(
-            "Failed to rename '{}' to '{}': {}",
-            tmp_path.display(),
-            path.display(),
-            e
-        )))
-    })?;
+    // Move to final destination (try rename first, fall back to copy+delete for cross-filesystem)
+    if std::fs::rename(&tmp_path, path).is_err() {
+        std::fs::copy(&tmp_path, path).map_err(|e| {
+            OspreyError::IoError(std::io::Error::other(format!(
+                "Failed to copy spectra cache to '{}': {}",
+                path.display(),
+                e
+            )))
+        })?;
+        let _ = std::fs::remove_file(&tmp_path);
+    }
     Ok(())
 }
 
