@@ -137,11 +137,6 @@ struct Args {
     #[arg(long)]
     no_rt_calibration: bool,
 
-    /// Maximum candidates per spectrum (use 0 for unlimited)
-    #[arg(long, default_value_t = 5250)]
-    max_candidates: usize,
-
-    /// Run-level FDR threshold
     /// Run-level FDR threshold
     #[arg(long, default_value_t = 0.01)]
     run_fdr: f64,
@@ -322,9 +317,6 @@ fn main() -> Result<()> {
             config.fragment_tolerance.unit
         );
     }
-
-    // Set max candidates
-    config.max_candidates_per_spectrum = args.max_candidates;
 
     // Set thread count
     if let Some(threads) = args.threads {
