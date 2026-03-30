@@ -1657,7 +1657,9 @@ fn load_fdr_stubs_from_parquet(
 /// Returns one Vec<CwtCandidate> per entry, in the same order as entries were written.
 /// This is a lightweight alternative to `load_scores_parquet` that only reads
 /// the cwt_candidates column, avoiding the cost of loading features and fragments.
-fn load_cwt_candidates_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<CwtCandidate>>> {
+pub(crate) fn load_cwt_candidates_from_parquet(
+    path: &std::path::Path,
+) -> Result<Vec<Vec<CwtCandidate>>> {
     use arrow::array::BinaryArray;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -2061,7 +2063,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             // Save binary spectra cache for fast reload during re-scoring
             let cache_path = spectra_cache_path(input_file);
             if let Err(e) = save_spectra_cache(&cache_path, &spectra, &ms1_index) {
-                log::debug!("Failed to save spectra cache: {}", e);
+                log::warn!("Failed to save spectra cache: {}", e);
             }
 
             // Run calibration (reuse the windowed calibration discovery)
@@ -2319,7 +2321,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         //    then plans which entries need re-scoring at reconciled boundaries.
         let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
 
-        let reconciliation_actions: HashMap<(String, usize), ReconcileAction>;
+        let mut reconciliation_actions: HashMap<(String, usize), ReconcileAction> = HashMap::new();
         let refined_calibrations: HashMap<String, RTCalibration>;
         let per_file_gap_fill: HashMap<String, Vec<GapFillTarget>>;
 
@@ -2346,36 +2348,35 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     })
                     .collect();
 
-                // Load CWT candidates per-file for reconciliation planning (parallel)
-                let per_file_cwt: HashMap<String, Vec<Vec<CwtCandidate>>> = per_file_entries
-                    .par_iter()
-                    .filter_map(|(file_name, _)| {
-                        per_file_cache_paths.get(file_name).and_then(|cache_path| {
-                            match load_cwt_candidates_from_parquet(cache_path) {
-                                Ok(cwt) => Some((file_name.clone(), cwt)),
-                                Err(e) => {
-                                    log::warn!(
-                                        "Failed to load CWT candidates for {}: {}",
-                                        file_name,
-                                        e
-                                    );
-                                    None
-                                }
-                            }
+                // Plan reconciliation with per-file CWT loading.
+                // Each file's CWT data (~240 MB) is loaded, planned, and dropped
+                // before the next batch, keeping peak memory at ~2.4 GB instead of ~57 GB.
+                const CWT_BATCH_SIZE: usize = 10;
+                for chunk in per_file_entries.chunks(CWT_BATCH_SIZE) {
+                    // Load CWT for this batch in parallel
+                    let batch_cwt: HashMap<String, Vec<Vec<CwtCandidate>>> = chunk
+                        .par_iter()
+                        .filter_map(|(file_name, _)| {
+                            per_file_cache_paths.get(file_name).and_then(|cache_path| {
+                                load_cwt_candidates_from_parquet(cache_path)
+                                    .ok()
+                                    .map(|cwt| (file_name.clone(), cwt))
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
 
-                reconciliation_actions = plan_reconciliation(
-                    &consensus,
-                    &per_file_entries,
-                    &per_file_cwt,
-                    &refined_calibrations,
-                    &per_file_calibrations,
-                    config.run_fdr,
-                );
-                // Drop CWT candidates to free memory
-                drop(per_file_cwt);
+                    // Plan reconciliation for this batch only
+                    let batch_actions = plan_reconciliation(
+                        &consensus,
+                        chunk,
+                        &batch_cwt,
+                        &refined_calibrations,
+                        &per_file_calibrations,
+                        config.run_fdr,
+                    );
+                    reconciliation_actions.extend(batch_actions);
+                    // batch_cwt dropped here — frees ~2.4 GB
+                }
 
                 // Gap-fill: identify passing precursors missing from each file
                 // Uses run-level FDR: any precursor passing in at least one replicate
@@ -3150,22 +3151,36 @@ fn run_percolator_fdr(
             .push((pos, local_idx));
     }
 
-    let mut subset_features: Vec<Vec<f64>> = vec![Vec::new(); subset.len()];
-    for (&file_idx, entries_in_file) in &subset_by_file {
-        let (file_name, _) = &per_file_entries[file_idx];
-        let file_overlay = overlay.get(file_name.as_str());
-        let cache_path = per_file_cache_paths
-            .get(file_name.as_str())
-            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
+    // Load features in parallel across files (each file is an independent Parquet read)
+    #[allow(clippy::type_complexity)]
+    let file_results: Vec<(usize, Vec<(usize, Vec<f64>)>)> = subset_by_file
+        .par_iter()
+        .filter_map(|(&file_idx, entries_in_file)| {
+            let (file_name, _) = &per_file_entries[file_idx];
+            let file_overlay = overlay.get(file_name.as_str());
+            let cache_path = per_file_cache_paths.get(file_name.as_str())?;
 
-        let file_features = load_pin_features_from_parquet(cache_path)?;
-        for &(pos, local_idx) in entries_in_file {
-            // Use overlay features for re-scored entries, parquet features otherwise
-            if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
-                subset_features[pos] = pin_feature_vector(&overlay_entry.features);
-            } else if local_idx < file_features.len() {
-                subset_features[pos] = file_features[local_idx].clone();
-            }
+            let file_features = load_pin_features_from_parquet(cache_path).ok()?;
+            let results: Vec<(usize, Vec<f64>)> = entries_in_file
+                .iter()
+                .filter_map(|&(pos, local_idx)| {
+                    if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                        Some((pos, pin_feature_vector(&overlay_entry.features)))
+                    } else if local_idx < file_features.len() {
+                        Some((pos, file_features[local_idx].clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Some((file_idx, results))
+        })
+        .collect();
+
+    let mut subset_features: Vec<Vec<f64>> = vec![Vec::new(); subset.len()];
+    for (_file_idx, results) in file_results {
+        for (pos, features) in results {
+            subset_features[pos] = features;
         }
     }
     drop(subset_by_file);
@@ -3231,63 +3246,69 @@ fn run_percolator_fdr(
     drop(subset_perc_entries);
     drop(train_results);
 
-    // Phase 4: Score ALL entries by streaming through Parquet files
-    // Write scores directly to entry.score (no flat scores array)
-    for (file_idx, (file_name, fdr_entries)) in per_file_entries.iter_mut().enumerate() {
-        let file_overlay = overlay.get(file_name.as_str());
-        let cache_path = per_file_cache_paths
-            .get(file_name.as_str())
-            .ok_or_else(|| OspreyError::config(format!("No parquet cache for {}", file_name)))?;
+    // Phase 4: Score ALL entries by streaming through Parquet files in parallel
+    // Each file is independent: load features, apply SVM model, write scores.
+    per_file_entries
+        .par_iter_mut()
+        .for_each(|(file_name, fdr_entries)| {
+            let file_overlay = overlay.get(file_name.as_str());
+            let cache_path = match per_file_cache_paths.get(file_name.as_str()) {
+                Some(p) => p,
+                None => return,
+            };
 
-        let file_features = load_pin_features_from_parquet(cache_path)?;
-        let parquet_len = file_features.len();
-
-        for (local_idx, parquet_features) in file_features.into_iter().enumerate() {
-            // Skip entries not in the restriction set (keep first-pass scores)
-            if let Some(restrict) = restrict_base_ids {
-                let base_id = fdr_entries[local_idx].entry_id & 0x7FFF_FFFF;
-                if !restrict.contains(&base_id) {
-                    continue;
+            let file_features = match load_pin_features_from_parquet(cache_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!("Failed to load features for {}: {}", file_name, e);
+                    return;
                 }
-            }
-            // Use overlay features for re-scored entries, parquet features otherwise
-            let mut features =
-                if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
-                    pin_feature_vector(&overlay_entry.features)
-                } else {
-                    parquet_features
-                };
-            standardizer.transform_slice(&mut features);
-            let mut score = avg_bias;
-            for (w, x) in avg_weights.iter().zip(features.iter()) {
-                score += w * x;
-            }
-            fdr_entries[local_idx].score = score;
-        }
+            };
+            let parquet_len = file_features.len();
 
-        // Score gap-fill entries (indices beyond parquet, only in overlay)
-        for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate().skip(parquet_len) {
-            if let Some(restrict) = restrict_base_ids {
-                let base_id = fdr_entry.entry_id & 0x7FFF_FFFF;
-                if !restrict.contains(&base_id) {
-                    continue;
+            for (local_idx, parquet_features) in file_features.into_iter().enumerate() {
+                // Skip entries not in the restriction set (keep first-pass scores)
+                if let Some(restrict) = restrict_base_ids {
+                    let base_id = fdr_entries[local_idx].entry_id & 0x7FFF_FFFF;
+                    if !restrict.contains(&base_id) {
+                        continue;
+                    }
                 }
-            }
-            if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
-                let mut features = pin_feature_vector(&overlay_entry.features);
+                // Use overlay features for re-scored entries, parquet features otherwise
+                let mut features =
+                    if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                        pin_feature_vector(&overlay_entry.features)
+                    } else {
+                        parquet_features
+                    };
                 standardizer.transform_slice(&mut features);
                 let mut score = avg_bias;
                 for (w, x) in avg_weights.iter().zip(features.iter()) {
                     score += w * x;
                 }
-                fdr_entry.score = score;
+                fdr_entries[local_idx].score = score;
             }
-        }
 
-        if (file_idx + 1) % 10 == 0 || file_idx + 1 == n_files {
-            log::info!("  Scored {}/{} files", file_idx + 1, n_files);
-        }
-    }
+            // Score gap-fill entries (indices beyond parquet, only in overlay)
+            for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate().skip(parquet_len) {
+                if let Some(restrict) = restrict_base_ids {
+                    let base_id = fdr_entry.entry_id & 0x7FFF_FFFF;
+                    if !restrict.contains(&base_id) {
+                        continue;
+                    }
+                }
+                if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                    let mut features = pin_feature_vector(&overlay_entry.features);
+                    standardizer.transform_slice(&mut features);
+                    let mut score = avg_bias;
+                    for (w, x) in avg_weights.iter().zip(features.iter()) {
+                        score += w * x;
+                    }
+                    fdr_entry.score = score;
+                }
+            }
+        });
+    log::info!("  Scored {}/{} files", n_files, n_files);
 
     // Phase 5: Compute q-values and PEP directly from per_file_entries
     // This avoids building any flat metadata arrays (~0 extra memory vs 33 GB before)
