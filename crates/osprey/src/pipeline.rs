@@ -2457,7 +2457,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         // Process files sequentially to limit peak memory — each file loads spectra
         // (~1.5 GB). Per-file re-scoring is already internally parallelized.
-        for (file_name, fdr_entries) in per_file_entries.iter_mut() {
+        let n_total_files = per_file_entries.len();
+        for (file_num, (file_name, fdr_entries)) in per_file_entries.iter_mut().enumerate() {
             // Collect consensus targets for this file
             let consensus_targets = per_file_consensus_targets
                 .get(file_name.as_str())
@@ -2507,9 +2508,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             let n_inter_replicate = reconciliation_targets.len();
             let n_gap_fill = gap_fill_targets.len();
             log::info!(
-                "Re-scoring {} entries in {} ({} multi-charge consensus, {} inter-replicate reconciliation, {} gap-fill, {} unique rescore after dedup)",
+                "Re-scoring {} entries in {} [{}/{}] ({} multi-charge consensus, {} inter-replicate reconciliation, {} gap-fill, {} unique rescore after dedup)",
                 all_targets.len() + n_gap_fill * 2, // *2 for target+decoy
                 file_name,
+                file_num + 1,
+                n_total_files,
                 n_multi_charge,
                 n_inter_replicate,
                 n_gap_fill,
@@ -2731,6 +2734,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 }
             }
             if !overlay.is_empty() {
+                // Shrink overlay entries to minimize memory: clear heavy fields
+                // (fragments, XICs) that can be reloaded from Parquet for blib output.
+                // Keeps features, boundaries, and identity for FDR scoring.
+                for entry in overlay.values_mut() {
+                    entry.fragment_mzs = Vec::new();
+                    entry.fragment_intensities = Vec::new();
+                    entry.reference_xic = Vec::new();
+                    entry.cwt_candidates = Vec::new();
+                }
                 per_file_overlays.insert(file_name.clone(), overlay);
             }
         }
