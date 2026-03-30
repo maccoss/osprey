@@ -2348,11 +2348,27 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     })
                     .collect();
 
-                // Plan reconciliation with per-file CWT loading.
-                // Each file's CWT data (~240 MB) is loaded, planned, and dropped
-                // before the next batch, keeping peak memory at ~2.4 GB instead of ~57 GB.
-                const CWT_BATCH_SIZE: usize = 10;
-                for chunk in per_file_entries.chunks(CWT_BATCH_SIZE) {
+                // Plan reconciliation with batched CWT loading.
+                // Each file's CWT data is ~240 MB. Batch size is the minimum of:
+                //   - available cores (no point loading more than we can process)
+                //   - RAM / 500 MB (leave headroom for other allocations)
+                // This keeps peak memory bounded while maximizing parallelism.
+                let n_cores = rayon::current_num_threads();
+                let available_ram_mb: usize = {
+                    use sysinfo::System;
+                    let mut sys = System::new();
+                    sys.refresh_memory();
+                    (sys.available_memory() / (1024 * 1024)) as usize
+                };
+                let ram_based_batch = (available_ram_mb / 500).max(1); // 500 MB per file with headroom
+                let cwt_batch_size = n_cores.min(ram_based_batch).max(1);
+                log::info!(
+                    "CWT batch loading: {} files per batch ({} cores, {} MB available RAM)",
+                    cwt_batch_size,
+                    n_cores,
+                    available_ram_mb
+                );
+                for chunk in per_file_entries.chunks(cwt_batch_size) {
                     // Load CWT for this batch in parallel
                     let batch_cwt: HashMap<String, Vec<Vec<CwtCandidate>>> = chunk
                         .par_iter()
