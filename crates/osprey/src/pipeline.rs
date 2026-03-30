@@ -2257,7 +2257,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Overlay: re-scored entries are kept in memory (~170 MB per file) and merged
     // at read time for second-pass FDR scoring and blib output, avoiding the need
     // to load/write the full ~1.5M-entry parquet during re-scoring.
-    let mut per_file_overlays: RescoreOverlay = HashMap::new();
+    let per_file_overlays: RescoreOverlay = HashMap::new(); // empty — reconciled entries written back to Parquet
     {
         use crate::reconciliation::{
             compute_consensus_rts, identify_gap_fill_targets, plan_reconciliation,
@@ -2733,17 +2733,41 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     fdr_entries[idx] = stub;
                 }
             }
+            // Write reconciled entries (overlay) back to Parquet, then drop overlay.
+            // This avoids accumulating ~28 GB of overlay data across 240 files.
+            // The blib output step will reload from this reconciled Parquet.
             if !overlay.is_empty() {
-                // Shrink overlay entries to minimize memory: clear heavy fields
-                // (fragments, XICs) that can be reloaded from Parquet for blib output.
-                // Keeps features, boundaries, and identity for FDR scoring.
-                for entry in overlay.values_mut() {
-                    entry.fragment_mzs = Vec::new();
-                    entry.fragment_intensities = Vec::new();
-                    entry.reference_xic = Vec::new();
-                    entry.cwt_candidates = Vec::new();
+                // Merge overlay into a complete entry list for this file:
+                // load original parquet, replace re-scored entries, append gap-fill entries.
+                let scores_path = per_file_cache_paths.get(file_name.as_str());
+                if let Some(cache_path) = scores_path {
+                    if let Ok(mut full_entries) = load_scores_parquet(cache_path) {
+                        // Replace re-scored entries
+                        for &idx in &existing_rescore_indices {
+                            if let Some(entry) = overlay.remove(&idx) {
+                                if idx < full_entries.len() {
+                                    full_entries[idx] = entry;
+                                }
+                            }
+                        }
+                        // Append gap-fill entries (remaining overlay entries beyond parquet range)
+                        let mut gap_entries: Vec<(usize, CoelutionScoredEntry)> =
+                            overlay.into_iter().collect();
+                        gap_entries.sort_by_key(|(idx, _)| *idx);
+                        for (_, entry) in gap_entries {
+                            full_entries.push(entry);
+                        }
+                        // Write back to Parquet
+                        if let Err(e) = write_scores_parquet(cache_path, &full_entries) {
+                            log::warn!(
+                                "Failed to write reconciled scores for {}: {}",
+                                file_name,
+                                e
+                            );
+                        }
+                    }
                 }
-                per_file_overlays.insert(file_name.clone(), overlay);
+                // Overlay is consumed — no memory accumulation
             }
         }
 
@@ -2851,22 +2875,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             }
         };
 
-        // Apply overlay: substitute re-scored entries from reconciliation
-        let file_overlay = per_file_overlays.get(file_name.as_str());
-        let parquet_len = full_entries.len();
-
-        // Merge FDR q-values from stubs into full entries — stubs have the
-        // final q-values from Percolator/Mokapot, while parquet has original scores.
-        for (idx, (full, fdr)) in full_entries.into_iter().zip(fdr_entries.iter()).enumerate() {
+        // Merge FDR q-values from stubs into full entries (from reconciled Parquet).
+        // Stubs have the final q-values from Percolator/Mokapot.
+        for (full, fdr) in full_entries.into_iter().zip(fdr_entries.iter()) {
             if !fdr.is_decoy
                 && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
             {
-                // Use overlay entry if this entry was re-scored, otherwise use parquet entry
-                let mut entry = if let Some(ov) = file_overlay.and_then(|o| o.get(&idx)) {
-                    ov.clone()
-                } else {
-                    full
-                };
+                let mut entry = full;
                 entry.run_qvalue = fdr.run_qvalue;
                 entry.experiment_qvalue = best_exp_q
                     .get(&(fdr.modified_sequence.clone(), fdr.charge))
@@ -2875,27 +2890,6 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 entry.score = fdr.score;
                 entry.pep = fdr.pep;
                 passing_entries.push(entry);
-            }
-        }
-
-        // Process gap-fill entries (overlay-only, beyond parquet length)
-        if let Some(file_ov) = file_overlay {
-            for (idx, fdr) in fdr_entries.iter().enumerate().skip(parquet_len) {
-                if !fdr.is_decoy
-                    && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
-                {
-                    if let Some(ov_entry) = file_ov.get(&idx) {
-                        let mut entry = ov_entry.clone();
-                        entry.run_qvalue = fdr.run_qvalue;
-                        entry.experiment_qvalue = best_exp_q
-                            .get(&(fdr.modified_sequence.clone(), fdr.charge))
-                            .copied()
-                            .unwrap_or(fdr.experiment_qvalue);
-                        entry.score = fdr.score;
-                        entry.pep = fdr.pep;
-                        passing_entries.push(entry);
-                    }
-                }
             }
         }
     }
