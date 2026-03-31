@@ -2012,28 +2012,39 @@ fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]
     Ok(())
 }
 
-/// Write coelution scored entries to TSV report
-fn write_scored_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]) -> Result<()> {
+/// Write TSV report from lightweight plan entries + library.
+/// Uses available plan fields (bounds_area for peak_area, precursor_mz from library).
+fn write_scored_report_from_plan(
+    path: &std::path::Path,
+    plan: &[BlibPlanEntry],
+    library: &[LibraryEntry],
+) -> Result<()> {
     use std::io::Write;
+
+    let lib_by_id: HashMap<u32, &LibraryEntry> = library.iter().map(|e| (e.id, e)).collect();
 
     let mut file = std::fs::File::create(path)?;
     writeln!(
         file,
-        "modified_sequence\tprecursor_mz\tcharge\tapex_rt\tpeak_apex\tpeak_area\tn_scans\tq_value"
+        "modified_sequence\tprecursor_mz\tcharge\tapex_rt\tpeak_area\tq_value\tpep\tscore"
     )?;
 
-    for entry in entries {
+    for entry in plan {
+        let precursor_mz = lib_by_id
+            .get(&entry.entry_id)
+            .map(|e| e.precursor_mz)
+            .unwrap_or(0.0);
         writeln!(
             file,
-            "{}\t{:.4}\t{}\t{:.2}\t{:.4}\t{:.4}\t{}\t{:.6}",
+            "{}\t{:.4}\t{}\t{:.2}\t{:.4}\t{:.6}\t{:.6}\t{:.4}",
             entry.modified_sequence,
-            entry.precursor_mz,
+            precursor_mz,
             entry.charge,
-            entry.peak_bounds.apex_rt,
-            entry.features.peak_apex,
-            entry.features.peak_area,
-            entry.features.n_scans,
-            entry.experiment_qvalue
+            entry.apex_rt,
+            entry.bounds_area,
+            entry.experiment_qvalue,
+            entry.pep,
+            entry.score
         )?;
     }
 
@@ -3015,15 +3026,6 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
     // Extract lightweight per-file FDR data for passing entries, then drop the
     // heavy FdrEntry stubs (~19 GB for 240 files) to free memory for blib loading.
-    struct LightFdr {
-        run_qvalue: f64,
-        experiment_qvalue: f64,
-        score: f64,
-        pep: f64,
-        is_decoy: bool,
-        modified_sequence: Arc<str>,
-        charge: u8,
-    }
     let per_file_fdr_data: Vec<(String, Vec<LightFdr>)> = per_file_entries
         .iter()
         .map(|(file_name, entries)| {
@@ -3063,8 +3065,21 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         n_total_files
     );
 
-    // Reload full entries from Parquet per-file, apply FDR q-values from lightweight data
-    let mut passing_entries: Vec<CoelutionScoredEntry> = Vec::new();
+    // Build file name index for lightweight plan entries
+    let file_names: Vec<String> = per_file_fdr_data
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let file_name_to_idx: HashMap<&str, u16> = file_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i as u16))
+        .collect();
+
+    // Load lightweight plan entries from Parquet (5-column projection, ~96 bytes per entry)
+    // instead of full CoelutionScoredEntry (~940 bytes per entry).
+    // For 24M entries: ~2.3 GB vs ~22 GB.
+    let mut plan_entries: Vec<BlibPlanEntry> = Vec::new();
 
     for (file_num, (file_name, fdr_values)) in per_file_fdr_data.iter().enumerate() {
         if !files_with_passing.contains(file_name) {
@@ -3074,32 +3089,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             Some(p) => p,
             None => continue,
         };
-        let full_entries = match load_scores_parquet(cache_path) {
-            Ok(e) => e,
+        let file_idx = *file_name_to_idx.get(file_name.as_str()).unwrap_or(&0);
+        match load_blib_plan_entries(
+            cache_path,
+            fdr_values,
+            &passing_precursors,
+            &best_exp_q,
+            file_idx,
+        ) {
+            Ok(entries) => {
+                plan_entries.extend(entries);
+            }
             Err(e) => {
                 log::warn!(
-                    "Failed to reload entries for output from {}: {}",
+                    "Failed to load plan entries for output from {}: {}",
                     file_name,
                     e
                 );
-                continue;
-            }
-        };
-
-        // Merge FDR q-values from lightweight data into full entries
-        for (full, fdr) in full_entries.into_iter().zip(fdr_values.iter()) {
-            if !fdr.is_decoy
-                && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
-            {
-                let mut entry = full;
-                entry.run_qvalue = fdr.run_qvalue;
-                entry.experiment_qvalue = best_exp_q
-                    .get(&(fdr.modified_sequence.clone(), fdr.charge))
-                    .copied()
-                    .unwrap_or(fdr.experiment_qvalue);
-                entry.score = fdr.score;
-                entry.pep = fdr.pep;
-                passing_entries.push(entry);
             }
         }
         if (file_num + 1) % 20 == 0 || file_num + 1 == n_total_files {
@@ -3107,23 +3113,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 "  Loaded {}/{} files ({} passing entries so far)",
                 file_num + 1,
                 n_total_files,
-                passing_entries.len()
+                plan_entries.len()
             );
         }
     }
 
     // Write blib output — write to a local temp file first, then move to the
     // final destination. This avoids SQLite locking issues on network filesystems.
-    if !passing_entries.is_empty() {
+    if !plan_entries.is_empty() {
         log::info!("Writing blib to {}", config.output_blib.display());
 
         let final_path = &config.output_blib;
         let temp_path = std::env::temp_dir().join(format!("osprey_{}.blib", std::process::id()));
 
-        // Write to local temp file
+        // Write to local temp file using streaming approach (plan + library, no full entries)
         let mut temp_config = config.clone();
         temp_config.output_blib = temp_path.clone();
-        write_blib_output(&temp_config, &library, &passing_entries)?;
+        write_blib_streaming(&temp_config, &library, &plan_entries, &file_names)?;
 
         // Move to final destination (safe copy for network filesystems)
         osprey_core::copy_and_verify(&temp_path, final_path)?;
@@ -3132,7 +3138,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     }
 
     // Write output report if specified
-    // TSV includes only passing entries. Parquet report needs all entries (targets + decoys)
+    // TSV uses plan entries. Parquet report needs all entries (targets + decoys)
     // for feature analysis and SVM retraining — reload from caches if requested.
     if let Some(report_path) = &config.output_report {
         let ext = report_path
@@ -3171,7 +3177,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             write_parquet_report(report_path, &all_entries)?;
         } else {
             log::info!("Writing TSV report to {}", report_path.display());
-            write_scored_report(report_path, &passing_entries)?;
+            write_scored_report_from_plan(report_path, &plan_entries, &library)?;
         }
     }
 
@@ -4264,25 +4270,175 @@ fn apply_simple_fdr(entries: &mut [FdrEntry], _fdr_threshold: f64) -> Result<()>
     Ok(())
 }
 
-/// Build shared peak boundaries per (modified_sequence, file_name) for coelution path.
-///
-/// When the same peptide is detected at multiple charge states in the same file,
-/// they elute at the same time. This function selects boundaries from the charge
-/// state with the lowest run q-value (best overall peak quality) for each peptide
-/// per file. Returns the lookup and a count of peptide-file pairs where boundaries
-/// were shared across charge states.
+// =============================================================================
+// Lightweight types for memory-efficient blib output
+// =============================================================================
+
+/// Lightweight per-entry FDR data extracted from FdrEntry stubs.
+/// Used to free heavy stubs (~19 GB) before loading blib plan data.
+struct LightFdr {
+    run_qvalue: f64,
+    experiment_qvalue: f64,
+    score: f64,
+    pep: f64,
+    is_decoy: bool,
+    modified_sequence: Arc<str>,
+    charge: u8,
+}
+
+/// Lightweight entry with only the fields needed for blib output planning.
+/// ~96 bytes per entry vs ~940 bytes for full CoelutionScoredEntry.
+struct BlibPlanEntry {
+    entry_id: u32,
+    charge: u8,
+    file_name_idx: u16,
+    run_qvalue: f64,
+    experiment_qvalue: f64,
+    score: f64,
+    pep: f64,
+    apex_rt: f64,
+    start_rt: f64,
+    end_rt: f64,
+    bounds_area: f64,
+    modified_sequence: Arc<str>,
+}
+
+/// Load lightweight blib plan entries from a Parquet cache file.
+/// Uses a 3-column projection (apex_rt, start_rt, end_rt already in LightFdr stub data?
+/// No — LightFdr doesn't have RT fields. We need them from Parquet.
+/// Actually we need: entry_id, apex_rt, start_rt, end_rt, bounds_area.
+/// But entry_id and apex_rt are already in LightFdr. We need start_rt, end_rt, bounds_area.
+/// However, to avoid index mismatch issues we just project the 5 columns we need.
+fn load_blib_plan_entries(
+    path: &std::path::Path,
+    fdr_data: &[LightFdr],
+    passing_precursors: &HashSet<(Arc<str>, u8)>,
+    best_exp_q: &HashMap<(Arc<str>, u8), f64>,
+    file_name_idx: u16,
+) -> Result<Vec<BlibPlanEntry>> {
+    use arrow::array::{Float64Array, UInt32Array};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::arrow::ProjectionMask;
+
+    let plan_columns = ["entry_id", "apex_rt", "start_rt", "end_rt", "bounds_area"];
+
+    let file = std::fs::File::open(path).map_err(|e| {
+        OspreyError::config(format!("Failed to open parquet {}: {}", path.display(), e))
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        OspreyError::config(format!("Failed to read parquet {}: {}", path.display(), e))
+    })?;
+
+    let parquet_schema = builder.parquet_schema().clone();
+    let arrow_schema = builder.schema().clone();
+    let col_indices: Vec<usize> = plan_columns
+        .iter()
+        .filter_map(|name| arrow_schema.column_with_name(name).map(|(idx, _)| idx))
+        .collect();
+
+    if col_indices.len() != plan_columns.len() {
+        return Err(OspreyError::OutputError(format!(
+            "Scores cache {}: missing blib plan columns. Delete and re-run.",
+            path.display(),
+        )));
+    }
+
+    let projection = ProjectionMask::roots(&parquet_schema, col_indices);
+    let reader = builder.with_projection(projection).build().map_err(|e| {
+        OspreyError::config(format!(
+            "Failed to build reader for {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let mut entries = Vec::new();
+    let mut row_offset = 0usize;
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| OspreyError::config(format!("Failed to read batch: {}", e)))?;
+
+        let entry_id_col = batch
+            .column_by_name("entry_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let apex_col = batch
+            .column_by_name("apex_rt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let start_col = batch
+            .column_by_name("start_rt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let end_col = batch
+            .column_by_name("end_rt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let area_col = batch
+            .column_by_name("bounds_area")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        for row in 0..batch.num_rows() {
+            let idx = row_offset + row;
+            if idx >= fdr_data.len() {
+                break;
+            }
+            let fdr = &fdr_data[idx];
+            if !fdr.is_decoy
+                && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
+            {
+                let exp_q = best_exp_q
+                    .get(&(fdr.modified_sequence.clone(), fdr.charge))
+                    .copied()
+                    .unwrap_or(fdr.experiment_qvalue);
+                entries.push(BlibPlanEntry {
+                    entry_id: entry_id_col.value(row),
+                    charge: fdr.charge,
+                    file_name_idx,
+                    run_qvalue: fdr.run_qvalue,
+                    experiment_qvalue: exp_q,
+                    score: fdr.score,
+                    pep: fdr.pep,
+                    apex_rt: apex_col.value(row),
+                    start_rt: start_col.value(row),
+                    end_rt: end_col.value(row),
+                    bounds_area: area_col.value(row),
+                    modified_sequence: fdr.modified_sequence.clone(),
+                });
+            }
+        }
+        row_offset += batch.num_rows();
+    }
+
+    Ok(entries)
+}
+
+/// Build shared peak boundaries from lightweight plan entries.
+/// Same logic as build_shared_boundaries but uses BlibPlanEntry + file_names lookup.
 #[allow(clippy::type_complexity)]
-fn build_shared_boundaries(
-    entries: &[CoelutionScoredEntry],
-) -> (HashMap<(String, String), (f64, f64, f64)>, usize) {
-    // For each (modified_sequence, file_name), keep boundaries from the entry
-    // with the lowest run q-value
-    let mut best_by_key: HashMap<(String, String), (f64, f64, f64, f64)> = HashMap::new();
-    // Track which keys have multiple charge states
-    let mut charges_by_key: HashMap<(String, String), HashSet<u8>> = HashMap::new();
+fn build_shared_boundaries_from_plan(
+    entries: &[BlibPlanEntry],
+    file_names: &[String],
+) -> (HashMap<(Arc<str>, u16), (f64, f64, f64)>, usize) {
+    // Key: (modified_sequence stripped of charge, file_name_idx)
+    // We want shared boundaries per peptide (not precursor), so group by sequence only
+    let mut best_by_key: HashMap<(Arc<str>, u16), (f64, f64, f64, f64)> = HashMap::new();
+    let mut charges_by_key: HashMap<(Arc<str>, u16), HashSet<u8>> = HashMap::new();
 
     for entry in entries {
-        let key = (entry.modified_sequence.clone(), entry.file_name.clone());
+        let key = (entry.modified_sequence.clone(), entry.file_name_idx);
 
         charges_by_key
             .entry(key.clone())
@@ -4298,8 +4454,8 @@ fn build_shared_boundaries(
                 key,
                 (
                     entry.apex_rt,
-                    entry.peak_bounds.start_rt,
-                    entry.peak_bounds.end_rt,
+                    entry.start_rt,
+                    entry.end_rt,
                     entry.run_qvalue,
                 ),
             );
@@ -4308,25 +4464,22 @@ fn build_shared_boundaries(
 
     let n_shared = charges_by_key.values().filter(|c| c.len() > 1).count();
 
-    let shared_bounds: HashMap<(String, String), (f64, f64, f64)> = best_by_key
+    let shared_bounds: HashMap<(Arc<str>, u16), (f64, f64, f64)> = best_by_key
         .into_iter()
         .map(|(k, (apex, start, end, _))| (k, (apex, start, end)))
         .collect();
 
+    let _ = file_names; // used by caller for logging
     (shared_bounds, n_shared)
 }
 
-/// Write coelution-mode blib output for Skyline.
-///
-/// Implementation details:
-/// - Groups entries by precursor (modified_sequence + charge)
-/// - Uses the best run (lowest run q-value) for the RefSpectra entry
-/// - Writes per-run RetentionTimes entries with run-level q-values
-/// - Populates OspreyRunScores and OspreyExperimentScores tables
-fn write_blib_output(
+/// Write blib output using lightweight plan entries + library lookups.
+/// Avoids loading full CoelutionScoredEntry objects (~22 GB for 24M entries).
+fn write_blib_streaming(
     config: &OspreyConfig,
     library: &[LibraryEntry],
-    entries: &[CoelutionScoredEntry],
+    plan: &[BlibPlanEntry],
+    file_names: &[String],
 ) -> Result<()> {
     let mut writer = BlibWriter::create(&config.output_blib)?;
 
@@ -4343,7 +4496,7 @@ fn write_blib_output(
         .unwrap_or("library")
         .to_string();
 
-    // Add source files — build lookup by file stem for matching with entry.file_name
+    // Add source files — build lookup by file stem
     let blib_dir = config.output_blib.parent();
     let mut file_stem_to_id: HashMap<String, i64> = HashMap::new();
     for input_file in &config.input_files {
@@ -4368,70 +4521,72 @@ fn write_blib_output(
 
     writer.begin_batch()?;
 
-    // Build shared boundaries: for each peptide per file, use boundaries from
-    // the charge state with the lowest run q-value (same peptide at different
-    // charge states elutes at the same time)
-    let (shared_bounds, n_shared) = build_shared_boundaries(entries);
+    // Build shared boundaries from plan
+    let (shared_bounds, n_shared) = build_shared_boundaries_from_plan(plan, file_names);
+    if n_shared > 0 {
+        log::info!(
+            "Shared peak boundaries for {} peptide-file pairs with multiple charge states",
+            n_shared
+        );
+    }
 
-    // Build library ID lookup for O(1) access instead of O(n) linear scan
+    // Build library ID lookup
     let lib_by_id: HashMap<u32, &LibraryEntry> = library.iter().map(|e| (e.id, e)).collect();
 
-    // Group entries by precursor (modified_sequence + charge) so we write one RefSpectra
-    // per unique precursor, with per-run entries in RetentionTimes
-    let mut precursor_groups: HashMap<(String, u8), Vec<&CoelutionScoredEntry>> = HashMap::new();
-    for entry in entries {
+    // Group plan entries by precursor (modified_sequence + charge)
+    let mut precursor_groups: HashMap<(Arc<str>, u8), Vec<usize>> = HashMap::new();
+    for (idx, entry) in plan.iter().enumerate() {
         precursor_groups
             .entry((entry.modified_sequence.clone(), entry.charge))
             .or_default()
-            .push(entry);
+            .push(idx);
     }
 
     let mut n_written = 0usize;
 
-    for ((_mod_seq, _charge), group) in &precursor_groups {
-        // Find the best run (lowest run q-value) for this precursor
-        let best = group
+    for ((mod_seq, charge), indices) in &precursor_groups {
+        // Find the best run (lowest run q-value)
+        let best_idx = *indices
             .iter()
-            .min_by(|a, b| a.run_qvalue.total_cmp(&b.run_qvalue))
+            .min_by(|&&a, &&b| plan[a].run_qvalue.total_cmp(&plan[b].run_qvalue))
             .unwrap();
+        let best = &plan[best_idx];
 
-        // Fragment m/z and intensities from library (entries may have been
-        // shrunk to save memory across hundreds of files).
-        let (frag_mzs, frag_intensities): (Vec<f64>, Vec<f32>) = if !best.fragment_mzs.is_empty() {
-            (best.fragment_mzs.clone(), best.fragment_intensities.clone())
-        } else if let Some(lib_entry) = lib_by_id.get(&best.entry_id) {
-            (
-                lib_entry.fragments.iter().map(|f| f.mz).collect(),
-                lib_entry
-                    .fragments
-                    .iter()
-                    .map(|f| f.relative_intensity)
-                    .collect(),
-            )
-        } else {
-            continue;
+        // Get fragment data from library
+        let lib_entry = match lib_by_id.get(&best.entry_id) {
+            Some(e) => e,
+            None => continue,
         };
 
-        let n_runs_detected = group.len() as i32;
-        let file_id = *file_stem_to_id.get(&best.file_name).unwrap_or(&1);
+        let frag_mzs: Vec<f64> = lib_entry.fragments.iter().map(|f| f.mz).collect();
+        let frag_intensities: Vec<f32> = lib_entry
+            .fragments
+            .iter()
+            .map(|f| f.relative_intensity)
+            .collect();
 
-        let tic: f64 = frag_intensities.iter().map(|&x| x as f64).sum();
+        if frag_mzs.is_empty() {
+            continue;
+        }
 
-        // Use shared boundaries from the best charge state for this peptide in this file
-        let shared_key = (best.modified_sequence.clone(), best.file_name.clone());
-        let (shared_apex, shared_start, shared_end) =
-            shared_bounds.get(&shared_key).copied().unwrap_or((
-                best.apex_rt,
-                best.peak_bounds.start_rt,
-                best.peak_bounds.end_rt,
-            ));
+        // Use shared boundaries if available
+        let shared_key = (mod_seq.clone(), best.file_name_idx);
+        let (shared_apex, shared_start, shared_end) = shared_bounds
+            .get(&shared_key)
+            .copied()
+            .unwrap_or((best.apex_rt, best.start_rt, best.end_rt));
 
-        // Score is the experiment q-value — Skyline GENERIC Q-VALUE convention
+        let n_runs_detected = indices.len() as i32;
+        let tic: f64 = frag_intensities.iter().map(|&i| i as f64).sum();
+
+        let best_file_stem = &file_names[best.file_name_idx as usize];
+        let file_id = file_stem_to_id.get(best_file_stem).copied().unwrap_or(1);
+
         let ref_id = writer.add_spectrum(
-            &best.sequence,
+            &lib_entry.sequence,
             &best.modified_sequence,
-            best.precursor_mz,
-            best.charge as i32,
+            lib_entry.precursor_mz,
+            *charge as i32,
             shared_apex,
             shared_start,
             shared_end,
@@ -4443,42 +4598,36 @@ fn write_blib_output(
             tic,
         )?;
 
-        // Add modifications from library entry if present
-        if let Some(lib_entry) = lib_by_id.get(&best.entry_id) {
-            if !lib_entry.modifications.is_empty() {
-                writer.add_modifications(ref_id, &lib_entry.modifications)?;
-            }
-            if !lib_entry.protein_ids.is_empty() {
-                writer.add_protein_mapping(ref_id, &lib_entry.protein_ids)?;
-            }
+        // Add modifications from library
+        if !lib_entry.modifications.is_empty() {
+            writer.add_modifications(ref_id, &lib_entry.modifications)?;
         }
 
-        // Write RetentionTimes entries for every run where this precursor was detected
-        for scored in group {
-            let run_file_id = *file_stem_to_id.get(&scored.file_name).unwrap_or(&1);
-            let is_best = std::ptr::eq(
-                *scored as *const CoelutionScoredEntry,
-                *best as *const CoelutionScoredEntry,
-            );
+        // Add protein mappings from library
+        if !lib_entry.protein_ids.is_empty() {
+            writer.add_protein_mapping(ref_id, &lib_entry.protein_ids)?;
+        }
 
-            // Use shared boundaries for this peptide in this run's file
-            let run_shared_key = (scored.modified_sequence.clone(), scored.file_name.clone());
-            let (run_apex, run_start, run_end) =
-                shared_bounds.get(&run_shared_key).copied().unwrap_or((
-                    scored.apex_rt,
-                    scored.peak_bounds.start_rt,
-                    scored.peak_bounds.end_rt,
-                ));
+        // Add per-run retention times
+        for &idx in indices {
+            let scored = &plan[idx];
+            let run_file_stem = &file_names[scored.file_name_idx as usize];
+            let run_file_id = file_stem_to_id.get(run_file_stem).copied().unwrap_or(1);
 
-            // Show an ID line (non-NULL retentionTime) only if this observation
-            // independently passed run-level FDR. Forced integrations and
-            // reconciled entries that didn't pass run-level FDR get NULL
-            // retentionTime (boundaries only, no ID line in Skyline).
+            let run_key = (scored.modified_sequence.clone(), scored.file_name_idx);
+            let (run_apex, run_start, run_end) = shared_bounds.get(&run_key).copied().unwrap_or((
+                scored.apex_rt,
+                scored.start_rt,
+                scored.end_rt,
+            ));
+
             let rt_for_id = if scored.run_qvalue <= config.run_fdr {
                 Some(run_apex)
             } else {
                 None
             };
+
+            let is_best = idx == best_idx;
 
             writer.add_retention_time(
                 ref_id,
@@ -4491,30 +4640,19 @@ fn write_blib_output(
             )?;
         }
 
-        // Note: With gap-filling, passing precursors will have actual scored entries
-        // in files where they're within the DIA window. Files where the precursor m/z
-        // is outside the isolation window (GPF) won't have entries and won't get
-        // RetentionTimes rows — there's no signal to quantify in those files.
-
-        // Add peak boundaries to Osprey extension table (shared across charge states)
+        // Add peak boundaries
         let boundaries = osprey_core::PeakBoundaries {
             start_rt: shared_start,
             end_rt: shared_end,
             apex_rt: shared_apex,
-            apex_coefficient: best.features.dot_product,
-            integrated_area: best.features.peak_area,
+            apex_coefficient: 0.0, // dot_product not available in plan
+            integrated_area: best.bounds_area,
             peak_quality: osprey_core::PeakQuality::default(),
         };
-        writer.add_peak_boundaries(ref_id, &best.file_name, &boundaries)?;
+        writer.add_peak_boundaries(ref_id, best_file_stem, &boundaries)?;
 
-        // Add run-level scores for best run
-        writer.add_run_scores(
-            ref_id,
-            &best.file_name,
-            best.run_qvalue,
-            best.features.dot_product,
-            0.0, // No PEP from coelution scoring yet
-        )?;
+        // Add run-level scores
+        writer.add_run_scores(ref_id, best_file_stem, best.run_qvalue, best.score, 0.0)?;
 
         // Add experiment-level scores
         writer.add_experiment_scores(
@@ -4531,17 +4669,10 @@ fn write_blib_output(
     writer.finalize()?;
 
     log::info!(
-        "Wrote {} total entries for {} precursors across {} files",
-        entries.len(),
+        "Wrote {} precursors ({} per-run retention times) to blib",
         n_written,
-        config.input_files.len()
+        plan.len()
     );
-    if n_shared > 0 {
-        log::info!(
-            "Shared peak boundaries across charge states for {} peptide-file pairs",
-            n_shared
-        );
-    }
 
     Ok(())
 }
