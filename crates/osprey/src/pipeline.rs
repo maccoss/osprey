@@ -75,6 +75,144 @@ use std::sync::Arc;
 
 use osprey_scoring::batch::CalibrationMatch;
 
+// Parquet cache metadata keys
+const META_OSPREY_VERSION: &str = "osprey.version";
+const META_SEARCH_HASH: &str = "osprey.search_hash";
+const META_LIBRARY_HASH: &str = "osprey.library_hash";
+const META_RECONCILED: &str = "osprey.reconciled";
+const META_RECONCILIATION_HASH: &str = "osprey.reconciliation_hash";
+
+/// Result of validating a cached scores parquet file's metadata.
+enum CacheValidity {
+    /// Cache is valid (first-pass scores match current config)
+    ValidFirstPass,
+    /// Cache contains reconciled data and reconciliation params still match
+    ValidReconciled,
+    /// Cache is stale — delete and re-score
+    Stale(String),
+}
+
+/// Read key-value metadata from a parquet file and check validity against current config.
+fn validate_scores_cache(path: &std::path::Path, config: &OspreyConfig) -> CacheValidity {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return CacheValidity::Stale("cannot open file".into()),
+    };
+    let reader = match SerializedFileReader::new(file) {
+        Ok(r) => r,
+        Err(_) => return CacheValidity::Stale("cannot read parquet metadata".into()),
+    };
+    let file_meta = reader.metadata().file_metadata();
+    let kv = match file_meta.key_value_metadata() {
+        Some(kv) => kv,
+        None => return CacheValidity::Stale("no metadata (pre-hash cache)".into()),
+    };
+
+    let get = |key: &str| -> Option<&str> {
+        kv.iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_deref())
+    };
+
+    // Check version
+    let cached_version = match get(META_OSPREY_VERSION) {
+        Some(v) => v,
+        None => return CacheValidity::Stale("missing version".into()),
+    };
+    if cached_version != env!("CARGO_PKG_VERSION") {
+        return CacheValidity::Stale(format!(
+            "version mismatch: cached={}, current={}",
+            cached_version,
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+
+    // Check search hash
+    let cached_search = match get(META_SEARCH_HASH) {
+        Some(h) => h,
+        None => return CacheValidity::Stale("missing search hash".into()),
+    };
+    let current_search = config.search_parameter_hash();
+    if cached_search != current_search {
+        return CacheValidity::Stale("search parameters changed".into());
+    }
+
+    // Check library hash
+    let cached_lib = match get(META_LIBRARY_HASH) {
+        Some(h) => h,
+        None => return CacheValidity::Stale("missing library hash".into()),
+    };
+    let current_lib = config.library_identity_hash();
+    if cached_lib != current_lib {
+        return CacheValidity::Stale("library changed".into());
+    }
+
+    // Check reconciliation status
+    let is_reconciled = get(META_RECONCILED) == Some("true");
+    if is_reconciled {
+        if let Some(cached_recon) = get(META_RECONCILIATION_HASH) {
+            let current_recon = config.reconciliation_parameter_hash();
+            if cached_recon == current_recon {
+                return CacheValidity::ValidReconciled;
+            }
+            // Reconciliation params changed — but first-pass is still valid
+            return CacheValidity::ValidFirstPass;
+        }
+    }
+
+    CacheValidity::ValidFirstPass
+}
+
+/// Build Parquet key-value metadata for a first-pass scores cache.
+fn build_scores_metadata(config: &OspreyConfig) -> Vec<parquet::file::metadata::KeyValue> {
+    vec![
+        parquet::file::metadata::KeyValue {
+            key: META_OSPREY_VERSION.to_string(),
+            value: Some(env!("CARGO_PKG_VERSION").to_string()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: META_SEARCH_HASH.to_string(),
+            value: Some(config.search_parameter_hash()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: META_LIBRARY_HASH.to_string(),
+            value: Some(config.library_identity_hash()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: META_RECONCILED.to_string(),
+            value: Some("false".to_string()),
+        },
+    ]
+}
+
+/// Build Parquet key-value metadata for a reconciled scores cache.
+fn build_reconciled_metadata(config: &OspreyConfig) -> Vec<parquet::file::metadata::KeyValue> {
+    vec![
+        parquet::file::metadata::KeyValue {
+            key: META_OSPREY_VERSION.to_string(),
+            value: Some(env!("CARGO_PKG_VERSION").to_string()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: META_SEARCH_HASH.to_string(),
+            value: Some(config.search_parameter_hash()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: META_LIBRARY_HASH.to_string(),
+            value: Some(config.library_identity_hash()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: META_RECONCILED.to_string(),
+            value: Some("true".to_string()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: META_RECONCILIATION_HASH.to_string(),
+            value: Some(config.reconciliation_parameter_hash()),
+        },
+    ]
+}
+
 /// Extract isolation window scheme from the first cycle of MS2 spectra
 ///
 /// Returns an IsolationScheme describing the DIA windows used in the acquisition.
@@ -868,8 +1006,12 @@ fn scores_path_for_input(input_path: &std::path::Path) -> std::path::PathBuf {
     parent.join(format!("{}.scores.parquet", stem))
 }
 
-/// Write per-file scored entries to parquet (pre-FDR, includes fragments and XIC for blib).
-fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]) -> Result<()> {
+/// Write per-file scored entries to parquet with optional key-value metadata.
+fn write_scores_parquet_with_metadata(
+    path: &std::path::Path,
+    entries: &[CoelutionScoredEntry],
+    metadata: Option<Vec<parquet::file::metadata::KeyValue>>,
+) -> Result<()> {
     use parquet::arrow::ArrowWriter;
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
@@ -1041,9 +1183,12 @@ fn write_scores_parquet(path: &std::path::Path, entries: &[CoelutionScoredEntry]
             e
         ))
     })?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .build();
+    let mut props_builder =
+        WriterProperties::builder().set_compression(Compression::ZSTD(Default::default()));
+    if metadata.is_some() {
+        props_builder = props_builder.set_key_value_metadata(metadata);
+    }
+    let props = props_builder.build();
     let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| OspreyError::OutputError(format!("Failed to create RecordBatch: {}", e)))?;
     let mut writer = ArrowWriter::try_new(file, schema, Some(props))
@@ -2156,8 +2301,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             // Deduplicate: keep best target and best decoy per base_id.
             let entries = deduplicate_pairs(entries);
 
-            // Save scores to parquet for future re-use
-            if let Err(e) = write_scores_parquet(&scores_path, &entries) {
+            // Save scores to parquet for future re-use (with search parameter metadata)
+            let scores_meta = build_scores_metadata(&config);
+            if let Err(e) =
+                write_scores_parquet_with_metadata(&scores_path, &entries, Some(scores_meta))
+            {
                 log::warn!("Failed to save scores to {}: {}", scores_path.display(), e);
             }
 
@@ -2325,7 +2473,29 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         let refined_calibrations: HashMap<String, RTCalibration>;
         let per_file_gap_fill: HashMap<String, Vec<GapFillTarget>>;
 
-        if reconciliation_enabled {
+        // Compute reconciliation parameter hash and check if all files are already reconciled
+        let all_already_reconciled = reconciliation_enabled
+            && per_file_cache_paths.values().all(|path| {
+                match validate_scores_cache(path, &config) {
+                    CacheValidity::ValidReconciled => true,
+                    CacheValidity::ValidFirstPass => false,
+                    CacheValidity::Stale(reason) => {
+                        log::debug!("Cache {} not reconciled: {}", path.display(), reason);
+                        false
+                    }
+                }
+            });
+
+        if all_already_reconciled {
+            log::info!("");
+            log::info!("=== Inter-Replicate Peak Reconciliation ===");
+            log::info!(
+                "All {} files already reconciled with matching parameters — skipping",
+                per_file_cache_paths.len()
+            );
+            refined_calibrations = HashMap::new();
+            per_file_gap_fill = HashMap::new();
+        } else if reconciliation_enabled {
             log::info!("");
             log::info!("=== Inter-Replicate Peak Reconciliation ===");
 
@@ -2757,8 +2927,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         for (_, entry) in gap_entries {
                             full_entries.push(entry);
                         }
-                        // Write back to Parquet
-                        if let Err(e) = write_scores_parquet(cache_path, &full_entries) {
+                        // Write back to Parquet with reconciliation metadata
+                        let recon_metadata = build_reconciled_metadata(&config);
+                        if let Err(e) = write_scores_parquet_with_metadata(
+                            cache_path,
+                            &full_entries,
+                            Some(recon_metadata),
+                        ) {
                             log::warn!(
                                 "Failed to write reconciled scores for {}: {}",
                                 file_name,
