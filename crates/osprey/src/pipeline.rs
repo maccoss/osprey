@@ -1006,6 +1006,106 @@ fn scores_path_for_input(input_path: &std::path::Path) -> std::path::PathBuf {
     parent.join(format!("{}.scores.parquet", stem))
 }
 
+/// Path for per-file first-pass FDR score sidecar.
+fn fdr_scores_path_pass1(input_path: &std::path::Path) -> std::path::PathBuf {
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
+    parent.join(format!("{}.1st-pass.fdr_scores.bin", stem))
+}
+
+/// Path for per-file second-pass FDR score sidecar.
+fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
+    parent.join(format!("{}.2nd-pass.fdr_scores.bin", stem))
+}
+
+/// Write per-file FDR scores to a sidecar binary file.
+/// Format: little-endian f64 array, one per entry, in Parquet row order.
+fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry]) -> Result<()> {
+    let tmp_path = std::env::temp_dir().join(format!(
+        "osprey_{}_{}",
+        std::process::id(),
+        path.file_name()
+            .unwrap_or(std::ffi::OsStr::new("fdr_scores.bin"))
+            .to_string_lossy()
+    ));
+    let mut file = std::fs::File::create(&tmp_path).map_err(|e| {
+        OspreyError::OutputError(format!(
+            "Failed to create temp scores sidecar {}: {}",
+            tmp_path.display(),
+            e
+        ))
+    })?;
+    use std::io::Write;
+    for entry in entries {
+        file.write_all(&entry.score.to_le_bytes())
+            .map_err(|e| OspreyError::OutputError(format!("Failed to write score: {}", e)))?;
+    }
+    file.flush()
+        .map_err(|e| OspreyError::OutputError(format!("Failed to flush scores sidecar: {}", e)))?;
+    drop(file);
+    osprey_core::copy_and_verify(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Load per-file FDR scores from sidecar into existing FdrEntry stubs.
+/// Returns true if scores were loaded successfully.
+fn load_fdr_scores_sidecar(path: &std::path::Path, entries: &mut [FdrEntry]) -> bool {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let expected_len = entries.len() * 8;
+    if data.len() != expected_len {
+        log::warn!(
+            "Score sidecar {} has wrong size ({} vs expected {}), ignoring",
+            path.display(),
+            data.len(),
+            expected_len
+        );
+        return false;
+    }
+    for (i, entry) in entries.iter_mut().enumerate() {
+        let offset = i * 8;
+        let bytes: [u8; 8] = data[offset..offset + 8].try_into().unwrap();
+        entry.score = f64::from_le_bytes(bytes);
+    }
+    true
+}
+
+/// Write FDR score sidecars for all files.
+fn persist_fdr_scores(
+    per_file_entries: &[(String, Vec<FdrEntry>)],
+    config: &OspreyConfig,
+    path_fn: fn(&std::path::Path) -> std::path::PathBuf,
+    label: &str,
+) {
+    for (file_name, entries) in per_file_entries.iter() {
+        if let Some(input_file) = config.input_files.iter().find(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s == file_name)
+        }) {
+            let sidecar_path = path_fn(input_file);
+            if let Err(e) = write_fdr_scores_sidecar(&sidecar_path, entries) {
+                log::warn!(
+                    "Failed to write {} score sidecar for {}: {}",
+                    label,
+                    file_name,
+                    e
+                );
+            }
+        }
+    }
+}
+
 /// Write per-file scored entries to parquet with optional key-value metadata.
 fn write_scores_parquet_with_metadata(
     path: &std::path::Path,
@@ -2122,6 +2222,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     let mut per_file_calibrations: HashMap<String, RTCalibration> = HashMap::new();
     // Interner for modified_sequence deduplication across files
     let mut seq_interner: HashSet<Arc<str>> = HashSet::new();
+    // Track whether all files loaded SVM scores from sidecars (enables skipping Percolator)
+    let mut all_scores_loaded = true;
 
     for (file_idx, input_file) in config.input_files.iter().enumerate() {
         log::info!("");
@@ -2144,12 +2246,30 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             scores_path.exists() && scores_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
         let cached_stubs = if scores_file_valid {
             match load_fdr_stubs_from_parquet(&scores_path, &mut seq_interner) {
-                Ok(stubs) => {
-                    log::info!(
-                        "Loaded {} cached scores from {}",
-                        stubs.len(),
-                        scores_path.display()
-                    );
+                Ok(mut stubs) => {
+                    // Try loading SVM scores from sidecar (prefer 2nd-pass, fall back to 1st-pass)
+                    let pass2_sidecar = fdr_scores_path_pass2(input_file);
+                    let pass1_sidecar = fdr_scores_path_pass1(input_file);
+                    if load_fdr_scores_sidecar(&pass2_sidecar, &mut stubs) {
+                        log::info!(
+                            "Loaded {} cached scores + 2nd-pass SVM scores from {}",
+                            stubs.len(),
+                            scores_path.display()
+                        );
+                    } else if load_fdr_scores_sidecar(&pass1_sidecar, &mut stubs) {
+                        log::info!(
+                            "Loaded {} cached scores + 1st-pass SVM scores from {}",
+                            stubs.len(),
+                            scores_path.display()
+                        );
+                    } else {
+                        all_scores_loaded = false;
+                        log::info!(
+                            "Loaded {} cached scores from {}",
+                            stubs.len(),
+                            scores_path.display()
+                        );
+                    }
                     // Load cached calibration for inter-replicate reconciliation
                     if let Some(input_dir) = input_file.parent() {
                         let cal_path = calibration_path_for_input(input_file, input_dir);
@@ -2198,6 +2318,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         scores_path.display(),
                         e
                     );
+                    all_scores_loaded = false;
                     None
                 }
             }
@@ -2209,6 +2330,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         let fdr_entries = if let Some(stubs) = cached_stubs {
             stubs
         } else {
+            // Freshly scored — no SVM scores available
+            all_scores_loaded = false;
             // Load spectra
             let (spectra, ms1_index) = load_all_spectra(input_file)?;
             if spectra.is_empty() {
@@ -2355,41 +2478,75 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         return Ok(());
     }
 
-    // Dispatch FDR control based on method
-    log::info!("");
-    log::info!(
-        "Running {} FDR control on coelution results...",
-        config.fdr_method
-    );
+    // Check if we can skip Percolator + reconciliation entirely:
+    // All files must be ValidReconciled (or single-file) AND have SVM scores loaded from sidecar.
+    let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
+    let all_already_reconciled = reconciliation_enabled
+        && per_file_cache_paths.values().all(|path| {
+            matches!(
+                validate_scores_cache(path, &config),
+                CacheValidity::ValidReconciled
+            )
+        });
+    let can_skip_fdr = all_scores_loaded
+        && (all_already_reconciled || !reconciliation_enabled)
+        && config.fdr_method != FdrMethod::Simple;
 
-    // No overlay for first-pass FDR (no re-scoring has happened yet)
-    let empty_overlay: RescoreOverlay = HashMap::new();
+    if can_skip_fdr {
+        // SVM scores loaded from sidecars — just recompute q-values
+        log::info!("");
+        log::info!(
+            "SVM scores loaded from cache. Recomputing q-values (skipping Percolator training)..."
+        );
+        percolator::compute_fdr_from_stubs(&mut per_file_entries, config.run_fdr, None);
+    } else {
+        // Dispatch FDR control based on method
+        log::info!("");
+        log::info!(
+            "Running {} FDR control on coelution results...",
+            config.fdr_method
+        );
 
-    match config.fdr_method {
-        FdrMethod::Percolator => {
-            run_percolator_fdr(
-                &mut per_file_entries,
-                &per_file_cache_paths,
-                &config,
-                &empty_overlay,
-                None,
-            )?;
-        }
-        FdrMethod::Mokapot => {
-            run_mokapot_fdr(
-                &mut per_file_entries,
-                &per_file_cache_paths,
-                &mokapot,
-                &pin_files,
-                &mokapot_dir,
-                &config,
-            )?;
-        }
-        FdrMethod::Simple => {
-            for (_, entries) in per_file_entries.iter_mut() {
-                apply_simple_fdr(entries, config.run_fdr)?;
+        // No overlay for first-pass FDR (no re-scoring has happened yet)
+        let empty_overlay: RescoreOverlay = HashMap::new();
+
+        match config.fdr_method {
+            FdrMethod::Percolator => {
+                run_percolator_fdr(
+                    &mut per_file_entries,
+                    &per_file_cache_paths,
+                    &config,
+                    &empty_overlay,
+                    None,
+                )?;
+            }
+            FdrMethod::Mokapot => {
+                run_mokapot_fdr(
+                    &mut per_file_entries,
+                    &per_file_cache_paths,
+                    &mokapot,
+                    &pin_files,
+                    &mokapot_dir,
+                    &config,
+                )?;
+            }
+            FdrMethod::Simple => {
+                for (_, entries) in per_file_entries.iter_mut() {
+                    apply_simple_fdr(entries, config.run_fdr)?;
+                }
             }
         }
+    }
+
+    // Persist first-pass SVM scores to sidecar files
+    if !can_skip_fdr {
+        log::info!("Persisting 1st-pass FDR scores...");
+        persist_fdr_scores(
+            &per_file_entries,
+            &config,
+            fdr_scores_path_pass1,
+            "1st-pass",
+        );
     }
 
     // Collect first-pass passing base_ids: any precursor passing run-level FDR
@@ -2410,14 +2567,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     );
 
     // Post-FDR re-scoring: multi-charge consensus + inter-replicate reconciliation.
-    // Both phases need to load spectra and re-score entries, so we merge them
-    // into a single spectra-load pass per file to avoid redundant I/O.
-    //
-    // Overlay: re-scored entries are kept in memory (~170 MB per file) and merged
-    // at read time for second-pass FDR scoring and blib output, avoiding the need
-    // to load/write the full ~1.5M-entry parquet during re-scoring.
+    // Skipped entirely when all files are already reconciled with scores loaded.
     let per_file_overlays: RescoreOverlay = HashMap::new(); // empty — reconciled entries written back to Parquet
-    {
+    if can_skip_fdr {
+        log::info!("");
+        log::info!("=== Skipping reconciliation (already complete with matching parameters) ===");
+    } else {
         use crate::reconciliation::{
             compute_consensus_rts, identify_gap_fill_targets, plan_reconciliation,
             refit_calibration_with_consensus, GapFillTarget, ReconcileAction,
@@ -2999,6 +3154,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     }
                 }
             }
+
+            // Persist second-pass SVM scores to sidecar files
+            log::info!("Persisting 2nd-pass FDR scores...");
+            persist_fdr_scores(
+                &per_file_entries,
+                &config,
+                fdr_scores_path_pass2,
+                "2nd-pass",
+            );
         }
     }
 
