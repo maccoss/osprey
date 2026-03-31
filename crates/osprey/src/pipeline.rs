@@ -2817,46 +2817,82 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     }
 
     // Determine which precursors pass experiment-level FDR from lightweight FdrEntry stubs
-    let all_fdr_entries: Vec<&FdrEntry> = per_file_entries
+    let passing_precursors: HashSet<(Arc<str>, u8)> = per_file_entries
         .iter()
         .flat_map(|(_, entries)| entries.iter())
-        .collect();
-
-    let passing_precursors: HashSet<(Arc<str>, u8)> = all_fdr_entries
-        .iter()
         .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
         .map(|e| (e.modified_sequence.clone(), e.charge))
         .collect();
 
-    // Compute best experiment q-value per precursor from FdrEntry stubs
+    // Compute best experiment q-value per precursor
     let mut best_exp_q: HashMap<(Arc<str>, u8), f64> = HashMap::new();
-    for e in all_fdr_entries.iter() {
-        if !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge)) {
-            best_exp_q
-                .entry((e.modified_sequence.clone(), e.charge))
-                .and_modify(|q| *q = q.min(e.experiment_qvalue))
-                .or_insert(e.experiment_qvalue);
+    for (_, entries) in per_file_entries.iter() {
+        for e in entries {
+            if !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge))
+            {
+                best_exp_q
+                    .entry((e.modified_sequence.clone(), e.charge))
+                    .and_modify(|q| *q = q.min(e.experiment_qvalue))
+                    .or_insert(e.experiment_qvalue);
+            }
         }
     }
-    drop(all_fdr_entries);
 
-    // Reload full entries from parquet ONLY for files with passing precursors,
-    // apply FDR q-values from stubs, and collect passing entries for blib/report.
-    let mut passing_entries: Vec<CoelutionScoredEntry> = Vec::new();
+    // Extract lightweight per-file FDR data for passing entries, then drop the
+    // heavy FdrEntry stubs (~19 GB for 240 files) to free memory for blib loading.
+    struct LightFdr {
+        run_qvalue: f64,
+        experiment_qvalue: f64,
+        score: f64,
+        pep: f64,
+        is_decoy: bool,
+        modified_sequence: Arc<str>,
+        charge: u8,
+    }
+    let per_file_fdr_data: Vec<(String, Vec<LightFdr>)> = per_file_entries
+        .iter()
+        .map(|(file_name, entries)| {
+            let fdr_values: Vec<LightFdr> = entries
+                .iter()
+                .map(|e| LightFdr {
+                    run_qvalue: e.run_qvalue,
+                    experiment_qvalue: e.experiment_qvalue,
+                    score: e.score,
+                    pep: e.pep,
+                    is_decoy: e.is_decoy,
+                    modified_sequence: e.modified_sequence.clone(),
+                    charge: e.charge,
+                })
+                .collect();
+            (file_name.clone(), fdr_values)
+        })
+        .collect();
 
-    // Identify which files have passing precursors
-    let files_with_passing: HashSet<&str> = per_file_entries
+    let files_with_passing: HashSet<String> = per_file_entries
         .iter()
         .filter(|(_, entries)| {
             entries.iter().any(|e| {
                 !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge))
             })
         })
-        .map(|(file_name, _)| file_name.as_str())
+        .map(|(file_name, _)| file_name.clone())
         .collect();
 
-    for (file_name, fdr_entries) in per_file_entries.iter() {
-        if !files_with_passing.contains(file_name.as_str()) {
+    let n_total_files = per_file_entries.len();
+
+    // Drop the heavy FdrEntry stubs — frees ~19 GB
+    drop(per_file_entries);
+    log::info!(
+        "Freed FDR stubs. Loading passing entries from {}/{} files for blib output",
+        files_with_passing.len(),
+        n_total_files
+    );
+
+    // Reload full entries from Parquet per-file, apply FDR q-values from lightweight data
+    let mut passing_entries: Vec<CoelutionScoredEntry> = Vec::new();
+
+    for (file_num, (file_name, fdr_values)) in per_file_fdr_data.iter().enumerate() {
+        if !files_with_passing.contains(file_name) {
             continue;
         }
         let cache_path = match per_file_cache_paths.get(file_name.as_str()) {
@@ -2875,9 +2911,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             }
         };
 
-        // Merge FDR q-values from stubs into full entries (from reconciled Parquet).
-        // Stubs have the final q-values from Percolator/Mokapot.
-        for (full, fdr) in full_entries.into_iter().zip(fdr_entries.iter()) {
+        // Merge FDR q-values from lightweight data into full entries
+        for (full, fdr) in full_entries.into_iter().zip(fdr_values.iter()) {
             if !fdr.is_decoy
                 && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
             {
@@ -2891,6 +2926,14 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 entry.pep = fdr.pep;
                 passing_entries.push(entry);
             }
+        }
+        if (file_num + 1) % 20 == 0 || file_num + 1 == n_total_files {
+            log::info!(
+                "  Loaded {}/{} files ({} passing entries so far)",
+                file_num + 1,
+                n_total_files,
+                passing_entries.len()
+            );
         }
     }
 
@@ -2925,15 +2968,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             log::info!("Writing Parquet report to {}", report_path.display());
             // Reload all entries from parquet caches for the full report
             let mut all_entries: Vec<CoelutionScoredEntry> = Vec::new();
-            for (file_name, fdr_entries) in per_file_entries.iter() {
+            for (file_name, fdr_values) in per_file_fdr_data.iter() {
                 let cache_path = match per_file_cache_paths.get(file_name.as_str()) {
                     Some(p) => p,
                     None => continue,
                 };
                 match load_scores_parquet(cache_path) {
                     Ok(mut entries) => {
-                        // Merge FDR q-values from stubs
-                        for (full, fdr) in entries.iter_mut().zip(fdr_entries.iter()) {
+                        // Merge FDR q-values from lightweight data
+                        for (full, fdr) in entries.iter_mut().zip(fdr_values.iter()) {
                             full.run_qvalue = fdr.run_qvalue;
                             full.experiment_qvalue = fdr.experiment_qvalue;
                             full.score = fdr.score;
