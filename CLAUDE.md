@@ -74,7 +74,7 @@ CI runs `cargo fmt --check` and `cargo clippy -D warnings` (including test targe
 - `docs/README.md` - Pipeline overview and algorithm documentation
 - `docs/07-fdr-control.md` - Two-level FDR with Mokapot
 - `docs/08-blib-output-schema.md` - BiblioSpec output format and Skyline integration
-- `docs/12-intermediate-files.md` - Intermediate file formats (calibration JSON, spectra cache, Parquet scores)
+- `docs/12-intermediate-files.md` - Intermediate file formats (calibration JSON, spectra cache, Parquet scores, FDR score sidecars, cache invalidation, memory architecture)
 - `crates/osprey/src/pipeline.rs` - Main analysis pipeline
 - `crates/osprey/src/main.rs` - CLI entry point
 - `crates/osprey-fdr/src/mokapot.rs` - Mokapot integration
@@ -271,13 +271,16 @@ This distinction is important: a NULL `retentionTime` with populated `startTime`
 
 ### Memory Architecture
 
-Osprey uses a disk-backed stub architecture to scale to 1000+ files:
+Osprey uses a tiered disk-backed architecture to scale to 1000+ files:
 
 - **FdrEntry** (~80 bytes inline): Lightweight stub with 13 fields (entry_id, is_decoy, charge, scan_number, apex/start/end_rt, coelution_sum, score, run/experiment_qvalue, pep, modified_sequence). The `file_name` is not stored in FdrEntry — entries are keyed by file name in the outer `Vec<(String, Vec<FdrEntry>)>`. The `modified_sequence` field uses `Arc<str>` for string interning, deduplicating identical peptide sequences across files (e.g., 240M entries → ~3.5M unique strings).
-- **Parquet caches** (`.scores.parquet`): Per-file ZSTD-compressed caches storing 21 PIN features, fragments, CWT candidates
-- **Selective loading**: `load_scores_parquet()` for full entry rehydration, `load_cwt_candidates_from_parquet()` for CWT-only reconciliation planning
+- **LightFdr** (~48 bytes): Extracted from FdrEntry stubs before blib output. Contains only q-values, score, pep, charge, and modified_sequence. Dropping FdrEntry stubs frees ~19 GB for 240-file experiments.
+- **BlibPlanEntry** (~96 bytes): Loaded from a 5-column Parquet projection for blib output. Contains entry_id (for library lookup), RT boundaries, q-values, and file_name_idx. Fragments, modifications, and protein mappings come from the in-memory library. Avoids loading full entries (~22 GB for 24M passing entries).
+- **Parquet caches** (`.scores.parquet`): Per-file ZSTD-compressed caches storing 21 PIN features, fragments, CWT candidates. Metadata footer contains SHA-256 hashes of search parameters, library identity, and reconciliation state for automatic cache invalidation.
+- **FDR score sidecars** (`.1st-pass.fdr_scores.bin`, `.2nd-pass.fdr_scores.bin`): Per-file binary files storing SVM discriminant scores (~9 MB each). Enable skipping Percolator SVM training on reruns.
+- **Selective loading**: `load_blib_plan_entries()` for 5-column projection, `load_fdr_stubs_from_parquet()` for FDR stubs, `load_pin_features_from_parquet()` for SVM scoring, `load_cwt_candidates_from_parquet()` for reconciliation planning
 - **Sequential re-scoring**: Reconciliation re-scoring processes files sequentially (not parallel) because each file loads ~3 GB (spectra + full Parquet entries); parallel loading causes OOM on large experiments
-- **Steady-state RAM**: ~80 bytes × entries × files (vs ~940 bytes without caching), plus shared `Arc<str>` interning pool
+- **Steady-state RAM**: ~80 bytes × entries × files during FDR (vs ~940 bytes without caching), ~96 bytes × passing entries during blib output, plus shared `Arc<str>` interning pool
 
 ## Recent Changes
 
@@ -322,3 +325,13 @@ Osprey uses a disk-backed stub architecture to scale to 1000+ files:
 - Consensus and reconciliation targets merged into single `run_search()` call per file (reconciliation wins on conflict)
 - Added 5 boundary_overrides tests with synthetic data helpers (make_lib_entry_with_fragments, make_gaussian_spectra, make_test_config)
 - Removed `rescore_for_reconciliation()`, `rescore_entry_in_window()`, `FileRescoreContext` (replaced by `run_search()` with boundary_overrides)
+- Added Parquet metadata hashing for cache invalidation: `osprey.version`, `osprey.search_hash`, `osprey.library_hash`, `osprey.reconciled`, `osprey.reconciliation_hash` — SHA-256 of search parameters, library identity, and reconciliation config stored in Parquet footer
+- Added `CacheValidity` enum (ValidFirstPass, ValidReconciled, Stale) — stale caches auto-detected and re-scored on parameter/library/version change
+- Added FDR score sidecar files (`.1st-pass.fdr_scores.bin`, `.2nd-pass.fdr_scores.bin`) — persists SVM discriminant scores per file, enabling skip-Percolator on reruns (~9 MB per file)
+- Skip-Percolator optimization: when all files have ValidReconciled Parquet + loaded SVM scores from sidecars, Osprey skips SVM training entirely and just recomputes q-values from cached scores
+- Streaming blib output via `BlibPlanEntry` (~96 bytes per entry): loads 5-column Parquet projection, looks up fragments/mods/proteins from library — avoids loading full entries (~940 bytes each, ~22 GB for 24M passing entries)
+- Added `LightFdr` struct (~48 bytes): extracted from FDR stubs before blib output to free ~19 GB of FDR stubs from memory
+- Removed `write_blib_output()`, `build_shared_boundaries()`, `write_scored_report()` — replaced by streaming plan-based equivalents
+- Safe NAS file writes: all cache writers (Parquet, spectra.bin, calibration JSON, score sidecars) write to local temp then `copy_and_verify` to final destination
+- Removed unused config settings: `max_candidates_per_spectrum`, `memory_limit_gb`, `custom_bin_width`, `initial_tolerance_fraction`, `use_percentile_tolerance`
+- Removed expensive unused `elution_weighted_cosine` feature computation (set to 0.0, not in PIN)

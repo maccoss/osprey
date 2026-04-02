@@ -199,17 +199,12 @@ library_source:
 output_blib: results.blib
 output_report: results.tsv
 
-# Candidate selection (precursor filtering uses isolation window from mzML)
-max_candidates_per_spectrum: 5250  # Use 0 for unlimited
-
 # RT Calibration
 rt_calibration:
   enabled: true
-  loess_bandwidth: 0.3     # Fraction of data for local fits (0.2-0.5)
-  n_rt_bins: 10            # Bins for stratified sampling
-  peptides_per_bin: 100    # Peptides to sample per bin
-  min_calibration_points: 50
-  rt_tolerance_factor: 3.0 # Multiplier for residual SD
+  loess_bandwidth: 0.3        # Fraction of data for local fits (0.2-0.5)
+  min_calibration_points: 200
+  rt_tolerance_factor: 3.0    # Multiplier for residual SD
   fallback_rt_tolerance: 2.0  # Used if calibration fails
 
 # FDR control
@@ -261,9 +256,6 @@ Options:
 
       --no-rt-calibration
           Disable RT calibration (use fixed rt_tolerance instead)
-
-      --max-candidates <N>
-          Maximum candidates per spectrum (use 0 for unlimited) [default: 5250]
 
       --run-fdr <THRESHOLD>
           Run-level FDR threshold [default: 0.01]
@@ -382,7 +374,11 @@ This ensures consistent quantification across replicates by aligning peak bounda
 
 ### Disk-Backed Memory Architecture
 
-Osprey uses per-file Parquet caching to scale to 1000+ file experiments without running out of memory. After scoring each file, the full scored entries are written to ZSTD-compressed Parquet caches and replaced in memory with lightweight FdrEntry stubs (~80 bytes each). Heavy data (features, fragments, CWT candidates) is reloaded on-demand from disk only when needed. Peptide sequence strings are deduplicated using `Arc<str>` interning across files. See [Pipeline Overview](docs/README.md) for memory architecture details.
+Osprey uses per-file Parquet caching to scale to 1000+ file experiments without running out of memory. After scoring each file, the full scored entries are written to ZSTD-compressed Parquet caches and replaced in memory with lightweight FdrEntry stubs (~80 bytes each). Heavy data (features, fragments, CWT candidates) is reloaded on-demand from disk only when needed. Peptide sequence strings are deduplicated using `Arc<str>` interning across files.
+
+Each Parquet cache stores SHA-256 hashes of search parameters, library identity, and reconciliation state in its file metadata. On subsequent runs, Osprey validates these hashes and automatically invalidates stale caches when parameters change. SVM discriminant scores from Percolator are persisted in lightweight sidecar files, enabling Osprey to skip SVM training entirely on reruns with matching parameters.
+
+See [Pipeline Overview](docs/README.md) for memory architecture details and [Intermediate File Formats](docs/12-intermediate-files.md) for cache file documentation.
 
 ## Development
 
@@ -443,8 +439,11 @@ cargo doc --open
 - Cross-run peak reconciliation: aligns integration boundaries across replicates using consensus RTs
 - Multi-file observation propagation: all per-file observations for passing precursors included in output
 - Disk-backed memory architecture with per-file Parquet caching for 1000+ file experiments
+- Intelligent cache invalidation via SHA-256 parameter hashing in Parquet metadata
+- FDR score sidecar caching — skips Percolator SVM training on reruns with same parameters
+- Streaming blib output via lightweight plan entries — avoids loading full entries into memory
 - Binary spectra cache for faster second-pass mzML loading
-- Fragment co-elution scoring, elution-weighted cosine
+- Fragment co-elution scoring
 - Mass accuracy features (ppm-level)
 - MS1 isotope envelope and precursor co-elution features
 - blib output with Osprey extension tables (library theoretical fragments)
