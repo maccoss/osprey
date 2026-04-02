@@ -2493,11 +2493,14 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         && config.fdr_method != FdrMethod::Simple;
 
     if can_skip_fdr {
-        // SVM scores loaded from sidecars — just recompute q-values
+        // SVM scores loaded from sidecars — recompute q-values using two-pass FDR
+        // (must match the structure of the real pipeline: first-pass unrestricted,
+        // then second-pass restricted to first-pass passing precursors)
         log::info!("");
         log::info!(
             "SVM scores loaded from cache. Recomputing q-values (skipping Percolator training)..."
         );
+        // First-pass: compute q-values on all entries
         percolator::compute_fdr_from_stubs(&mut per_file_entries, config.run_fdr, None);
     } else {
         // Dispatch FDR control based on method
@@ -2572,6 +2575,16 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     if can_skip_fdr {
         log::info!("");
         log::info!("=== Skipping reconciliation (already complete with matching parameters) ===");
+        // Second-pass FDR: restrict to first-pass passing precursors (same as real pipeline)
+        log::info!(
+            "Recomputing second-pass q-values on {} first-pass precursors + paired decoys...",
+            first_pass_base_ids.len(),
+        );
+        percolator::compute_fdr_from_stubs(
+            &mut per_file_entries,
+            config.run_fdr,
+            Some(&first_pass_base_ids),
+        );
     } else {
         use crate::reconciliation::{
             compute_consensus_rts, identify_gap_fill_targets, plan_reconciliation,
