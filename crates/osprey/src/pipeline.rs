@@ -3154,8 +3154,16 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     }
                 }
             }
+        }
+    }
 
-            // Persist second-pass SVM scores to sidecar files
+    // Persist second-pass SVM scores to sidecar files (after reconciliation block closes,
+    // freeing temporary allocations from Percolator feature loading)
+    if !can_skip_fdr {
+        // Check if 2nd-pass actually ran (reconciliation produced re-scored entries)
+        // by checking if a 1st-pass sidecar exists — if so, 2nd-pass scores are different
+        let has_reconciliation = config.reconciliation.enabled && config.input_files.len() > 1;
+        if has_reconciliation {
             log::info!("Persisting 2nd-pass FDR scores...");
             persist_fdr_scores(
                 &per_file_entries,
