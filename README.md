@@ -405,10 +405,15 @@ osprey/
 - **osprey-fdr**: `FdrController`, `MokapotRunner`
 - **osprey-ml**: `LinearSvmClassifier`, `PepEstimator`
 
-### Running tests
+### Build and test
+
+A Makefile provides convenience targets that run formatting and linting before each step:
 
 ```bash
-cargo test
+make check    # Format and lint (cargo fmt + clippy)
+make test     # Format, lint, and run tests
+make build    # Format, lint, and build release
+make install  # Format, lint, build release, and install
 ```
 
 ### Building documentation
