@@ -17,7 +17,15 @@ const VERSION: u32 = 1;
 
 /// Save library entries to a binary cache file.
 pub fn save_library_cache(entries: &[LibraryEntry], path: &Path) -> Result<()> {
-    let file = std::fs::File::create(path).map_err(|e| {
+    // Write to local temp dir first, then copy to final destination.
+    let tmp_path = std::env::temp_dir().join(format!(
+        "osprey_{}_{}",
+        std::process::id(),
+        path.file_name()
+            .unwrap_or(std::ffi::OsStr::new("library.libcache"))
+            .to_string_lossy()
+    ));
+    let file = std::fs::File::create(&tmp_path).map_err(|e| {
         OspreyError::LibraryLoadError(format!("Failed to create cache file: {}", e))
     })?;
     let mut w = BufWriter::new(file);
@@ -98,6 +106,9 @@ pub fn save_library_cache(entries: &[LibraryEntry], path: &Path) -> Result<()> {
     }
 
     w.flush().map_err(write_err)?;
+    drop(w);
+
+    osprey_core::copy_and_verify(&tmp_path, path)?;
     Ok(())
 }
 

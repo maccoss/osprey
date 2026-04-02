@@ -115,7 +115,10 @@
       "WebFetch(domain:pubs.acs.org)",
       "Bash(git merge:*)",
       "Bash(gh auth status:*)",
-      "Bash(git mv:*)"
+      "Bash(git mv:*)",
+      "Bash(git -C /mnt/d/GitHub-Repo/maccoss/osprey config --global --list)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ],
     "additionalDirectories": [
       "/mnt/c/Users/macco/Documents/github/maccoss/osprey/example_test_data/astral"

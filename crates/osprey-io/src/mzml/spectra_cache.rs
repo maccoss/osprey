@@ -31,9 +31,14 @@ const VERSION: u32 = 1;
 
 /// Save spectra to a binary cache file for fast reload.
 pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Index) -> Result<()> {
-    // Write to temp file first, then rename atomically to prevent
-    // 0-byte/corrupt files if the process is killed mid-write.
-    let tmp_path = path.with_extension("bin.tmp");
+    // Write to local temp dir first, then copy to final destination.
+    let tmp_path = std::env::temp_dir().join(format!(
+        "osprey_{}_{}",
+        std::process::id(),
+        path.file_name()
+            .unwrap_or(std::ffi::OsStr::new("spectra.bin"))
+            .to_string_lossy()
+    ));
     let file = File::create(&tmp_path).map_err(|e| {
         OspreyError::IoError(std::io::Error::other(format!(
             "Failed to create spectra cache '{}': {}",
@@ -98,16 +103,9 @@ pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Inde
     }
 
     w.flush().map_err(write_err)?;
-    drop(w); // close file before rename
+    drop(w);
 
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        OspreyError::IoError(std::io::Error::other(format!(
-            "Failed to rename '{}' to '{}': {}",
-            tmp_path.display(),
-            path.display(),
-            e
-        )))
-    })?;
+    osprey_core::copy_and_verify(&tmp_path, path)?;
     Ok(())
 }
 

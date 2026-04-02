@@ -27,9 +27,15 @@ use std::path::Path;
 ///     .expect("Failed to save calibration");
 /// ```
 pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> Result<()> {
-    // Write to temp file first, then rename atomically to prevent
-    // 0-byte/corrupt files if the process is killed mid-write.
-    let tmp_path = output_path.with_extension("json.tmp");
+    // Write to local temp dir first, then copy to final destination.
+    let tmp_path = std::env::temp_dir().join(format!(
+        "osprey_{}_{}",
+        std::process::id(),
+        output_path
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("calibration.json"))
+            .to_string_lossy()
+    ));
     let file = File::create(&tmp_path).map_err(|e| {
         osprey_core::OspreyError::OutputError(format!(
             "Failed to create calibration file {}: {}",
@@ -47,15 +53,7 @@ pub fn save_calibration(calibration: &CalibrationParams, output_path: &Path) -> 
         ))
     })?;
 
-    std::fs::rename(&tmp_path, output_path).map_err(|e| {
-        osprey_core::OspreyError::OutputError(format!(
-            "Failed to rename '{}' to '{}': {}",
-            tmp_path.display(),
-            output_path.display(),
-            e
-        ))
-    })?;
-
+    osprey_core::copy_and_verify(&tmp_path, output_path)?;
     log::info!("Saved calibration to: {}", output_path.display());
 
     Ok(())

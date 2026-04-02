@@ -100,7 +100,9 @@ PHASE 5: CROSS-RUN RECONCILIATION (multi-file only)
   |
   v
 OUTPUT
-  +- Reload full entries from Parquet only for files with FDR-passing precursors
+  +- Persist SVM scores to sidecar files (.1st-pass.fdr_scores.bin, .2nd-pass.fdr_scores.bin)
+  +- Load lightweight BlibPlanEntry (~96 bytes) from 5-column Parquet projection
+  +- Look up fragments, modifications, proteins from in-memory library (no full entry reload)
   +- BiblioSpec (.blib) for Skyline (library theoretical fragments)
   +- SVM/Mokapot model weights for feature analysis
 ```
@@ -261,9 +263,15 @@ For multi-file experiments (100s–1000s of files), Osprey uses a disk-backed me
    - **FDR**: Loads PIN feature columns to build `PercolatorEntry` for SVM scoring
    - **Reconciliation**: Loads CWT candidates only via `load_cwt_candidates_from_parquet()`
    - **Re-scoring**: Loads full entries per file sequentially (not parallel) to limit memory — each file loads ~3 GB (spectra + full Parquet entries)
-   - **Output**: Loads full entries only for files containing FDR-passing precursors
+   - **Output**: Loads a 5-column Parquet projection into `BlibPlanEntry` (~96 bytes each) — fragments and metadata are looked up from the in-memory library rather than reloading full entries
 
-This reduces steady-state memory from ~45 GB (200K entries × 240 files × 940 bytes) to ~4 GB (200K × 240 × 80 bytes), enabling experiments with 1000+ files on standard hardware.
+4. **Score sidecar caching**: After Percolator FDR, SVM discriminant scores are persisted to lightweight binary sidecar files (`.1st-pass.fdr_scores.bin`, `.2nd-pass.fdr_scores.bin`). On rerun with matching parameters, these scores are loaded with the stubs, allowing Osprey to skip Percolator SVM training entirely and just recompute q-values.
+
+5. **Cache invalidation**: Each Parquet file stores SHA-256 hashes of search parameters, library identity, and reconciliation parameters in its footer metadata. On rerun, stale caches (mismatched parameters, different library, version upgrade) are automatically detected, deleted, and re-scored.
+
+This reduces steady-state memory from ~45 GB (200K entries × 240 files × 940 bytes) to ~4 GB (200K × 240 × 80 bytes), enabling experiments with 1000+ files on standard hardware. The blib output phase uses only ~5 GB (BlibPlanEntry + library) instead of ~22 GB (full entries).
+
+See [Intermediate File Formats](12-intermediate-files.md) for complete documentation of cache files, metadata hashing, memory tiers, and the skip-Percolator optimization.
 
 See [FDR Control](07-fdr-control.md) for full algorithm details, fold assignment, and the target-decoy competition strategy.
 
@@ -394,7 +402,7 @@ See: [FDR Control](07-fdr-control.md)
 | **Method** | Co-elution search + LDA | Coelution search |
 | **Features** | 4 LDA features | 21 PIN features |
 | **FDR method** | Target-decoy on LDA score | Semi-supervised SVM (Percolator/Mokapot) |
-| **Scope** | First file only, wide tolerance | All files, tight calibrated tolerance |
+| **Scope** | Per file, wide tolerance | All files, tight calibrated tolerance |
 
 ---
 

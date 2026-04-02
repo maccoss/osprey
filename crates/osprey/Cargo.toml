@@ -34,6 +34,7 @@ chrono = { workspace = true }
 pathdiff = "0.2"
 arrow = { workspace = true }
 parquet = { workspace = true }
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

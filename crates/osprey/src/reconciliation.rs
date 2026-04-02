@@ -99,13 +99,18 @@ pub fn compute_consensus_rts(
         decoy_peptides.len()
     );
 
-    // Collect all detections for consensus peptides (targets and decoys)
+    // Collect detections for consensus peptides.
+    // For targets: only include detections that pass run-level FDR in that replicate.
+    // This ensures the consensus RT and peak width are computed from actual good
+    // detections, not noise peaks in replicates where the peptide wasn't confidently found.
+    // For decoys: include all (paired to passing targets for reconciliation planning).
     for (file_name, entries) in per_file_entries {
         for entry in entries {
             let include = if entry.is_decoy {
                 decoy_peptides.contains(&*entry.modified_sequence)
             } else {
                 target_peptides.contains(&*entry.modified_sequence)
+                    && entry.run_qvalue <= consensus_fdr
             };
 
             if include {
@@ -133,14 +138,17 @@ pub fn compute_consensus_rts(
 
         // Map each detection's apex_rt to library RT space
         let mut library_rt_weights: Vec<(f64, f64)> = Vec::new();
-        let mut peak_widths: Vec<f64> = Vec::new();
+        let mut peak_width_weights: Vec<(f64, f64)> = Vec::new();
 
         for (file_name, apex_rt, coelution_sum, peak_width) in dets {
             if let Some(cal) = per_file_calibrations.get(file_name) {
                 let library_rt = cal.inverse_predict(*apex_rt);
                 if library_rt.is_finite() && *coelution_sum > 0.0 {
                     library_rt_weights.push((library_rt, *coelution_sum));
-                    peak_widths.push(*peak_width);
+                    // Weight peak widths by coelution_sum so high-quality detections
+                    // dominate — avoids noisy detections with wide fallback peaks
+                    // inflating the median_peak_width used for forced integration
+                    peak_width_weights.push((*peak_width, *coelution_sum));
                 }
             }
         }
@@ -150,7 +158,7 @@ pub fn compute_consensus_rts(
         }
 
         let consensus_library_rt = weighted_median(&library_rt_weights);
-        let median_peak_width = simple_median(&peak_widths);
+        let median_peak_width = weighted_median(&peak_width_weights);
         let n_runs_detected = library_rt_weights.len();
 
         consensus.push(PeptideConsensusRT {
@@ -645,21 +653,6 @@ fn weighted_median(pairs: &[(f64, f64)]) -> f64 {
     sorted.last().unwrap().0
 }
 
-/// Simple median of a slice.
-fn simple_median(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let n = sorted.len();
-    if n % 2 == 0 {
-        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
-    } else {
-        sorted[n / 2]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,16 +726,6 @@ mod tests {
             "Weighted median should be ~10.0 with heavy weight there, got {}",
             result
         );
-    }
-
-    #[test]
-    fn test_simple_median_odd() {
-        assert!((simple_median(&[3.0, 1.0, 2.0]) - 2.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_simple_median_even() {
-        assert!((simple_median(&[1.0, 2.0, 3.0, 4.0]) - 2.5).abs() < 1e-10);
     }
 
     #[test]
@@ -1013,6 +996,54 @@ mod tests {
             "Consensus RT {} should be near 15.0, not pulled by outlier",
             target.consensus_library_rt
         );
+    }
+
+    #[test]
+    fn test_consensus_peak_width_excludes_non_passing_detections() {
+        // 2 good detections (pass FDR, narrow 0.2 min peaks)
+        // + 1 bad detection (fails FDR with run_qvalue=0.05, wide 2.0 min peak)
+        // The bad detection should be excluded from consensus entirely,
+        // so median_peak_width should be ~0.2, not influenced by the 2.0 min peak.
+        let cal = make_identity_calibration();
+        let per_file_calibrations: HashMap<String, RTCalibration> = vec![
+            ("file1".to_string(), cal.clone()),
+            ("file2".to_string(), cal.clone()),
+            ("file3".to_string(), cal),
+        ]
+        .into_iter()
+        .collect();
+
+        let per_file_entries = vec![
+            (
+                "file1".to_string(),
+                vec![make_fdr_entry(
+                    1, "PEPTIDEK", 2, false, 15.0, 14.9, 15.1, 100.0, 0.005,
+                )], // width 0.2, passes FDR
+            ),
+            (
+                "file2".to_string(),
+                vec![make_fdr_entry(
+                    1, "PEPTIDEK", 2, false, 15.1, 15.0, 15.2, 90.0, 0.008,
+                )], // width 0.2, passes FDR
+            ),
+            (
+                "file3".to_string(),
+                vec![make_fdr_entry(
+                    1, "PEPTIDEK", 2, false, 15.0, 14.0, 16.0, 2.0, 0.05,
+                )], // width 2.0, FAILS FDR (run_qvalue=0.05 > consensus_fdr=0.01)
+            ),
+        ];
+
+        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01);
+        let target = consensus.iter().find(|c| !c.is_decoy).unwrap();
+        // Bad detection excluded — only 0.2 min peaks contribute
+        assert!(
+            target.median_peak_width < 0.3,
+            "Peak width {} should be ~0.2 min (bad detection excluded by FDR filter)",
+            target.median_peak_width
+        );
+        // Only 2 runs should contribute to the consensus
+        assert_eq!(target.n_runs_detected, 2, "Only 2 runs pass FDR, not 3");
     }
 
     // ---- plan_reconciliation tests ----

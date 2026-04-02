@@ -7,6 +7,7 @@
 
 use crate::{OspreyError, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -276,6 +277,140 @@ n_threads: 0  # 0 = auto-detect
         if args.write_pin {
             self.write_pin = true;
         }
+    }
+
+    /// Compute SHA-256 hash of parameters that affect first-pass scoring.
+    /// If this hash changes, cached .scores.parquet files are invalid.
+    pub fn search_parameter_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(format!("resolution_mode:{:?}\n", self.resolution_mode).as_bytes());
+        hasher.update(
+            format!(
+                "fragment_tolerance:{},{:?}\n",
+                self.fragment_tolerance.tolerance, self.fragment_tolerance.unit
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!(
+                "precursor_tolerance:{},{:?}\n",
+                self.precursor_tolerance.tolerance, self.precursor_tolerance.unit
+            )
+            .as_bytes(),
+        );
+        hasher.update(format!("prefilter_enabled:{}\n", self.prefilter_enabled).as_bytes());
+        hasher.update(format!("decoy_method:{:?}\n", self.decoy_method).as_bytes());
+        hasher.update(format!("decoys_in_library:{}\n", self.decoys_in_library).as_bytes());
+        hasher.update(format!("rt_cal.enabled:{}\n", self.rt_calibration.enabled).as_bytes());
+        hasher.update(
+            format!(
+                "rt_cal.fallback_rt_tolerance:{}\n",
+                self.rt_calibration.fallback_rt_tolerance
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!(
+                "rt_cal.rt_tolerance_factor:{}\n",
+                self.rt_calibration.rt_tolerance_factor
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!(
+                "rt_cal.min_rt_tolerance:{}\n",
+                self.rt_calibration.min_rt_tolerance
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!(
+                "rt_cal.max_rt_tolerance:{}\n",
+                self.rt_calibration.max_rt_tolerance
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!(
+                "rt_cal.loess_bandwidth:{}\n",
+                self.rt_calibration.loess_bandwidth
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!(
+                "rt_cal.min_calibration_points:{}\n",
+                self.rt_calibration.min_calibration_points
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!(
+                "rt_cal.calibration_sample_size:{}\n",
+                self.rt_calibration.calibration_sample_size
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!(
+                "rt_cal.calibration_retry_factor:{}\n",
+                self.rt_calibration.calibration_retry_factor
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!(
+                "reconciliation.top_n_peaks:{}\n",
+                self.reconciliation.top_n_peaks
+            )
+            .as_bytes(),
+        );
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Compute a fast identity hash for the library file (path + size + mtime).
+    /// Uses filesystem metadata only — no content hashing.
+    pub fn library_identity_hash(&self) -> String {
+        let lib_path = self.library_source.path();
+        let mut hasher = Sha256::new();
+        hasher.update(format!("path:{}\n", lib_path.display()).as_bytes());
+        if let Ok(meta) = std::fs::metadata(lib_path) {
+            hasher.update(format!("size:{}\n", meta.len()).as_bytes());
+            if let Ok(mtime) = meta.modified() {
+                hasher.update(format!("mtime:{:?}\n", mtime).as_bytes());
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Compute SHA-256 hash of parameters that affect reconciliation.
+    /// Includes the search hash (if search changed, reconciliation is also invalid).
+    pub fn reconciliation_parameter_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.search_parameter_hash().as_bytes());
+        hasher
+            .update(format!("reconciliation.enabled:{}\n", self.reconciliation.enabled).as_bytes());
+        hasher.update(
+            format!(
+                "reconciliation.consensus_fdr:{}\n",
+                self.reconciliation.consensus_fdr
+            )
+            .as_bytes(),
+        );
+        hasher.update(format!("run_fdr:{}\n", self.run_fdr).as_bytes());
+        // File set affects consensus RTs
+        let mut stems: Vec<String> = self
+            .input_files
+            .iter()
+            .filter_map(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        stems.sort();
+        hasher.update(format!("file_stems:{:?}\n", stems).as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 }
 
@@ -835,5 +970,41 @@ mod tests {
         // Default should be 10 ppm for HRAM
         assert_eq!(config.tolerance, 10.0);
         assert_eq!(config.unit, ToleranceUnit::Ppm);
+    }
+
+    #[test]
+    fn test_search_hash_deterministic() {
+        let config = OspreyConfig::default();
+        let hash1 = config.search_parameter_hash();
+        let hash2 = config.search_parameter_hash();
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 64); // SHA-256 hex is 64 chars
+    }
+
+    #[test]
+    fn test_search_hash_changes_with_tolerance() {
+        let mut config = OspreyConfig::default();
+        let hash1 = config.search_parameter_hash();
+        config.fragment_tolerance.tolerance = 20.0;
+        let hash2 = config.search_parameter_hash();
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_reconciliation_hash_includes_search_hash() {
+        let mut config = OspreyConfig::default();
+        let recon1 = config.reconciliation_parameter_hash();
+        config.fragment_tolerance.tolerance = 20.0;
+        let recon2 = config.reconciliation_parameter_hash();
+        assert_ne!(recon1, recon2); // search change propagates
+    }
+
+    #[test]
+    fn test_reconciliation_hash_changes_with_consensus_fdr() {
+        let mut config = OspreyConfig::default();
+        let hash1 = config.reconciliation_parameter_hash();
+        config.reconciliation.consensus_fdr = 0.05;
+        let hash2 = config.reconciliation_parameter_hash();
+        assert_ne!(hash1, hash2);
     }
 }

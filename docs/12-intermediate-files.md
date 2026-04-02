@@ -1,6 +1,6 @@
 # 12 - Intermediate File Formats
 
-Osprey produces several intermediate files during analysis. These files enable fast re-loading, disk-backed memory management, and calibration reuse across runs. All intermediate files are written alongside the input mzML files.
+Osprey produces several intermediate files during analysis. These files enable fast re-loading, disk-backed memory management, calibration reuse, and intelligent cache invalidation across runs. All intermediate files are written alongside the input mzML files.
 
 ## File Overview
 
@@ -8,7 +8,9 @@ Osprey produces several intermediate files during analysis. These files enable f
 |---|---|---|---|---|
 | `*.calibration.json` | JSON | RT and mass calibration parameters | 5–50 KB | Yes (across runs with same LC-MS setup) |
 | `*.spectra.bin` | Custom binary | Decoded spectra for fast reload | 2–5 GB (larger than mzML) | Auto-created on first run |
-| `*.scores.parquet` | Apache Parquet (ZSTD) | Full scored entries with features, fragments, CWT candidates | 100 MB–2 GB | Per-run, deleted after pipeline |
+| `*.scores.parquet` | Apache Parquet (ZSTD) | Full scored entries with features, fragments, CWT candidates | 100 MB–2 GB | Validated via parameter hash |
+| `*.1st-pass.fdr_scores.bin` | Raw binary (f64 LE) | SVM discriminant scores after first-pass Percolator | ~9 MB per file | Enables skipping Percolator on rerun |
+| `*.2nd-pass.fdr_scores.bin` | Raw binary (f64 LE) | SVM discriminant scores after second-pass Percolator | ~9 MB per file | Enables skipping Percolator on rerun |
 | `*.blib` | SQLite (BiblioSpec) | Final output for Skyline | 50–500 MB | N/A (output) |
 
 ---
@@ -204,7 +206,38 @@ Osprey never loads the full Parquet unless needed. Four specialized loaders read
 | `load_fdr_stubs_from_parquet()` | 9 identity + boundary columns | Convert to lightweight `FdrEntry` stubs for FDR |
 | `load_pin_features_from_parquet()` | 21 feature columns + `entry_id` | SVM re-scoring with trained model |
 | `load_cwt_candidates_from_parquet()` | `entry_id`, `cwt_candidates` | Reconciliation planning (peak candidates) |
-| `load_scores_parquet()` | All ~40 columns | Full entry rehydration for blib output |
+| `load_blib_plan_entries()` | 5 columns (entry_id, apex_rt, start_rt, end_rt, bounds_area) | Lightweight plan for streaming blib output |
+| `load_scores_parquet()` | All ~40 columns | Full entry rehydration (Parquet report only) |
+
+### Cache Invalidation via Parquet Metadata
+
+Each `.scores.parquet` file stores key-value metadata in its footer that enables intelligent cache reuse on subsequent runs. Osprey checks this metadata before accepting a cached file.
+
+**Metadata keys stored in every Parquet file:**
+
+| Key | Value | Purpose |
+|---|---|---|
+| `osprey.version` | Osprey binary version (e.g., `0.1.0`) | Version upgrade invalidates cache (feature set may change) |
+| `osprey.search_hash` | SHA-256 hex string | Hash of all search parameters that affect scoring |
+| `osprey.library_hash` | SHA-256 hex string | Hash of library file path + size + modification time |
+| `osprey.reconciled` | `"true"` or `"false"` | Whether this file has been through reconciliation |
+| `osprey.reconciliation_hash` | SHA-256 hex string (when reconciled) | Hash of reconciliation parameters + file set |
+
+**Search parameter hash includes**: resolution mode, fragment/precursor tolerance (value + unit), prefilter setting, decoy method, all RT calibration parameters (bandwidth, tolerance factor, min/max tolerance, sample size, retry factor), and `reconciliation.top_n_peaks`.
+
+**Library identity hash uses**: file path + file size + filesystem modification time (fast metadata check, no content hashing).
+
+**Reconciliation parameter hash includes**: the search hash (if search changed, reconciliation is also invalid), `reconciliation.enabled`, `reconciliation.consensus_fdr`, `run_fdr`, and sorted input file stems (changing the file set changes consensus RTs).
+
+**Cache validity states:**
+
+| State | Condition | Action |
+|---|---|---|
+| `ValidReconciled` | All hashes match, reconciled=true | Skip scoring, FDR, and reconciliation |
+| `ValidFirstPass` | Search + library hashes match, not reconciled | Skip scoring; run FDR and reconciliation |
+| `Stale` | Any hash mismatch or missing metadata | Delete cache and re-score from scratch |
+
+Pre-existing Parquet files without metadata (from older Osprey versions) are treated as `Stale` and automatically re-scored.
 
 ### Inspection
 
@@ -214,13 +247,98 @@ python -c "import pyarrow.parquet as pq; print(pq.read_schema('sample.scores.par
 
 # Read into pandas
 python -c "import pandas as pd; df = pd.read_parquet('sample.scores.parquet'); print(df.shape); print(df.columns.tolist())"
+
+# View cache metadata
+python -c "import pyarrow.parquet as pq; print(pq.read_metadata('sample.scores.parquet').metadata)"
 ```
 
 ---
 
-## 4. BiblioSpec Output (`*.blib`)
+## 4. FDR Score Sidecars (`*.1st-pass.fdr_scores.bin`, `*.2nd-pass.fdr_scores.bin`)
+
+**Source**: `crates/osprey/src/pipeline.rs` (`write_fdr_scores_sidecar()`, `load_fdr_scores_sidecar()`)
+
+Lightweight binary files that persist the SVM discriminant scores from Percolator training. These files enable skipping the expensive Percolator SVM training and scoring step on subsequent runs with the same parameters.
+
+### Why Two Passes?
+
+Osprey runs Percolator twice in a multi-file experiment:
+
+1. **First-pass FDR** (after initial scoring): Trains SVM on all entries, produces run-level q-values used to identify passing precursors for reconciliation.
+2. **Second-pass FDR** (after reconciliation): Retrains SVM restricted to first-pass passing precursors + paired decoys, incorporating re-scored reconciliation entries for final q-values.
+
+Each pass produces different SVM scores, so both are persisted independently.
+
+### Format
+
+Raw little-endian `f64` array, one value per entry, in Parquet row order:
+
+```text
+[f64 score_0][f64 score_1][f64 score_2]...[f64 score_N-1]
+```
+
+- **Entry count**: Must exactly match the number of entries in the corresponding `.scores.parquet`
+- **Byte size**: `N_entries × 8 bytes` (e.g., 1.1M entries = ~9 MB)
+- **Validation**: On load, the file size is checked against `entries.len() * 8`. Mismatches are silently ignored (scores will be recomputed).
+
+### When Created/Used
+
+- **Written**: After each Percolator FDR pass completes (first-pass after Phase 4, second-pass after Phase 5 reconciliation)
+- **Loaded**: On subsequent runs, during stub loading from cached Parquet. The second-pass sidecar is preferred; the first-pass sidecar is used as fallback.
+- **Safe to delete**: Yes — Percolator will retrain on next run
+
+### Skip-Percolator Optimization
+
+When all of the following conditions are met, Osprey skips both Percolator training passes entirely:
+
+1. All files loaded stubs from cached Parquet (no fresh scoring)
+2. All files have SVM scores loaded from sidecars
+3. All files are `ValidReconciled` (or reconciliation is disabled / single file)
+
+In this fast path, Osprey runs only `compute_fdr_from_stubs()` — target-decoy competition and PEP estimation on the existing scores — which takes seconds instead of minutes.
+
+---
+
+## 5. BiblioSpec Output (`*.blib`)
 
 The final output file in SQLite BiblioSpec format. See [08 - BiblioSpec Output Schema](08-blib-output-schema.md) for complete documentation of the schema, Osprey extension tables, and Skyline integration.
+
+---
+
+## Memory Architecture
+
+Osprey uses a tiered memory strategy to process experiments with hundreds of files without running out of memory. Each tier uses progressively lighter data structures, loading heavy data only when needed.
+
+### Tier 1: Full Scored Entries (~940 bytes each)
+
+`CoelutionScoredEntry` contains all scored data: 21 PIN features, fragment m/z and intensities, reference XIC, CWT candidates, peak boundaries, and metadata. These exist in memory only during per-file scoring (Phase 3) and are immediately written to Parquet and replaced with stubs.
+
+### Tier 2: FDR Stubs (~80 bytes each)
+
+`FdrEntry` retains only the 13 fields needed for FDR control: entry_id, is_decoy, charge, scan_number, apex/start/end RT, coelution_sum, score, q-values, pep, and an `Arc<str>`-interned modified_sequence. These stubs remain in memory for all files throughout the FDR and reconciliation phases.
+
+For a 240-file experiment with 1.1M entries per file: `240 × 1.1M × 80 bytes ≈ 21 GB`
+
+### Tier 3: Lightweight FDR Data (~48 bytes each)
+
+`LightFdr` extracts only q-values, score, pep, charge, and modified_sequence from the FDR stubs. Created right before blib output to free the heavier FDR stubs (~19 GB) from memory.
+
+### Tier 4: Blib Plan Entries (~96 bytes each)
+
+`BlibPlanEntry` contains only the fields needed for blib output: entry_id (for library lookup), charge, file_name_idx, q-values, RT boundaries, bounds_area, and interned modified_sequence. These are loaded from a 5-column Parquet projection merged with LightFdr data.
+
+For 24M passing entries: `24M × 96 bytes ≈ 2.3 GB` (vs 22 GB if full entries were loaded).
+
+Fragment m/z, intensities, modifications, and protein mappings are looked up from the in-memory library (via entry_id) rather than reloaded from Parquet. This eliminates the need to load any full `CoelutionScoredEntry` for blib output.
+
+### Memory Flow (240-file experiment)
+
+| Phase | In Memory | Peak RAM |
+|---|---|---|
+| Scoring (per file) | 1 file's spectra + full entries | ~3-5 GB |
+| FDR (all files) | FDR stubs for all files | ~21 GB |
+| Reconciliation | FDR stubs + 1 file's spectra | ~24 GB |
+| Blib output | LightFdr + BlibPlanEntry + library | ~5 GB |
 
 ---
 
@@ -231,12 +349,16 @@ All intermediate files can be safely deleted. They will be recreated on the next
 ```bash
 # Remove all intermediate files for a sample
 rm -f sample.spectra.bin sample.scores.parquet
+rm -f sample.1st-pass.fdr_scores.bin sample.2nd-pass.fdr_scores.bin
 
 # Remove calibration (forces recalibration on next run)
 rm -f sample.calibration.json
 
 # Remove all intermediates in a directory
-rm -f *.spectra.bin *.scores.parquet
+rm -f *.spectra.bin *.scores.parquet *.fdr_scores.bin
+
+# Remove everything (forces full re-analysis)
+rm -f *.spectra.bin *.scores.parquet *.fdr_scores.bin *.calibration.json
 ```
 
-The `.calibration.json` files are small and worth keeping if you plan to re-run with the same LC-MS setup, since they skip the calibration phase entirely.
+The `.calibration.json` files are small and worth keeping if you plan to re-run with the same LC-MS setup, since they skip the calibration phase entirely. The `.scores.parquet` and `.fdr_scores.bin` files are worth keeping if re-running with the same parameters, as they enable skipping scoring, FDR training, and reconciliation.
