@@ -1,0 +1,2 @@
+# Mark Jupyter notebooks as generated so they don't skew GitHub language stats
+notebooks/*.ipynb linguist-generated
