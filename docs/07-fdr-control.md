@@ -501,10 +501,116 @@ If FDR results are significantly higher than expected:
 2. For mokapot: ensure pre-competition is running before PIN writing
 3. Check that the best separating feature has high ROC AUC (logged at competition time)
 
+## FDR Filtering Level
+
+Osprey computes q-values at both precursor level (modified_sequence + charge) and peptide level (modified_sequence only), at both run and experiment scope. The `fdr_level` setting controls which level is used for output filtering.
+
+### Configuration
+
+CLI: `--fdr-level <precursor|peptide|both>`
+
+YAML:
+
+```yaml
+fdr_level: Both  # default
+```
+
+### Modes
+
+| Mode | Filter applied | Description |
+|------|---------------|-------------|
+| `Precursor` | precursor q-value only | Filters on modified_sequence + charge. Less conservative. |
+| `Peptide` | peptide q-value only | Filters on modified_sequence (ignoring charge). |
+| `Both` (default) | max(precursor, peptide) | A precursor must pass at both levels. Most conservative. |
+
+The `Both` mode is the most conservative and matches the behavior of Percolator and Mokapot, which enforce dual precursor + peptide level FDR. Use `Precursor` if you want charge-state-specific filtering without the peptide-level constraint.
+
+### How q-values are stored
+
+Each `FdrEntry` stores six q-value fields:
+
+- `run_precursor_qvalue`, `run_peptide_qvalue`, `run_protein_qvalue`
+- `experiment_precursor_qvalue`, `experiment_peptide_qvalue`, `experiment_protein_qvalue`
+
+The `effective_run_qvalue(level)` and `effective_experiment_qvalue(level)` methods return the appropriate value based on the configured `fdr_level`.
+
+## Protein-Level FDR
+
+Osprey supports optional protein-level FDR control using native Rust protein parsimony and the picked-protein approach.
+
+### Configuration
+
+CLI:
+
+```bash
+# Enable protein FDR at 1%
+osprey -i *.mzML -l library.tsv -o results.blib --protein-fdr 0.01
+
+# With razor peptide assignment
+osprey -i *.mzML -l library.tsv -o results.blib --protein-fdr 0.01 --shared-peptides razor
+```
+
+YAML:
+
+```yaml
+protein_fdr: 0.01       # Enable protein-level FDR at 1%
+shared_peptides: All     # Options: All (default), Razor, Unique
+```
+
+When `protein_fdr` is not set (the default), protein-level FDR is disabled and all peptides passing precursor/peptide FDR are included in the output.
+
+### Protein Parsimony Algorithm
+
+Protein inference runs once on the spectral library at startup. Protein accessions come from `LibraryEntry.protein_ids` (loaded from DIA-NN TSV, elib, or blib libraries). No FASTA file is required.
+
+```
+Protein Parsimony Steps:
+  1. Build bipartite graph: peptide <-> protein from target library entries
+  2. Group proteins with identical peptide sets into protein groups
+  3. Subset elimination: remove groups whose peptides are a strict subset of another
+  4. Classify peptides as unique (1 group) or shared (2+ groups)
+  5. Apply shared peptide mode (All, Razor, or Unique)
+```
+
+### Shared Peptide Modes
+
+| Mode | Behavior | Use case |
+|------|----------|----------|
+| `All` (default) | Shared peptides contribute to all their protein groups. Each peptide inherits the best (lowest) protein q-value among its groups. | Maximum sensitivity. |
+| `Razor` | Shared peptides assigned exclusively to the protein group with the most unique peptides (tiebreak: lowest group ID). After assignment, treated as unique. | Balanced approach. Matches MaxQuant's razor peptide logic. |
+| `Unique` | Shared peptides excluded from protein scoring and output entirely. Only unique peptides are used. | Most conservative. |
+
+### Picked-Protein FDR
+
+After SVM scoring, protein-level FDR is computed using the picked-protein approach (Savitski et al., 2015; The and Kall, 2016):
+
+```
+Picked-Protein FDR Steps:
+  1. Find the best SVM score per peptide across all relevant files
+  2. Score each target protein group: best target peptide score
+  3. Score each decoy protein group: best decoy peptide score
+     (decoy proteins paired to targets via DECOY_ prefix stripping)
+  4. Picked competition: for each protein, target vs decoy -- higher score wins
+  5. Compute q-values via standard TDC on picked proteins
+  6. Propagate protein q-values to peptides (best q-value among groups)
+```
+
+Protein FDR is computed at both run level (per file) and experiment level (across all files), matching the structure of precursor/peptide FDR.
+
+### Decoy Protein Pairing
+
+Osprey's `DecoyGenerator` prefixes each decoy protein accession with `DECOY_` (e.g., target `P12345` becomes decoy `DECOY_P12345`). The picked-protein approach pairs target and decoy proteins by stripping this prefix, so each target protein group competes against its decoy counterpart.
+
+### Output Filtering with Protein FDR
+
+When `protein_fdr` is set, an additional filter is applied to the output: a precursor must belong to a protein group passing the protein-level FDR threshold. This filter is applied after precursor/peptide FDR filtering.
+
 ## References
 
-- Percolator: Käll L, Canterbury J, Weston J, Noble WS, MacCoss MJ. Nat Methods. 2007;4(11):923-925.
-- Score calibration: Granholm V, Noble WS, Käll L. BMC Bioinformatics. 2012;13 Suppl 16:S3.
+- Percolator: Kall L, Canterbury J, Weston J, Noble WS, MacCoss MJ. Nat Methods. 2007;4(11):923-925.
+- Score calibration: Granholm V, Noble WS, Kall L. BMC Bioinformatics. 2012;13 Suppl 16:S3.
 - Mokapot: Fondrie WE, Noble WS. J Proteome Res. 2021;20(4):1966-1971.
 - Target-decoy approach: Elias JE, Gygi SP. Nat Methods. 2007;4(3):207-214.
 - Conservative FDR: Levitsky LI, et al. J Proteome Res. 2017;16(2):689-694.
+- Picked protein FDR: Savitski MM, et al. Mol Cell Proteomics. 2015;14(9):2394-2404.
+- Picked protein group FDR: The M, Kall L. J Proteome Res. 2016;15(4):1456-1461.

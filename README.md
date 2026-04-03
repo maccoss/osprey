@@ -169,6 +169,12 @@ osprey -i sample.mzML -l library.tsv -o results.blib --fragment-tolerance 20
 
 # Unit resolution mode (uses Th/Dalton tolerances instead of ppm)
 osprey -i sample.mzML -l library.tsv -o results.blib --resolution unit
+
+# Filter output at precursor-level FDR only (less conservative than default)
+osprey -i sample.mzML -l library.tsv -o results.blib --fdr-level precursor
+
+# Enable protein-level FDR at 1% with razor peptide assignment
+osprey -i *.mzML -l library.tsv -o results.blib --protein-fdr 0.01 --shared-peptides razor
 ```
 
 ### Using configuration files
@@ -212,6 +218,11 @@ run_fdr: 0.01
 experiment_fdr: 0.01
 decoy_method: Reverse  # Options: Reverse, Shuffle, FromLibrary
 decoys_in_library: false
+fdr_level: Both         # Output filtering level: Precursor, Peptide, or Both (default)
+
+# Protein-level FDR (optional)
+# protein_fdr: 0.01    # Uncomment to enable protein-level FDR at 1%
+# shared_peptides: All  # How to handle shared peptides: All (default), Razor, or Unique
 ```
 
 ## Command-line Options
@@ -266,6 +277,24 @@ Options:
       --fdr-method <METHOD>
           FDR method: percolator (built-in SVM, default), mokapot (external Python),
           or simple (no ML) [default: percolator]
+
+      --fdr-level <LEVEL>
+          FDR filtering level for output: precursor, peptide, or both [default: both]
+          - precursor: filter on precursor-level q-values (peptide + charge)
+          - peptide: filter on peptide-level q-values (peptide sequence only)
+          - both: filter on max(precursor, peptide) q-values (most conservative)
+
+      --protein-fdr <THRESHOLD>
+          Protein-level FDR threshold. Enables protein parsimony and
+          picked-protein FDR. Only peptides from passing protein groups
+          are included in the output.
+
+      --shared-peptides <MODE>
+          How to handle peptides mapping to multiple protein groups: all, razor,
+          or unique [default: all]
+          - all: shared peptides contribute to all their protein groups
+          - razor: shared peptides assigned to the group with most unique peptides
+          - unique: only unique peptides used; shared peptides excluded
 
       --write-pin
           Write PIN files for external tools

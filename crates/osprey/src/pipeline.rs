@@ -44,11 +44,11 @@ use osprey_chromatography::{
 };
 use osprey_core::{
     CoelutionFeatureSet, CoelutionScoredEntry, CwtCandidate, DecoyMethod as CoreDecoyMethod,
-    FdrEntry, FdrMethod, FragmentToleranceConfig, LibraryEntry, LibraryFragment, MS1Spectrum,
-    OspreyConfig, OspreyError, Result, Spectrum, ToleranceUnit, XICPeakBounds,
+    FdrEntry, FdrLevel, FdrMethod, FragmentToleranceConfig, LibraryEntry, LibraryFragment,
+    MS1Spectrum, OspreyConfig, OspreyError, Result, Spectrum, ToleranceUnit, XICPeakBounds,
 };
 use osprey_fdr::{
-    get_pin_feature_names, percolator, pin_feature_value, MokapotRunner, NUM_PIN_FEATURES,
+    get_pin_feature_names, percolator, pin_feature_value, protein, MokapotRunner, NUM_PIN_FEATURES,
 };
 use osprey_io::{
     load_all_spectra, load_library, load_spectra_cache, save_spectra_cache, spectra_cache_path,
@@ -1567,8 +1567,12 @@ fn load_scores_parquet(path: &std::path::Path) -> Result<Vec<CoelutionScoredEntr
                 fragment_intensities: frag_ints,
                 reference_xic,
                 file_name: file_names.value(row).to_string(),
-                run_qvalue: 1.0,
-                experiment_qvalue: 1.0,
+                run_precursor_qvalue: 1.0,
+                run_peptide_qvalue: 1.0,
+                run_protein_qvalue: 1.0,
+                experiment_precursor_qvalue: 1.0,
+                experiment_peptide_qvalue: 1.0,
+                experiment_protein_qvalue: 1.0,
                 score: 0.0,
                 pep: 1.0,
                 cwt_candidates,
@@ -1886,8 +1890,12 @@ fn load_fdr_stubs_from_parquet(
                 end_rt: end_col.value(row),
                 coelution_sum: coelution_col.value(row),
                 score: 0.0,
-                run_qvalue: 1.0,
-                experiment_qvalue: 1.0,
+                run_precursor_qvalue: 1.0,
+                run_peptide_qvalue: 1.0,
+                run_protein_qvalue: 1.0,
+                experiment_precursor_qvalue: 1.0,
+                experiment_peptide_qvalue: 1.0,
+                experiment_protein_qvalue: 1.0,
                 pep: 1.0,
                 modified_sequence: intern_seq(seq_interner, modseq_col.value(row)),
             });
@@ -2044,8 +2052,12 @@ fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         lib_rt_b.append_value(0.0); // CoelutionScoredEntry doesn't store library RT
         scan_b.append_value(entry.scan_number);
         score_b.append_value(entry.score);
-        qval_b.append_value(entry.run_qvalue);
-        gqval_b.append_value(entry.experiment_qvalue);
+        qval_b.append_value(entry.run_precursor_qvalue.max(entry.run_peptide_qvalue));
+        gqval_b.append_value(
+            entry
+                .experiment_precursor_qvalue
+                .max(entry.experiment_peptide_qvalue),
+        );
         pep_b.append_value(entry.pep);
         mode_b.append_value("coelution");
 
@@ -2142,7 +2154,9 @@ fn write_scored_report_from_plan(
             entry.charge,
             entry.apex_rt,
             entry.bounds_area,
-            entry.experiment_qvalue,
+            entry
+                .experiment_precursor_qvalue
+                .max(entry.experiment_peptide_qvalue),
             entry.pep,
             entry.score
         )?;
@@ -2201,6 +2215,17 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         library.extend(decoys);
         log::info!("Total library size: {} (targets + decoys)", library.len());
     }
+
+    // Build protein parsimony from library (if protein FDR is enabled)
+    let protein_parsimony = if config.protein_fdr.is_some() {
+        log::info!("Building protein parsimony from library...");
+        Some(protein::build_protein_parsimony(
+            &library,
+            config.shared_peptides,
+        ))
+    } else {
+        None
+    };
 
     // Set up output directories
     let output_dir = config
@@ -2493,11 +2518,14 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         && config.fdr_method != FdrMethod::Simple;
 
     if can_skip_fdr {
-        // SVM scores loaded from sidecars — just recompute q-values
+        // SVM scores loaded from sidecars — recompute q-values using two-pass FDR
+        // (must match the structure of the real pipeline: first-pass unrestricted,
+        // then second-pass restricted to first-pass passing precursors)
         log::info!("");
         log::info!(
             "SVM scores loaded from cache. Recomputing q-values (skipping Percolator training)..."
         );
+        // First-pass: compute q-values on all entries
         percolator::compute_fdr_from_stubs(&mut per_file_entries, config.run_fdr, None);
     } else {
         // Dispatch FDR control based on method
@@ -2556,7 +2584,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     let first_pass_base_ids: HashSet<u32> = per_file_entries
         .iter()
         .flat_map(|(_, entries)| entries.iter())
-        .filter(|e| !e.is_decoy && e.run_qvalue <= config.run_fdr)
+        .filter(|e| !e.is_decoy && e.effective_run_qvalue(FdrLevel::Both) <= config.run_fdr)
         .map(|e| e.entry_id & 0x7FFF_FFFF)
         .collect();
 
@@ -2572,6 +2600,16 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     if can_skip_fdr {
         log::info!("");
         log::info!("=== Skipping reconciliation (already complete with matching parameters) ===");
+        // Second-pass FDR: restrict to first-pass passing precursors (same as real pipeline)
+        log::info!(
+            "Recomputing second-pass q-values on {} first-pass precursors + paired decoys...",
+            first_pass_base_ids.len(),
+        );
+        percolator::compute_fdr_from_stubs(
+            &mut per_file_entries,
+            config.run_fdr,
+            Some(&first_pass_base_ids),
+        );
     } else {
         use crate::reconciliation::{
             compute_consensus_rts, identify_gap_fill_targets, plan_reconciliation,
@@ -3154,8 +3192,16 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     }
                 }
             }
+        }
+    }
 
-            // Persist second-pass SVM scores to sidecar files
+    // Persist second-pass SVM scores to sidecar files (after reconciliation block closes,
+    // freeing temporary allocations from Percolator feature loading)
+    if !can_skip_fdr {
+        // Check if 2nd-pass actually ran (reconciliation produced re-scored entries)
+        // by checking if a 1st-pass sidecar exists — if so, 2nd-pass scores are different
+        let has_reconciliation = config.reconciliation.enabled && config.input_files.len() > 1;
+        if has_reconciliation {
             log::info!("Persisting 2nd-pass FDR scores...");
             persist_fdr_scores(
                 &per_file_entries,
@@ -3166,11 +3212,61 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
+    // Compute protein-level FDR (if enabled)
+    if let (Some(ref parsimony), Some(protein_fdr_threshold)) =
+        (&protein_parsimony, config.protein_fdr)
+    {
+        log::info!("Computing protein-level FDR...");
+
+        // Run-level protein FDR: best scores per peptide within each file
+        for (file_name, entries) in per_file_entries.iter_mut() {
+            let file_entries = vec![(file_name.clone(), std::mem::take(entries))];
+            let best_scores = protein::collect_best_peptide_scores(&file_entries);
+            let run_fdr = protein::compute_protein_fdr(parsimony, &best_scores);
+            let mut file_entries = file_entries;
+            let (_, restored) = file_entries.pop().unwrap();
+            *entries = restored;
+            // Propagate run-level protein q-values
+            for entry in entries.iter_mut() {
+                entry.run_protein_qvalue = run_fdr
+                    .peptide_qvalues
+                    .get(&*entry.modified_sequence)
+                    .copied()
+                    .unwrap_or(1.0);
+            }
+        }
+
+        // Experiment-level protein FDR: best scores per peptide across all files
+        let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
+        let exp_fdr = protein::compute_protein_fdr(parsimony, &best_scores);
+        protein::propagate_protein_qvalues(&mut per_file_entries, &exp_fdr, false, true);
+
+        let n_passing = exp_fdr
+            .group_qvalues
+            .values()
+            .filter(|&&q| q <= protein_fdr_threshold)
+            .count();
+        let n_total = exp_fdr.group_qvalues.len();
+        log::info!(
+            "Protein FDR: {} / {} protein groups at {}% FDR",
+            n_passing,
+            n_total,
+            protein_fdr_threshold * 100.0
+        );
+    }
+
     // Determine which precursors pass experiment-level FDR from lightweight FdrEntry stubs
+    let fdr_level = config.fdr_level;
     let passing_precursors: HashSet<(Arc<str>, u8)> = per_file_entries
         .iter()
         .flat_map(|(_, entries)| entries.iter())
-        .filter(|e| !e.is_decoy && e.experiment_qvalue <= config.experiment_fdr)
+        .filter(|e| {
+            !e.is_decoy
+                && e.effective_experiment_qvalue(fdr_level) <= config.experiment_fdr
+                && config
+                    .protein_fdr
+                    .map_or(true, |pf| e.experiment_protein_qvalue <= pf)
+        })
         .map(|e| (e.modified_sequence.clone(), e.charge))
         .collect();
 
@@ -3180,10 +3276,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         for e in entries {
             if !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge))
             {
+                let eff_q = e.effective_experiment_qvalue(fdr_level);
                 best_exp_q
                     .entry((e.modified_sequence.clone(), e.charge))
-                    .and_modify(|q| *q = q.min(e.experiment_qvalue))
-                    .or_insert(e.experiment_qvalue);
+                    .and_modify(|q| *q = q.min(eff_q))
+                    .or_insert(eff_q);
             }
         }
     }
@@ -3196,8 +3293,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             let fdr_values: Vec<LightFdr> = entries
                 .iter()
                 .map(|e| LightFdr {
-                    run_qvalue: e.run_qvalue,
-                    experiment_qvalue: e.experiment_qvalue,
+                    run_precursor_qvalue: e.run_precursor_qvalue,
+                    run_peptide_qvalue: e.run_peptide_qvalue,
+                    run_protein_qvalue: e.run_protein_qvalue,
+                    experiment_precursor_qvalue: e.experiment_precursor_qvalue,
+                    experiment_peptide_qvalue: e.experiment_peptide_qvalue,
+                    experiment_protein_qvalue: e.experiment_protein_qvalue,
                     score: e.score,
                     pep: e.pep,
                     is_decoy: e.is_decoy,
@@ -3260,6 +3361,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             &passing_precursors,
             &best_exp_q,
             file_idx,
+            fdr_level,
         ) {
             Ok(entries) => {
                 plan_entries.extend(entries);
@@ -3322,8 +3424,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     Ok(mut entries) => {
                         // Merge FDR q-values from lightweight data
                         for (full, fdr) in entries.iter_mut().zip(fdr_values.iter()) {
-                            full.run_qvalue = fdr.run_qvalue;
-                            full.experiment_qvalue = fdr.experiment_qvalue;
+                            full.run_precursor_qvalue = fdr.run_precursor_qvalue;
+                            full.run_peptide_qvalue = fdr.run_peptide_qvalue;
+                            full.run_protein_qvalue = fdr.run_protein_qvalue;
+                            full.experiment_precursor_qvalue = fdr.experiment_precursor_qvalue;
+                            full.experiment_peptide_qvalue = fdr.experiment_peptide_qvalue;
+                            full.experiment_protein_qvalue = fdr.experiment_protein_qvalue;
                             full.score = fdr.score;
                             full.pep = fdr.pep;
                         }
@@ -3829,10 +3935,10 @@ fn run_percolator_fdr_direct(
                 file_name, entry.modified_sequence, entry.charge, entry.scan_number
             );
             if let Some(result) = result_map.get(psm_id.as_str()) {
-                entry.run_qvalue = result.run_precursor_qvalue.max(result.run_peptide_qvalue);
-                entry.experiment_qvalue = result
-                    .experiment_precursor_qvalue
-                    .max(result.experiment_peptide_qvalue);
+                entry.run_precursor_qvalue = result.run_precursor_qvalue;
+                entry.run_peptide_qvalue = result.run_peptide_qvalue;
+                entry.experiment_precursor_qvalue = result.experiment_precursor_qvalue;
+                entry.experiment_peptide_qvalue = result.experiment_peptide_qvalue;
                 entry.score = result.score;
                 entry.pep = result.pep;
             }
@@ -3937,22 +4043,22 @@ fn run_mokapot_fdr(
                             file_name, entry.modified_sequence, entry.charge, entry.scan_number
                         );
                         if let Some(&(q, score, pep)) = run_qmap.get(&psm_id) {
-                            // Enforce dual FDR: max of precursor and peptide q-values
+                            entry.run_precursor_qvalue = q;
                             let peptide_q = peptide_qmap
                                 .and_then(|m| m.get(&*entry.modified_sequence))
                                 .copied()
                                 .unwrap_or(1.0);
-                            entry.run_qvalue = q.max(peptide_q);
+                            entry.run_peptide_qvalue = peptide_q;
                             entry.score = score;
                             entry.pep = pep;
                         }
                         if let Some(&q) = experiment_qmap.get(&psm_id) {
-                            // Enforce dual FDR: max of precursor and peptide q-values
+                            entry.experiment_precursor_qvalue = q;
                             let peptide_q = exp_peptide_qmap
                                 .get(&*entry.modified_sequence)
                                 .copied()
                                 .unwrap_or(1.0);
-                            entry.experiment_qvalue = q.max(peptide_q);
+                            entry.experiment_peptide_qvalue = peptide_q;
                         }
                         if let Some(&(score, pep)) = experiment_score_map.get(&psm_id) {
                             entry.score = score;
@@ -4420,15 +4526,18 @@ fn apply_simple_fdr(entries: &mut [FdrEntry], _fdr_threshold: f64) -> Result<()>
             1.0
         };
 
-        entry.run_qvalue = fdr;
+        entry.run_precursor_qvalue = fdr;
+        entry.run_peptide_qvalue = fdr;
     }
 
     // Convert to q-values (monotonic)
     let mut min_fdr = 1.0f64;
     for entry in entries.iter_mut().rev() {
-        min_fdr = min_fdr.min(entry.run_qvalue);
-        entry.run_qvalue = min_fdr;
-        entry.experiment_qvalue = min_fdr; // No two-level distinction in fallback mode
+        min_fdr = min_fdr.min(entry.run_precursor_qvalue);
+        entry.run_precursor_qvalue = min_fdr;
+        entry.run_peptide_qvalue = min_fdr;
+        entry.experiment_precursor_qvalue = min_fdr; // No two-level distinction in fallback mode
+        entry.experiment_peptide_qvalue = min_fdr;
     }
 
     Ok(())
@@ -4441,8 +4550,12 @@ fn apply_simple_fdr(entries: &mut [FdrEntry], _fdr_threshold: f64) -> Result<()>
 /// Lightweight per-entry FDR data extracted from FdrEntry stubs.
 /// Used to free heavy stubs (~19 GB) before loading blib plan data.
 struct LightFdr {
-    run_qvalue: f64,
-    experiment_qvalue: f64,
+    run_precursor_qvalue: f64,
+    run_peptide_qvalue: f64,
+    run_protein_qvalue: f64,
+    experiment_precursor_qvalue: f64,
+    experiment_peptide_qvalue: f64,
+    experiment_protein_qvalue: f64,
     score: f64,
     pep: f64,
     is_decoy: bool,
@@ -4450,14 +4563,40 @@ struct LightFdr {
     charge: u8,
 }
 
+impl LightFdr {
+    #[allow(dead_code)]
+    fn effective_run_qvalue(&self, level: FdrLevel) -> f64 {
+        match level {
+            FdrLevel::Precursor => self.run_precursor_qvalue,
+            FdrLevel::Peptide => self.run_peptide_qvalue,
+            FdrLevel::Both => self.run_precursor_qvalue.max(self.run_peptide_qvalue),
+        }
+    }
+
+    fn effective_experiment_qvalue(&self, level: FdrLevel) -> f64 {
+        match level {
+            FdrLevel::Precursor => self.experiment_precursor_qvalue,
+            FdrLevel::Peptide => self.experiment_peptide_qvalue,
+            FdrLevel::Both => self
+                .experiment_precursor_qvalue
+                .max(self.experiment_peptide_qvalue),
+        }
+    }
+}
+
 /// Lightweight entry with only the fields needed for blib output planning.
 /// ~96 bytes per entry vs ~940 bytes for full CoelutionScoredEntry.
+#[allow(dead_code)]
 struct BlibPlanEntry {
     entry_id: u32,
     charge: u8,
     file_name_idx: u16,
-    run_qvalue: f64,
-    experiment_qvalue: f64,
+    run_precursor_qvalue: f64,
+    run_peptide_qvalue: f64,
+    run_protein_qvalue: f64,
+    experiment_precursor_qvalue: f64,
+    experiment_peptide_qvalue: f64,
+    experiment_protein_qvalue: f64,
     score: f64,
     pep: f64,
     apex_rt: f64,
@@ -4465,6 +4604,26 @@ struct BlibPlanEntry {
     end_rt: f64,
     bounds_area: f64,
     modified_sequence: Arc<str>,
+}
+
+impl BlibPlanEntry {
+    fn effective_run_qvalue(&self, level: FdrLevel) -> f64 {
+        match level {
+            FdrLevel::Precursor => self.run_precursor_qvalue,
+            FdrLevel::Peptide => self.run_peptide_qvalue,
+            FdrLevel::Both => self.run_precursor_qvalue.max(self.run_peptide_qvalue),
+        }
+    }
+
+    fn effective_experiment_qvalue(&self, level: FdrLevel) -> f64 {
+        match level {
+            FdrLevel::Precursor => self.experiment_precursor_qvalue,
+            FdrLevel::Peptide => self.experiment_peptide_qvalue,
+            FdrLevel::Both => self
+                .experiment_precursor_qvalue
+                .max(self.experiment_peptide_qvalue),
+        }
+    }
 }
 
 /// Load lightweight blib plan entries from a Parquet cache file.
@@ -4479,6 +4638,7 @@ fn load_blib_plan_entries(
     passing_precursors: &HashSet<(Arc<str>, u8)>,
     best_exp_q: &HashMap<(Arc<str>, u8), f64>,
     file_name_idx: u16,
+    fdr_level: FdrLevel,
 ) -> Result<Vec<BlibPlanEntry>> {
     use arrow::array::{Float64Array, UInt32Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -4563,16 +4723,23 @@ fn load_blib_plan_entries(
             if !fdr.is_decoy
                 && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
             {
+                // Propagate best experiment q-value across all observations of this precursor.
+                // best_exp_q contains min(effective_experiment_qvalue) across files;
+                // set both precursor and peptide experiment fields to preserve the propagated value.
                 let exp_q = best_exp_q
                     .get(&(fdr.modified_sequence.clone(), fdr.charge))
                     .copied()
-                    .unwrap_or(fdr.experiment_qvalue);
+                    .unwrap_or(fdr.effective_experiment_qvalue(fdr_level));
                 entries.push(BlibPlanEntry {
                     entry_id: entry_id_col.value(row),
                     charge: fdr.charge,
                     file_name_idx,
-                    run_qvalue: fdr.run_qvalue,
-                    experiment_qvalue: exp_q,
+                    run_precursor_qvalue: fdr.run_precursor_qvalue,
+                    run_peptide_qvalue: fdr.run_peptide_qvalue,
+                    run_protein_qvalue: fdr.run_protein_qvalue,
+                    experiment_precursor_qvalue: exp_q,
+                    experiment_peptide_qvalue: exp_q,
+                    experiment_protein_qvalue: fdr.experiment_protein_qvalue,
                     score: fdr.score,
                     pep: fdr.pep,
                     apex_rt: apex_col.value(row),
@@ -4609,9 +4776,9 @@ fn build_shared_boundaries_from_plan(
             .or_default()
             .insert(entry.charge);
 
-        let should_update = best_by_key
-            .get(&key)
-            .map_or(true, |&(_, _, _, qval)| entry.run_qvalue < qval);
+        let should_update = best_by_key.get(&key).map_or(true, |&(_, _, _, qval)| {
+            entry.effective_run_qvalue(FdrLevel::Both) < qval
+        });
 
         if should_update {
             best_by_key.insert(
@@ -4620,7 +4787,7 @@ fn build_shared_boundaries_from_plan(
                     entry.apex_rt,
                     entry.start_rt,
                     entry.end_rt,
-                    entry.run_qvalue,
+                    entry.effective_run_qvalue(FdrLevel::Both),
                 ),
             );
         }
@@ -4645,6 +4812,7 @@ fn write_blib_streaming(
     plan: &[BlibPlanEntry],
     file_names: &[String],
 ) -> Result<()> {
+    let fdr_level = config.fdr_level;
     let mut writer = BlibWriter::create(&config.output_blib)?;
 
     writer.add_metadata("osprey_version", env!("CARGO_PKG_VERSION"))?;
@@ -4712,7 +4880,11 @@ fn write_blib_streaming(
         // Find the best run (lowest run q-value)
         let best_idx = *indices
             .iter()
-            .min_by(|&&a, &&b| plan[a].run_qvalue.total_cmp(&plan[b].run_qvalue))
+            .min_by(|&&a, &&b| {
+                plan[a]
+                    .effective_run_qvalue(fdr_level)
+                    .total_cmp(&plan[b].effective_run_qvalue(fdr_level))
+            })
             .unwrap();
         let best = &plan[best_idx];
 
@@ -4756,7 +4928,7 @@ fn write_blib_streaming(
             shared_end,
             &frag_mzs,
             &frag_intensities,
-            best.experiment_qvalue,
+            best.effective_experiment_qvalue(fdr_level),
             file_id,
             n_runs_detected,
             tic,
@@ -4785,7 +4957,7 @@ fn write_blib_streaming(
                 scored.end_rt,
             ));
 
-            let rt_for_id = if scored.run_qvalue <= config.run_fdr {
+            let rt_for_id = if scored.effective_run_qvalue(fdr_level) <= config.run_fdr {
                 Some(run_apex)
             } else {
                 None
@@ -4799,7 +4971,7 @@ fn write_blib_streaming(
                 rt_for_id,
                 run_start,
                 run_end,
-                scored.run_qvalue,
+                scored.effective_run_qvalue(fdr_level),
                 is_best,
             )?;
         }
@@ -4816,12 +4988,18 @@ fn write_blib_streaming(
         writer.add_peak_boundaries(ref_id, best_file_stem, &boundaries)?;
 
         // Add run-level scores
-        writer.add_run_scores(ref_id, best_file_stem, best.run_qvalue, best.score, 0.0)?;
+        writer.add_run_scores(
+            ref_id,
+            best_file_stem,
+            best.effective_run_qvalue(fdr_level),
+            best.score,
+            0.0,
+        )?;
 
         // Add experiment-level scores
         writer.add_experiment_scores(
             ref_id,
-            best.experiment_qvalue,
+            best.effective_experiment_qvalue(fdr_level),
             n_runs_detected,
             config.input_files.len() as i32,
         )?;
@@ -5241,8 +5419,12 @@ fn compute_features_at_peak(
         fragment_intensities: frag_intensities,
         reference_xic: ref_xic_peak,
         file_name: ctx.file_name.to_string(),
-        run_qvalue: 1.0,
-        experiment_qvalue: 1.0,
+        run_precursor_qvalue: 1.0,
+        run_peptide_qvalue: 1.0,
+        run_protein_qvalue: 1.0,
+        experiment_precursor_qvalue: 1.0,
+        experiment_peptide_qvalue: 1.0,
+        experiment_protein_qvalue: 1.0,
         score: 0.0,
         pep: 1.0,
         cwt_candidates: Vec::new(), // populated by caller after peak selection
@@ -5280,12 +5462,13 @@ fn select_post_fdr_consensus(
         // Skip groups where no charge state passes FDR.
         let best_idx = match indices
             .iter()
-            .filter(|&&i| entries[i].run_qvalue <= fdr_threshold)
+            .filter(|&&i| entries[i].effective_run_qvalue(FdrLevel::Both) <= fdr_threshold)
             .max_by(|&&a, &&b| {
-                entries[a]
-                    .score
-                    .total_cmp(&entries[b].score)
-                    .then_with(|| entries[b].run_qvalue.total_cmp(&entries[a].run_qvalue))
+                entries[a].score.total_cmp(&entries[b].score).then_with(|| {
+                    entries[b]
+                        .effective_run_qvalue(FdrLevel::Both)
+                        .total_cmp(&entries[a].effective_run_qvalue(FdrLevel::Both))
+                })
             })
             .copied()
         {
@@ -6571,8 +6754,12 @@ mod tests {
             fragment_intensities: vec![],
             reference_xic: vec![],
             file_name: "test".into(),
-            run_qvalue: 1.0,
-            experiment_qvalue: 1.0,
+            run_precursor_qvalue: 1.0,
+            run_peptide_qvalue: 1.0,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: 1.0,
+            experiment_peptide_qvalue: 1.0,
+            experiment_protein_qvalue: 1.0,
             score: 0.0,
             pep: 1.0,
             cwt_candidates: vec![],
@@ -6690,8 +6877,12 @@ mod tests {
             fragment_intensities: vec![],
             reference_xic: vec![],
             file_name: "test".to_string(),
-            run_qvalue,
-            experiment_qvalue: 1.0,
+            run_precursor_qvalue: run_qvalue,
+            run_peptide_qvalue: run_qvalue,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: 1.0,
+            experiment_peptide_qvalue: 1.0,
+            experiment_protein_qvalue: 1.0,
             score,
             pep: 1.0,
             cwt_candidates: vec![],

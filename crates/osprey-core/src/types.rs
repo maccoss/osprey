@@ -3,6 +3,7 @@
 //! These types represent the fundamental data structures used throughout
 //! the analysis pipeline, from spectral library entries to detection results.
 
+use crate::config::FdrLevel;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -668,10 +669,18 @@ pub struct CoelutionScoredEntry {
     pub reference_xic: Vec<(f64, f64)>,
     /// Source file name (file stem, e.g. "sample1")
     pub file_name: String,
-    /// Run-level q-value (from Mokapot on single file, default 1.0)
-    pub run_qvalue: f64,
-    /// Experiment-level q-value (from Mokapot across files, default 1.0)
-    pub experiment_qvalue: f64,
+    /// Run-level precursor q-value (modified_sequence + charge, default 1.0)
+    pub run_precursor_qvalue: f64,
+    /// Run-level peptide q-value (modified_sequence only, default 1.0)
+    pub run_peptide_qvalue: f64,
+    /// Run-level protein q-value (picked-protein FDR, default 1.0)
+    pub run_protein_qvalue: f64,
+    /// Experiment-level precursor q-value (modified_sequence + charge, default 1.0)
+    pub experiment_precursor_qvalue: f64,
+    /// Experiment-level peptide q-value (modified_sequence only, default 1.0)
+    pub experiment_peptide_qvalue: f64,
+    /// Experiment-level protein q-value (picked-protein FDR, default 1.0)
+    pub experiment_protein_qvalue: f64,
     /// SVM discriminant score (from Percolator/Mokapot, same score used for q-value and PEP)
     pub score: f64,
     /// Posterior error probability (computed on the final SVM score)
@@ -698,8 +707,12 @@ impl CoelutionScoredEntry {
             end_rt: self.peak_bounds.end_rt,
             coelution_sum: self.features.coelution_sum,
             score: self.score,
-            run_qvalue: self.run_qvalue,
-            experiment_qvalue: self.experiment_qvalue,
+            run_precursor_qvalue: self.run_precursor_qvalue,
+            run_peptide_qvalue: self.run_peptide_qvalue,
+            run_protein_qvalue: self.run_protein_qvalue,
+            experiment_precursor_qvalue: self.experiment_precursor_qvalue,
+            experiment_peptide_qvalue: self.experiment_peptide_qvalue,
+            experiment_protein_qvalue: self.experiment_protein_qvalue,
             pep: self.pep,
             modified_sequence: Arc::from(self.modified_sequence.as_str()),
         }
@@ -713,10 +726,10 @@ impl CoelutionScoredEntry {
 /// planning.  Full entry data (features, CWT candidates, fragments) is
 /// stored in per-file `.scores.parquet` caches and reloaded on demand.
 ///
-/// ~80 bytes inline per entry, versus ~940 bytes for `CoelutionScoredEntry`.
+/// ~120 bytes inline per entry, versus ~940 bytes for `CoelutionScoredEntry`.
 /// `modified_sequence` uses `Arc<str>` for deduplication: with 240 GPF files
 /// the same ~3.5M unique sequences appear across all files, so interning
-/// reduces heap from ~6 GB to ~90 MB.  `file_name` is not stored — entries
+/// reduces heap from ~6 GB to ~90 MB.  `file_name` is not stored -- entries
 /// are already keyed by file in `Vec<(String, Vec<FdrEntry>)>`.
 #[derive(Debug, Clone)]
 pub struct FdrEntry {
@@ -738,14 +751,52 @@ pub struct FdrEntry {
     pub coelution_sum: f64,
     /// SVM discriminant score (for consensus ranking)
     pub score: f64,
-    /// Run-level q-value (mutated by FDR)
-    pub run_qvalue: f64,
-    /// Experiment-level q-value (mutated by FDR)
-    pub experiment_qvalue: f64,
+    /// Run-level precursor q-value (modified_sequence + charge, mutated by FDR)
+    pub run_precursor_qvalue: f64,
+    /// Run-level peptide q-value (modified_sequence only, mutated by FDR)
+    pub run_peptide_qvalue: f64,
+    /// Run-level protein q-value (picked-protein FDR, default 1.0)
+    pub run_protein_qvalue: f64,
+    /// Experiment-level precursor q-value (modified_sequence + charge, mutated by FDR)
+    pub experiment_precursor_qvalue: f64,
+    /// Experiment-level peptide q-value (modified_sequence only, mutated by FDR)
+    pub experiment_peptide_qvalue: f64,
+    /// Experiment-level protein q-value (picked-protein FDR, default 1.0)
+    pub experiment_protein_qvalue: f64,
     /// Posterior error probability (mutated by FDR)
     pub pep: f64,
     /// Modified sequence (interned Arc<str> for psm_id, grouping, passing_precursors)
     pub modified_sequence: Arc<str>,
+}
+
+impl FdrEntry {
+    /// Effective run-level q-value based on the chosen FDR filtering level.
+    ///
+    /// - `Precursor`: returns run_precursor_qvalue
+    /// - `Peptide`: returns run_peptide_qvalue
+    /// - `Both`: returns max(run_precursor_qvalue, run_peptide_qvalue)
+    pub fn effective_run_qvalue(&self, level: FdrLevel) -> f64 {
+        match level {
+            FdrLevel::Precursor => self.run_precursor_qvalue,
+            FdrLevel::Peptide => self.run_peptide_qvalue,
+            FdrLevel::Both => self.run_precursor_qvalue.max(self.run_peptide_qvalue),
+        }
+    }
+
+    /// Effective experiment-level q-value based on the chosen FDR filtering level.
+    ///
+    /// - `Precursor`: returns experiment_precursor_qvalue
+    /// - `Peptide`: returns experiment_peptide_qvalue
+    /// - `Both`: returns max(experiment_precursor_qvalue, experiment_peptide_qvalue)
+    pub fn effective_experiment_qvalue(&self, level: FdrLevel) -> f64 {
+        match level {
+            FdrLevel::Precursor => self.experiment_precursor_qvalue,
+            FdrLevel::Peptide => self.experiment_peptide_qvalue,
+            FdrLevel::Both => self
+                .experiment_precursor_qvalue
+                .max(self.experiment_peptide_qvalue),
+        }
+    }
 }
 
 #[cfg(test)]

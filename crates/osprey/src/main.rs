@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::Parser;
 use osprey::{
-    run_analysis, ConfigOverrides, FdrMethod, OspreyConfig, ResolutionMode, ToleranceUnit,
+    run_analysis, ConfigOverrides, FdrLevel, FdrMethod, OspreyConfig, ResolutionMode,
+    SharedPeptideMode, ToleranceUnit,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -157,6 +158,18 @@ struct Args {
     #[arg(long, default_value = "percolator")]
     fdr_method: String,
 
+    /// FDR filtering level: precursor, peptide, or both (default)
+    #[arg(long)]
+    fdr_level: Option<String>,
+
+    /// Protein-level FDR threshold (enables protein parsimony and picked-protein FDR)
+    #[arg(long)]
+    protein_fdr: Option<f64>,
+
+    /// How to handle shared peptides for protein FDR: all (default), razor, or unique
+    #[arg(long)]
+    shared_peptides: Option<String>,
+
     /// Write PIN files for external tools
     #[arg(long)]
     write_pin: bool,
@@ -254,6 +267,37 @@ fn main() -> Result<()> {
         }
     };
 
+    // Parse FDR level
+    let fdr_level = args
+        .fdr_level
+        .as_ref()
+        .map(|s| match s.to_lowercase().as_str() {
+            "precursor" => FdrLevel::Precursor,
+            "peptide" => FdrLevel::Peptide,
+            "both" => FdrLevel::Both,
+            other => {
+                log::warn!("Unknown FDR level '{}', defaulting to both", other);
+                FdrLevel::Both
+            }
+        });
+
+    // Parse shared peptide mode
+    let shared_peptides = args
+        .shared_peptides
+        .as_ref()
+        .map(|s| match s.to_lowercase().as_str() {
+            "all" => SharedPeptideMode::All,
+            "razor" => SharedPeptideMode::Razor,
+            "unique" => SharedPeptideMode::Unique,
+            other => {
+                log::warn!(
+                    "Unknown shared peptides mode '{}', defaulting to all",
+                    other
+                );
+                SharedPeptideMode::All
+            }
+        });
+
     // Create overrides from CLI args (these take precedence over config file)
     let overrides = ConfigOverrides {
         input_files: args.input,
@@ -271,6 +315,9 @@ fn main() -> Result<()> {
         precursor_tolerance: args.precursor_tolerance,
         precursor_unit,
         fdr_method,
+        fdr_level,
+        protein_fdr: args.protein_fdr,
+        shared_peptides,
         write_pin: args.write_pin,
     };
 
