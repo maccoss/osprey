@@ -118,7 +118,11 @@
       "Bash(git mv:*)",
       "Bash(git -C /mnt/d/GitHub-Repo/maccoss/osprey config --global --list)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git merge-tree:*)",
+      "WebFetch(domain:percolator.ms)",
+      "WebSearch",
+      "WebFetch(domain:www.mcponline.org)"
     ],
     "additionalDirectories": [
       "/mnt/c/Users/macco/Documents/github/maccoss/osprey/example_test_data/astral"
