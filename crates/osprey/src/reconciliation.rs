@@ -7,7 +7,7 @@
 //! 4. Runs a second FDR pass on the reconciled consensus set
 
 use osprey_chromatography::RTCalibration;
-use osprey_core::{CwtCandidate, FdrEntry};
+use osprey_core::{CwtCandidate, FdrEntry, FdrLevel};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,7 +53,7 @@ pub fn compute_consensus_rts(
     let mut target_peptides: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.run_qvalue <= consensus_fdr {
+            if !entry.is_decoy && entry.effective_run_qvalue(FdrLevel::Both) <= consensus_fdr {
                 target_peptides.insert(entry.modified_sequence.clone());
             }
         }
@@ -110,7 +110,7 @@ pub fn compute_consensus_rts(
                 decoy_peptides.contains(&*entry.modified_sequence)
             } else {
                 target_peptides.contains(&*entry.modified_sequence)
-                    && entry.run_qvalue <= consensus_fdr
+                    && entry.effective_run_qvalue(FdrLevel::Both) <= consensus_fdr
             };
 
             if include {
@@ -219,7 +219,7 @@ pub fn refit_calibration_with_consensus(
     let mut measured_rts = Vec::new();
 
     for entry in entries {
-        if entry.is_decoy || entry.experiment_qvalue > consensus_fdr {
+        if entry.is_decoy || entry.effective_experiment_qvalue(FdrLevel::Both) > consensus_fdr {
             continue;
         }
         if let Some(&consensus_lib_rt) = consensus_map.get(&*entry.modified_sequence) {
@@ -351,7 +351,7 @@ pub fn plan_reconciliation(
         std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.run_qvalue <= experiment_fdr {
+            if !entry.is_decoy && entry.effective_run_qvalue(FdrLevel::Both) <= experiment_fdr {
                 passing_precursors.insert((&entry.modified_sequence, entry.charge));
             }
         }
@@ -530,7 +530,7 @@ pub fn identify_gap_fill_targets(
     let mut passing_precursors: HashSet<(Arc<str>, u8)> = HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.run_qvalue <= experiment_fdr {
+            if !entry.is_decoy && entry.effective_run_qvalue(FdrLevel::Both) <= experiment_fdr {
                 passing_precursors.insert((entry.modified_sequence.clone(), entry.charge));
             }
         }
@@ -692,8 +692,12 @@ mod tests {
             end_rt,
             coelution_sum,
             score: 0.0,
-            run_qvalue: experiment_qvalue,
-            experiment_qvalue,
+            run_precursor_qvalue: experiment_qvalue,
+            run_peptide_qvalue: experiment_qvalue,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: experiment_qvalue,
+            experiment_peptide_qvalue: experiment_qvalue,
+            experiment_protein_qvalue: 1.0,
             pep: 1.0,
             modified_sequence: Arc::from(modified_sequence),
         }

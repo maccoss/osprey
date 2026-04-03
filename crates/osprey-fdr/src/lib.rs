@@ -9,6 +9,7 @@
 
 pub mod mokapot;
 pub mod percolator;
+pub mod protein;
 
 pub use mokapot::{
     get_pin_feature_names, pin_feature_value, MokapotResult, MokapotRunner, NUM_PIN_FEATURES,

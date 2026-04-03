@@ -11,6 +11,7 @@
 //! Osprey is peptide-centric: the units are precursors (peptide + charge)
 //! and peptides (unique modified sequences), not PSMs.
 
+use osprey_core::config::FdrLevel;
 use osprey_core::types::FdrEntry;
 use osprey_ml::matrix::Matrix;
 use osprey_ml::pep::PepEstimator;
@@ -1614,9 +1615,13 @@ pub fn compute_fdr_from_scores(
 /// Scores must already be written to `entry.score` before calling this.
 ///
 /// Writes results directly to FdrEntry fields:
-/// - `entry.run_qvalue = max(run_precursor_q, run_peptide_q)`
-/// - `entry.experiment_qvalue = max(exp_precursor_q, exp_peptide_q)`
+/// - `entry.run_precursor_qvalue` = per-file precursor-level q-value
+/// - `entry.run_peptide_qvalue` = per-file peptide-level q-value
+/// - `entry.experiment_precursor_qvalue` = experiment-wide precursor-level q-value
+/// - `entry.experiment_peptide_qvalue` = experiment-wide peptide-level q-value
 /// - `entry.pep` = posterior error probability (1.0 for non-competition-winners)
+///
+/// Protein-level q-value fields are not set here (they default to 1.0).
 pub fn compute_fdr_from_stubs(
     per_file_entries: &mut [(String, Vec<FdrEntry>)],
     test_fdr: f64,
@@ -1784,20 +1789,21 @@ pub fn compute_fdr_from_stubs(
             );
         }
 
-        // Write run_qvalue = max(precursor, peptide) for active entries only
+        // Write run-level precursor and peptide q-values separately
         for (ai, &orig_idx) in active_indices.iter().enumerate() {
             let entry = &mut entries[orig_idx];
             let pept_qv = peptide_qvalue
                 .get(&*entry.modified_sequence)
                 .copied()
                 .unwrap_or(1.0);
-            entry.run_qvalue = active_prec_qvalue[ai].max(pept_qv);
+            entry.run_precursor_qvalue = active_prec_qvalue[ai];
+            entry.run_peptide_qvalue = pept_qv;
         }
 
         // Log per-file stats
         let passing: Vec<&FdrEntry> = entries
             .iter()
-            .filter(|e| !e.is_decoy && e.run_qvalue <= test_fdr)
+            .filter(|e| !e.is_decoy && e.effective_run_qvalue(FdrLevel::Both) <= test_fdr)
             .collect();
         let precursor_count = passing
             .iter()
@@ -1822,7 +1828,8 @@ pub fn compute_fdr_from_stubs(
         // Single file: experiment q-values = run q-values
         for (_, entries) in per_file_entries.iter_mut() {
             for entry in entries.iter_mut() {
-                entry.experiment_qvalue = entry.run_qvalue;
+                entry.experiment_precursor_qvalue = entry.run_precursor_qvalue;
+                entry.experiment_peptide_qvalue = entry.run_peptide_qvalue;
             }
         }
     } else {
@@ -1944,7 +1951,7 @@ pub fn compute_fdr_from_stubs(
         // Free intermediate structures
         drop(pept_data);
 
-        // Write experiment q-values = max(precursor_q, peptide_q)
+        // Write experiment-level precursor and peptide q-values separately
         for (_, entries) in per_file_entries.iter_mut() {
             for entry in entries.iter_mut() {
                 let base_id = entry.entry_id & 0x7FFF_FFFF;
@@ -1958,7 +1965,8 @@ pub fn compute_fdr_from_stubs(
                     .get(&*entry.modified_sequence)
                     .copied()
                     .unwrap_or(1.0);
-                entry.experiment_qvalue = prec_q.max(pept_q);
+                entry.experiment_precursor_qvalue = prec_q;
+                entry.experiment_peptide_qvalue = pept_q;
             }
         }
     }
@@ -1968,7 +1976,7 @@ pub fn compute_fdr_from_stubs(
     let exp_passing: Vec<&FdrEntry> = per_file_entries
         .iter()
         .flat_map(|(_, entries)| entries.iter())
-        .filter(|e| !e.is_decoy && e.experiment_qvalue <= test_fdr)
+        .filter(|e| !e.is_decoy && e.effective_experiment_qvalue(FdrLevel::Both) <= test_fdr)
         .collect();
     let exp_precursors = exp_passing
         .iter()
