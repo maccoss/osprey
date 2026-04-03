@@ -51,6 +51,9 @@ Thumbs.db
 __pycache__/
 *.pyc
 
+# Claude local settings (may contain secrets).
+.claude/settings.local.json
+
 # Environment files (may contain secrets)
 .env
 .env.local
