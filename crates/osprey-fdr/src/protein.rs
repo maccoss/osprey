@@ -372,7 +372,7 @@ pub fn compute_protein_fdr(
     }
 }
 
-/// Write a protein-level TSV report.
+/// Write a protein-level CSV report.
 ///
 /// Each row is a protein group that passes the FDR threshold. Columns include
 /// protein accessions, q-value, best peptide score, number of peptides, and
@@ -388,7 +388,7 @@ pub fn write_protein_report(
     let mut file = std::fs::File::create(path)?;
     writeln!(
         file,
-        "protein_group\tprotein_accessions\tprotein_qvalue\tbest_score\tn_unique_peptides\tn_shared_peptides\tunique_peptides\tshared_peptides"
+        "protein_group,protein_accessions,protein_qvalue,best_score,n_unique_peptides,n_shared_peptides,unique_peptides,shared_peptides"
     )?;
 
     // Collect passing groups, sorted by q-value
@@ -443,7 +443,7 @@ pub fn write_protein_report(
 
         writeln!(
             file,
-            "{}\t{}\t{:.6}\t{:.4}\t{}\t{}\t{}\t{}",
+            "{},{},{:.6},{:.4},{},{},{},{}",
             group.id,
             accessions,
             q,

@@ -2165,6 +2165,65 @@ fn write_scored_report_from_plan(
     Ok(())
 }
 
+/// Write a peptide-level CSV report from blib plan entries.
+///
+/// Always written alongside the blib output. Includes precursor-level and
+/// peptide-level q-values, protein q-values, protein accessions, and
+/// peak boundaries.
+fn write_peptide_report_from_plan(
+    path: &std::path::Path,
+    plan: &[BlibPlanEntry],
+    library: &[LibraryEntry],
+    fdr_level: FdrLevel,
+) -> Result<()> {
+    use std::io::Write;
+
+    let lib_by_id: HashMap<u32, &LibraryEntry> = library.iter().map(|e| (e.id, e)).collect();
+
+    let mut file = std::fs::File::create(path)?;
+    writeln!(
+        file,
+        "modified_sequence,precursor_mz,charge,protein_accessions,apex_rt,start_rt,end_rt,peak_area,precursor_qvalue,peptide_qvalue,protein_qvalue,pep,score"
+    )?;
+
+    for entry in plan {
+        let lib_entry = lib_by_id.get(&entry.entry_id);
+        let precursor_mz = lib_entry.map(|e| e.precursor_mz).unwrap_or(0.0);
+        let proteins = lib_entry
+            .map(|e| e.protein_ids.join(";"))
+            .unwrap_or_default();
+
+        writeln!(
+            file,
+            "{},{:.4},{},{},{:.2},{:.2},{:.2},{:.4},{:.6},{:.6},{:.6},{:.6},{:.4}",
+            entry.modified_sequence,
+            precursor_mz,
+            entry.charge,
+            proteins,
+            entry.apex_rt,
+            entry.start_rt,
+            entry.end_rt,
+            entry.bounds_area,
+            entry.experiment_precursor_qvalue,
+            entry.experiment_peptide_qvalue,
+            entry.experiment_protein_qvalue,
+            entry.pep,
+            entry.score,
+        )?;
+    }
+
+    log::info!(
+        "Wrote peptide report: {} entries to {}",
+        plan.len(),
+        path.display()
+    );
+
+    // Suppress unused variable warning when fdr_level is not yet used for filtering within this fn
+    let _ = fdr_level;
+
+    Ok(())
+}
+
 // =============================================================================
 // Main analysis entry point
 // =============================================================================
@@ -3469,9 +3528,19 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // Write protein report (if protein FDR was computed)
+    // Write peptide-level CSV report (always)
+    {
+        let peptide_report_path = config.output_blib.with_extension("peptides.csv");
+        log::info!(
+            "Writing peptide report to {}",
+            peptide_report_path.display()
+        );
+        write_peptide_report_from_plan(&peptide_report_path, &plan_entries, &library, fdr_level)?;
+    }
+
+    // Write protein-level CSV report (if protein FDR was computed)
     if let Some((ref parsimony, ref exp_fdr, protein_fdr_threshold)) = protein_fdr_results {
-        let protein_report_path = config.output_blib.with_extension("proteins.tsv");
+        let protein_report_path = config.output_blib.with_extension("proteins.csv");
         log::info!(
             "Writing protein report to {}",
             protein_report_path.display()
