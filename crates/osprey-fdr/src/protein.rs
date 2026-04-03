@@ -45,6 +45,8 @@ pub struct ProteinParsimonyResult {
 pub struct ProteinFdrResult {
     /// Protein group ID -> q-value
     pub group_qvalues: HashMap<ProteinGroupId, f64>,
+    /// Protein group ID -> best peptide SVM score (target side)
+    pub group_scores: HashMap<ProteinGroupId, f64>,
     /// Peptide (modified_sequence) -> best protein q-value among its groups
     pub peptide_qvalues: HashMap<String, f64>,
 }
@@ -54,13 +56,18 @@ const DECOY_PREFIX: &str = "DECOY_";
 
 /// Build protein parsimony from the spectral library.
 ///
-/// Runs on target entries only. Groups proteins with identical peptide sets,
-/// eliminates subsets, and classifies peptides as unique or shared.
-/// The shared peptide mode determines how shared peptides are handled
-/// (assigned to all groups, razor assignment, or excluded).
+/// Groups proteins with identical peptide sets, eliminates subsets, and
+/// classifies peptides as unique or shared. Only target entries are used.
+///
+/// If `detected_peptides` is provided, only library entries whose
+/// modified_sequence is in the detected set are included. This ensures
+/// protein groups reflect what was actually observed rather than the
+/// full theoretical library, since two proteins may be distinguishable
+/// in theory but indistinguishable based on the peptides that were detected.
 pub fn build_protein_parsimony(
     library: &[LibraryEntry],
     mode: SharedPeptideMode,
+    detected_peptides: Option<&HashSet<String>>,
 ) -> ProteinParsimonyResult {
     // Step 1: Build bipartite graph from target entries only
     let mut peptide_to_proteins: HashMap<String, HashSet<String>> = HashMap::new();
@@ -69,6 +76,12 @@ pub fn build_protein_parsimony(
     for entry in library {
         if entry.is_decoy {
             continue;
+        }
+        // If a detected set is provided, skip undetected peptides
+        if let Some(detected) = detected_peptides {
+            if !detected.contains(&entry.modified_sequence) {
+                continue;
+            }
         }
         for protein in &entry.protein_ids {
             peptide_to_proteins
@@ -354,8 +367,101 @@ pub fn compute_protein_fdr(
 
     ProteinFdrResult {
         group_qvalues,
+        group_scores: target_group_scores,
         peptide_qvalues,
     }
+}
+
+/// Write a protein-level TSV report.
+///
+/// Each row is a protein group that passes the FDR threshold. Columns include
+/// protein accessions, q-value, best peptide score, number of peptides, and
+/// the contributing peptide sequences.
+pub fn write_protein_report(
+    path: &std::path::Path,
+    parsimony: &ProteinParsimonyResult,
+    fdr_result: &ProteinFdrResult,
+    protein_fdr_threshold: f64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path)?;
+    writeln!(
+        file,
+        "protein_group\tprotein_accessions\tprotein_qvalue\tbest_score\tn_unique_peptides\tn_shared_peptides\tunique_peptides\tshared_peptides"
+    )?;
+
+    // Collect passing groups, sorted by q-value
+    let mut passing_groups: Vec<&ProteinGroup> = parsimony
+        .groups
+        .iter()
+        .filter(|g| {
+            fdr_result
+                .group_qvalues
+                .get(&g.id)
+                .is_some_and(|&q| q <= protein_fdr_threshold)
+        })
+        .collect();
+    passing_groups.sort_by(|a, b| {
+        let qa = fdr_result.group_qvalues.get(&a.id).copied().unwrap_or(1.0);
+        let qb = fdr_result.group_qvalues.get(&b.id).copied().unwrap_or(1.0);
+        qa.total_cmp(&qb)
+    });
+
+    for group in &passing_groups {
+        let q = fdr_result
+            .group_qvalues
+            .get(&group.id)
+            .copied()
+            .unwrap_or(1.0);
+        let score = fdr_result
+            .group_scores
+            .get(&group.id)
+            .copied()
+            .unwrap_or(0.0);
+        let accessions = group.accessions.join(";");
+        let unique_peps: Vec<&String> = {
+            let mut v: Vec<&String> = group.unique_peptides.iter().collect();
+            v.sort();
+            v
+        };
+        let shared_peps: Vec<&String> = {
+            let mut v: Vec<&String> = group.shared_peptides.iter().collect();
+            v.sort();
+            v
+        };
+        let unique_str = unique_peps
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+        let shared_str = shared_peps
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+
+        writeln!(
+            file,
+            "{}\t{}\t{:.6}\t{:.4}\t{}\t{}\t{}\t{}",
+            group.id,
+            accessions,
+            q,
+            score,
+            group.unique_peptides.len(),
+            group.shared_peptides.len(),
+            unique_str,
+            shared_str,
+        )?;
+    }
+
+    log::info!(
+        "Wrote protein report: {} protein groups to {}",
+        passing_groups.len(),
+        path.display()
+    );
+
+    Ok(())
 }
 
 /// Collect the best SVM score per peptide (modified_sequence) across entries.
@@ -445,7 +551,7 @@ mod tests {
             make_lib_entry(5, "PEPTIDEE", vec!["P3"], false),
         ];
 
-        let result = build_protein_parsimony(&library, SharedPeptideMode::All);
+        let result = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         // P1 and P2 should be merged into one group
         assert_eq!(result.groups.len(), 2);
@@ -469,7 +575,7 @@ mod tests {
             make_lib_entry(3, "PEPTIDEC", vec!["P1"], false),
         ];
 
-        let result = build_protein_parsimony(&library, SharedPeptideMode::All);
+        let result = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         // Only P1 should remain (P2's peptide set is a strict subset)
         assert_eq!(result.groups.len(), 1);
@@ -487,7 +593,7 @@ mod tests {
             make_lib_entry(5, "PEPTIDED", vec!["P2"], false),
         ];
 
-        let result = build_protein_parsimony(&library, SharedPeptideMode::All);
+        let result = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         assert_eq!(result.groups.len(), 2);
         // SHARED should map to both groups
@@ -506,7 +612,7 @@ mod tests {
             make_lib_entry(5, "PEPTIDED", vec!["P2"], false),
         ];
 
-        let result = build_protein_parsimony(&library, SharedPeptideMode::Razor);
+        let result = build_protein_parsimony(&library, SharedPeptideMode::Razor, None);
 
         assert_eq!(result.groups.len(), 2);
         // SHARED should map to only one group (the one with more unique peptides)
@@ -531,7 +637,7 @@ mod tests {
             make_lib_entry(3, "PEPTIDEC", vec!["P2"], false),
         ];
 
-        let result = build_protein_parsimony(&library, SharedPeptideMode::Unique);
+        let result = build_protein_parsimony(&library, SharedPeptideMode::Unique, None);
 
         // SHARED should not be in the mapping
         assert!(!result.peptide_to_groups.contains_key("SHARED"));
@@ -544,7 +650,7 @@ mod tests {
             make_lib_entry(2, "DECOY_PEPTIDEA", vec!["DECOY_P1"], true),
         ];
 
-        let result = build_protein_parsimony(&library, SharedPeptideMode::All);
+        let result = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         // Only target entries used; decoys excluded
         assert_eq!(result.groups.len(), 1);
@@ -559,7 +665,7 @@ mod tests {
             make_lib_entry(2, "PEPTIDEB", vec!["P2"], false),
         ];
 
-        let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All);
+        let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         // Best scores: P1's target peptide scores 5.0, P2's target scores 1.0
         // Decoy versions: DECOY_PEPTIDEA scores 2.0, DECOY_PEPTIDEB scores 3.0
@@ -593,7 +699,7 @@ mod tests {
             make_lib_entry(3, "UNIQUEB", vec!["P2"], false),
         ];
 
-        let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All);
+        let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         // Both proteins are targets that win; P1 higher scoring
         let mut best_scores: HashMap<Arc<str>, (f64, bool)> = HashMap::new();
@@ -622,7 +728,7 @@ mod tests {
         // Protein group with no observed peptides gets q-value 1.0
         let library = vec![make_lib_entry(1, "PEPTIDEA", vec!["P1"], false)];
 
-        let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All);
+        let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         // No scores at all
         let best_scores: HashMap<Arc<str>, (f64, bool)> = HashMap::new();

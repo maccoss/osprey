@@ -2216,17 +2216,6 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         log::info!("Total library size: {} (targets + decoys)", library.len());
     }
 
-    // Build protein parsimony from library (if protein FDR is enabled)
-    let protein_parsimony = if config.protein_fdr.is_some() {
-        log::info!("Building protein parsimony from library...");
-        Some(protein::build_protein_parsimony(
-            &library,
-            config.shared_peptides,
-        ))
-    } else {
-        None
-    };
-
     // Set up output directories
     let output_dir = config
         .output_blib
@@ -3212,23 +3201,51 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // Compute protein-level FDR (if enabled)
-    if let (Some(ref parsimony), Some(protein_fdr_threshold)) =
-        (&protein_parsimony, config.protein_fdr)
-    {
-        log::info!("Computing protein-level FDR...");
+    // Determine which precursors pass precursor/peptide-level FDR
+    let fdr_level = config.fdr_level;
+    let mut passing_precursors: HashSet<(Arc<str>, u8)> = per_file_entries
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .filter(|e| {
+            !e.is_decoy && e.effective_experiment_qvalue(fdr_level) <= config.experiment_fdr
+        })
+        .map(|e| (e.modified_sequence.clone(), e.charge))
+        .collect();
+
+    // Compute protein-level FDR on detected peptides (if enabled)
+    // Parsimony is built from detected peptides only, since protein groups
+    // depend on which peptides were actually observed -- two proteins may be
+    // distinguishable in theory but indistinguishable based on detected peptides.
+    let protein_fdr_results: Option<(
+        protein::ProteinParsimonyResult,
+        protein::ProteinFdrResult,
+        f64,
+    )> = if let Some(protein_fdr_threshold) = config.protein_fdr {
+        log::info!("Computing protein-level FDR on detected peptides...");
+
+        // Collect detected target peptide sequences (passing precursor/peptide FDR)
+        let detected_peptides: HashSet<String> = passing_precursors
+            .iter()
+            .map(|(seq, _)| seq.to_string())
+            .collect();
+
+        // Build parsimony from detected peptides only
+        let parsimony = protein::build_protein_parsimony(
+            &library,
+            config.shared_peptides,
+            Some(&detected_peptides),
+        );
 
         // Run-level protein FDR: best scores per peptide within each file
         for (file_name, entries) in per_file_entries.iter_mut() {
             let file_entries = vec![(file_name.clone(), std::mem::take(entries))];
             let best_scores = protein::collect_best_peptide_scores(&file_entries);
-            let run_fdr = protein::compute_protein_fdr(parsimony, &best_scores);
+            let run_fdr_result = protein::compute_protein_fdr(&parsimony, &best_scores);
             let mut file_entries = file_entries;
             let (_, restored) = file_entries.pop().unwrap();
             *entries = restored;
-            // Propagate run-level protein q-values
             for entry in entries.iter_mut() {
-                entry.run_protein_qvalue = run_fdr
+                entry.run_protein_qvalue = run_fdr_result
                     .peptide_qvalues
                     .get(&*entry.modified_sequence)
                     .copied()
@@ -3238,7 +3255,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         // Experiment-level protein FDR: best scores per peptide across all files
         let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
-        let exp_fdr = protein::compute_protein_fdr(parsimony, &best_scores);
+        let exp_fdr = protein::compute_protein_fdr(&parsimony, &best_scores);
         protein::propagate_protein_qvalues(&mut per_file_entries, &exp_fdr, false, true);
 
         let n_passing = exp_fdr
@@ -3253,22 +3270,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             n_total,
             protein_fdr_threshold * 100.0
         );
-    }
 
-    // Determine which precursors pass experiment-level FDR from lightweight FdrEntry stubs
-    let fdr_level = config.fdr_level;
-    let passing_precursors: HashSet<(Arc<str>, u8)> = per_file_entries
-        .iter()
-        .flat_map(|(_, entries)| entries.iter())
-        .filter(|e| {
-            !e.is_decoy
-                && e.effective_experiment_qvalue(fdr_level) <= config.experiment_fdr
-                && config
-                    .protein_fdr
-                    .map_or(true, |pf| e.experiment_protein_qvalue <= pf)
-        })
-        .map(|e| (e.modified_sequence.clone(), e.charge))
-        .collect();
+        // Re-filter passing_precursors to also require protein FDR
+        passing_precursors.retain(|(seq, _charge)| {
+            per_file_entries
+                .iter()
+                .flat_map(|(_, entries)| entries.iter())
+                .any(|e| {
+                    !e.is_decoy
+                        && e.modified_sequence == *seq
+                        && e.experiment_protein_qvalue <= protein_fdr_threshold
+                })
+        });
+
+        Some((parsimony, exp_fdr, protein_fdr_threshold))
+    } else {
+        None
+    };
 
     // Compute best experiment q-value per precursor
     let mut best_exp_q: HashMap<(Arc<str>, u8), f64> = HashMap::new();
@@ -3449,6 +3467,21 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             log::info!("Writing TSV report to {}", report_path.display());
             write_scored_report_from_plan(report_path, &plan_entries, &library)?;
         }
+    }
+
+    // Write protein report (if protein FDR was computed)
+    if let Some((ref parsimony, ref exp_fdr, protein_fdr_threshold)) = protein_fdr_results {
+        let protein_report_path = config.output_blib.with_extension("proteins.tsv");
+        log::info!(
+            "Writing protein report to {}",
+            protein_report_path.display()
+        );
+        protein::write_protein_report(
+            &protein_report_path,
+            parsimony,
+            exp_fdr,
+            protein_fdr_threshold,
+        )?;
     }
 
     Ok(())
