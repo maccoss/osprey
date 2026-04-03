@@ -33,6 +33,9 @@ coverage/
 lcov.info
 tarpaulin-report.html
 
+# Generated HTML reports (calibration reports, etc.)
+scripts/*.html
+
 # Documentation build
 /target/doc/
 
