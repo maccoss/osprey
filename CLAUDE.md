@@ -35,7 +35,7 @@ osprey/
 - **osprey-io**: `MzmlReader` (uses mzdata crate), `DiannTsvLoader`, `ElibLoader`, `BlibLoader`, `BlibWriter`
 - **osprey-chromatography**: `PeakDetector`, `RTCalibrator`, `MzCalibration`, `CalibrationParams`
 - **osprey-scoring**: `SpectralScorer`, `DecoyGenerator`, batch scoring
-- **osprey-fdr**: `FdrController`, `MokapotRunner` (PIN file + semi-supervised FDR)
+- **osprey-fdr**: `FdrController`, `MokapotRunner` (PIN file + semi-supervised FDR), `protein` module (parsimony + picked-protein FDR)
 - **osprey-ml**: `LinearSvmClassifier`, `PepEstimator`, `LDA`, matrix operations
 
 ## Build Commands
@@ -335,3 +335,9 @@ Osprey uses a tiered disk-backed architecture to scale to 1000+ files:
 - Safe NAS file writes: all cache writers (Parquet, spectra.bin, calibration JSON, score sidecars) write to local temp then `copy_and_verify` to final destination
 - Removed unused config settings: `max_candidates_per_spectrum`, `memory_limit_gb`, `custom_bin_width`, `initial_tolerance_fraction`, `use_percentile_tolerance`
 - Removed expensive unused `elution_weighted_cosine` feature computation (set to 0.0, not in PIN)
+- Split FdrEntry q-value fields: `run_qvalue`/`experiment_qvalue` replaced by 6 separate fields (run/experiment x precursor/peptide/protein) with `effective_*_qvalue(FdrLevel)` methods
+- Added `FdrLevel` enum (Precursor, Peptide, Both) for configurable output filtering via `--fdr-level`
+- Added `SharedPeptideMode` enum (All, Razor, Unique) for protein-level shared peptide handling via `--shared-peptides`
+- Added native Rust protein parsimony in `osprey-fdr/src/protein.rs`: bipartite graph, identical-set grouping, subset elimination, greedy razor assignment, picked-protein FDR with TDC q-values
+- Added `--protein-fdr` CLI flag and `protein_fdr` config for optional protein-level FDR control
+- Pipeline integration for protein FDR pending (parsimony module and types are complete)

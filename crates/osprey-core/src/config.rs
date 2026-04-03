@@ -228,7 +228,16 @@ experiment_fdr: 0.01
 decoy_method: Reverse  # Options: Reverse, Shuffle, FromLibrary
 decoys_in_library: false
 fdr_method: Percolator  # Options: Percolator (native SVM), Mokapot (external Python), Simple (no ML)
+fdr_level: Both         # Output filtering: Precursor, Peptide, or Both (default, most conservative)
 write_pin: false  # Write PIN files for external tools
+
+# Protein-level FDR (optional, disabled by default)
+# Uncomment to enable protein parsimony and picked-protein FDR:
+# protein_fdr: 0.01       # Protein group FDR threshold
+# shared_peptides: All    # How to handle shared peptides: All (default), Razor, or Unique
+#   All:    shared peptides contribute to all their protein groups
+#   Razor:  shared peptides assigned to the group with the strongest evidence
+#   Unique: only unique peptides used; shared peptides excluded entirely
 
 # Performance
 n_threads: 0  # 0 = auto-detect
