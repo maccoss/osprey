@@ -12,6 +12,7 @@
 
 use osprey_core::config::SharedPeptideMode;
 use osprey_core::types::{FdrEntry, LibraryEntry};
+use osprey_ml::pep::PepEstimator;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -45,6 +46,8 @@ pub struct ProteinParsimonyResult {
 pub struct ProteinFdrResult {
     /// Protein group ID -> q-value
     pub group_qvalues: HashMap<ProteinGroupId, f64>,
+    /// Protein group ID -> posterior error probability
+    pub group_pep: HashMap<ProteinGroupId, f64>,
     /// Protein group ID -> best peptide SVM score (target side)
     pub group_scores: HashMap<ProteinGroupId, f64>,
     /// Peptide (modified_sequence) -> best protein q-value among its groups
@@ -318,6 +321,17 @@ pub fn compute_protein_fdr(
     // Sort by score descending
     picked.sort_by(|a, b| b.0.total_cmp(&a.0));
 
+    // Compute protein-level PEP from picked competition winners
+    let winner_scores: Vec<f64> = picked.iter().map(|&(s, _, _)| s).collect();
+    let winner_is_decoy: Vec<bool> = picked.iter().map(|&(_, d, _)| d).collect();
+    let pep_estimator = PepEstimator::fit_default(&winner_scores, &winner_is_decoy);
+    let mut group_pep: HashMap<ProteinGroupId, f64> = HashMap::new();
+    for &(score, is_decoy, gid) in &picked {
+        if !is_decoy {
+            group_pep.insert(gid, pep_estimator.posterior_error(score));
+        }
+    }
+
     // Compute conservative q-values via TDC
     let mut group_qvalues: HashMap<ProteinGroupId, f64> = HashMap::new();
     let mut n_targets = 0usize;
@@ -367,6 +381,7 @@ pub fn compute_protein_fdr(
 
     ProteinFdrResult {
         group_qvalues,
+        group_pep,
         group_scores: target_group_scores,
         peptide_qvalues,
     }
@@ -375,20 +390,42 @@ pub fn compute_protein_fdr(
 /// Write a protein-level CSV report.
 ///
 /// Each row is a protein group that passes the FDR threshold. Columns include
-/// protein accessions, q-value, best peptide score, number of peptides, and
-/// the contributing peptide sequences.
+/// protein accessions, gene names, q-value, PEP, best peptide score, number of
+/// peptides, and the contributing peptide sequences.
+///
+/// Gene names are looked up from the library entries. If multiple accessions in a
+/// group have different gene names, they are joined with semicolons.
 pub fn write_protein_report(
     path: &std::path::Path,
     parsimony: &ProteinParsimonyResult,
     fdr_result: &ProteinFdrResult,
     protein_fdr_threshold: f64,
+    library: &[LibraryEntry],
 ) -> std::io::Result<()> {
     use std::io::Write;
+
+    // Build accession -> gene name lookup from library
+    let mut accession_to_genes: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for entry in library {
+        if entry.is_decoy {
+            continue;
+        }
+        for (i, acc) in entry.protein_ids.iter().enumerate() {
+            if let Some(gene) = entry.gene_names.get(i) {
+                if !gene.is_empty() {
+                    accession_to_genes
+                        .entry(acc.as_str())
+                        .or_default()
+                        .insert(gene.as_str());
+                }
+            }
+        }
+    }
 
     let mut file = std::fs::File::create(path)?;
     writeln!(
         file,
-        "protein_group,protein_accessions,protein_qvalue,best_score,n_unique_peptides,n_shared_peptides,unique_peptides,shared_peptides"
+        "protein_group,protein_accessions,gene_names,protein_qvalue,protein_pep,best_score,n_unique_peptides,n_shared_peptides,unique_peptides,shared_peptides"
     )?;
 
     // Collect passing groups, sorted by q-value
@@ -414,12 +451,30 @@ pub fn write_protein_report(
             .get(&group.id)
             .copied()
             .unwrap_or(1.0);
+        let pep = fdr_result.group_pep.get(&group.id).copied().unwrap_or(1.0);
         let score = fdr_result
             .group_scores
             .get(&group.id)
             .copied()
             .unwrap_or(0.0);
         let accessions = group.accessions.join(";");
+
+        // Collect gene names for all accessions in this group
+        let mut genes: Vec<&str> = group
+            .accessions
+            .iter()
+            .flat_map(|acc| {
+                accession_to_genes
+                    .get(acc.as_str())
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
+            .collect();
+        genes.sort();
+        genes.dedup();
+        let gene_str = genes.join(";");
+
         let unique_peps: Vec<&String> = {
             let mut v: Vec<&String> = group.unique_peptides.iter().collect();
             v.sort();
@@ -443,10 +498,12 @@ pub fn write_protein_report(
 
         writeln!(
             file,
-            "{},{},{:.6},{:.4},{},{},{},{}",
+            "{},{},{},{:.6},{:.6},{:.4},{},{},{},{}",
             group.id,
             accessions,
+            gene_str,
             q,
+            pep,
             score,
             group.unique_peptides.len(),
             group.shared_peptides.len(),

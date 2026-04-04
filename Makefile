@@ -1,4 +1,4 @@
-.PHONY: check build install test
+.PHONY: check build install test clean
 
 check:
 	cargo fmt
@@ -11,4 +11,9 @@ test: check
 	cargo test
 
 install: build
-	cargo install --path crates/osprey
+	@echo "Installing osprey to ~/.cargo/bin/"
+	@cp target/release/osprey ~/.cargo/bin/osprey
+	@echo "Installed: $$(osprey --version 2>/dev/null || echo 'osprey')"
+
+clean:
+	cargo clean

@@ -3101,6 +3101,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             &parsimony,
             &protein_fdr_result,
             protein_fdr_threshold,
+            &library,
         ) {
             log::warn!("Failed to write protein report: {}", e);
         }
