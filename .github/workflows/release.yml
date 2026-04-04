@@ -10,27 +10,35 @@ env:
 
 jobs:
   build-release:
-    name: Build Release (${{ matrix.target }})
+    name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - name: linux-x86_64
+            os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: osprey
-            asset_name: osprey-linux-x86_64
-          - os: macos-latest
+            binary: osprey
+            cross: false
+
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: osprey
+            cross: false
+
+          - name: macos-aarch64
+            os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: osprey
-            asset_name: osprey-macos-aarch64
-          - os: windows-latest
+            binary: osprey
+            cross: false
+
+          - name: windows-x86_64
+            os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: osprey.exe
-            asset_name: osprey-windows-x86_64.exe
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            artifact_name: osprey.exe
-            asset_name: osprey-windows-aarch64.exe
+            binary: osprey.exe
+            cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -50,21 +58,36 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install openblas openssl cmake
+          BREW_PREFIX=$(brew --prefix openblas)
+          echo "LDFLAGS=-L${BREW_PREFIX}/lib" >> $GITHUB_ENV
+          echo "CPPFLAGS=-I${BREW_PREFIX}/include" >> $GITHUB_ENV
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          $triplet = if ('${{ matrix.target }}' -eq 'aarch64-pc-windows-msvc') { 'arm64-windows' } else { 'x64-windows' }
-          vcpkg install openblas:$triplet openssl:$triplet
+          vcpkg install openblas:x64-windows openssl:x64-windows
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../osprey-${{ matrix.name }}.tar.gz ${{ matrix.binary }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" -DestinationPath "osprey-${{ matrix.name }}.zip"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          name: osprey-${{ matrix.name }}
+          path: osprey-${{ matrix.name }}.*
           if-no-files-found: error
 
   create-release:
@@ -85,18 +108,12 @@ jobs:
         run: |
           mkdir -p release
           for dir in artifacts/*/; do
-            name=$(basename "$dir")
-            if [[ "$name" == *.exe ]]; then
-              cp "$dir"/* "release/$name"
-            else
-              cp "$dir"/* "release/$name"
-              chmod +x "release/$name"
-            fi
+            cp "$dir"/* release/
           done
           ls -la release/
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: release/*
           generate_release_notes: true
