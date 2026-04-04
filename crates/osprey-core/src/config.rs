@@ -51,18 +51,6 @@ pub struct OspreyConfig {
     #[serde(default)]
     pub fdr_method: FdrMethod,
 
-    /// Which FDR level to use for output filtering (precursor, peptide, or both)
-    #[serde(default)]
-    pub fdr_level: FdrLevel,
-
-    /// Protein-level FDR threshold (None = protein FDR disabled)
-    #[serde(default)]
-    pub protein_fdr: Option<f64>,
-
-    /// How to handle shared peptides for protein-level FDR
-    #[serde(default)]
-    pub shared_peptides: SharedPeptideMode,
-
     /// Write PIN files for external tools (default: false)
     #[serde(default)]
     pub write_pin: bool,
@@ -95,9 +83,6 @@ impl Default for OspreyConfig {
             precursor_tolerance: FragmentToleranceConfig::hram(10.0), // 10 ppm for precursor
             rt_calibration: RTCalibrationConfig::default(),
             fdr_method: FdrMethod::default(),
-            fdr_level: FdrLevel::default(),
-            protein_fdr: None,
-            shared_peptides: SharedPeptideMode::default(),
             write_pin: false,
             run_fdr: 0.01,
             experiment_fdr: 0.01,
@@ -228,16 +213,7 @@ experiment_fdr: 0.01
 decoy_method: Reverse  # Options: Reverse, Shuffle, FromLibrary
 decoys_in_library: false
 fdr_method: Percolator  # Options: Percolator (native SVM), Mokapot (external Python), Simple (no ML)
-fdr_level: Both         # Output filtering: Precursor, Peptide, or Both (default, most conservative)
 write_pin: false  # Write PIN files for external tools
-
-# Protein-level FDR (optional, disabled by default)
-# Uncomment to enable protein parsimony and picked-protein FDR:
-# protein_fdr: 0.01       # Protein group FDR threshold
-# shared_peptides: All    # How to handle shared peptides: All (default), Razor, or Unique
-#   All:    shared peptides contribute to all their protein groups
-#   Razor:  shared peptides assigned to the group with the strongest evidence
-#   Unique: only unique peptides used; shared peptides excluded entirely
 
 # Performance
 n_threads: 0  # 0 = auto-detect
@@ -297,15 +273,6 @@ n_threads: 0  # 0 = auto-detect
         }
         if let Some(method) = args.fdr_method {
             self.fdr_method = method;
-        }
-        if let Some(level) = args.fdr_level {
-            self.fdr_level = level;
-        }
-        if let Some(pf) = args.protein_fdr {
-            self.protein_fdr = Some(pf);
-        }
-        if let Some(mode) = args.shared_peptides {
-            self.shared_peptides = mode;
         }
         if args.write_pin {
             self.write_pin = true;
@@ -594,50 +561,6 @@ pub enum DecoyMethod {
     FromLibrary,
 }
 
-/// Which FDR level to use for output filtering
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum FdrLevel {
-    /// Filter on precursor-level q-values only (modified_sequence + charge)
-    Precursor,
-    /// Filter on peptide-level q-values only (modified_sequence)
-    Peptide,
-    /// Filter on max(precursor, peptide) q-values (default, most conservative)
-    #[default]
-    Both,
-}
-
-impl std::fmt::Display for FdrLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FdrLevel::Precursor => write!(f, "precursor"),
-            FdrLevel::Peptide => write!(f, "peptide"),
-            FdrLevel::Both => write!(f, "both"),
-        }
-    }
-}
-
-/// How to handle shared peptides (mapping to multiple protein groups) for protein-level FDR
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum SharedPeptideMode {
-    /// Shared peptides contribute to all their protein groups (default)
-    #[default]
-    All,
-    /// Shared peptides assigned to the protein group with the strongest evidence
-    Razor,
-    /// Only unique peptides used; shared peptides excluded from scoring and output
-    Unique,
-}
-
-impl std::fmt::Display for SharedPeptideMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SharedPeptideMode::All => write!(f, "all"),
-            SharedPeptideMode::Razor => write!(f, "razor"),
-            SharedPeptideMode::Unique => write!(f, "unique"),
-        }
-    }
-}
-
 /// FDR control method
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FdrMethod {
@@ -658,6 +581,36 @@ impl std::fmt::Display for FdrMethod {
             FdrMethod::Simple => write!(f, "simple"),
         }
     }
+}
+
+/// Shared peptide handling mode for protein-level analysis
+///
+/// Controls how peptides shared between multiple protein groups are handled
+/// during protein inference and quantification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SharedPeptideMode {
+    /// Include all peptides (shared and unique) for each protein group
+    #[default]
+    All,
+    /// Assign shared peptides to the protein group with the most unique peptides (razor)
+    Razor,
+    /// Use only proteotypic (unique) peptides for each protein group
+    Unique,
+}
+
+/// FDR filtering level for output
+///
+/// Controls whether precursors must pass FDR at the precursor level,
+/// peptide level, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FdrLevel {
+    /// Filter by precursor-level q-value only (modified_sequence + charge)
+    Precursor,
+    /// Filter by peptide-level q-value only (modified_sequence)
+    Peptide,
+    /// Filter by max(precursor, peptide) q-value (default, most conservative)
+    #[default]
+    Both,
 }
 
 /// Inter-replicate peak reconciliation configuration
