@@ -3044,6 +3044,65 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
+    // Protein-level FDR (if enabled via --protein-fdr)
+    if let Some(protein_fdr_threshold) = config.protein_fdr {
+        use osprey_fdr::protein;
+        log::info!("");
+        log::info!("=== Protein-Level FDR ===");
+
+        // Collect detected peptides (passing precursor-level experiment FDR)
+        let detected_peptides: HashSet<String> = per_file_entries
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .filter(|e| !e.is_decoy && e.experiment_precursor_qvalue <= config.experiment_fdr)
+            .map(|e| e.modified_sequence.to_string())
+            .collect();
+
+        // Build protein parsimony from library using only detected peptides
+        let parsimony = protein::build_protein_parsimony(
+            &library,
+            config.shared_peptides,
+            Some(&detected_peptides),
+        );
+
+        // Collect best SVM score per peptide for protein scoring
+        let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
+
+        // Compute picked-protein FDR
+        let protein_fdr_result = protein::compute_protein_fdr(&parsimony, &best_scores);
+
+        let n_passing = protein_fdr_result
+            .group_qvalues
+            .values()
+            .filter(|&&q| q <= protein_fdr_threshold)
+            .count();
+        log::info!(
+            "Protein FDR: {} protein groups at {:.0}% FDR (from {} total groups)",
+            n_passing,
+            protein_fdr_threshold * 100.0,
+            parsimony.groups.len()
+        );
+
+        // Propagate protein q-values to FdrEntry stubs (experiment-level)
+        protein::propagate_protein_qvalues(
+            &mut per_file_entries,
+            &protein_fdr_result,
+            false, // don't set run-level (protein FDR is experiment-wide)
+            true,  // set experiment-level
+        );
+
+        // Write protein report
+        let protein_report_path = config.output_blib.with_extension("proteins.csv");
+        if let Err(e) = protein::write_protein_report(
+            &protein_report_path,
+            &parsimony,
+            &protein_fdr_result,
+            protein_fdr_threshold,
+        ) {
+            log::warn!("Failed to write protein report: {}", e);
+        }
+    }
+
     // Determine which precursors pass experiment-level FDR from lightweight FdrEntry stubs
     let passing_precursors: HashSet<(Arc<str>, u8)> = per_file_entries
         .iter()

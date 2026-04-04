@@ -66,6 +66,20 @@ pub struct OspreyConfig {
     #[serde(default = "default_true")]
     pub prefilter_enabled: bool,
 
+    // Protein FDR
+    /// Protein-level FDR threshold (enables protein parsimony and picked-protein FDR).
+    /// When set, precursors must also pass protein-level FDR to be reported.
+    #[serde(default)]
+    pub protein_fdr: Option<f64>,
+
+    /// How to handle shared peptides for protein inference
+    #[serde(default)]
+    pub shared_peptides: SharedPeptideMode,
+
+    /// FDR filtering level for output
+    #[serde(default)]
+    pub fdr_level: FdrLevel,
+
     // Performance
     /// Number of threads to use
     pub n_threads: usize,
@@ -90,6 +104,9 @@ impl Default for OspreyConfig {
             decoys_in_library: false,
             reconciliation: ReconciliationConfig::default(),
             prefilter_enabled: true,
+            protein_fdr: None,
+            shared_peptides: SharedPeptideMode::default(),
+            fdr_level: FdrLevel::default(),
             n_threads: num_cpus(),
         }
     }
@@ -276,6 +293,15 @@ n_threads: 0  # 0 = auto-detect
         }
         if args.write_pin {
             self.write_pin = true;
+        }
+        if let Some(level) = args.fdr_level {
+            self.fdr_level = level;
+        }
+        if let Some(fdr) = args.protein_fdr {
+            self.protein_fdr = Some(fdr);
+        }
+        if let Some(mode) = args.shared_peptides {
+            self.shared_peptides = mode;
         }
     }
 
