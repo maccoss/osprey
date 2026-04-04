@@ -2973,12 +2973,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                                 }
                             }
                         }
-                        // Append gap-fill entries (remaining overlay entries beyond parquet range)
+                        // Append gap-fill entries and update their parquet_index
+                        let gap_start_pq = full_entries.len();
                         let mut gap_entries: Vec<(usize, CoelutionScoredEntry)> =
                             overlay.into_iter().collect();
                         gap_entries.sort_by_key(|(idx, _)| *idx);
-                        for (_, entry) in gap_entries {
+                        for (gap_i, (vec_idx, entry)) in gap_entries.into_iter().enumerate() {
                             full_entries.push(entry);
+                            // Update the FdrEntry stub's parquet_index to its actual row
+                            fdr_entries[vec_idx].parquet_index = (gap_start_pq + gap_i) as u32;
                         }
                         // Write back to Parquet with reconciliation metadata
                         let recon_metadata = build_reconciled_metadata(&config);
