@@ -403,7 +403,10 @@ pub fn plan_reconciliation(
                 }
 
                 let expected_rt = cal.predict(consensus_entry.consensus_library_rt);
-                let cwt = file_cwt.get(entry_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+                let cwt = file_cwt
+                    .get(entry.parquet_index as usize)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 let action = determine_reconcile_action(
                     entry.start_rt,
                     entry.end_rt,
@@ -684,6 +687,7 @@ mod tests {
     ) -> FdrEntry {
         FdrEntry {
             entry_id,
+            parquet_index: 0,
             is_decoy,
             charge,
             scan_number: 1,

@@ -1720,6 +1720,7 @@ fn load_fdr_stubs_from_parquet(
     })?;
 
     let mut stubs = Vec::new();
+    let mut row_offset = 0usize;
     for batch_result in reader {
         let batch = batch_result
             .map_err(|e| OspreyError::config(format!("Failed to read batch: {}", e)))?;
@@ -1780,8 +1781,10 @@ fn load_fdr_stubs_from_parquet(
             .unwrap();
 
         for row in 0..batch.num_rows() {
+            let parquet_idx = (row_offset + row) as u32;
             stubs.push(FdrEntry {
                 entry_id: entry_id_col.value(row),
+                parquet_index: parquet_idx,
                 is_decoy: decoy_col.value(row),
                 charge: charge_col.value(row),
                 scan_number: scan_col.value(row),
@@ -1800,6 +1803,7 @@ fn load_fdr_stubs_from_parquet(
                 modified_sequence: intern_seq(seq_interner, modseq_col.value(row)),
             });
         }
+        row_offset += batch.num_rows();
     }
 
     Ok(stubs)
@@ -2329,7 +2333,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             }
 
             // Convert to lightweight FdrEntry stubs (intern modified_sequences)
-            let mut fdr_stubs: Vec<FdrEntry> = entries.iter().map(|e| e.to_fdr_entry()).collect();
+            let mut fdr_stubs: Vec<FdrEntry> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let mut stub = e.to_fdr_entry();
+                    stub.parquet_index = i as u32;
+                    stub
+                })
+                .collect();
             for stub in &mut fdr_stubs {
                 stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
             }
@@ -2389,6 +2401,9 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
+    // Score sidecar infrastructure was removed during refactoring — skip-FDR disabled for now
+    let can_skip_fdr = false;
+
     // Collect first-pass passing base_ids: any precursor passing run-level FDR
     // in at least one replicate. The second-pass FDR will be restricted to only
     // these precursors (+ paired decoys), ensuring complete gap-fill coverage
@@ -2405,6 +2420,31 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         first_pass_base_ids.len(),
         config.run_fdr * 100.0,
     );
+
+    // Compact FDR stubs: drop entries for precursors that didn't pass first-pass FDR.
+    // Keeps passing targets + their paired decoys (by base_id).
+    // This reduces memory from ~35 GB to ~14 GB for 240-file experiments,
+    // leaving headroom for reconciliation re-scoring (~3 GB per file).
+    // The parquet_index field preserves the original row index for CWT/feature lookup.
+    if !can_skip_fdr {
+        let entries_before: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
+        for (_, entries) in per_file_entries.iter_mut() {
+            entries.retain(|e| {
+                let base_id = e.entry_id & 0x7FFF_FFFF;
+                first_pass_base_ids.contains(&base_id)
+            });
+            entries.shrink_to_fit();
+        }
+        let entries_after: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
+        let saved_gb =
+            ((entries_before - entries_after) as f64 * 128.0) / (1024.0 * 1024.0 * 1024.0);
+        log::info!(
+            "Compacted FDR stubs: {} -> {} entries (freed {:.1} GB)",
+            entries_before,
+            entries_after,
+            saved_gb,
+        );
+    }
 
     // Post-FDR re-scoring: multi-charge consensus + inter-replicate reconciliation.
     // Both phases need to load spectra and re-score entries, so we merge them
@@ -2813,10 +2853,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     cwt_results.iter().map(|e| e.entry_id).collect();
                 n_gap_cwt = cwt_results.len();
 
-                // Append CWT results as new FdrEntry stubs
+                // Append CWT results as new FdrEntry stubs (gap-fill: no Parquet row)
                 let gap_fill_start_idx = fdr_entries.len();
                 for (i, entry) in cwt_results.into_iter().enumerate() {
                     let mut stub = entry.to_fdr_entry();
+                    stub.parquet_index = u32::MAX; // gap-fill sentinel: features in overlay only
                     stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
                     fdr_entries.push(stub);
                     overlay.insert(gap_fill_start_idx + i, entry);
@@ -2864,10 +2905,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
                     n_gap_forced = forced_results.len();
 
-                    // Append forced results as new FdrEntry stubs
+                    // Append forced results as new FdrEntry stubs (gap-fill: no Parquet row)
                     let forced_start_idx = fdr_entries.len();
                     for (i, entry) in forced_results.into_iter().enumerate() {
                         let mut stub = entry.to_fdr_entry();
+                        stub.parquet_index = u32::MAX; // gap-fill sentinel
                         stub.modified_sequence =
                             intern_seq(&mut seq_interner, &stub.modified_sequence);
                         fdr_entries.push(stub);
@@ -2907,6 +2949,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             for &idx in &existing_rescore_indices {
                 if let Some(entry) = overlay.get(&idx) {
                     let mut stub = entry.to_fdr_entry();
+                    stub.parquet_index = fdr_entries[idx].parquet_index;
                     stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
                     fdr_entries[idx] = stub;
                 }
@@ -2917,14 +2960,16 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             if !overlay.is_empty() {
                 // Merge overlay into a complete entry list for this file:
                 // load original parquet, replace re-scored entries, append gap-fill entries.
+                // Use parquet_index (not Vec index) since stubs may have been compacted.
                 let scores_path = per_file_cache_paths.get(file_name.as_str());
                 if let Some(cache_path) = scores_path {
                     if let Ok(mut full_entries) = load_scores_parquet(cache_path) {
-                        // Replace re-scored entries
-                        for &idx in &existing_rescore_indices {
-                            if let Some(entry) = overlay.remove(&idx) {
-                                if idx < full_entries.len() {
-                                    full_entries[idx] = entry;
+                        // Replace re-scored entries using parquet_index
+                        for &vec_idx in &existing_rescore_indices {
+                            if let Some(entry) = overlay.remove(&vec_idx) {
+                                let pq_idx = fdr_entries[vec_idx].parquet_index as usize;
+                                if pq_idx < full_entries.len() {
+                                    full_entries[pq_idx] = entry;
                                 }
                             }
                         }
@@ -3409,15 +3454,20 @@ fn run_percolator_fdr(
             let cache_path = per_file_cache_paths.get(file_name.as_str())?;
 
             let file_features = load_pin_features_from_parquet(cache_path).ok()?;
+            let fdr_entries_ref = &per_file_entries[file_idx].1;
             let results: Vec<(usize, Vec<f64>)> = entries_in_file
                 .iter()
                 .filter_map(|&(pos, local_idx)| {
                     if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
                         Some((pos, pin_feature_vector(&overlay_entry.features)))
-                    } else if local_idx < file_features.len() {
-                        Some((pos, file_features[local_idx].clone()))
                     } else {
-                        None
+                        // Use parquet_index for feature lookup (Vec may be compacted)
+                        let pq_idx = fdr_entries_ref[local_idx].parquet_index as usize;
+                        if pq_idx < file_features.len() {
+                            Some((pos, file_features[pq_idx].clone()))
+                        } else {
+                            None
+                        }
                     }
                 })
                 .collect();
@@ -3512,33 +3562,40 @@ fn run_percolator_fdr(
                     return;
                 }
             };
-            let parquet_len = file_features.len();
 
-            for (local_idx, parquet_features) in file_features.into_iter().enumerate() {
+            // Score entries using parquet_index for feature lookup
+            // (stubs may have been compacted, so Vec index != Parquet row)
+            for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate() {
                 // Skip entries not in the restriction set (keep first-pass scores)
                 if let Some(restrict) = restrict_base_ids {
-                    let base_id = fdr_entries[local_idx].entry_id & 0x7FFF_FFFF;
+                    let base_id = fdr_entry.entry_id & 0x7FFF_FFFF;
                     if !restrict.contains(&base_id) {
                         continue;
                     }
                 }
+                let pq_idx = fdr_entry.parquet_index as usize;
                 // Use overlay features for re-scored entries, parquet features otherwise
                 let mut features =
                     if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
                         pin_feature_vector(&overlay_entry.features)
+                    } else if pq_idx < file_features.len() {
+                        file_features[pq_idx].clone()
                     } else {
-                        parquet_features
+                        continue; // gap-fill without parquet features
                     };
                 standardizer.transform_slice(&mut features);
                 let mut score = avg_bias;
                 for (w, x) in avg_weights.iter().zip(features.iter()) {
                     score += w * x;
                 }
-                fdr_entries[local_idx].score = score;
+                fdr_entry.score = score;
             }
 
-            // Score gap-fill entries (indices beyond parquet, only in overlay)
-            for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate().skip(parquet_len) {
+            // Score gap-fill entries (parquet_index == u32::MAX, features only in overlay)
+            for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate() {
+                if fdr_entry.parquet_index != u32::MAX {
+                    continue; // already scored above from Parquet features
+                }
                 if let Some(restrict) = restrict_base_ids {
                     let base_id = fdr_entry.entry_id & 0x7FFF_FFFF;
                     if !restrict.contains(&base_id) {
@@ -3590,25 +3647,24 @@ fn run_percolator_fdr_direct(
                 OspreyError::config(format!("No parquet cache path for file {}", file_name))
             })?;
         let file_features = load_pin_features_from_parquet(cache_path)?;
-        let parquet_len = file_features.len();
 
-        // Process parquet-aligned entries
-        for (local_idx, (fdr_entry, parquet_features)) in fdr_entries[..parquet_len]
-            .iter()
-            .zip(file_features.into_iter())
-            .enumerate()
-        {
+        // Process entries using parquet_index for feature lookup
+        // (stubs may have been compacted, so Vec index != Parquet row index)
+        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate() {
             if let Some(restrict) = restrict_base_ids {
                 if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
                     continue;
                 }
             }
+            let pq_idx = fdr_entry.parquet_index as usize;
             // Use overlay features for re-scored entries, parquet features otherwise
             let features = if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx))
             {
                 pin_feature_vector(&overlay_entry.features)
+            } else if pq_idx < file_features.len() {
+                file_features[pq_idx].clone()
             } else {
-                parquet_features
+                continue; // gap-fill entry without parquet features
             };
             let psm_id = format!(
                 "{}_{}_{}_{}",
@@ -3626,8 +3682,11 @@ fn run_percolator_fdr_direct(
             });
         }
 
-        // Process gap-fill entries (indices beyond parquet, from overlay only)
-        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate().skip(parquet_len) {
+        // Process gap-fill entries (parquet_index == u32::MAX, features from overlay only)
+        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate() {
+            if fdr_entry.parquet_index != u32::MAX {
+                continue; // already processed above
+            }
             if let Some(restrict) = restrict_base_ids {
                 if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
                     continue;

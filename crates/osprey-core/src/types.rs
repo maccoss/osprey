@@ -699,6 +699,7 @@ impl CoelutionScoredEntry {
     pub fn to_fdr_entry(&self) -> FdrEntry {
         FdrEntry {
             entry_id: self.entry_id,
+            parquet_index: 0, // populated by caller after Parquet write
             is_decoy: self.is_decoy,
             charge: self.charge,
             scan_number: self.scan_number,
@@ -735,6 +736,9 @@ impl CoelutionScoredEntry {
 pub struct FdrEntry {
     /// Library entry ID (for psm_id construction and library lookup)
     pub entry_id: u32,
+    /// Row index in the per-file Parquet cache (for CWT candidate and feature lookup
+    /// after the FDR stub Vec is compacted to remove non-passing entries)
+    pub parquet_index: u32,
     /// Whether this is a decoy
     pub is_decoy: bool,
     /// Precursor charge (for psm_id and passing_precursors key)

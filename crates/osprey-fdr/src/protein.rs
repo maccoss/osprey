@@ -750,6 +750,7 @@ mod tests {
             vec![
                 FdrEntry {
                     entry_id: 1,
+                    parquet_index: 0,
                     is_decoy: false,
                     charge: 2,
                     scan_number: 100,
@@ -769,6 +770,7 @@ mod tests {
                 },
                 FdrEntry {
                     entry_id: 1,
+                    parquet_index: 0,
                     is_decoy: false,
                     charge: 2,
                     scan_number: 200,
