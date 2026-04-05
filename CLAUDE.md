@@ -273,7 +273,7 @@ This distinction is important: a NULL `retentionTime` with populated `startTime`
 
 Osprey uses a tiered disk-backed architecture to scale to 1000+ files:
 
-- **FdrEntry** (~80 bytes inline): Lightweight stub with 13 fields (entry_id, is_decoy, charge, scan_number, apex/start/end_rt, coelution_sum, score, run/experiment_qvalue, pep, modified_sequence). The `file_name` is not stored in FdrEntry — entries are keyed by file name in the outer `Vec<(String, Vec<FdrEntry>)>`. The `modified_sequence` field uses `Arc<str>` for string interning, deduplicating identical peptide sequences across files (e.g., 240M entries → ~3.5M unique strings).
+- **FdrEntry** (~128 bytes): Lightweight stub with fields: entry_id, parquet_index, is_decoy, charge, scan_number, apex/start/end_rt, coelution_sum, score, 6 q-values (run/experiment x precursor/peptide/protein), pep, modified_sequence (`Arc<str>`). After first-pass FDR, non-passing entries are compacted out (saves ~21 GB for 240-file experiments). The `parquet_index` preserves original Parquet row references after compaction.
 - **LightFdr** (~48 bytes): Extracted from FdrEntry stubs before blib output. Contains only q-values, score, pep, charge, and modified_sequence. Dropping FdrEntry stubs frees ~19 GB for 240-file experiments.
 - **BlibPlanEntry** (~96 bytes): Loaded from a 5-column Parquet projection for blib output. Contains entry_id (for library lookup), RT boundaries, q-values, and file_name_idx. Fragments, modifications, and protein mappings come from the in-memory library. Avoids loading full entries (~22 GB for 24M passing entries).
 - **Parquet caches** (`.scores.parquet`): Per-file ZSTD-compressed caches storing 21 PIN features, fragments, CWT candidates. Metadata footer contains SHA-256 hashes of search parameters, library identity, and reconciliation state for automatic cache invalidation.
@@ -340,4 +340,10 @@ Osprey uses a tiered disk-backed architecture to scale to 1000+ files:
 - Added `SharedPeptideMode` enum (All, Razor, Unique) for protein-level shared peptide handling via `--shared-peptides`
 - Added native Rust protein parsimony in `osprey-fdr/src/protein.rs`: bipartite graph, identical-set grouping, subset elimination, greedy razor assignment, picked-protein FDR with TDC q-values
 - Added `--protein-fdr` CLI flag and `protein_fdr` config for optional protein-level FDR control
-- Pipeline integration for protein FDR pending (parsimony module and types are complete)
+- Protein FDR integrated into pipeline: `build_protein_parsimony` + `compute_protein_fdr` + `propagate_protein_qvalues` called after precursor/peptide FDR when `--protein-fdr` is set. Peptide scores collected before stub compaction to include decoy competition winners. CSV protein report with gene names, PEP, and q-values.
+- FDR stub compaction after first-pass: drops non-passing entries, `parquet_index` field preserves original Parquet row references (~21 GB freed for 240-file experiments)
+- Streaming blib output via `BlibPlanEntry` (~96 bytes): 5-column Parquet projection + library lookup, avoids loading full entries (~22 GB)
+- Calibration cache validation: `search_hash` in CalibrationMetadata detects stale calibration files when parameters change (e.g., resolution mode)
+- Parquet cache validation: SHA-256 hashes of search/library/reconciliation parameters in Parquet footer metadata
+- Consensus RT fix: only FDR-passing detections included, weighted median peak widths by coelution_sum
+- Safe NAS file writes: all cache writers use `copy_and_verify` pattern (write to local temp, verify, move to final destination)

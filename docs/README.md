@@ -4,14 +4,20 @@ This folder contains detailed documentation of the algorithms used in Osprey, a 
 
 ## Current Status (Working Prototype)
 
-Osprey has a **working prototype** that can:
+Osprey v0.1.0 features:
 - Parse mzML files with DIA data
 - Load spectral libraries (DIA-NN TSV, EncyclopeDIA elib, BiblioSpec blib)
 - Generate enzyme-aware decoys
-- Run auto-calibration with target-decoy FDR control
+- Auto-calibration with target-decoy FDR control (RT, MS1, MS2)
 - Coelution search with 21 features extracted per precursor
-- Run FDR control via native Percolator (default), external Mokapot, or simple TDC
-- Output BiblioSpec .blib files for Skyline (library theoretical fragments)
+- FDR control via native Percolator (default), external Mokapot, or simple TDC
+- Two-level FDR (run + experiment) at precursor and peptide levels
+- Protein-level FDR with parsimony and picked-protein approach
+- Cross-run peak reconciliation with consensus RT alignment
+- Disk-backed memory architecture for 1000+ file experiments
+- Automatic cache invalidation via SHA-256 parameter hashing
+- BiblioSpec .blib output for Skyline (library theoretical fragments)
+- Safe file writes for NAS/CIFS mounts (copy_and_verify pattern)
 
 ## Algorithm Documentation
 
@@ -30,6 +36,7 @@ Osprey has a **working prototype** that can:
 | [12 - Intermediate File Formats](12-intermediate-files.md) | Calibration JSON, spectra cache, Parquet scores, blib output |
 | [13 - Boundary Overrides & Forced Integration](13-boundary-overrides.md) | How `run_search()` handles override boundaries for consensus and reconciliation |
 | [14 - RT Alignment & Consensus Library RT](14-rt-alignment.md) | LOWESS calibration, inverse prediction, weighted median consensus RT, peak imputation |
+| [15 - Protein FDR](07-fdr-control.md#protein-level-fdr) | Protein parsimony, picked-protein FDR, shared peptide modes, protein PEP |
 
 ---
 
@@ -85,9 +92,12 @@ PHASE 4: FIRST-PASS FDR + POST-FDR CONSENSUS
   |
   v
 PHASE 5: CROSS-RUN RECONCILIATION (multi-file only)
-  +- Collect peptides passing experiment-level FDR (at consensus_fdr threshold)
+  +- Compact FDR stubs: drop non-passing entries (saves ~21 GB for 240-file experiments)
+  |    (parquet_index field preserves original Parquet row reference after compaction)
+  +- Collect peptides passing run-level FDR in each replicate (only FDR-passing detections)
   +- Compute consensus library RTs: weighted median of per-run detections
   |    (weight = coelution_sum; mapped back to library RT space via inverse calibration)
+  |    (peak widths also use weighted median to resist noisy wide detections)
   +- Refit per-run LOESS calibration using consensus peptides
   +- Plan reconciliation for each entry:
   |    Keep | UseCwtPeak (alternate stored candidate) | ForcedIntegration
@@ -99,11 +109,21 @@ PHASE 5: CROSS-RUN RECONCILIATION (multi-file only)
   +- Second-pass FDR -> final q-values
   |
   v
+PHASE 6: PROTEIN FDR (optional, --protein-fdr)
+  +- Build protein parsimony from library (bipartite graph, identical-set grouping,
+  |    subset elimination, shared peptide assignment: All/Razor/Unique)
+  +- Picked-protein FDR: target group vs decoy shadow (best peptide SVM score)
+  |    (peptide scores collected BEFORE stub compaction to include decoy winners)
+  +- Compute protein PEP from picked competition winners
+  +- Propagate protein q-values to FdrEntry stubs
+  +- Write protein CSV report (accessions, gene names, q-value, PEP, peptides)
+  |
+  v
 OUTPUT
-  +- Persist SVM scores to sidecar files (.1st-pass.fdr_scores.bin, .2nd-pass.fdr_scores.bin)
   +- Load lightweight BlibPlanEntry (~96 bytes) from 5-column Parquet projection
   +- Look up fragments, modifications, proteins from in-memory library (no full entry reload)
   +- BiblioSpec (.blib) for Skyline (library theoretical fragments)
+  +- Protein CSV report (if --protein-fdr enabled)
   +- SVM/Mokapot model weights for feature analysis
 ```
 
@@ -253,27 +273,46 @@ Osprey uses **two-level FDR control** with three available methods (`--fdr-metho
 
 ### Memory Architecture: FdrEntry Stubs + Parquet Caching
 
-For multi-file experiments (100s–1000s of files), Osprey uses a disk-backed memory architecture to keep RAM usage constant regardless of file count:
+For multi-file experiments (100s-1000s of files), Osprey uses a disk-backed memory architecture to keep RAM usage manageable:
 
-1. **Per-file Parquet caching**: After scoring each file, the full `CoelutionScoredEntry` data (features, fragments, CWT candidates) is written to a ZSTD-compressed Parquet cache file (`.scores.parquet`).
+1. **Per-file Parquet caching**: After scoring each file, the full `CoelutionScoredEntry` data (features, fragments, CWT candidates) is written to a ZSTD-compressed Parquet cache file (`.scores.parquet`). All cache writers use a safe write pattern: write to local temp file, then `copy_and_verify` to the final destination. This prevents corrupt files on NAS/CIFS mounts if the process is interrupted.
 
-2. **FdrEntry conversion**: Full entries are then converted to lightweight `FdrEntry` stubs (~80 bytes inline each vs ~940 bytes for the full entry). Stubs retain only the 13 fields needed for FDR control: `entry_id`, `is_decoy`, `charge`, `scan_number`, `apex_rt`, `start_rt`, `end_rt`, `coelution_sum`, `score`, `run_qvalue`, `experiment_qvalue`, `pep`, `modified_sequence`. The `file_name` is not stored in FdrEntry — entries are keyed by file name in the outer container. The `modified_sequence` field uses `Arc<str>` for string interning, deduplicating identical peptide sequences across files (e.g., 240M entries → ~3.5M unique strings).
+2. **FdrEntry conversion**: Full entries are converted to lightweight `FdrEntry` stubs (~128 bytes each vs ~940 bytes for the full entry). Stubs retain only the fields needed for FDR control: `entry_id`, `parquet_index`, `is_decoy`, `charge`, `scan_number`, RTs, `coelution_sum`, `score`, 6 q-value fields (run/experiment x precursor/peptide/protein), `pep`, `modified_sequence`. The `modified_sequence` field uses `Arc<str>` for string interning, deduplicating identical peptide sequences across files (e.g., 240M entries -> ~3.5M unique strings).
 
-3. **On-demand loading**: When downstream phases need heavy data, they load selectively from the Parquet cache:
-   - **FDR**: Loads PIN feature columns to build `PercolatorEntry` for SVM scoring
+3. **FDR stub compaction**: After first-pass FDR, stubs for precursors that didn't pass run-level FDR in any replicate are dropped. The `parquet_index` field preserves the original Parquet row reference for CWT/feature lookup after compaction. For 240-file experiments this reduces ~271M entries to ~106M, freeing ~21 GB of RAM for reconciliation.
+
+4. **On-demand loading**: Downstream phases load selectively from the Parquet cache:
+   - **FDR**: Loads PIN feature columns using `parquet_index` for lookup
    - **Reconciliation**: Loads CWT candidates only via `load_cwt_candidates_from_parquet()`
-   - **Re-scoring**: Loads full entries per file sequentially (not parallel) to limit memory — each file loads ~3 GB (spectra + full Parquet entries)
-   - **Output**: Loads a 5-column Parquet projection into `BlibPlanEntry` (~96 bytes each) — fragments and metadata are looked up from the in-memory library rather than reloading full entries
+   - **Re-scoring**: Loads full entries per file sequentially (not parallel) to limit memory
+   - **Output**: Loads a 5-column Parquet projection (entry_id, apex_rt, start_rt, end_rt, bounds_area) into `BlibPlanEntry` (~96 bytes each), with fragments and metadata looked up from the in-memory library
 
-4. **Score sidecar caching**: After Percolator FDR, SVM discriminant scores are persisted to lightweight binary sidecar files (`.1st-pass.fdr_scores.bin`, `.2nd-pass.fdr_scores.bin`). On rerun with matching parameters, these scores are loaded with the stubs, allowing Osprey to skip Percolator SVM training entirely and just recompute q-values.
+5. **LightFdr extraction**: Before blib output, the remaining FDR stubs (~128 bytes each) are converted to `LightFdr` structs (~48 bytes each) containing only q-values, score, pep, and grouping fields. The heavy stubs are then dropped, freeing memory for the blib loading phase.
 
-5. **Cache invalidation**: Each Parquet file stores SHA-256 hashes of search parameters, library identity, and reconciliation parameters in its footer metadata. On rerun, stale caches (mismatched parameters, different library, version upgrade) are automatically detected, deleted, and re-scored.
+6. **Cache invalidation**: Each Parquet file stores SHA-256 hashes in its footer metadata (`osprey.version`, `osprey.search_hash`, `osprey.library_hash`, `osprey.reconciled`, `osprey.reconciliation_hash`). Calibration JSON files also store a `search_hash`. On rerun, stale caches are automatically detected, deleted, and re-scored.
 
-This reduces steady-state memory from ~45 GB (200K entries × 240 files × 940 bytes) to ~4 GB (200K × 240 × 80 bytes), enabling experiments with 1000+ files on standard hardware. The blib output phase uses only ~5 GB (BlibPlanEntry + library) instead of ~22 GB (full entries).
+This architecture enables 240-file experiments (~275M total entries) on machines with 54 GB RAM. The blib output phase uses ~5 GB (BlibPlanEntry + library) instead of ~22 GB (full entries).
 
-See [Intermediate File Formats](12-intermediate-files.md) for complete documentation of cache files, metadata hashing, memory tiers, and the skip-Percolator optimization.
+See [Intermediate File Formats](12-intermediate-files.md) for cache file formats, metadata hashing, and memory tier details.
 
-See [FDR Control](07-fdr-control.md) for full algorithm details, fold assignment, and the target-decoy competition strategy.
+### Protein-Level FDR
+
+When `--protein-fdr <threshold>` is specified, Osprey runs native protein inference after precursor/peptide FDR:
+
+1. **Protein parsimony**: Builds a bipartite peptide-protein graph from the library (using only detected peptides). Proteins with identical peptide sets are merged into groups. Groups whose peptides are a strict subset of another group are eliminated.
+
+2. **Shared peptide handling** (`--shared-peptides`): Controls how peptides mapping to multiple protein groups are assigned:
+   - **All** (default): Include shared peptides for all their groups
+   - **Razor**: Assign shared peptides to the group with the most unique peptides
+   - **Unique**: Use only proteotypic (unique) peptides
+
+3. **Picked-protein FDR**: Each target protein group is paired with a decoy "shadow" group (same peptide set with `DECOY_` prefix). The best peptide SVM score determines the group score. Target and decoy groups compete; only the winner enters the ranked list for TDC q-value computation. Peptide scores are collected before FDR stub compaction to include decoy competition winners.
+
+4. **Protein PEP**: Posterior error probabilities are estimated from the picked-protein competition winners using the same kernel density approach as peptide PEP.
+
+5. **Output**: A CSV protein report (`{output}.proteins.csv`) with columns: protein_group, protein_accessions, gene_names, protein_qvalue, protein_pep, best_score, n_unique_peptides, n_shared_peptides, unique_peptides, shared_peptides.
+
+See [FDR Control](07-fdr-control.md) for full algorithm details.
 
 ---
 
