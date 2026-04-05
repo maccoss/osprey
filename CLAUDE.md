@@ -183,6 +183,23 @@ Test data should be placed in a `example_test_data/` directory (not committed):
 
 This applies to: `percolator.rs` (fold assignment, subsampling), `calibration_ml.rs` (LDA fold assignment), and any future code that partitions entries for cross-validation.
 
+### Protein FDR Scoring
+
+**CRITICAL**: Protein FDR must use **second-pass SVM scores** collected from the compacted stubs AFTER reconciliation and second-pass Percolator FDR. The pipeline has two Percolator passes:
+
+1. **First-pass**: scores all entries, identifies passing precursors
+2. **Compaction**: drops non-passing entries (but keeps both target + paired decoy for each passing base_id)
+3. **Reconciliation**: corrects peak boundaries for BOTH targets and decoys
+4. **Second-pass**: re-scores all compacted entries with reconciliation-corrected features
+
+Protein FDR scores each protein group by the best SVM score among its peptides (target group) vs the best SVM score among the DECOY_ versions (decoy group). The winner enters a ranked list for TDC q-value computation.
+
+**Do NOT collect protein scores before compaction.** First-pass scores do not reflect reconciliation corrections. The compacted stubs after second-pass have the correct final scores for both targets and decoys.
+
+**Do NOT use PEP for protein scoring.** PEP is estimated for peptide-level competition winners using the decoy distribution as a null model. It is only meaningful for targets. In `compute_fdr_from_stubs`, winning decoys also receive PEP values from the same estimator, giving them artificially low PEP values. Use the raw SVM discriminant score, which is on the same scale for both targets and decoys.
+
+This applies to: `protein.rs` (`collect_best_peptide_scores`, `compute_protein_fdr`) and `pipeline.rs` (protein FDR block placement).
+
 ## Code Style
 
 - Use `log::info!`, `log::debug!` for logging
@@ -347,3 +364,13 @@ Osprey uses a tiered disk-backed architecture to scale to 1000+ files:
 - Parquet cache validation: SHA-256 hashes of search/library/reconciliation parameters in Parquet footer metadata
 - Consensus RT fix: only FDR-passing detections included, weighted median peak widths by coelution_sum
 - Safe NAS file writes: all cache writers use `copy_and_verify` pattern (write to local temp, verify, move to final destination)
+
+## Versioning and Release Notes
+
+Osprey uses `YY.feature.patch` versioning (e.g., `26.1.0` = 2026, first feature release, no patches).
+
+- **Release notes** are maintained in `release-notes/RELEASE_NOTES_v{version}.md`
+- See `release-notes/README.md` for the full format, conventions, and release process
+- During development, maintain a draft release notes file for the next version and append entries as features and fixes land
+- The workspace version in `Cargo.toml` is updated only at release time, not during development
+- When adding significant features or fixes, add a brief entry to the current draft release notes file

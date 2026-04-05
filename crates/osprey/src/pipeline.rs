@@ -2427,18 +2427,6 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Score sidecar infrastructure was removed during refactoring — skip-FDR disabled for now
     let can_skip_fdr = false;
 
-    // Collect best peptide scores for protein FDR BEFORE stub compaction.
-    // After compaction, decoy entries that won their peptide competition are dropped
-    // (their base_ids aren't in first_pass_base_ids), making protein-level
-    // target-decoy competition degenerate. Collecting now captures all winners.
-    let protein_best_scores = if config.protein_fdr.is_some() {
-        Some(osprey_fdr::protein::collect_best_peptide_scores(
-            &per_file_entries,
-        ))
-    } else {
-        None
-    };
-
     // Collect first-pass passing base_ids: any precursor passing run-level FDR
     // in at least one replicate. The second-pass FDR will be restricted to only
     // these precursors (+ paired decoys), ensuring complete gap-fill coverage
@@ -3103,14 +3091,16 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             Some(&detected_peptides),
         );
 
-        // Use pre-compaction peptide scores for protein FDR (collected before stub compaction
-        // to include decoy competition winners that are dropped during compaction)
-        let best_scores = protein_best_scores
-            .as_ref()
-            .expect("protein_best_scores should be Some when protein_fdr is set");
+        // Collect best SVM score per peptide from the compacted stubs AFTER second-pass FDR.
+        // At this point both targets and decoys have been reconciled and re-scored.
+        // Compaction preserves both sides of each base_id (target + paired decoy).
+        // Do NOT collect before compaction — those are first-pass scores that don't
+        // reflect reconciliation corrections. Do NOT use PEP — it's only meaningful
+        // for targets (decoys are used to estimate PEP, not receive it).
+        let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
 
         // Compute picked-protein FDR
-        let protein_fdr_result = protein::compute_protein_fdr(&parsimony, best_scores);
+        let protein_fdr_result = protein::compute_protein_fdr(&parsimony, &best_scores);
 
         let n_passing = protein_fdr_result
             .group_qvalues

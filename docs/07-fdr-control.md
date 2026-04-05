@@ -585,24 +585,30 @@ Protein Parsimony Steps:
 
 ### Picked-Protein FDR
 
-After SVM scoring, protein-level FDR is computed using the picked-protein approach (Savitski et al., 2015; The and Kall, 2016):
+After reconciliation and second-pass FDR, protein-level FDR is computed using the picked-protein approach (Savitski et al., 2015; The and Kall, 2016). The protein-level competition mirrors the precursor and peptide levels:
+
+- **Precursor level**: For each base_id, target score vs decoy score. Winner enters ranked list.
+- **Peptide level**: For each modified_sequence, best precursor's score. Target vs decoy. Winner enters ranked list.
+- **Protein level**: For each protein group, best peptide's SVM score. Target group vs decoy shadow group. Winner enters ranked list.
 
 ```
 Picked-Protein FDR Steps:
-  1. Collect best peptide PEP per modified_sequence BEFORE stub compaction
-     (must include decoy competition winners that are dropped during compaction)
-  2. Score each target protein group: best (lowest) target peptide PEP
-  3. Score each decoy "shadow" group: best (lowest) decoy peptide PEP
-     (decoy peptides are DECOY_ prefixed versions of the target group's peptides)
-  4. Picked competition: for each group, target vs decoy shadow -- lower PEP wins
+  1. Collect best SVM score per peptide from compacted stubs AFTER second-pass FDR
+     (both targets and decoys have been reconciled and re-scored at this point)
+  2. Score each target protein group: best SVM score among its target peptides
+  3. Score each decoy "shadow" group: best SVM score among DECOY_ versions
+     of those same peptides
+  4. Picked competition: for each group, target vs decoy shadow -- higher score wins
   5. Compute q-values via standard TDC on picked proteins
   6. Estimate protein PEP via kernel density estimation on picked winners
   7. Propagate protein q-values to peptides (best q-value among groups)
 ```
 
-**Why PEP instead of SVM score**: The SVM discriminant score is trained to maximize separation between targets and decoys. At the protein level, the best target peptide's SVM score almost always exceeds the best decoy peptide's score, producing nearly zero decoy wins and degenerate FDR. PEP (posterior error probability) is calibrated as a probability with meaningful overlap between target and decoy distributions, enabling proper picked-protein competition.
+**CRITICAL: Protein FDR must use second-pass scores.** Reconciliation corrects peak boundaries for both targets and decoys. The second-pass Percolator re-scores all compacted entries with these corrected features. First-pass scores are stale after reconciliation. The compacted stubs contain both targets and their paired decoys (compaction preserves both sides of each base_id), so the picked-protein competition has access to both populations.
 
-**Pre-compaction collection**: After first-pass FDR, non-passing stubs are compacted to reduce memory. This drops decoy entries that won their peptide-level competition (their base_ids aren't in `first_pass_base_ids`). Peptide scores must be collected before compaction to include these decoy winners.
+**Do NOT use PEP for protein scoring.** PEP (posterior error probability) is estimated using the decoy distribution as a null model. It is only meaningful for target entries. In `compute_fdr_from_stubs`, winning decoys also receive PEP values from the same estimator, giving them artificially low PEP that corrupts protein-level competition. Use the raw SVM discriminant score, which is on the same scale for both targets and decoys.
+
+**Do NOT collect scores before compaction.** Earlier code did this as a workaround but it captures first-pass scores that don't reflect reconciliation corrections. The correct approach is to collect from the compacted stubs after the second-pass FDR has applied the final reconciliation-corrected SVM scores.
 
 Protein FDR is computed at experiment level (across all files) and the protein q-values are propagated to the `experiment_protein_qvalue` field on each FdrEntry stub.
 
@@ -621,7 +627,7 @@ When `--protein-fdr` is set, Osprey writes a CSV protein report (`{output}.prote
 | `gene_names` | Semicolon-separated gene names (from library) |
 | `protein_qvalue` | Protein group q-value from picked-protein TDC |
 | `protein_pep` | Protein group posterior error probability |
-| `best_score` | Best peptide score (negative PEP) for the group |
+| `best_score` | Best peptide SVM score for the group |
 | `n_unique_peptides` | Number of unique (proteotypic) peptides |
 | `n_shared_peptides` | Number of shared peptides |
 | `unique_peptides` | Semicolon-separated unique peptide sequences |

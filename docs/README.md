@@ -113,7 +113,7 @@ PHASE 6: PROTEIN FDR (optional, --protein-fdr)
   +- Build protein parsimony from library (bipartite graph, identical-set grouping,
   |    subset elimination, shared peptide assignment: All/Razor/Unique)
   +- Picked-protein FDR: target group vs decoy shadow (best peptide SVM score)
-  |    (peptide scores collected BEFORE stub compaction to include decoy winners)
+  |    (uses second-pass scores AFTER reconciliation, not first-pass)
   +- Compute protein PEP from picked competition winners
   +- Propagate protein q-values to FdrEntry stubs
   +- Write protein CSV report (accessions, gene names, q-value, PEP, peptides)
@@ -306,7 +306,7 @@ When `--protein-fdr <threshold>` is specified, Osprey runs native protein infere
    - **Razor**: Assign shared peptides to the group with the most unique peptides
    - **Unique**: Use only proteotypic (unique) peptides
 
-3. **Picked-protein FDR**: Each target protein group is paired with a decoy "shadow" group (same peptide set with `DECOY_` prefix). The best peptide SVM score determines the group score. Target and decoy groups compete; only the winner enters the ranked list for TDC q-value computation. Peptide scores are collected before FDR stub compaction to include decoy competition winners.
+3. **Picked-protein FDR**: Each target protein group is paired with a decoy "shadow" group (same peptide set with `DECOY_` prefix). The best peptide SVM score determines the group score. Target and decoy groups compete; only the winner enters the ranked list for TDC q-value computation. Peptide scores are collected from the compacted stubs AFTER second-pass FDR, which reflects reconciliation-corrected features for both targets and decoys.
 
 4. **Protein PEP**: Posterior error probabilities are estimated from the picked-protein competition winners using the same kernel density approach as peptide PEP.
 
