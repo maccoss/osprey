@@ -14,10 +14,12 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 - **RT calibration**: LOESS-based retention time calibration with stratified sampling
 - **Decoy generation**: Enzyme-aware sequence reversal with fragment m/z recalculation
 - **Skyline integration**: Outputs BiblioSpec (.blib) format for seamless quantification in Skyline
-- **FDR control**: Built-in Percolator-style semi-supervised SVM with target-decoy competition; optional Mokapot integration for an alternative semi-supervised approach
+- **FDR control**: Built-in Percolator-style semi-supervised SVM with two-level FDR (run + experiment) at precursor and peptide levels
+- **Protein FDR**: Native protein parsimony with picked-protein FDR, shared peptide handling (All/Razor/Unique), and protein PEP estimation
+- **Cross-run reconciliation**: Consensus RT alignment across replicates with peak boundary imputation for missing detections
 - **Flexible input**: Supports DIA-NN TSV, EncyclopeDIA elib, and BiblioSpec blib libraries
-- **Scalable**: Disk-backed memory architecture processes 1000+ files without running out of memory
-- **Configurable**: YAML configuration files for reproducible analyses
+- **Scalable**: Disk-backed memory architecture with automatic cache invalidation; tested on 240-file experiments
+- **Configurable**: YAML configuration files with CLI argument overrides for reproducible analyses
 
 ## Installation
 
