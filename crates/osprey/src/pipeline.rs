@@ -3099,8 +3099,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // for targets (decoys are used to estimate PEP, not receive it).
         let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
 
-        // Compute picked-protein FDR
-        let protein_fdr_result = protein::compute_protein_fdr(&parsimony, &best_scores);
+        // Compute protein FDR using DIA-NN-style composite scoring.
+        // Gate: only peptides with q-value <= 2x run_fdr contribute to protein scoring.
+        let protein_qvalue_gate = config.run_fdr * 2.0;
+        let protein_fdr_result =
+            protein::compute_protein_fdr(&parsimony, &best_scores, protein_qvalue_gate);
 
         let n_passing = protein_fdr_result
             .group_qvalues

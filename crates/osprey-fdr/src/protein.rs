@@ -253,137 +253,140 @@ pub fn build_protein_parsimony(
 /// For each protein group, finds the best peptide score (target and decoy separately).
 /// Uses picked-protein competition: if the best target peptide outscores the best
 /// decoy peptide, the protein is a target; otherwise it is a decoy. Q-values are
-/// computed via standard target-decoy competition on the picked proteins.
+/// Compute protein-level FDR using DIA-NN-style composite scoring.
 ///
-/// Returns protein group q-values and per-peptide q-values (best among groups).
+/// Uses two complementary scoring metrics, computing q-values independently
+/// on each and taking the minimum:
+///
+/// 1. **Composite score** (sum of per-peptide log-likelihoods):
+///    `score += -log(max(E, min(1.0, peptide_err * n_proteotypic_peptides)))`
+///    This favors proteins with multiple confident peptides. False proteins
+///    (from ~1% peptide FDR) typically have 1 peptide and score low.
+///
+/// 2. **Best peptide quality**: `max(0, 1 - peptide_err)`
+///    This captures the confidence of the single best peptide.
+///
+/// Both metrics are computed independently for target and decoy protein groups.
+/// Target-decoy competition at the protein level produces q-values for each metric,
+/// and the final protein q-value is min(q_composite, q_best_quality).
+///
+/// `qvalue_gate`: only peptides with run q-value <= this threshold contribute
+/// to protein scoring (DIA-NN uses 0.02).
 pub fn compute_protein_fdr(
     parsimony: &ProteinParsimonyResult,
-    best_scores: &HashMap<Arc<str>, (f64, bool)>,
+    best_scores: &HashMap<Arc<str>, PeptideScore>,
+    qvalue_gate: f64,
 ) -> ProteinFdrResult {
-    // Build protein accession -> group ID mapping
-    let mut accession_to_group: HashMap<&str, ProteinGroupId> = HashMap::new();
+    const EPSILON: f64 = 1e-16;
+
+    // Count number of unique proteotypic peptides per protein group (from parsimony)
+    let mut n_peptides_per_group: HashMap<ProteinGroupId, usize> = HashMap::new();
     for group in &parsimony.groups {
-        for acc in &group.accessions {
-            accession_to_group.insert(acc.as_str(), group.id);
-        }
+        n_peptides_per_group.insert(
+            group.id,
+            group.unique_peptides.len() + group.shared_peptides.len(),
+        );
     }
 
-    // Score each target protein group by its best TARGET peptide SVM score.
-    // Score each decoy "shadow" group by its best DECOY peptide SVM score.
-    // The decoy shadow uses the DECOY_ prefix on the same peptide sequences
-    // that define the target group, creating a paired competition.
-    let mut target_group_scores: HashMap<ProteinGroupId, f64> = HashMap::new();
-    let mut decoy_group_scores: HashMap<ProteinGroupId, f64> = HashMap::new();
+    // For each protein group, accumulate two scores for target and decoy versions.
+    // Target scores come from target peptides; decoy scores from DECOY_ prefixed peptides.
+    // Both use the SAME n_peptides (from the target group in parsimony).
+    let mut target_composite: HashMap<ProteinGroupId, f64> = HashMap::new();
+    let mut target_best_quality: HashMap<ProteinGroupId, f64> = HashMap::new();
+    let mut decoy_composite: HashMap<ProteinGroupId, f64> = HashMap::new();
+    let mut decoy_best_quality: HashMap<ProteinGroupId, f64> = HashMap::new();
 
     for (peptide, group_ids) in &parsimony.peptide_to_groups {
-        // Target score: best score for the target peptide (must be from a target entry)
-        if let Some(&(score, is_decoy)) = best_scores.get(peptide.as_str()) {
-            if !is_decoy {
+        let n_pep = group_ids
+            .iter()
+            .filter_map(|gid| n_peptides_per_group.get(gid))
+            .copied()
+            .max()
+            .unwrap_or(1) as f64;
+
+        // Target peptide contribution
+        if let Some(ps) = best_scores.get(peptide.as_str()) {
+            if !ps.is_decoy && ps.best_qvalue <= qvalue_gate {
+                // Convert SVM score to error probability via logistic function
+                let err = 1.0 / (1.0 + ps.score.exp());
+                let quality = (1.0 - err).max(0.0);
+                let composite_contrib = -(EPSILON.max((err * n_pep).min(1.0)).ln());
+
                 for &gid in group_ids {
-                    target_group_scores
+                    *target_composite.entry(gid).or_insert(0.0) += composite_contrib;
+                    target_best_quality
                         .entry(gid)
-                        .and_modify(|s| *s = s.max(score))
-                        .or_insert(score);
+                        .and_modify(|q| *q = q.max(quality))
+                        .or_insert(quality);
                 }
             }
         }
 
-        // Decoy score: best score for the DECOY_ version of this peptide
-        // (must be from a decoy entry). This scores the "decoy shadow" of
-        // the same protein group for picked-protein competition.
+        // Decoy peptide contribution (DECOY_ prefixed version)
         let decoy_key = format!("{}{}", DECOY_PREFIX, peptide);
-        if let Some(&(score, is_decoy)) = best_scores.get(decoy_key.as_str()) {
-            if is_decoy {
+        if let Some(ps) = best_scores.get(decoy_key.as_str()) {
+            if ps.is_decoy && ps.best_qvalue <= qvalue_gate {
+                let err = 1.0 / (1.0 + ps.score.exp());
+                let quality = (1.0 - err).max(0.0);
+                let composite_contrib = -(EPSILON.max((err * n_pep).min(1.0)).ln());
+
                 for &gid in group_ids {
-                    decoy_group_scores
+                    *decoy_composite.entry(gid).or_insert(0.0) += composite_contrib;
+                    decoy_best_quality
                         .entry(gid)
-                        .and_modify(|s| *s = s.max(score))
-                        .or_insert(score);
+                        .and_modify(|q| *q = q.max(quality))
+                        .or_insert(quality);
                 }
             }
         }
     }
 
-    // Picked-protein competition: target group vs its decoy shadow.
-    // Only the WINNER enters the ranked list for TDC q-value computation.
-    // This is the key difference from precursor-level FDR: the competition
-    // is between matched target/decoy protein groups, not individual PSMs.
-    let mut picked: Vec<(f64, bool, ProteinGroupId)> = Vec::new();
-    let mut n_target_wins = 0usize;
-    let mut n_decoy_wins = 0usize;
-    let mut n_no_decoy = 0usize;
-    for group in &parsimony.groups {
-        let t_score = target_group_scores
-            .get(&group.id)
-            .copied()
-            .unwrap_or(f64::NEG_INFINITY);
-        let d_score = decoy_group_scores
-            .get(&group.id)
-            .copied()
-            .unwrap_or(f64::NEG_INFINITY);
+    // Compute q-values independently on each metric using DIA-NN-style TDC.
+    // For each metric: sort all target and decoy scores, then for each target protein,
+    // q = n_decoys_with_score_>=_s / max(1, n_targets_with_score_>=_s).
+    let q_composite =
+        compute_protein_qvalues_diann(&parsimony.groups, &target_composite, &decoy_composite);
+    let q_best =
+        compute_protein_qvalues_diann(&parsimony.groups, &target_best_quality, &decoy_best_quality);
 
-        if d_score == f64::NEG_INFINITY {
-            // No decoy peptides observed for this group — target wins by default
-            if t_score > f64::NEG_INFINITY {
-                picked.push((t_score, false, group.id));
-                n_no_decoy += 1;
-            }
-        } else if t_score > d_score {
-            picked.push((t_score, false, group.id));
-            n_target_wins += 1;
-        } else {
-            picked.push((d_score, true, group.id));
-            n_decoy_wins += 1;
-        }
-    }
-
-    log::info!(
-        "Picked-protein competition: {} target wins, {} decoy wins, {} without decoy shadow",
-        n_target_wins,
-        n_decoy_wins,
-        n_no_decoy,
-    );
-
-    // Sort by score descending
-    picked.sort_by(|a, b| b.0.total_cmp(&a.0));
-
-    // Compute protein-level PEP from picked competition winners
-    let winner_scores: Vec<f64> = picked.iter().map(|&(s, _, _)| s).collect();
-    let winner_is_decoy: Vec<bool> = picked.iter().map(|&(_, d, _)| d).collect();
-    let pep_estimator = PepEstimator::fit_default(&winner_scores, &winner_is_decoy);
-    let mut group_pep: HashMap<ProteinGroupId, f64> = HashMap::new();
-    for &(score, is_decoy, gid) in &picked {
-        if !is_decoy {
-            group_pep.insert(gid, pep_estimator.posterior_error(score));
-        }
-    }
-
-    // Compute conservative q-values via TDC
+    // Final q-value = min(q_composite, q_best_quality)
     let mut group_qvalues: HashMap<ProteinGroupId, f64> = HashMap::new();
-    let mut n_targets = 0usize;
-    let mut n_decoys = 0usize;
-    let mut qvals: Vec<(f64, ProteinGroupId, bool)> = Vec::with_capacity(picked.len());
-
-    for &(_score, is_decoy, gid) in &picked {
-        if is_decoy {
-            n_decoys += 1;
-        } else {
-            n_targets += 1;
-        }
-        let fdr = if n_targets > 0 {
-            (n_decoys as f64 + 1.0) / n_targets as f64
-        } else {
-            1.0
-        };
-        qvals.push((fdr.min(1.0), gid, is_decoy));
+    let mut group_scores: HashMap<ProteinGroupId, f64> = HashMap::new();
+    for group in &parsimony.groups {
+        let qc = q_composite.get(&group.id).copied().unwrap_or(1.0);
+        let qb = q_best.get(&group.id).copied().unwrap_or(1.0);
+        group_qvalues.insert(group.id, qc.min(qb));
+        group_scores.insert(
+            group.id,
+            target_composite.get(&group.id).copied().unwrap_or(0.0),
+        );
     }
 
-    // Backward sweep for monotonicity
-    let mut min_q = 1.0f64;
-    for (fdr, gid, is_decoy) in qvals.iter().rev() {
-        min_q = min_q.min(*fdr);
-        if !is_decoy {
-            group_qvalues.insert(*gid, min_q);
+    // Compute protein PEP from the composite score
+    let mut target_scores_vec: Vec<f64> = Vec::new();
+    let mut decoy_scores_vec: Vec<f64> = Vec::new();
+    for group in &parsimony.groups {
+        if let Some(&s) = target_composite.get(&group.id) {
+            target_scores_vec.push(s);
+        }
+        if let Some(&s) = decoy_composite.get(&group.id) {
+            decoy_scores_vec.push(s);
+        }
+    }
+    let all_scores: Vec<f64> = target_scores_vec
+        .iter()
+        .chain(decoy_scores_vec.iter())
+        .copied()
+        .collect();
+    let all_is_decoy: Vec<bool> = std::iter::repeat(false)
+        .take(target_scores_vec.len())
+        .chain(std::iter::repeat(true).take(decoy_scores_vec.len()))
+        .collect();
+    let pep_estimator = PepEstimator::fit_default(&all_scores, &all_is_decoy);
+    let mut group_pep: HashMap<ProteinGroupId, f64> = HashMap::new();
+    for group in &parsimony.groups {
+        if let Some(&s) = target_composite.get(&group.id) {
+            group_pep.insert(group.id, pep_estimator.posterior_error(s));
         }
     }
 
@@ -398,19 +401,87 @@ pub fn compute_protein_fdr(
         peptide_qvalues.insert(peptide.clone(), best_q);
     }
 
+    let n_scored = group_qvalues.values().filter(|&&q| q < 1.0).count();
     let n_passing_1pct = group_qvalues.values().filter(|&&q| q <= 0.01).count();
     log::info!(
         "Protein FDR: {} protein groups scored, {} at 1% FDR",
-        group_qvalues.len(),
+        n_scored,
         n_passing_1pct
     );
 
     ProteinFdrResult {
         group_qvalues,
         group_pep,
-        group_scores: target_group_scores,
+        group_scores,
         peptide_qvalues,
     }
+}
+
+/// Compute protein q-values using DIA-NN-style TDC (not picked-protein).
+///
+/// For each target protein with score s:
+///   q = n_decoys_with_score_>=_s / max(1, n_targets_with_score_>=_s)
+///
+/// This does NOT require explicit target-decoy pairing. Targets and decoys
+/// are scored independently, and the decoy score distribution serves as the
+/// null model for FDR estimation.
+fn compute_protein_qvalues_diann(
+    groups: &[ProteinGroup],
+    target_scores: &HashMap<ProteinGroupId, f64>,
+    decoy_scores: &HashMap<ProteinGroupId, f64>,
+) -> HashMap<ProteinGroupId, f64> {
+    // Collect and sort all target and decoy scores
+    let mut all_target: Vec<f64> = target_scores.values().copied().collect();
+    let mut all_decoy: Vec<f64> = decoy_scores.values().copied().collect();
+    all_target.sort_by(|a, b| a.total_cmp(b));
+    all_decoy.sort_by(|a, b| a.total_cmp(b));
+
+    let n_targets_with = all_target.len();
+    let n_decoys_with = all_decoy.len();
+
+    log::debug!(
+        "Protein TDC: {} target scores, {} decoy scores",
+        n_targets_with,
+        n_decoys_with
+    );
+
+    // For each target protein, compute raw FDR
+    let mut raw_qvals: Vec<(f64, f64, ProteinGroupId)> = Vec::new(); // (score, raw_q, gid)
+    for group in groups {
+        let score = match target_scores.get(&group.id) {
+            Some(&s) if s > 0.0 => s,
+            _ => continue,
+        };
+
+        // Count decoys with score >= this target's score (binary search)
+        let d_pos = all_decoy.partition_point(|&s| s < score);
+        let n_decoys_ge = n_decoys_with - d_pos;
+
+        // Count targets with score >= this target's score
+        let t_pos = all_target.partition_point(|&s| s < score);
+        let n_targets_ge = n_targets_with - t_pos;
+
+        let q = if n_targets_ge > 0 {
+            (n_decoys_ge as f64 / n_targets_ge as f64).min(1.0)
+        } else {
+            1.0
+        };
+
+        raw_qvals.push((score, q, group.id));
+    }
+
+    // Sort by score ascending for backward sweep (monotonicity)
+    raw_qvals.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    // Backward sweep: enforce monotonicity (lower score -> higher q-value)
+    let mut min_q = 1.0f64;
+    let mut result: HashMap<ProteinGroupId, f64> = HashMap::new();
+    for &(_, q, gid) in raw_qvals.iter().rev() {
+        min_q = min_q.min(q);
+        result.insert(gid, min_q);
+    }
+
+    result
 }
 
 /// Write a protein-level CSV report.
@@ -547,37 +618,52 @@ pub fn write_protein_report(
     Ok(())
 }
 
-/// Collect the best peptide-level SVM score per peptide (modified_sequence) across entries.
+/// Peptide-level data for protein FDR scoring.
+#[derive(Debug, Clone)]
+pub struct PeptideScore {
+    /// Best SVM discriminant score for this peptide across all files
+    pub score: f64,
+    /// Whether this peptide is a decoy
+    pub is_decoy: bool,
+    /// Best (lowest) run-level precursor q-value for this peptide
+    pub best_qvalue: f64,
+}
+
+/// Collect peptide-level scores for protein FDR.
 ///
-/// Uses the raw SVM discriminant score (higher = more confident). This is the
-/// same scale for both targets and decoys, enabling fair picked-protein competition.
+/// For each unique modified_sequence, keeps the best SVM score and best q-value
+/// across all files. Called on compacted stubs after second-pass FDR, which
+/// contains both passing targets and their paired decoys with reconciliation-
+/// corrected scores.
 ///
-/// Must be called BEFORE stub compaction so that decoy competition winners
-/// (which are dropped during compaction) are included. These decoy winners
-/// are the entries that legitimately beat their paired targets in the SVM
-/// scoring, providing the decoy population for protein-level FDR.
-///
-/// Returns a map from modified_sequence -> (best_svm_score, is_decoy).
+/// Returns a map from modified_sequence -> PeptideScore.
 pub fn collect_best_peptide_scores(
     per_file_entries: &[(String, Vec<FdrEntry>)],
-) -> HashMap<Arc<str>, (f64, bool)> {
-    let mut best: HashMap<Arc<str>, (f64, bool)> = HashMap::new();
+) -> HashMap<Arc<str>, PeptideScore> {
+    let mut best: HashMap<Arc<str>, PeptideScore> = HashMap::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
             best.entry(entry.modified_sequence.clone())
-                .and_modify(|(s, d)| {
-                    if entry.score > *s {
-                        *s = entry.score;
-                        *d = entry.is_decoy;
+                .and_modify(|ps| {
+                    if entry.score > ps.score {
+                        ps.score = entry.score;
+                    }
+                    // Keep the best (lowest) q-value
+                    let qval = entry.run_precursor_qvalue;
+                    if qval < ps.best_qvalue {
+                        ps.best_qvalue = qval;
                     }
                 })
-                .or_insert((entry.score, entry.is_decoy));
+                .or_insert(PeptideScore {
+                    score: entry.score,
+                    is_decoy: entry.is_decoy,
+                    best_qvalue: entry.run_precursor_qvalue,
+                });
         }
     }
 
-    // Diagnostic: log target vs decoy peptide score distributions
-    let n_target = best.values().filter(|(_, d)| !d).count();
-    let n_decoy = best.values().filter(|(_, d)| *d).count();
+    let n_target = best.values().filter(|ps| !ps.is_decoy).count();
+    let n_decoy = best.values().filter(|ps| ps.is_decoy).count();
     log::info!(
         "Peptide scores for protein FDR: {} target peptides, {} decoy peptides",
         n_target,
@@ -769,16 +855,44 @@ mod tests {
 
         // Best scores: P1's target peptide scores 5.0, P2's target scores 1.0
         // Decoy versions: DECOY_PEPTIDEA scores 2.0, DECOY_PEPTIDEB scores 3.0
-        let mut best_scores: HashMap<Arc<str>, (f64, bool)> = HashMap::new();
-        best_scores.insert(Arc::from("PEPTIDEA"), (5.0, false));
-        best_scores.insert(Arc::from("DECOY_PEPTIDEA"), (2.0, true));
-        best_scores.insert(Arc::from("PEPTIDEB"), (1.0, false));
-        best_scores.insert(Arc::from("DECOY_PEPTIDEB"), (3.0, true));
+        let mut best_scores: HashMap<Arc<str>, PeptideScore> = HashMap::new();
+        best_scores.insert(
+            Arc::from("PEPTIDEA"),
+            PeptideScore {
+                score: 5.0,
+                is_decoy: false,
+                best_qvalue: 0.001,
+            },
+        );
+        best_scores.insert(
+            Arc::from("DECOY_PEPTIDEA"),
+            PeptideScore {
+                score: 2.0,
+                is_decoy: true,
+                best_qvalue: 0.5,
+            },
+        );
+        best_scores.insert(
+            Arc::from("PEPTIDEB"),
+            PeptideScore {
+                score: 1.0,
+                is_decoy: false,
+                best_qvalue: 0.005,
+            },
+        );
+        best_scores.insert(
+            Arc::from("DECOY_PEPTIDEB"),
+            PeptideScore {
+                score: 3.0,
+                is_decoy: true,
+                best_qvalue: 0.3,
+            },
+        );
 
-        let fdr_result = compute_protein_fdr(&parsimony, &best_scores);
+        let fdr_result = compute_protein_fdr(&parsimony, &best_scores, 1.0);
 
-        // P1: target 5.0 > decoy 2.0 -> target wins -> should have a q-value
-        // P2: target 1.0 < decoy 3.0 -> decoy wins -> no q-value for P2
+        // With composite scoring, both groups have peptides contributing.
+        // The exact q-values depend on the composite + best_quality TDC.
         let p1_group = parsimony
             .groups
             .iter()
@@ -802,15 +916,57 @@ mod tests {
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         // Both proteins are targets that win; P1 higher scoring
-        let mut best_scores: HashMap<Arc<str>, (f64, bool)> = HashMap::new();
-        best_scores.insert(Arc::from("UNIQUEA"), (10.0, false));
-        best_scores.insert(Arc::from("SHARED"), (8.0, false));
-        best_scores.insert(Arc::from("UNIQUEB"), (3.0, false));
-        best_scores.insert(Arc::from("DECOY_UNIQUEA"), (1.0, true));
-        best_scores.insert(Arc::from("DECOY_SHARED"), (1.0, true));
-        best_scores.insert(Arc::from("DECOY_UNIQUEB"), (1.0, true));
+        let mut best_scores: HashMap<Arc<str>, PeptideScore> = HashMap::new();
+        best_scores.insert(
+            Arc::from("UNIQUEA"),
+            PeptideScore {
+                score: 10.0,
+                is_decoy: false,
+                best_qvalue: 0.001,
+            },
+        );
+        best_scores.insert(
+            Arc::from("SHARED"),
+            PeptideScore {
+                score: 8.0,
+                is_decoy: false,
+                best_qvalue: 0.001,
+            },
+        );
+        best_scores.insert(
+            Arc::from("UNIQUEB"),
+            PeptideScore {
+                score: 3.0,
+                is_decoy: false,
+                best_qvalue: 0.005,
+            },
+        );
+        best_scores.insert(
+            Arc::from("DECOY_UNIQUEA"),
+            PeptideScore {
+                score: 1.0,
+                is_decoy: true,
+                best_qvalue: 0.5,
+            },
+        );
+        best_scores.insert(
+            Arc::from("DECOY_SHARED"),
+            PeptideScore {
+                score: 1.0,
+                is_decoy: true,
+                best_qvalue: 0.5,
+            },
+        );
+        best_scores.insert(
+            Arc::from("DECOY_UNIQUEB"),
+            PeptideScore {
+                score: 1.0,
+                is_decoy: true,
+                best_qvalue: 0.5,
+            },
+        );
 
-        let fdr_result = compute_protein_fdr(&parsimony, &best_scores);
+        let fdr_result = compute_protein_fdr(&parsimony, &best_scores, 1.0);
 
         // SHARED maps to both groups; should get the better q-value
         let shared_q = fdr_result.peptide_qvalues["SHARED"];
@@ -831,8 +987,8 @@ mod tests {
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         // No scores at all
-        let best_scores: HashMap<Arc<str>, (f64, bool)> = HashMap::new();
-        let fdr_result = compute_protein_fdr(&parsimony, &best_scores);
+        let best_scores: HashMap<Arc<str>, PeptideScore> = HashMap::new();
+        let fdr_result = compute_protein_fdr(&parsimony, &best_scores, 1.0);
 
         // PEPTIDEA should get q-value 1.0 (no scores)
         let q = fdr_result
@@ -894,12 +1050,12 @@ mod tests {
 
         let best = collect_best_peptide_scores(&entries);
         // Best is the one with higher SVM score (5.0)
-        let (svm_score, is_decoy) = best[&Arc::from("PEPTIDEA") as &Arc<str>];
+        let ps = &best[&Arc::from("PEPTIDEA") as &Arc<str>];
         assert!(
-            (svm_score - 5.0).abs() < 1e-10,
+            (ps.score - 5.0).abs() < 1e-10,
             "Expected 5.0, got {}",
-            svm_score
+            ps.score
         );
-        assert!(!is_decoy);
+        assert!(!ps.is_decoy);
     }
 }
