@@ -341,6 +341,33 @@ pub fn compute_protein_fdr(
         }
     }
 
+    // Diagnostic: log score distributions
+    let tc_vals: Vec<f64> = target_composite.values().copied().collect();
+    let dc_vals: Vec<f64> = decoy_composite.values().copied().collect();
+    let tb_vals: Vec<f64> = target_best_quality.values().copied().collect();
+    let db_vals: Vec<f64> = decoy_best_quality.values().copied().collect();
+    let median = |v: &mut Vec<f64>| -> f64 {
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    let mut tc = tc_vals.clone();
+    let mut dc = dc_vals.clone();
+    let mut tb = tb_vals.clone();
+    let mut db = db_vals.clone();
+    log::info!(
+        "Composite scores: {} targets (median={:.2}, max={:.2}), {} decoys (median={:.2}, max={:.2})",
+        tc_vals.len(), median(&mut tc), tc_vals.iter().cloned().fold(0.0f64, f64::max),
+        dc_vals.len(), median(&mut dc), dc_vals.iter().cloned().fold(0.0f64, f64::max),
+    );
+    log::info!(
+        "Best quality scores: {} targets (median={:.4}, max={:.4}), {} decoys (median={:.4}, max={:.4})",
+        tb_vals.len(), median(&mut tb), tb_vals.iter().cloned().fold(0.0f64, f64::max),
+        db_vals.len(), median(&mut db), db_vals.iter().cloned().fold(0.0f64, f64::max),
+    );
+
     // Compute q-values independently on each metric using DIA-NN-style TDC.
     // For each metric: sort all target and decoy scores, then for each target protein,
     // q = n_decoys_with_score_>=_s / max(1, n_targets_with_score_>=_s).
