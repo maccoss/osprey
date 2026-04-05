@@ -547,44 +547,41 @@ pub fn write_protein_report(
     Ok(())
 }
 
-/// Collect the best peptide-level score per peptide (modified_sequence) across entries.
+/// Collect the best peptide-level SVM score per peptide (modified_sequence) across entries.
 ///
-/// Uses **1 - PEP** (probability of correct identification) as the score.
-/// This follows the PeptideProphet/ProteinProphet convention where higher
-/// scores indicate higher confidence. PEP is calibrated via kernel density
-/// estimation and isotonic regression, providing more granular discrimination
-/// than q-values (which are step functions).
+/// Uses the raw SVM discriminant score (higher = more confident). This is the
+/// same scale for both targets and decoys, enabling fair picked-protein competition.
 ///
-/// Must be called BEFORE stub compaction and AFTER first-pass FDR (so that PEP has
-/// been estimated for competition winners). Non-winners have PEP = 1.0 (score = 0.0).
+/// Must be called BEFORE stub compaction so that decoy competition winners
+/// (which are dropped during compaction) are included. These decoy winners
+/// are the entries that legitimately beat their paired targets in the SVM
+/// scoring, providing the decoy population for protein-level FDR.
 ///
-/// Returns a map from modified_sequence -> (1 - pep, is_decoy).
+/// Returns a map from modified_sequence -> (best_svm_score, is_decoy).
 pub fn collect_best_peptide_scores(
     per_file_entries: &[(String, Vec<FdrEntry>)],
 ) -> HashMap<Arc<str>, (f64, bool)> {
     let mut best: HashMap<Arc<str>, (f64, bool)> = HashMap::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            let prob_correct = 1.0 - entry.pep; // higher = better
             best.entry(entry.modified_sequence.clone())
                 .and_modify(|(s, d)| {
-                    if prob_correct > *s {
-                        *s = prob_correct;
+                    if entry.score > *s {
+                        *s = entry.score;
                         *d = entry.is_decoy;
                     }
                 })
-                .or_insert((prob_correct, entry.is_decoy));
+                .or_insert((entry.score, entry.is_decoy));
         }
     }
 
     // Diagnostic: log target vs decoy peptide score distributions
     let n_target = best.values().filter(|(_, d)| !d).count();
     let n_decoy = best.values().filter(|(_, d)| *d).count();
-    let n_target_confident = best.values().filter(|(s, d)| !d && *s > 0.99).count();
-    let n_decoy_confident = best.values().filter(|(s, d)| *d && *s > 0.99).count();
     log::info!(
-        "Peptide scores for protein FDR: {} targets ({} with 1-PEP>0.99), {} decoys ({} with 1-PEP>0.99)",
-        n_target, n_target_confident, n_decoy, n_decoy_confident
+        "Peptide scores for protein FDR: {} target peptides, {} decoy peptides",
+        n_target,
+        n_decoy,
     );
 
     best
@@ -847,8 +844,8 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_best_peptide_scores_uses_1_minus_pep() {
-        // collect_best_peptide_scores uses 1-PEP (probability correct, higher = better)
+    fn test_collect_best_peptide_scores_uses_svm_score() {
+        // collect_best_peptide_scores uses raw SVM score (higher = better)
         let entries = vec![(
             "file1".to_string(),
             vec![
@@ -896,12 +893,12 @@ mod tests {
         )];
 
         let best = collect_best_peptide_scores(&entries);
-        // Best is the one with lower PEP (0.001), stored as 1-PEP = 0.999
-        let (prob_correct, is_decoy) = best[&Arc::from("PEPTIDEA") as &Arc<str>];
+        // Best is the one with higher SVM score (5.0)
+        let (svm_score, is_decoy) = best[&Arc::from("PEPTIDEA") as &Arc<str>];
         assert!(
-            (prob_correct - 0.999).abs() < 1e-10,
-            "Expected 0.999, got {}",
-            prob_correct
+            (svm_score - 5.0).abs() < 1e-10,
+            "Expected 5.0, got {}",
+            svm_score
         );
         assert!(!is_decoy);
     }
