@@ -549,34 +549,44 @@ pub fn write_protein_report(
 
 /// Collect the best peptide-level score per peptide (modified_sequence) across entries.
 ///
-/// Uses **negative PEP** as the score (lower PEP = better = higher score value).
-/// PEP is calibrated to represent the actual probability of incorrect identification,
-/// producing meaningful overlap between target and decoy distributions at the protein
-/// level. Raw SVM discriminant scores are trained to separate targets from decoys,
-/// making them unsuitable for picked-protein competition (targets always win).
+/// Uses **1 - PEP** (probability of correct identification) as the score.
+/// This follows the PeptideProphet/ProteinProphet convention where higher
+/// scores indicate higher confidence. PEP is calibrated via kernel density
+/// estimation and isotonic regression, providing more granular discrimination
+/// than q-values (which are step functions).
 ///
 /// Must be called BEFORE stub compaction and AFTER first-pass FDR (so that PEP has
-/// been estimated for competition winners). Non-winners have PEP = 1.0, which gives
-/// them a score of -1.0 (worst possible).
+/// been estimated for competition winners). Non-winners have PEP = 1.0 (score = 0.0).
 ///
-/// Returns a map from modified_sequence -> (neg_pep, is_decoy).
+/// Returns a map from modified_sequence -> (1 - pep, is_decoy).
 pub fn collect_best_peptide_scores(
     per_file_entries: &[(String, Vec<FdrEntry>)],
 ) -> HashMap<Arc<str>, (f64, bool)> {
     let mut best: HashMap<Arc<str>, (f64, bool)> = HashMap::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            let neg_pep = -entry.pep; // lower PEP = better = higher neg_pep
+            let prob_correct = 1.0 - entry.pep; // higher = better
             best.entry(entry.modified_sequence.clone())
                 .and_modify(|(s, d)| {
-                    if neg_pep > *s {
-                        *s = neg_pep;
+                    if prob_correct > *s {
+                        *s = prob_correct;
                         *d = entry.is_decoy;
                     }
                 })
-                .or_insert((neg_pep, entry.is_decoy));
+                .or_insert((prob_correct, entry.is_decoy));
         }
     }
+
+    // Diagnostic: log target vs decoy peptide score distributions
+    let n_target = best.values().filter(|(_, d)| !d).count();
+    let n_decoy = best.values().filter(|(_, d)| *d).count();
+    let n_target_confident = best.values().filter(|(s, d)| !d && *s > 0.99).count();
+    let n_decoy_confident = best.values().filter(|(s, d)| *d && *s > 0.99).count();
+    log::info!(
+        "Peptide scores for protein FDR: {} targets ({} with 1-PEP>0.99), {} decoys ({} with 1-PEP>0.99)",
+        n_target, n_target_confident, n_decoy, n_decoy_confident
+    );
+
     best
 }
 
@@ -837,8 +847,8 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_best_peptide_scores_uses_pep() {
-        // collect_best_peptide_scores uses negative PEP (lower PEP = better = higher score)
+    fn test_collect_best_peptide_scores_uses_1_minus_pep() {
+        // collect_best_peptide_scores uses 1-PEP (probability correct, higher = better)
         let entries = vec![(
             "file1".to_string(),
             vec![
@@ -853,13 +863,13 @@ mod tests {
                     end_rt: 31.0,
                     coelution_sum: 5.0,
                     score: 3.0,
-                    run_precursor_qvalue: 1.0,
-                    run_peptide_qvalue: 1.0,
+                    run_precursor_qvalue: 0.001,
+                    run_peptide_qvalue: 0.002,
                     run_protein_qvalue: 1.0,
                     experiment_precursor_qvalue: 1.0,
                     experiment_peptide_qvalue: 1.0,
                     experiment_protein_qvalue: 1.0,
-                    pep: 0.05, // good PEP
+                    pep: 0.001, // good PEP
                     modified_sequence: Arc::from("PEPTIDEA"),
                 },
                 FdrEntry {
@@ -873,8 +883,8 @@ mod tests {
                     end_rt: 32.0,
                     coelution_sum: 6.0,
                     score: 5.0,
-                    run_precursor_qvalue: 1.0,
-                    run_peptide_qvalue: 1.0,
+                    run_precursor_qvalue: 0.05,
+                    run_peptide_qvalue: 0.06,
                     run_protein_qvalue: 1.0,
                     experiment_precursor_qvalue: 1.0,
                     experiment_peptide_qvalue: 1.0,
@@ -886,12 +896,12 @@ mod tests {
         )];
 
         let best = collect_best_peptide_scores(&entries);
-        // Best is the one with lower PEP (0.05), stored as neg_pep = -0.05
-        let (neg_pep, is_decoy) = best[&Arc::from("PEPTIDEA") as &Arc<str>];
+        // Best is the one with lower PEP (0.001), stored as 1-PEP = 0.999
+        let (prob_correct, is_decoy) = best[&Arc::from("PEPTIDEA") as &Arc<str>];
         assert!(
-            (neg_pep - (-0.05)).abs() < 1e-10,
-            "Expected -0.05, got {}",
-            neg_pep
+            (prob_correct - 0.999).abs() < 1e-10,
+            "Expected 0.999, got {}",
+            prob_correct
         );
         assert!(!is_decoy);
     }
