@@ -547,28 +547,34 @@ pub fn write_protein_report(
     Ok(())
 }
 
-/// Collect the best SVM discriminant score per peptide (modified_sequence) across entries.
+/// Collect the best peptide-level score per peptide (modified_sequence) across entries.
 ///
-/// Must be called BEFORE stub compaction so that both winning targets and winning
-/// decoys are included. After compaction, only base_ids from first-pass passing
-/// targets remain, meaning decoy competition winners are dropped and protein-level
-/// FDR becomes degenerate (targets always win).
+/// Uses **negative PEP** as the score (lower PEP = better = higher score value).
+/// PEP is calibrated to represent the actual probability of incorrect identification,
+/// producing meaningful overlap between target and decoy distributions at the protein
+/// level. Raw SVM discriminant scores are trained to separate targets from decoys,
+/// making them unsuitable for picked-protein competition (targets always win).
 ///
-/// Returns a map from modified_sequence -> (best_score, is_decoy_of_best).
+/// Must be called BEFORE stub compaction and AFTER first-pass FDR (so that PEP has
+/// been estimated for competition winners). Non-winners have PEP = 1.0, which gives
+/// them a score of -1.0 (worst possible).
+///
+/// Returns a map from modified_sequence -> (neg_pep, is_decoy).
 pub fn collect_best_peptide_scores(
     per_file_entries: &[(String, Vec<FdrEntry>)],
 ) -> HashMap<Arc<str>, (f64, bool)> {
     let mut best: HashMap<Arc<str>, (f64, bool)> = HashMap::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
+            let neg_pep = -entry.pep; // lower PEP = better = higher neg_pep
             best.entry(entry.modified_sequence.clone())
                 .and_modify(|(s, d)| {
-                    if entry.score > *s {
-                        *s = entry.score;
+                    if neg_pep > *s {
+                        *s = neg_pep;
                         *d = entry.is_decoy;
                     }
                 })
-                .or_insert((entry.score, entry.is_decoy));
+                .or_insert((neg_pep, entry.is_decoy));
         }
     }
     best
@@ -831,7 +837,8 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_best_peptide_scores() {
+    fn test_collect_best_peptide_scores_uses_pep() {
+        // collect_best_peptide_scores uses negative PEP (lower PEP = better = higher score)
         let entries = vec![(
             "file1".to_string(),
             vec![
@@ -852,7 +859,7 @@ mod tests {
                     experiment_precursor_qvalue: 1.0,
                     experiment_peptide_qvalue: 1.0,
                     experiment_protein_qvalue: 1.0,
-                    pep: 1.0,
+                    pep: 0.05, // good PEP
                     modified_sequence: Arc::from("PEPTIDEA"),
                 },
                 FdrEntry {
@@ -865,21 +872,27 @@ mod tests {
                     start_rt: 30.0,
                     end_rt: 32.0,
                     coelution_sum: 6.0,
-                    score: 5.0, // higher score
+                    score: 5.0,
                     run_precursor_qvalue: 1.0,
                     run_peptide_qvalue: 1.0,
                     run_protein_qvalue: 1.0,
                     experiment_precursor_qvalue: 1.0,
                     experiment_peptide_qvalue: 1.0,
                     experiment_protein_qvalue: 1.0,
-                    pep: 1.0,
+                    pep: 0.20, // worse PEP
                     modified_sequence: Arc::from("PEPTIDEA"),
                 },
             ],
         )];
 
         let best = collect_best_peptide_scores(&entries);
-        assert_eq!(best[&Arc::from("PEPTIDEA") as &Arc<str>].0, 5.0);
-        assert!(!best[&Arc::from("PEPTIDEA") as &Arc<str>].1);
+        // Best is the one with lower PEP (0.05), stored as neg_pep = -0.05
+        let (neg_pep, is_decoy) = best[&Arc::from("PEPTIDEA") as &Arc<str>];
+        assert!(
+            (neg_pep - (-0.05)).abs() < 1e-10,
+            "Expected -0.05, got {}",
+            neg_pep
+        );
+        assert!(!is_decoy);
     }
 }
