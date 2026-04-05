@@ -268,11 +268,15 @@ pub fn compute_protein_fdr(
         }
     }
 
-    // Score each protein group: best target score and best decoy score
+    // Score each target protein group by its best TARGET peptide SVM score.
+    // Score each decoy "shadow" group by its best DECOY peptide SVM score.
+    // The decoy shadow uses the DECOY_ prefix on the same peptide sequences
+    // that define the target group, creating a paired competition.
     let mut target_group_scores: HashMap<ProteinGroupId, f64> = HashMap::new();
     let mut decoy_group_scores: HashMap<ProteinGroupId, f64> = HashMap::new();
 
     for (peptide, group_ids) in &parsimony.peptide_to_groups {
+        // Target score: best score for the target peptide (must be from a target entry)
         if let Some(&(score, is_decoy)) = best_scores.get(peptide.as_str()) {
             if !is_decoy {
                 for &gid in group_ids {
@@ -284,7 +288,9 @@ pub fn compute_protein_fdr(
             }
         }
 
-        // For decoy scoring: find the DECOY_ version of this peptide
+        // Decoy score: best score for the DECOY_ version of this peptide
+        // (must be from a decoy entry). This scores the "decoy shadow" of
+        // the same protein group for picked-protein competition.
         let decoy_key = format!("{}{}", DECOY_PREFIX, peptide);
         if let Some(&(score, is_decoy)) = best_scores.get(decoy_key.as_str()) {
             if is_decoy {
@@ -298,8 +304,14 @@ pub fn compute_protein_fdr(
         }
     }
 
-    // Picked-protein competition
+    // Picked-protein competition: target group vs its decoy shadow.
+    // Only the WINNER enters the ranked list for TDC q-value computation.
+    // This is the key difference from precursor-level FDR: the competition
+    // is between matched target/decoy protein groups, not individual PSMs.
     let mut picked: Vec<(f64, bool, ProteinGroupId)> = Vec::new();
+    let mut n_target_wins = 0usize;
+    let mut n_decoy_wins = 0usize;
+    let mut n_no_decoy = 0usize;
     for group in &parsimony.groups {
         let t_score = target_group_scores
             .get(&group.id)
@@ -310,13 +322,27 @@ pub fn compute_protein_fdr(
             .copied()
             .unwrap_or(f64::NEG_INFINITY);
 
-        if t_score > d_score {
-            picked.push((t_score, false, group.id)); // target wins
-        } else if d_score > f64::NEG_INFINITY {
-            picked.push((d_score, true, group.id)); // decoy wins
+        if d_score == f64::NEG_INFINITY {
+            // No decoy peptides observed for this group — target wins by default
+            if t_score > f64::NEG_INFINITY {
+                picked.push((t_score, false, group.id));
+                n_no_decoy += 1;
+            }
+        } else if t_score > d_score {
+            picked.push((t_score, false, group.id));
+            n_target_wins += 1;
+        } else {
+            picked.push((d_score, true, group.id));
+            n_decoy_wins += 1;
         }
-        // If both are NEG_INFINITY, skip (no peptides observed)
     }
+
+    log::info!(
+        "Picked-protein competition: {} target wins, {} decoy wins, {} without decoy shadow",
+        n_target_wins,
+        n_decoy_wins,
+        n_no_decoy,
+    );
 
     // Sort by score descending
     picked.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -521,10 +547,14 @@ pub fn write_protein_report(
     Ok(())
 }
 
-/// Collect the best SVM score per peptide (modified_sequence) across entries.
+/// Collect the best SVM discriminant score per peptide (modified_sequence) across entries.
+///
+/// Must be called BEFORE stub compaction so that both winning targets and winning
+/// decoys are included. After compaction, only base_ids from first-pass passing
+/// targets remain, meaning decoy competition winners are dropped and protein-level
+/// FDR becomes degenerate (targets always win).
 ///
 /// Returns a map from modified_sequence -> (best_score, is_decoy_of_best).
-/// This is used as input to `compute_protein_fdr`.
 pub fn collect_best_peptide_scores(
     per_file_entries: &[(String, Vec<FdrEntry>)],
 ) -> HashMap<Arc<str>, (f64, bool)> {
