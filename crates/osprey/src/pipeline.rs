@@ -852,6 +852,7 @@ fn run_calibration_discovery_windowed(
                 calibration_successful: true,
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 isolation_scheme,
+                search_hash: None, // set by caller before saving
             },
             ms1_calibration,
             ms2_calibration,
@@ -2238,6 +2239,26 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     if !cal_params.rt_calibration.has_model_data() || !cal_params.is_calibrated() {
                         return None;
                     }
+                    // Validate search parameter hash (reject stale calibration from different settings)
+                    if let Some(ref cached_hash) = cal_params.metadata.search_hash {
+                        let current_hash = config.search_parameter_hash();
+                        if cached_hash != &current_hash {
+                            log::info!(
+                                "Stale calibration cache {} (search parameters changed), re-calibrating",
+                                cal_path.display()
+                            );
+                            let _ = std::fs::remove_file(&cal_path);
+                            return None;
+                        }
+                    } else {
+                        // No hash in old calibration file — treat as stale
+                        log::info!(
+                            "Stale calibration cache {} (no parameter hash), re-calibrating",
+                            cal_path.display()
+                        );
+                        let _ = std::fs::remove_file(&cal_path);
+                        return None;
+                    }
                     let model_params = cal_params.rt_calibration.model_params.as_ref()?;
                     let rt_cal = RTCalibration::from_model_params(
                         model_params,
@@ -2256,8 +2277,10 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     match run_calibration_discovery_windowed(
                         &library, &spectra, &ms1_index, &config,
                     ) {
-                        Ok((rt_cal, cal_params)) => {
+                        Ok((rt_cal, mut cal_params)) => {
                             cal_params.log_summary();
+                            // Store search parameter hash for cache invalidation
+                            cal_params.metadata.search_hash = Some(config.search_parameter_hash());
                             if let Some(input_dir) = input_file.parent() {
                                 let cal_path = calibration_path_for_input(input_file, input_dir);
                                 if let Err(e) = save_calibration(&cal_params, &cal_path) {

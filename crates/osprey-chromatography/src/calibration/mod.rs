@@ -43,6 +43,7 @@ impl CalibrationParams {
                 calibration_successful: false,
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 isolation_scheme: None,
+                search_hash: None,
             },
             ms1_calibration: MzCalibration::uncalibrated(),
             ms2_calibration: MzCalibration::uncalibrated(),
@@ -118,6 +119,10 @@ pub struct CalibrationMetadata {
     /// DIA isolation window scheme (from first cycle of MS2 spectra)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isolation_scheme: Option<IsolationScheme>,
+    /// SHA-256 hash of search parameters that affect calibration.
+    /// Used to detect stale cached calibration files when parameters change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_hash: Option<String>,
 }
 
 /// DIA isolation window scheme extracted from mzML
@@ -398,6 +403,7 @@ mod tests {
                 calibration_successful: true,
                 timestamp: "2024-01-15T10:30:00Z".to_string(),
                 isolation_scheme: None,
+                search_hash: None,
             },
             ms1_calibration: MzCalibration {
                 mean: -2.5,

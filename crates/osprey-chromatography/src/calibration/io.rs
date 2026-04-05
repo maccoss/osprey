@@ -178,6 +178,7 @@ mod tests {
                 calibration_successful: true,
                 timestamp: "2024-01-15T10:30:00Z".to_string(),
                 isolation_scheme: None,
+                search_hash: None,
             },
             ms1_calibration: MzCalibration {
                 mean: -2.5,
