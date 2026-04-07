@@ -67,15 +67,12 @@ pub struct OspreyConfig {
     pub prefilter_enabled: bool,
 
     // Protein FDR
-    /// Protein-level FDR threshold (enables protein parsimony and picked-protein FDR).
-    /// When set, precursors must also pass protein-level FDR to be reported.
+    /// Protein-level FDR threshold (enables protein parsimony and picked-protein FDR)
     #[serde(default)]
     pub protein_fdr: Option<f64>,
-
     /// How to handle shared peptides for protein inference
     #[serde(default)]
     pub shared_peptides: SharedPeptideMode,
-
     /// FDR filtering level for output
     #[serde(default)]
     pub fdr_level: FdrLevel,
@@ -609,21 +606,6 @@ impl std::fmt::Display for FdrMethod {
     }
 }
 
-/// Shared peptide handling mode for protein-level analysis
-///
-/// Controls how peptides shared between multiple protein groups are handled
-/// during protein inference and quantification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum SharedPeptideMode {
-    /// Include all peptides (shared and unique) for each protein group
-    #[default]
-    All,
-    /// Assign shared peptides to the protein group with the most unique peptides (razor)
-    Razor,
-    /// Use only proteotypic (unique) peptides for each protein group
-    Unique,
-}
-
 /// FDR filtering level for output
 ///
 /// Controls whether precursors must pass FDR at the precursor level,
@@ -637,6 +619,18 @@ pub enum FdrLevel {
     /// Filter by max(precursor, peptide) q-value (default, most conservative)
     #[default]
     Both,
+}
+
+/// Shared peptide handling mode for protein-level analysis
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SharedPeptideMode {
+    /// Include all peptides (shared and unique) for each protein group
+    #[default]
+    All,
+    /// Assign shared peptides to the protein group with the most unique peptides (razor)
+    Razor,
+    /// Use only proteotypic (unique) peptides for each protein group
+    Unique,
 }
 
 /// Inter-replicate peak reconciliation configuration
