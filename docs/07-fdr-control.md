@@ -7,7 +7,7 @@ Osprey uses two-level FDR (False Discovery Rate) control to ensure high-quality 
 ```
 FDR Control Workflow:
   1. Extract features per precursor (21 PIN features written to per-file Parquet cache)
-  2. Convert to FdrEntry stubs (lightweight, ~80 bytes inline each, Arc<str>-interned peptide sequences)
+  2. Convert to FdrEntry stubs (~128 bytes each, Arc<str>-interned peptide sequences)
   3. Dispatch to selected FDR method:
      - Percolator (default): native linear SVM with cross-validation
        (loads PIN features on-demand from Parquet)
@@ -15,7 +15,10 @@ FDR Control Workflow:
      - Simple: direct target-decoy FDR on a single feature
   4. Two-level q-values: per-run (within file) and experiment-level (across files)
   5. Posterior error probabilities (PEP) via KDE + isotonic regression
-  6. Blib output: reload full entries from Parquet only for files with passing precursors
+  6. Compact stubs: drop non-passing entries to free ~21 GB (240-file experiments)
+  7. Cross-run reconciliation + second-pass FDR
+  8. Protein FDR (optional): picked-protein competition using peptide PEP
+  9. Blib output: load lightweight plan entries from Parquet projection
 ```
 
 ## Key Terminology
@@ -582,28 +585,55 @@ Protein Parsimony Steps:
 
 ### Picked-Protein FDR
 
-After SVM scoring, protein-level FDR is computed using the picked-protein approach (Savitski et al., 2015; The and Kall, 2016):
+After reconciliation and second-pass FDR, protein-level FDR is computed using the picked-protein approach (Savitski et al., 2015; The and Kall, 2016). The protein-level competition mirrors the precursor and peptide levels:
+
+- **Precursor level**: For each base_id, target score vs decoy score. Winner enters ranked list.
+- **Peptide level**: For each modified_sequence, best precursor's score. Target vs decoy. Winner enters ranked list.
+- **Protein level**: For each protein group, best peptide's SVM score. Target group vs decoy shadow group. Winner enters ranked list.
 
 ```
 Picked-Protein FDR Steps:
-  1. Find the best SVM score per peptide across all relevant files
-  2. Score each target protein group: best target peptide score
-  3. Score each decoy protein group: best decoy peptide score
-     (decoy proteins paired to targets via DECOY_ prefix stripping)
-  4. Picked competition: for each protein, target vs decoy -- higher score wins
+  1. Collect best SVM score per peptide from compacted stubs AFTER second-pass FDR
+     (both targets and decoys have been reconciled and re-scored at this point)
+  2. Score each target protein group: best SVM score among its target peptides
+  3. Score each decoy "shadow" group: best SVM score among DECOY_ versions
+     of those same peptides
+  4. Picked competition: for each group, target vs decoy shadow -- higher score wins
   5. Compute q-values via standard TDC on picked proteins
-  6. Propagate protein q-values to peptides (best q-value among groups)
+  6. Estimate protein PEP via kernel density estimation on picked winners
+  7. Propagate protein q-values to peptides (best q-value among groups)
 ```
 
-Protein FDR is computed at both run level (per file) and experiment level (across all files), matching the structure of precursor/peptide FDR.
+**CRITICAL: Protein FDR must use second-pass scores.** Reconciliation corrects peak boundaries for both targets and decoys. The second-pass Percolator re-scores all compacted entries with these corrected features. First-pass scores are stale after reconciliation. The compacted stubs contain both targets and their paired decoys (compaction preserves both sides of each base_id), so the picked-protein competition has access to both populations.
+
+**Do NOT use PEP for protein scoring.** PEP (posterior error probability) is estimated using the decoy distribution as a null model. It is only meaningful for target entries. In `compute_fdr_from_stubs`, winning decoys also receive PEP values from the same estimator, giving them artificially low PEP that corrupts protein-level competition. Use the raw SVM discriminant score, which is on the same scale for both targets and decoys.
+
+**Do NOT collect scores before compaction.** Earlier code did this as a workaround but it captures first-pass scores that don't reflect reconciliation corrections. The correct approach is to collect from the compacted stubs after the second-pass FDR has applied the final reconciliation-corrected SVM scores.
+
+Protein FDR is computed at experiment level (across all files) and the protein q-values are propagated to the `experiment_protein_qvalue` field on each FdrEntry stub.
 
 ### Decoy Protein Pairing
 
 Osprey's `DecoyGenerator` prefixes each decoy protein accession with `DECOY_` (e.g., target `P12345` becomes decoy `DECOY_P12345`). The picked-protein approach pairs target and decoy proteins by stripping this prefix, so each target protein group competes against its decoy counterpart.
 
-### Output Filtering with Protein FDR
+### Protein Report Output
 
-When `protein_fdr` is set, an additional filter is applied to the output: a precursor must belong to a protein group passing the protein-level FDR threshold. This filter is applied after precursor/peptide FDR filtering.
+When `--protein-fdr` is set, Osprey writes a CSV protein report (`{output}.proteins.csv`) with columns:
+
+| Column | Description |
+|--------|-------------|
+| `protein_group` | Numeric group ID |
+| `protein_accessions` | Semicolon-separated protein accessions |
+| `gene_names` | Semicolon-separated gene names (from library) |
+| `protein_qvalue` | Protein group q-value from picked-protein TDC |
+| `protein_pep` | Protein group posterior error probability |
+| `best_score` | Best peptide SVM score for the group |
+| `n_unique_peptides` | Number of unique (proteotypic) peptides |
+| `n_shared_peptides` | Number of shared peptides |
+| `unique_peptides` | Semicolon-separated unique peptide sequences |
+| `shared_peptides` | Semicolon-separated shared peptide sequences |
+
+Protein q-values are also propagated to each FdrEntry stub's `experiment_protein_qvalue` field for downstream filtering.
 
 ## References
 

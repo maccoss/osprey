@@ -19,7 +19,7 @@ Osprey produces several intermediate files during analysis. These files enable f
 
 **Source**: `crates/osprey-chromatography/src/calibration/io.rs`
 
-Stores the calibration parameters computed during Phase 2 (auto-calibration). If a calibration file already exists for an input file, Osprey skips the calibration phase and loads it directly.
+Stores the calibration parameters computed during Phase 2 (auto-calibration). If a calibration file already exists for an input file and its `search_hash` matches the current search parameters, Osprey skips the calibration phase and loads it directly. If the hash is missing (old file) or doesn't match (parameters changed, e.g., resolution mode), the stale file is deleted and calibration is re-run.
 
 ### Structure
 
@@ -30,6 +30,7 @@ Stores the calibration parameters computed during Phase 2 (auto-calibration). If
     "num_sampled_precursors": 10000,
     "calibration_successful": true,
     "timestamp": "2025-01-15T10:30:00Z",
+    "search_hash": "de620a21cb001009...",
     "isolation_scheme": {
       "num_windows": 166,
       "mz_min": 401.5,
@@ -313,11 +314,13 @@ Osprey uses a tiered memory strategy to process experiments with hundreds of fil
 
 `CoelutionScoredEntry` contains all scored data: 21 PIN features, fragment m/z and intensities, reference XIC, CWT candidates, peak boundaries, and metadata. These exist in memory only during per-file scoring (Phase 3) and are immediately written to Parquet and replaced with stubs.
 
-### Tier 2: FDR Stubs (~80 bytes each)
+### Tier 2: FDR Stubs (~128 bytes each)
 
-`FdrEntry` retains only the 13 fields needed for FDR control: entry_id, is_decoy, charge, scan_number, apex/start/end RT, coelution_sum, score, q-values, pep, and an `Arc<str>`-interned modified_sequence. These stubs remain in memory for all files throughout the FDR and reconciliation phases.
+`FdrEntry` retains the fields needed for FDR control and reconciliation: entry_id, parquet_index, is_decoy, charge, scan_number, apex/start/end RT, coelution_sum, score, 6 q-value fields (run/experiment x precursor/peptide/protein), pep, and an `Arc<str>`-interned modified_sequence.
 
-For a 240-file experiment with 1.1M entries per file: `240 × 1.1M × 80 bytes ≈ 21 GB`
+After first-pass FDR, stubs for non-passing precursors are dropped (compaction). The `parquet_index` field preserves the original Parquet row reference for CWT/feature lookup after compaction.
+
+For a 240-file experiment: `271M entries x 128 bytes = ~35 GB` before compaction, reduced to `~106M x 128 bytes = ~14 GB` after compaction (drops ~21 GB of non-passing entries).
 
 ### Tier 3: Lightweight FDR Data (~48 bytes each)
 
@@ -336,8 +339,10 @@ Fragment m/z, intensities, modifications, and protein mappings are looked up fro
 | Phase | In Memory | Peak RAM |
 |---|---|---|
 | Scoring (per file) | 1 file's spectra + full entries | ~3-5 GB |
-| FDR (all files) | FDR stubs for all files | ~21 GB |
-| Reconciliation | FDR stubs + 1 file's spectra | ~24 GB |
+| First-pass FDR (all files) | FDR stubs for all files | ~35 GB |
+| Post-compaction | FDR stubs (passing only) | ~14 GB |
+| Reconciliation | Compacted stubs + 1 file's spectra | ~17 GB |
+| Protein FDR | Compacted stubs + peptide score map | ~14 GB |
 | Blib output | LightFdr + BlibPlanEntry + library | ~5 GB |
 
 ---
