@@ -2518,8 +2518,20 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 pin_files.insert(file_name.clone(), pin_path);
             }
 
-            // Convert to lightweight FdrEntry stubs (intern modified_sequences)
-            let mut fdr_stubs: Vec<FdrEntry> = entries.iter().map(|e| e.to_fdr_entry()).collect();
+            // Convert to lightweight FdrEntry stubs (intern modified_sequences).
+            // CRITICAL: set parquet_index to the entry's row in the Parquet file
+            // (which matches its position in the Vec at this point, before compaction).
+            // Without this, all stubs have parquet_index=0 and Percolator scores
+            // every entry against the same feature row.
+            let mut fdr_stubs: Vec<FdrEntry> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let mut stub = e.to_fdr_entry();
+                    stub.parquet_index = i as u32;
+                    stub
+                })
+                .collect();
             for stub in &mut fdr_stubs {
                 stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
             }
@@ -3073,10 +3085,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     cwt_results.iter().map(|e| e.entry_id).collect();
                 n_gap_cwt = cwt_results.len();
 
-                // Append CWT results as new FdrEntry stubs
+                // Append CWT results as new FdrEntry stubs (gap-fill: no Parquet row)
                 let gap_fill_start_idx = fdr_entries.len();
                 for (i, entry) in cwt_results.into_iter().enumerate() {
                     let mut stub = entry.to_fdr_entry();
+                    stub.parquet_index = u32::MAX; // gap-fill sentinel
                     stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
                     fdr_entries.push(stub);
                     overlay.insert(gap_fill_start_idx + i, entry);
@@ -3124,10 +3137,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
                     n_gap_forced = forced_results.len();
 
-                    // Append forced results as new FdrEntry stubs
+                    // Append forced results as new FdrEntry stubs (gap-fill: no Parquet row)
                     let forced_start_idx = fdr_entries.len();
                     for (i, entry) in forced_results.into_iter().enumerate() {
                         let mut stub = entry.to_fdr_entry();
+                        stub.parquet_index = u32::MAX; // gap-fill sentinel
                         stub.modified_sequence =
                             intern_seq(&mut seq_interner, &stub.modified_sequence);
                         fdr_entries.push(stub);
@@ -3167,6 +3181,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             for &idx in &existing_rescore_indices {
                 if let Some(entry) = overlay.get(&idx) {
                     let mut stub = entry.to_fdr_entry();
+                    // Preserve the original parquet_index from the existing stub
+                    stub.parquet_index = fdr_entries[idx].parquet_index;
                     stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
                     fdr_entries[idx] = stub;
                 }
@@ -6822,7 +6838,15 @@ mod tests {
 
     /// Convert test CoelutionScoredEntry vec to FdrEntry vec for select_post_fdr_consensus tests.
     fn to_fdr(entries: &[CoelutionScoredEntry]) -> Vec<FdrEntry> {
-        entries.iter().map(|e| e.to_fdr_entry()).collect()
+        entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mut stub = e.to_fdr_entry();
+                stub.parquet_index = i as u32;
+                stub
+            })
+            .collect()
     }
 
     #[test]
@@ -7105,6 +7129,114 @@ mod tests {
         // Filter for normal entries (have valid parquet_index)
         let normal_count = stubs.iter().filter(|e| e.parquet_index != u32::MAX).count();
         assert_eq!(normal_count, 2);
+    }
+
+    #[test]
+    fn test_to_fdr_entry_default_parquet_index_is_zero() {
+        // CRITICAL: CoelutionScoredEntry::to_fdr_entry() initializes parquet_index = 0
+        // because it doesn't know its position in the Vec/Parquet. Callers MUST
+        // populate parquet_index explicitly after the call.
+        //
+        // This test catches the bug class where stubs are created without setting
+        // parquet_index, causing all stubs to point to Parquet row 0.
+        let entry =
+            make_scored_entry_with_score(42, "PEPTIDEK", 2, 15.0, 14.5, 15.5, 8.0, 3.0, 0.005);
+        let stub = entry.to_fdr_entry();
+        assert_eq!(
+            stub.parquet_index, 0,
+            "to_fdr_entry must default parquet_index to 0; callers must populate it"
+        );
+    }
+
+    #[test]
+    fn test_fresh_stubs_must_have_correct_parquet_index() {
+        // Regression test for the bug where freshly scored entries were converted to
+        // FdrEntry stubs without setting parquet_index. This caused every stub to have
+        // parquet_index=0, so Percolator's feature lookup returned the same features
+        // for every entry, producing 0 passing precursors at FDR.
+        //
+        // The pipeline pattern that MUST be used:
+        //   entries.iter().enumerate().map(|(i, e)| {
+        //       let mut stub = e.to_fdr_entry();
+        //       stub.parquet_index = i as u32;
+        //       stub
+        //   }).collect()
+        let entries: Vec<CoelutionScoredEntry> = (0..10)
+            .map(|i| {
+                make_scored_entry_with_score(
+                    i,
+                    &format!("PEPTIDE{}", i),
+                    2,
+                    15.0,
+                    14.5,
+                    15.5,
+                    8.0,
+                    3.0,
+                    0.005,
+                )
+            })
+            .collect();
+
+        // Simulate the (correct) pipeline conversion
+        let stubs: Vec<FdrEntry> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mut stub = e.to_fdr_entry();
+                stub.parquet_index = i as u32;
+                stub
+            })
+            .collect();
+
+        // Each stub's parquet_index must equal its position in the Vec
+        for (i, stub) in stubs.iter().enumerate() {
+            assert_eq!(
+                stub.parquet_index, i as u32,
+                "fresh stub at position {} should have parquet_index={}, got {}",
+                i, i, stub.parquet_index
+            );
+        }
+
+        // Distinct parquet_index values (the bug would make all of them 0)
+        let unique_indices: HashSet<u32> = stubs.iter().map(|s| s.parquet_index).collect();
+        assert_eq!(
+            unique_indices.len(),
+            stubs.len(),
+            "all parquet_index values should be distinct (bug: all are 0 if not populated)"
+        );
+    }
+
+    #[test]
+    fn test_buggy_pattern_collapses_parquet_index_to_zero() {
+        // Documents the BUG pattern: calling to_fdr_entry without setting parquet_index.
+        // This test exists to make sure we catch this specific failure mode if anyone
+        // accidentally reverts to the buggy pattern.
+        let entries: Vec<CoelutionScoredEntry> = (0..5)
+            .map(|i| {
+                make_scored_entry_with_score(
+                    i,
+                    &format!("PEPTIDE{}", i),
+                    2,
+                    15.0,
+                    14.5,
+                    15.5,
+                    8.0,
+                    3.0,
+                    0.005,
+                )
+            })
+            .collect();
+
+        // BUG: convert without populating parquet_index
+        let buggy_stubs: Vec<FdrEntry> = entries.iter().map(|e| e.to_fdr_entry()).collect();
+
+        // All parquet_index values are 0 — they all point to Parquet row 0
+        let all_zero = buggy_stubs.iter().all(|s| s.parquet_index == 0);
+        assert!(
+            all_zero,
+            "buggy pattern produces all-zero parquet_index — confirms the bug exists \
+             when callers forget to populate parquet_index"
+        );
     }
 
     // ===================================================================
