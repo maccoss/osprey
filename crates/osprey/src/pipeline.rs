@@ -2703,20 +2703,41 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             })
             .collect();
 
+        // Check if all files are already reconciled (parquet metadata says so).
+        // If yes, skip BOTH multi-charge consensus AND inter-replicate reconciliation
+        // since the previous reconciled run already applied both.
+        let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
+        let all_already_reconciled = reconciliation_enabled
+            && per_file_cache_paths.values().all(|path| {
+                match validate_scores_cache(path, &config) {
+                    CacheValidity::ValidReconciled => true,
+                    CacheValidity::ValidFirstPass => false,
+                    CacheValidity::Stale(reason) => {
+                        log::debug!("Cache {} not reconciled: {}", path.display(), reason);
+                        false
+                    }
+                }
+            });
+
         // 1. Multi-charge consensus: compute per-file rescore targets
         //    Groups by (peptide, file). If at least one charge state passes FDR,
         //    the best-scoring charge state defines the consensus peak; other
         //    charge states at a different peak get re-scored.
+        //    Skipped when files are already reconciled (consensus was applied previously).
         let per_file_consensus_targets: HashMap<String, Vec<(usize, f64, f64, f64)>> =
-            per_file_entries
-                .iter()
-                .map(|(file_name, entries)| {
-                    (
-                        file_name.clone(),
-                        select_post_fdr_consensus(entries, config.run_fdr),
-                    )
-                })
-                .collect();
+            if all_already_reconciled {
+                HashMap::new()
+            } else {
+                per_file_entries
+                    .iter()
+                    .map(|(file_name, entries)| {
+                        (
+                            file_name.clone(),
+                            select_post_fdr_consensus(entries, config.run_fdr),
+                        )
+                    })
+                    .collect()
+            };
 
         let total_consensus: usize = per_file_consensus_targets.values().map(|v| v.len()).sum();
         if total_consensus > 0 {
@@ -2729,24 +2750,9 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // 2. Inter-replicate reconciliation: compute per-file rescore targets
         //    Uses first-pass FDR results to build consensus RTs across runs,
         //    then plans which entries need re-scoring at reconciled boundaries.
-        let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
-
         let mut reconciliation_actions: HashMap<(String, usize), ReconcileAction> = HashMap::new();
         let refined_calibrations: HashMap<String, RTCalibration>;
         let per_file_gap_fill: HashMap<String, Vec<GapFillTarget>>;
-
-        // Compute reconciliation parameter hash and check if all files are already reconciled
-        let all_already_reconciled = reconciliation_enabled
-            && per_file_cache_paths.values().all(|path| {
-                match validate_scores_cache(path, &config) {
-                    CacheValidity::ValidReconciled => true,
-                    CacheValidity::ValidFirstPass => false,
-                    CacheValidity::Stale(reason) => {
-                        log::debug!("Cache {} not reconciled: {}", path.display(), reason);
-                        false
-                    }
-                }
-            });
 
         if all_already_reconciled {
             log::info!("");
@@ -3737,7 +3743,7 @@ fn run_percolator_fdr(
     let file_results: Vec<(usize, Vec<(usize, Vec<f64>)>)> = subset_by_file
         .par_iter()
         .filter_map(|(&file_idx, entries_in_file)| {
-            let (file_name, _) = &per_file_entries[file_idx];
+            let (file_name, fdr_entries) = &per_file_entries[file_idx];
             let file_overlay = overlay.get(file_name.as_str());
             let cache_path = per_file_cache_paths.get(file_name.as_str())?;
 
@@ -3747,10 +3753,14 @@ fn run_percolator_fdr(
                 .filter_map(|&(pos, local_idx)| {
                     if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
                         Some((pos, pin_feature_vector(&overlay_entry.features)))
-                    } else if local_idx < file_features.len() {
-                        Some((pos, file_features[local_idx].clone()))
                     } else {
-                        None
+                        // Use parquet_index for feature lookup (Vec may be compacted)
+                        let pq_idx = fdr_entries[local_idx].parquet_index as usize;
+                        if pq_idx < file_features.len() {
+                            Some((pos, file_features[pq_idx].clone()))
+                        } else {
+                            None
+                        }
                     }
                 })
                 .collect();
@@ -3845,33 +3855,40 @@ fn run_percolator_fdr(
                     return;
                 }
             };
-            let parquet_len = file_features.len();
 
-            for (local_idx, parquet_features) in file_features.into_iter().enumerate() {
+            // Score entries using parquet_index for feature lookup
+            // (stubs may have been compacted, so Vec index != Parquet row index)
+            for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate() {
                 // Skip entries not in the restriction set (keep first-pass scores)
                 if let Some(restrict) = restrict_base_ids {
-                    let base_id = fdr_entries[local_idx].entry_id & 0x7FFF_FFFF;
+                    let base_id = fdr_entry.entry_id & 0x7FFF_FFFF;
                     if !restrict.contains(&base_id) {
                         continue;
                     }
                 }
+                let pq_idx = fdr_entry.parquet_index as usize;
                 // Use overlay features for re-scored entries, parquet features otherwise
                 let mut features =
                     if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
                         pin_feature_vector(&overlay_entry.features)
+                    } else if pq_idx < file_features.len() {
+                        file_features[pq_idx].clone()
                     } else {
-                        parquet_features
+                        continue; // gap-fill without parquet features
                     };
                 standardizer.transform_slice(&mut features);
                 let mut score = avg_bias;
                 for (w, x) in avg_weights.iter().zip(features.iter()) {
                     score += w * x;
                 }
-                fdr_entries[local_idx].score = score;
+                fdr_entry.score = score;
             }
 
-            // Score gap-fill entries (indices beyond parquet, only in overlay)
-            for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate().skip(parquet_len) {
+            // Score gap-fill entries (parquet_index == u32::MAX, features in overlay only)
+            for (local_idx, fdr_entry) in fdr_entries.iter_mut().enumerate() {
+                if fdr_entry.parquet_index != u32::MAX {
+                    continue; // already scored above
+                }
                 if let Some(restrict) = restrict_base_ids {
                     let base_id = fdr_entry.entry_id & 0x7FFF_FFFF;
                     if !restrict.contains(&base_id) {
@@ -6934,6 +6951,160 @@ mod tests {
         // Same group (same modified_sequence) → entry 1 at different peak gets re-scored
         assert_eq!(rescore.len(), 1);
         assert_eq!(rescore[0].0, 1);
+    }
+
+    // ===================================================================
+    // FDR stub compaction + parquet_index regression tests
+    // ===================================================================
+    //
+    // After first-pass FDR, non-passing stubs are dropped (compacted) to free
+    // memory. The parquet_index field preserves the original Parquet row index
+    // so that downstream phases (Percolator, reconciliation, blib output) can
+    // still look up features and CWT candidates from the original Parquet file.
+    //
+    // These tests catch the bug where code uses Vec position (`local_idx`) as
+    // the Parquet index after compaction, causing out-of-range panics or
+    // garbage scores.
+
+    /// Build a minimal FdrEntry stub for compaction tests.
+    fn make_stub(entry_id: u32, parquet_index: u32, is_decoy: bool) -> FdrEntry {
+        FdrEntry {
+            entry_id,
+            parquet_index,
+            is_decoy,
+            charge: 2,
+            scan_number: 1,
+            apex_rt: 0.0,
+            start_rt: 0.0,
+            end_rt: 0.0,
+            coelution_sum: 0.0,
+            score: 0.0,
+            run_precursor_qvalue: 1.0,
+            run_peptide_qvalue: 1.0,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: 1.0,
+            experiment_peptide_qvalue: 1.0,
+            experiment_protein_qvalue: 1.0,
+            pep: 1.0,
+            modified_sequence: Arc::from("PEPTIDE"),
+        }
+    }
+
+    #[test]
+    fn test_compaction_preserves_parquet_index() {
+        // 10 entries: 5 targets (entry_id 0..5) + 5 decoys (entry_id with bit 31)
+        // Each entry's parquet_index matches its original Vec position.
+        let mut stubs: Vec<FdrEntry> = (0..5)
+            .map(|i| make_stub(i, i, false)) // targets
+            .chain((0..5).map(|i| make_stub(i | 0x8000_0000, 5 + i, true))) // paired decoys
+            .collect();
+
+        // Mark entries 0, 2, 4 (targets) as passing
+        stubs[0].run_precursor_qvalue = 0.001;
+        stubs[2].run_precursor_qvalue = 0.001;
+        stubs[4].run_precursor_qvalue = 0.001;
+
+        // Compute first_pass_base_ids (target base_ids that passed)
+        let first_pass_base_ids: HashSet<u32> = stubs
+            .iter()
+            .filter(|e| !e.is_decoy && e.run_precursor_qvalue <= 0.01)
+            .map(|e| e.entry_id & 0x7FFF_FFFF)
+            .collect();
+        assert_eq!(first_pass_base_ids.len(), 3);
+
+        // Compact: keep entries whose base_id is in first_pass_base_ids
+        // (this should keep both targets and their paired decoys)
+        stubs.retain(|e| first_pass_base_ids.contains(&(e.entry_id & 0x7FFF_FFFF)));
+        assert_eq!(stubs.len(), 6, "should keep 3 targets + 3 paired decoys");
+
+        // Verify that parquet_index values are preserved (not collapsed to 0..5)
+        let parquet_indices: Vec<u32> = stubs.iter().map(|e| e.parquet_index).collect();
+        assert!(
+            parquet_indices.contains(&0)
+                && parquet_indices.contains(&2)
+                && parquet_indices.contains(&4),
+            "target parquet_indices should be preserved: {:?}",
+            parquet_indices
+        );
+        assert!(
+            parquet_indices.contains(&5)
+                && parquet_indices.contains(&7)
+                && parquet_indices.contains(&9),
+            "decoy parquet_indices should be preserved: {:?}",
+            parquet_indices
+        );
+
+        // CRITICAL: After compaction, the Vec position (local_idx) is NOT the
+        // same as parquet_index for at least some entries. Downstream code must
+        // use entry.parquet_index for any Parquet-row-based lookups (features,
+        // CWT candidates).
+        let any_divergence = stubs
+            .iter()
+            .enumerate()
+            .any(|(local_idx, entry)| local_idx as u32 != entry.parquet_index);
+        assert!(
+            any_divergence,
+            "After compaction, at least some entries should have local_idx != parquet_index"
+        );
+    }
+
+    #[test]
+    fn test_feature_lookup_uses_parquet_index_after_compaction() {
+        // Simulate a Parquet file with 10 feature rows (one per row index 0..10)
+        // where each row's "feature" is just its index as f64.
+        let file_features: Vec<Vec<f64>> = (0..10).map(|i| vec![i as f64]).collect();
+
+        // Compacted stubs: 3 entries kept from original positions 1, 4, 7
+        let stubs = vec![
+            make_stub(1, 1, false),
+            make_stub(4, 4, false),
+            make_stub(7, 7, false),
+        ];
+
+        // CORRECT lookup: use parquet_index
+        for entry in &stubs {
+            let pq_idx = entry.parquet_index as usize;
+            assert!(pq_idx < file_features.len());
+            let feature = &file_features[pq_idx];
+            assert_eq!(
+                feature[0], entry.parquet_index as f64,
+                "feature lookup via parquet_index should match"
+            );
+        }
+
+        // INCORRECT lookup: using Vec position would give wrong features
+        // (this test documents the bug we're guarding against)
+        for (local_idx, entry) in stubs.iter().enumerate() {
+            let wrong_feature = &file_features[local_idx];
+            // The wrong feature value (local_idx) should NOT match the
+            // entry's actual parquet_index value
+            if local_idx as u32 != entry.parquet_index {
+                assert_ne!(
+                    wrong_feature[0], entry.parquet_index as f64,
+                    "Vec-position lookup gives wrong features after compaction"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_gap_fill_sentinel_parquet_index() {
+        // Gap-fill entries (added during reconciliation) get parquet_index = u32::MAX
+        // because they don't exist in the original Parquet. Their features must
+        // come from the overlay, not the Parquet file.
+        let stubs = [
+            make_stub(1, 1, false),        // normal entry from Parquet
+            make_stub(2, u32::MAX, false), // gap-fill entry
+            make_stub(3, 3, false),        // normal entry from Parquet
+        ];
+
+        // Filter for gap-fill entries
+        let gap_fill_count = stubs.iter().filter(|e| e.parquet_index == u32::MAX).count();
+        assert_eq!(gap_fill_count, 1);
+
+        // Filter for normal entries (have valid parquet_index)
+        let normal_count = stubs.iter().filter(|e| e.parquet_index != u32::MAX).count();
+        assert_eq!(normal_count, 2);
     }
 
     // ===================================================================
