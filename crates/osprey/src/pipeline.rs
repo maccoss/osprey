@@ -3923,25 +3923,24 @@ fn run_percolator_fdr_direct(
                 OspreyError::config(format!("No parquet cache path for file {}", file_name))
             })?;
         let file_features = load_pin_features_from_parquet(cache_path)?;
-        let parquet_len = file_features.len();
 
-        // Process parquet-aligned entries
-        for (local_idx, (fdr_entry, parquet_features)) in fdr_entries[..parquet_len]
-            .iter()
-            .zip(file_features.into_iter())
-            .enumerate()
-        {
+        // Process entries using parquet_index for feature lookup
+        // (stubs may have been compacted, so Vec index != Parquet row index)
+        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate() {
             if let Some(restrict) = restrict_base_ids {
                 if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
                     continue;
                 }
             }
+            let pq_idx = fdr_entry.parquet_index as usize;
             // Use overlay features for re-scored entries, parquet features otherwise
             let features = if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx))
             {
                 pin_feature_vector(&overlay_entry.features)
+            } else if pq_idx < file_features.len() {
+                file_features[pq_idx].clone()
             } else {
-                parquet_features
+                continue; // gap-fill entry without parquet features
             };
             let psm_id = format!(
                 "{}_{}_{}_{}",
@@ -3959,8 +3958,11 @@ fn run_percolator_fdr_direct(
             });
         }
 
-        // Process gap-fill entries (indices beyond parquet, from overlay only)
-        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate().skip(parquet_len) {
+        // Process gap-fill entries (parquet_index == u32::MAX, features in overlay only)
+        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate() {
+            if fdr_entry.parquet_index != u32::MAX {
+                continue; // already processed above
+            }
             if let Some(restrict) = restrict_base_ids {
                 if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
                     continue;
