@@ -583,34 +583,46 @@ Protein Parsimony Steps:
 | `Razor` | Shared peptides assigned exclusively to the protein group with the most unique peptides (tiebreak: lowest group ID). After assignment, treated as unique. | Balanced approach. Matches MaxQuant's razor peptide logic. |
 | `Unique` | Shared peptides excluded from protein scoring and output entirely. Only unique peptides are used. | Most conservative. |
 
-### Picked-Protein FDR
+### Protein-Level FDR (DIA-NN-style composite scoring)
 
-After reconciliation and second-pass FDR, protein-level FDR is computed using the picked-protein approach (Savitski et al., 2015; The and Kall, 2016). The protein-level competition mirrors the precursor and peptide levels:
+After reconciliation and second-pass FDR, protein-level FDR is computed using a two-metric approach inspired by DIA-NN's `calculate_protein_qvalues`. Each target and decoy protein group is scored independently on two complementary metrics, and the final protein q-value is the minimum of the two metric q-values.
 
-- **Precursor level**: For each base_id, target score vs decoy score. Winner enters ranked list.
-- **Peptide level**: For each modified_sequence, best precursor's score. Target vs decoy. Winner enters ranked list.
-- **Protein level**: For each protein group, best peptide's SVM score. Target group vs decoy shadow group. Winner enters ranked list.
+**Metric 1: Composite log-likelihood (sum across peptides)**
 
+For each protein group, sum across its detected peptides:
 ```
-Picked-Protein FDR Steps:
-  1. Collect best SVM score per peptide from compacted stubs AFTER second-pass FDR
-     (both targets and decoys have been reconciled and re-scored at this point)
-  2. Score each target protein group: best SVM score among its target peptides
-  3. Score each decoy "shadow" group: best SVM score among DECOY_ versions
-     of those same peptides
-  4. Picked competition: for each group, target vs decoy shadow -- higher score wins
-  5. Compute q-values via standard TDC on picked proteins
-  6. Estimate protein PEP via kernel density estimation on picked winners
-  7. Propagate protein q-values to peptides (best q-value among groups)
+score += -log(max(EPSILON, min(1.0, peptide_err * n_proteotypic_peptides)))
 ```
+This naturally favors proteins with multiple confident peptides. False proteins (from ~1% peptide FDR) typically have only 1 peptide and accumulate low composite scores. True proteins with many peptides accumulate high scores. `peptide_err` is derived from the SVM discriminant score via a logistic transform: `err = 1 / (1 + exp(score))`.
 
-**CRITICAL: Protein FDR must use second-pass scores.** Reconciliation corrects peak boundaries for both targets and decoys. The second-pass Percolator re-scores all compacted entries with these corrected features. First-pass scores are stale after reconciliation. The compacted stubs contain both targets and their paired decoys (compaction preserves both sides of each base_id), so the picked-protein competition has access to both populations.
+**Metric 2: Best peptide quality**
 
-**Do NOT use PEP for protein scoring.** PEP (posterior error probability) is estimated using the decoy distribution as a null model. It is only meaningful for target entries. In `compute_fdr_from_stubs`, winning decoys also receive PEP values from the same estimator, giving them artificially low PEP that corrupts protein-level competition. Use the raw SVM discriminant score, which is on the same scale for both targets and decoys.
+For each protein group:
+```
+best_quality = max(0, 1 - peptide_err) across all peptides
+```
+Captures the confidence of the single best-scoring peptide.
+
+**Q-value computation**
+
+For each metric independently:
+1. Sort all target protein scores and decoy protein scores
+2. For each target protein at score s: q = n_decoys_with_score >= s / max(1, n_targets_with_score >= s)
+3. Backward sweep for monotonicity
+
+Final protein q-value = min(q_composite, q_best_quality).
+
+**Q-value gate**: Only peptides with run-level q-value <= 2x `run_fdr` contribute to protein scoring (mirrors DIA-NN's `ProteinQCalcQvalue`).
+
+**CRITICAL: Protein FDR must use second-pass SVM scores.** Reconciliation corrects peak boundaries for both targets and decoys. The second-pass Percolator re-scores all compacted entries with these corrected features. First-pass scores are stale after reconciliation. The compacted stubs contain both targets and their paired decoys (compaction preserves both sides of each base_id), so the picked-protein competition has access to both populations.
+
+**Do NOT use PEP for protein scoring.** PEP (posterior error probability) is estimated using the decoy distribution as a null model. It is only meaningful for target entries. In `compute_fdr_from_stubs`, winning decoys also receive PEP values from the same estimator, giving them artificially low PEP that corrupts protein-level competition.
 
 **Do NOT collect scores before compaction.** Earlier code did this as a workaround but it captures first-pass scores that don't reflect reconciliation corrections. The correct approach is to collect from the compacted stubs after the second-pass FDR has applied the final reconciliation-corrected SVM scores.
 
 Protein FDR is computed at experiment level (across all files) and the protein q-values are propagated to the `experiment_protein_qvalue` field on each FdrEntry stub.
+
+> **Known limitation**: With the current SVM-based scoring, target and decoy protein group score distributions separate too cleanly (the SVM is trained to maximize target/decoy separation at the precursor level, and aggregating to proteins amplifies the gap). This produces artificially low protein q-values where most target groups pass at 1% FDR. The protein report still includes meaningful per-group statistics (composite score, best quality, peptide counts), but the q-value column should be treated with caution. A follow-up release will refine the scoring metric to use a calibrated peptide error rate rather than a logistic transform of the SVM discriminant.
 
 ### Decoy Protein Pairing
 
