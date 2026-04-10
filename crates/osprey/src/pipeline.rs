@@ -4888,7 +4888,27 @@ fn write_blib_from_plan(
             writer.add_protein_mapping(ref_id, &lib_entry.protein_ids)?;
         }
 
-        // Write RetentionTimes entries for every run where this precursor was detected
+        // Write RetentionTimes entries for every run where this precursor was detected.
+        // A non-NULL retentionTime produces an ID line in Skyline for that run.
+        // Normally, only runs passing run-level FDR get an ID line. However, after
+        // two-pass FDR, second-pass run q-values can shift slightly above the threshold
+        // even though the precursor passes experiment-level FDR. In that case, the run
+        // with the lowest q-value gets the ID line as a fallback, guaranteeing at least
+        // one ID line per precursor in the blib.
+        let any_passes_run_fdr = group.iter().any(|s| s.run_qvalue <= config.run_fdr);
+        let best_run_file_idx = if !any_passes_run_fdr {
+            // No run passes strict threshold; find the best one for fallback ID line
+            Some(
+                group
+                    .iter()
+                    .min_by(|a, b| a.run_qvalue.total_cmp(&b.run_qvalue))
+                    .unwrap()
+                    .file_name_idx,
+            )
+        } else {
+            None
+        };
+
         for scored in group {
             let run_file_stem = &file_names[scored.file_name_idx as usize];
             let run_file_id = *file_stem_to_id.get(run_file_stem).unwrap_or(&1);
@@ -4901,9 +4921,12 @@ fn write_blib_from_plan(
                 .copied()
                 .unwrap_or((scored.apex_rt, scored.start_rt, scored.end_rt));
 
-            // Show an ID line (non-NULL retentionTime) only if this observation
-            // independently passed run-level FDR
-            let rt_for_id = if scored.run_qvalue <= config.run_fdr {
+            // Show an ID line (non-NULL retentionTime) if:
+            //   1. This run passes run-level FDR, OR
+            //   2. No run passes but this is the best run (fallback)
+            let rt_for_id = if scored.run_qvalue <= config.run_fdr
+                || best_run_file_idx == Some(scored.file_name_idx)
+            {
                 Some(run_apex)
             } else {
                 None
