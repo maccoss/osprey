@@ -1,6 +1,8 @@
 # Osprey v26.1.0 Release Notes
 
-First public release of Osprey, a peptide-centric DIA analysis tool for mass spectrometry proteomics. Osprey uses fragment XIC co-elution analysis to detect peptides in DIA data, with machine learning scoring and rigorous FDR control. Results integrate with Skyline for quantification.
+First public release of Osprey under the `YY.feature.patch` versioning scheme, a peptide-centric DIA analysis tool for mass spectrometry proteomics. Osprey uses fragment XIC co-elution analysis to detect peptides in DIA data, with machine learning scoring and rigorous FDR control. Results integrate with Skyline for quantification.
+
+This release consolidates all development since the initial `v0.1.0` tag, including a series of bug fixes for large-experiment memory usage and FDR scoring correctness.
 
 ## Core Analysis Pipeline
 
@@ -67,6 +69,49 @@ First public release of Osprey, a peptide-centric DIA analysis tool for mass spe
 ### Safe File I/O for Network Storage
 
 - All cache writers (Parquet, spectra.bin, calibration JSON, score sidecars, blib) write to local temp directory first, then `copy_and_verify` to final destination. Prevents corrupt/zero-byte files from process kills or network interruptions on NAS/CIFS mounts.
+
+## Bug Fixes (since v0.1.0)
+
+### FDR Scoring
+
+- **Fixed missing `parquet_index` population on fresh stub creation**: FdrEntry stubs created from freshly scored entries were left with `parquet_index = 0`, causing Percolator's feature lookup to return `file_features[0]` for every entry. The SVM trained on identical features and produced 0 passing precursors at 1% FDR on large datasets. Now sets `parquet_index = i` during the Vec enumeration.
+- **Fixed compaction-vs-parquet-index bugs in Percolator**: The streaming and direct Percolator paths used Vec position (`local_idx`) as the Parquet row index after FDR stub compaction. After compaction the Vec is shorter than the Parquet, causing out-of-range panics (direct path) or loading the wrong features (streaming path). All three feature-loading sites now use `entry.parquet_index` for Parquet lookups.
+- **Fixed gap-fill stub `parquet_index` sentinel**: Gap-fill entries (added during reconciliation) now use `parquet_index = u32::MAX` as a sentinel to indicate their features come from the overlay, not the Parquet file.
+- **Fixed two-pass FDR in skip-Percolator path**: When cached SVM scores were loaded from sidecars, the q-value recomputation was running only the first-pass TDC instead of the two-pass structure (first unrestricted, then restricted to first-pass passing precursors). Experiment-level results were dropping by ~40%. Now correctly runs two-pass q-value computation in the skip path.
+- **Fixed second-pass sidecar write location**: Moved the second-pass FDR score sidecar persistence out of the reconciliation scoped block so that temporary allocations are freed first. Prevented OOM on 240-file experiments.
+
+### Reconciliation and Consensus
+
+- **Fixed protein FDR scoring to use second-pass SVM scores**: Protein-level FDR scoring was using peptide scores from before stub compaction (first-pass scores). Reconciliation corrects peak boundaries for both targets and decoys; first-pass scores don't reflect those corrections. Now collects scores from compacted stubs after the second-pass FDR.
+- **Skip multi-charge consensus when files are already reconciled**: Multi-charge consensus re-scoring was running unconditionally, even for files marked as already reconciled. It now skips the consensus step together with inter-replicate reconciliation when all files have matching reconciliation metadata.
+- **Fixed consensus RT filtering**: Peak width estimation for forced integration boundaries now uses a weighted median across FDR-passing detections (weighted by coelution sum), preventing noisy detections with wide fallback peaks from inflating the forced integration window.
+
+### Memory and I/O
+
+- **Fixed blib output OOM on 240-file experiments**: The blib writer was loading all ~28M passing `CoelutionScoredEntry` objects from Parquet into a single Vec (~27 GB). Replaced with `BlibPlanEntry` (~96 bytes) loaded from a 5-column Parquet projection with fragments and metadata looked up from the in-memory library. Memory dropped from ~27 GB to ~2.3 GB for large experiments.
+- **Fixed FDR stub memory for large experiments**: Added FDR stub compaction after first-pass FDR that drops entries for precursors that didn't pass in any replicate (saves ~21 GB for 240-file experiments). The `parquet_index` field preserves original Parquet row references for downstream lookups.
+- **Fixed calibration cache invalidation**: Added `search_hash` to `CalibrationMetadata` so that stale calibration JSON files (e.g., from a different resolution mode) are detected and re-computed on rerun.
+
+### Build and Install
+
+- **Fixed Makefile install on WSL**: `cargo install` fails on WSL cross-filesystem builds due to a `libz-sys` cmake/zlib-ng extraction issue. The Makefile `install` target now copies the already-built release binary directly to `~/.cargo/bin/`.
+- **Added `make install-clean` target**: Forces a full `cargo clean` before rebuild for cases when incremental compilation artifacts are stale.
+
+### Regression Tests
+
+Added tests to catch these bug classes in the future:
+
+- `test_compaction_preserves_parquet_index`: verifies compaction keeps both targets and paired decoys with correct parquet_index
+- `test_feature_lookup_uses_parquet_index_after_compaction`: documents the correct lookup pattern
+- `test_gap_fill_sentinel_parquet_index`: verifies gap-fill entries use u32::MAX sentinel
+- `test_to_fdr_entry_default_parquet_index_is_zero`: documents the dangerous default
+- `test_fresh_stubs_must_have_correct_parquet_index`: verifies fresh stubs populate parquet_index from Vec position
+- `test_buggy_pattern_collapses_parquet_index_to_zero`: explicitly catches the buggy pattern
+- `test_consensus_peak_width_excludes_non_passing_detections`: verifies peak width estimation uses only FDR-passing entries
+
+## Known Issues
+
+- **Protein-level FDR target/decoy separation**: With the current SVM-based scoring, target and decoy protein groups separate too cleanly, producing artificially low protein FDR values. The picked-protein competition rarely selects decoy winners. This is tracked for a follow-up release; the current CSV output includes all passing target proteins with their best peptide scores, but the protein q-values should be treated with caution until the scoring metric is refined.
 
 ## Build and CI
 
