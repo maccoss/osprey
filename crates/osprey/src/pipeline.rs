@@ -3204,12 +3204,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                                 }
                             }
                         }
-                        // Append gap-fill entries (remaining overlay entries beyond parquet range)
+                        // Append gap-fill entries (remaining overlay entries beyond parquet range).
+                        // Update the corresponding fdr_entries stubs' parquet_index to point to
+                        // the actual Parquet row they will occupy after write-back. Without this,
+                        // gap-fill stubs keep parquet_index = u32::MAX and Phase 2 of the next
+                        // Percolator run can't load their features.
+                        let gap_start_pq_row = full_entries.len();
                         let mut gap_entries: Vec<(usize, CoelutionScoredEntry)> =
                             overlay.into_iter().collect();
                         gap_entries.sort_by_key(|(idx, _)| *idx);
-                        for (_, entry) in gap_entries {
+                        for (gap_offset, (vec_idx, entry)) in gap_entries.into_iter().enumerate() {
+                            let new_pq_row = (gap_start_pq_row + gap_offset) as u32;
                             full_entries.push(entry);
+                            // The vec_idx in the overlay matches the position in fdr_entries
+                            // (gap-fill entries were appended to fdr_entries in order)
+                            if vec_idx < fdr_entries.len() {
+                                fdr_entries[vec_idx].parquet_index = new_pq_row;
+                            }
                         }
                         // Write back to Parquet with reconciliation metadata
                         let recon_metadata = build_reconciled_metadata(&config);
@@ -7237,6 +7248,131 @@ mod tests {
             "buggy pattern produces all-zero parquet_index — confirms the bug exists \
              when callers forget to populate parquet_index"
         );
+    }
+
+    /// Models the reconciliation Parquet write-back step that appends gap-fill
+    /// entries and updates their stubs' parquet_index. This is the bug class
+    /// where gap-fill stubs were left with parquet_index = u32::MAX even though
+    /// their features had been written to the end of the Parquet file.
+    fn simulate_reconcile_writeback(
+        fdr_entries: &mut [FdrEntry],
+        original_parquet_len: usize,
+        gap_fill_vec_indices: &[usize],
+    ) {
+        // Mirrors the reconciliation write-back logic in pipeline.rs:
+        // 1. Start at original_parquet_len (the end of the original Parquet rows)
+        // 2. For each gap-fill entry (in vec order), assign sequential parquet_index
+        //    matching the row it will occupy after append + write-back
+        let gap_start_pq_row = original_parquet_len;
+        for (gap_offset, &vec_idx) in gap_fill_vec_indices.iter().enumerate() {
+            let new_pq_row = (gap_start_pq_row + gap_offset) as u32;
+            if vec_idx < fdr_entries.len() {
+                fdr_entries[vec_idx].parquet_index = new_pq_row;
+            }
+        }
+    }
+
+    #[test]
+    fn test_reconcile_writeback_updates_gap_fill_parquet_index() {
+        // Setup: 5 normal entries (parquet rows 0..5), then 3 gap-fill entries appended.
+        // The gap-fill entries initially have parquet_index = u32::MAX (sentinel).
+        let mut stubs: Vec<FdrEntry> = (0..5).map(|i| make_stub(i, i, false)).collect();
+        // Append gap-fill stubs with sentinel parquet_index
+        for i in 0..3 {
+            stubs.push(make_stub(100 + i, u32::MAX, false));
+        }
+
+        // Verify all 3 gap-fill stubs start with u32::MAX
+        let initial_max_count = stubs.iter().filter(|s| s.parquet_index == u32::MAX).count();
+        assert_eq!(initial_max_count, 3);
+
+        // Simulate reconciliation write-back: gap-fill entries are at vec indices 5, 6, 7
+        // and will be written at parquet rows 5, 6, 7 (right after the original 5 rows)
+        let gap_fill_vec_indices = vec![5, 6, 7];
+        simulate_reconcile_writeback(&mut stubs, 5, &gap_fill_vec_indices);
+
+        // After write-back, gap-fill stubs should have actual parquet rows assigned
+        assert_eq!(stubs[5].parquet_index, 5, "gap-fill 0 -> parquet row 5");
+        assert_eq!(stubs[6].parquet_index, 6, "gap-fill 1 -> parquet row 6");
+        assert_eq!(stubs[7].parquet_index, 7, "gap-fill 2 -> parquet row 7");
+
+        // No stubs should still have the u32::MAX sentinel
+        let remaining_max_count = stubs.iter().filter(|s| s.parquet_index == u32::MAX).count();
+        assert_eq!(
+            remaining_max_count, 0,
+            "all gap-fill entries should have real parquet_index after write-back"
+        );
+
+        // All parquet_index values should be unique and contiguous (0..8)
+        let mut indices: Vec<u32> = stubs.iter().map(|s| s.parquet_index).collect();
+        indices.sort();
+        assert_eq!(
+            indices,
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            "parquet_index values should cover all rows 0..8"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_writeback_with_no_gap_fill() {
+        // No gap-fill entries -> stubs unchanged
+        let mut stubs: Vec<FdrEntry> = (0..5).map(|i| make_stub(i, i, false)).collect();
+        simulate_reconcile_writeback(&mut stubs, 5, &[]);
+        for (i, stub) in stubs.iter().enumerate() {
+            assert_eq!(stub.parquet_index, i as u32);
+        }
+    }
+
+    #[test]
+    fn test_reconcile_writeback_buggy_pattern_leaves_max_sentinel() {
+        // Document the bug: if write-back forgets to update parquet_index,
+        // gap-fill stubs are left with u32::MAX which breaks Phase 2 of the
+        // next Percolator run (feature lookup at file_features[u32::MAX as usize]
+        // is out of range, so the entry is filtered out, leaving an empty
+        // feature vector that causes a matrix shape mismatch).
+        let mut stubs: Vec<FdrEntry> = (0..5).map(|i| make_stub(i, i, false)).collect();
+        for i in 0..3 {
+            stubs.push(make_stub(100 + i, u32::MAX, false));
+        }
+
+        // BUG: don't call simulate_reconcile_writeback (forget to update gap-fill stubs)
+
+        // The bug leaves gap-fill stubs with the sentinel
+        let max_count = stubs.iter().filter(|s| s.parquet_index == u32::MAX).count();
+        assert_eq!(
+            max_count, 3,
+            "buggy pattern leaves u32::MAX sentinel on gap-fill stubs after write-back"
+        );
+
+        // Documenting the failure mode: when these stubs are passed to Percolator's
+        // Phase 2 feature loader, the loader tries file_features[u32::MAX as usize]
+        // which is out of range. The .filter_map skips them, returning fewer feature
+        // vectors than expected entries. The matrix shape assertion (n*p) then fails.
+    }
+
+    #[test]
+    fn test_reconcile_writeback_preserves_existing_parquet_index() {
+        // Existing entries (positions 0..5) should keep their parquet_index unchanged.
+        // Only gap-fill entries (positions 5..8) get updated.
+        let mut stubs: Vec<FdrEntry> = vec![
+            make_stub(0, 100, false), // existing, parquet_index = 100
+            make_stub(1, 101, false),
+            make_stub(2, 102, false),
+            make_stub(3, u32::MAX, false), // gap-fill at vec position 3
+            make_stub(4, u32::MAX, false), // gap-fill at vec position 4
+        ];
+
+        // Simulate write-back: original Parquet had 103 rows (0..103),
+        // gap-fill entries are at vec indices 3, 4 and get parquet rows 103, 104
+        simulate_reconcile_writeback(&mut stubs, 103, &[3, 4]);
+
+        // Existing entries unchanged
+        assert_eq!(stubs[0].parquet_index, 100);
+        assert_eq!(stubs[1].parquet_index, 101);
+        assert_eq!(stubs[2].parquet_index, 102);
+        // Gap-fill entries got new parquet_index values
+        assert_eq!(stubs[3].parquet_index, 103);
+        assert_eq!(stubs[4].parquet_index, 104);
     }
 
     // ===================================================================
