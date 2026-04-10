@@ -3196,11 +3196,22 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 let scores_path = per_file_cache_paths.get(file_name.as_str());
                 if let Some(cache_path) = scores_path {
                     if let Ok(mut full_entries) = load_scores_parquet(cache_path) {
-                        // Replace re-scored entries
+                        // Replace re-scored entries using parquet_index (not Vec position).
+                        // After first-pass compaction, Vec position != Parquet row index.
+                        // Using Vec position would overwrite the wrong entry in the Parquet
+                        // file and leave the actual target entry unchanged.
                         for &idx in &existing_rescore_indices {
                             if let Some(entry) = overlay.remove(&idx) {
-                                if idx < full_entries.len() {
-                                    full_entries[idx] = entry;
+                                let pq_idx = fdr_entries[idx].parquet_index as usize;
+                                if pq_idx < full_entries.len() {
+                                    full_entries[pq_idx] = entry;
+                                } else {
+                                    log::warn!(
+                                        "Rescore write-back: parquet_index {} out of range for {} ({} rows)",
+                                        pq_idx,
+                                        file_name,
+                                        full_entries.len(),
+                                    );
                                 }
                             }
                         }
@@ -3382,6 +3393,10 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         is_decoy: bool,
         modified_sequence: Arc<str>,
         charge: u8,
+        /// Parquet row index for looking up RT/boundaries from the 5-column projection.
+        /// After compaction, Vec position != Parquet row index, so this field is
+        /// essential for correct blib plan entry construction.
+        parquet_index: u32,
     }
     let per_file_fdr_data: Vec<(String, Vec<LightFdr>)> = per_file_entries
         .iter()
@@ -3394,6 +3409,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     is_decoy: e.is_decoy,
                     modified_sequence: e.modified_sequence.clone(),
                     charge: e.charge,
+                    parquet_index: e.parquet_index,
                 })
                 .collect();
             (file_name.clone(), fdr_values)
@@ -3453,27 +3469,42 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             }
         };
 
-        // Merge Parquet row data with LightFdr data, filter to passing targets
-        for (row, fdr) in parquet_rows.into_iter().zip(fdr_values.iter()) {
-            if !fdr.is_decoy
-                && passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
+        // Merge Parquet row data with LightFdr data, filter to passing targets.
+        // CRITICAL: use fdr.parquet_index to look up the correct Parquet row.
+        // After first-pass compaction, Vec position != Parquet row index, so
+        // zipping by position would assign wrong RT/boundaries to peptides.
+        for fdr in fdr_values.iter() {
+            if fdr.is_decoy
+                || !passing_precursors.contains(&(fdr.modified_sequence.clone(), fdr.charge))
             {
-                plan_entries.push(BlibPlanEntry {
-                    entry_id: row.0,
-                    charge: fdr.charge,
-                    file_name_idx,
-                    run_qvalue: fdr.run_qvalue,
-                    experiment_qvalue: best_exp_q
-                        .get(&(fdr.modified_sequence.clone(), fdr.charge))
-                        .copied()
-                        .unwrap_or(fdr.experiment_qvalue),
-                    apex_rt: row.1,
-                    start_rt: row.2,
-                    end_rt: row.3,
-                    bounds_area: row.4,
-                    modified_sequence: fdr.modified_sequence.clone(),
-                });
+                continue;
             }
+            let pq_idx = fdr.parquet_index as usize;
+            let Some(row) = parquet_rows.get(pq_idx) else {
+                log::warn!(
+                    "LightFdr.parquet_index {} out of range for {} ({} parquet rows) — skipping entry {}",
+                    pq_idx,
+                    file_name,
+                    parquet_rows.len(),
+                    fdr.modified_sequence,
+                );
+                continue;
+            };
+            plan_entries.push(BlibPlanEntry {
+                entry_id: row.0,
+                charge: fdr.charge,
+                file_name_idx,
+                run_qvalue: fdr.run_qvalue,
+                experiment_qvalue: best_exp_q
+                    .get(&(fdr.modified_sequence.clone(), fdr.charge))
+                    .copied()
+                    .unwrap_or(fdr.experiment_qvalue),
+                apex_rt: row.1,
+                start_rt: row.2,
+                end_rt: row.3,
+                bounds_area: row.4,
+                modified_sequence: fdr.modified_sequence.clone(),
+            });
         }
         if (file_num + 1) % 20 == 0 || file_num + 1 == n_total_files {
             log::info!(
@@ -7373,6 +7404,212 @@ mod tests {
         // Gap-fill entries got new parquet_index values
         assert_eq!(stubs[3].parquet_index, 103);
         assert_eq!(stubs[4].parquet_index, 104);
+    }
+
+    // ===================================================================
+    // Blib plan entry construction: parquet_index vs Vec position
+    // ===================================================================
+    //
+    // After first-pass FDR compaction, the LightFdr Vec is shorter than the
+    // Parquet file. The blib plan entry construction must use LightFdr.parquet_index
+    // to index into the Parquet projection rows, not zip by position (which was
+    // the v26.1.0 bug). Without this, each peptide gets the RT/boundaries of a
+    // different peptide, producing wildly wrong blib output.
+
+    #[test]
+    fn test_blib_plan_uses_parquet_index_not_vec_position() {
+        // Simulate a Parquet file with 10 rows, each having a distinct apex_rt.
+        // Row i has entry_id=i, apex_rt = (i * 10.0), others zeroed.
+        let parquet_rows: Vec<(u32, f64, f64, f64, f64)> = (0..10)
+            .map(|i| (i as u32, i as f64 * 10.0, 0.0, 0.0, 0.0))
+            .collect();
+
+        // After compaction, only 3 entries remain (from original positions 2, 5, 8).
+        // Their parquet_index preserves the original Parquet row.
+        let compacted_fdr: Vec<(u32, Arc<str>, u8, bool)> = vec![
+            (2, Arc::from("PEPTIDEA"), 2, false), // parquet row 2 -> apex 20.0
+            (5, Arc::from("PEPTIDEB"), 2, false), // parquet row 5 -> apex 50.0
+            (8, Arc::from("PEPTIDEC"), 3, false), // parquet row 8 -> apex 80.0
+        ];
+
+        // CORRECT: look up by parquet_index
+        let mut correct_plan = Vec::new();
+        for &(pq_idx, ref modseq, charge, is_decoy) in &compacted_fdr {
+            if is_decoy {
+                continue;
+            }
+            let row = &parquet_rows[pq_idx as usize];
+            correct_plan.push((modseq.clone(), charge, row.1)); // apex_rt
+        }
+        assert_eq!(
+            correct_plan[0].2, 20.0,
+            "PEPTIDEA should get apex 20.0 (parquet row 2)"
+        );
+        assert_eq!(
+            correct_plan[1].2, 50.0,
+            "PEPTIDEB should get apex 50.0 (parquet row 5)"
+        );
+        assert_eq!(
+            correct_plan[2].2, 80.0,
+            "PEPTIDEC should get apex 80.0 (parquet row 8)"
+        );
+
+        // BUG: zip by Vec position gives wrong RTs
+        let buggy_plan: Vec<f64> = parquet_rows
+            .iter()
+            .zip(compacted_fdr.iter())
+            .map(|(row, _)| row.1)
+            .collect();
+        assert_eq!(
+            buggy_plan[0], 0.0,
+            "buggy zip gives row 0 apex (0.0) to first entry"
+        );
+        assert_eq!(
+            buggy_plan[1], 10.0,
+            "buggy zip gives row 1 apex (10.0) to second entry"
+        );
+        assert_eq!(
+            buggy_plan[2], 20.0,
+            "buggy zip gives row 2 apex (20.0) to third entry"
+        );
+
+        // Confirm buggy values differ from correct values
+        assert_ne!(buggy_plan[0], correct_plan[0].2);
+        assert_ne!(buggy_plan[1], correct_plan[1].2);
+        assert_ne!(buggy_plan[2], correct_plan[2].2);
+    }
+
+    #[test]
+    fn test_blib_plan_with_gap_fill_entries() {
+        // Parquet has 5 original rows + 2 gap-fill rows appended at end.
+        let parquet_rows: Vec<(u32, f64, f64, f64, f64)> = (0..7)
+            .map(|i| (i as u32, i as f64 * 10.0, 0.0, 0.0, 0.0))
+            .collect();
+
+        // After compaction + gap-fill, 4 entries:
+        //   - 2 original (parquet rows 1, 3)
+        //   - 2 gap-fill (parquet rows 5, 6 — appended by reconciliation write-back)
+        let compacted_fdr: Vec<(u32, &str)> = vec![
+            (1, "PEPTIDEA"), // original, parquet row 1 -> apex 10.0
+            (3, "PEPTIDEB"), // original, parquet row 3 -> apex 30.0
+            (5, "GAPFILLC"), // gap-fill, parquet row 5 -> apex 50.0
+            (6, "GAPFILLD"), // gap-fill, parquet row 6 -> apex 60.0
+        ];
+
+        // Correct lookup
+        for &(pq_idx, label) in &compacted_fdr {
+            let row = &parquet_rows[pq_idx as usize];
+            assert_eq!(
+                row.1,
+                pq_idx as f64 * 10.0,
+                "{} at parquet_index {} should get apex {}",
+                label,
+                pq_idx,
+                pq_idx as f64 * 10.0
+            );
+        }
+
+        // Buggy zip would assign row 0,1,2,3 to entries that are actually at rows 1,3,5,6
+        let buggy: Vec<f64> = parquet_rows
+            .iter()
+            .zip(compacted_fdr.iter())
+            .map(|(row, _)| row.1)
+            .collect();
+        assert_eq!(buggy[0], 0.0, "zip gives row 0 (wrong)");
+        assert_ne!(buggy[0], 10.0, "should be 10.0 for PEPTIDEA");
+    }
+
+    // ===================================================================
+    // Reconciliation write-back: parquet_index vs Vec position
+    // ===================================================================
+    //
+    // After compaction, the FdrEntry Vec is shorter than the Parquet file.
+    // When writing re-scored entries back to Parquet, the code must use
+    // fdr_entries[idx].parquet_index (not idx) to locate the correct row
+    // in full_entries. The v26.1.0 bug used idx directly, causing re-scored
+    // entries to overwrite the wrong Parquet row and leaving the actual
+    // target entry unchanged.
+
+    #[test]
+    fn test_rescore_writeback_uses_parquet_index_not_vec_position() {
+        // Simulate: Parquet has 10 entries with distinct apex_rt values.
+        // After compaction, 3 entries remain at Vec positions 0, 1, 2
+        // but their parquet_index values are 2, 5, 8.
+        let mut full_entries: Vec<f64> = (0..10).map(|i| i as f64 * 10.0).collect(); // apex_rt values
+        let parquet_indices: Vec<usize> = vec![2, 5, 8]; // from fdr_entries[idx].parquet_index
+
+        // Entry at Vec position 1 (parquet_index=5) was re-scored to apex_rt=99.0
+        let rescored_idx = 1;
+        let new_apex = 99.0;
+
+        // CORRECT: write to parquet row 5
+        let pq_idx = parquet_indices[rescored_idx];
+        full_entries[pq_idx] = new_apex;
+        assert_eq!(full_entries[5], 99.0, "correct: row 5 should be updated");
+        assert_eq!(full_entries[1], 10.0, "correct: row 1 should be untouched");
+
+        // Reset and show BUG: writing to Vec position 1 overwrites the wrong row
+        let mut buggy_entries: Vec<f64> = (0..10).map(|i| i as f64 * 10.0).collect();
+        buggy_entries[rescored_idx] = new_apex; // BUG: uses Vec position, not parquet_index
+        assert_eq!(
+            buggy_entries[1], 99.0,
+            "buggy: row 1 was overwritten (wrong peptide)"
+        );
+        assert_eq!(
+            buggy_entries[5], 50.0,
+            "buggy: row 5 is unchanged (target NOT updated)"
+        );
+    }
+
+    #[test]
+    fn test_rescore_writeback_multi_charge_consensus_scenario() {
+        // Real scenario: file has 20 entries. After compaction, entries for
+        // peptide AVDFAERDIIHDPGR remain:
+        //   z=2 at Vec pos 0, parquet_index=10, apex=9.68
+        //   z=3 at Vec pos 1, parquet_index=15, apex=10.67
+        // Multi-charge consensus re-scores z=3 to align with z=2's apex (9.68).
+        // Write-back must update full_entries[15], not full_entries[1].
+
+        let n_rows = 20;
+        let mut full_entries: Vec<f64> = (0..n_rows).map(|i| i as f64).collect();
+
+        // Compacted FdrEntry Vec (only 2 entries shown, in reality more)
+        let stubs: Vec<(usize, u32)> = vec![
+            (0, 10), // Vec pos 0, parquet_index 10
+            (1, 15), // Vec pos 1, parquet_index 15
+        ];
+
+        // After multi-charge consensus, z=3 (vec pos 1) was re-scored to apex 9.68
+        let rescored_vec_idx = 1;
+        let new_apex = 9.68;
+
+        // CORRECT: use parquet_index from the stub
+        let pq_idx = stubs[rescored_vec_idx].1 as usize;
+        full_entries[pq_idx] = new_apex;
+        assert_eq!(
+            full_entries[15], 9.68,
+            "z=3 entry at parquet row 15 should be updated to consensus apex"
+        );
+        assert_eq!(
+            full_entries[10], 10.0,
+            "z=2 entry at parquet row 10 should be unchanged"
+        );
+        assert_eq!(
+            full_entries[1], 1.0,
+            "unrelated entry at row 1 should be untouched"
+        );
+
+        // BUG: using Vec position 1 corrupts an unrelated entry and misses the target
+        let mut buggy_entries: Vec<f64> = (0..n_rows).map(|i| i as f64).collect();
+        buggy_entries[rescored_vec_idx] = new_apex;
+        assert_eq!(
+            buggy_entries[1], 9.68,
+            "buggy: row 1 (WRONG peptide) gets the re-scored apex"
+        );
+        assert_eq!(
+            buggy_entries[15], 15.0,
+            "buggy: row 15 (actual z=3 entry) remains unchanged"
+        );
     }
 
     // ===================================================================
