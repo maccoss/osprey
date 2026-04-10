@@ -16,11 +16,12 @@ The workspace version in `Cargo.toml` is updated only at release time, not durin
 
 ## File Format
 
-Each release gets one file: `RELEASE_NOTES_v{version}.md`
+Each release gets one file: `RELEASE_NOTES_v{version}.md`. During development, the unreleased draft lives in `RELEASE_NOTES_next.md` and gets renamed at release time.
 
-```
+```text
 release-notes/
   README.md                      # this file
+  RELEASE_NOTES_next.md          # working draft for the next release
   RELEASE_NOTES_v26.1.0.md
   RELEASE_NOTES_v26.1.1.md
   RELEASE_NOTES_v26.2.0.md
@@ -72,10 +73,13 @@ Sections can be omitted if empty. For major releases with many changes, subsecti
 
 ## Release Process
 
-1. Finalize the release notes file on the development branch
-2. Merge to `main`
-3. Update `version` in the workspace `Cargo.toml` to match the release
-4. Commit the version bump
-5. Tag: `git tag v{version}`
-6. Push: `git push origin main --tags`
-7. CI builds and publishes the release artifacts
+1. Finalize `RELEASE_NOTES_next.md` on the development branch
+2. Rename it: `git mv release-notes/RELEASE_NOTES_next.md release-notes/RELEASE_NOTES_v{version}.md`
+3. Update the title heading inside the file to match the version
+4. Create a fresh empty `RELEASE_NOTES_next.md` for the following release
+5. Update `version` in the workspace `Cargo.toml` to match the release
+6. Commit the version bump and renames
+7. Merge to `main`
+8. Tag: `git tag v{version}`
+9. Push: `git push origin main --tags`
+10. CI builds and publishes the release artifacts
