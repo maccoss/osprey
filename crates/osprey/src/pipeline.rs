@@ -3431,7 +3431,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Drop the heavy FdrEntry stubs — frees ~19 GB
     drop(per_file_entries);
     log::info!(
-        "Freed FDR stubs. Loading passing entries from {}/{} files for blib output",
+        "Loading blib data from {}/{} files with passing precursors",
         files_with_passing.len(),
         n_total_files
     );
@@ -3508,7 +3508,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
         if (file_num + 1) % 20 == 0 || file_num + 1 == n_total_files {
             log::info!(
-                "  Loaded {}/{} files ({} passing plan entries so far)",
+                "  Loaded {}/{} files ({} observations so far)",
                 file_num + 1,
                 n_total_files,
                 plan_entries.len()
@@ -4978,9 +4978,9 @@ fn write_blib_from_plan(
     writer.finalize()?;
 
     log::info!(
-        "Wrote {} total plan entries for {} precursors across {} files",
-        plan_entries.len(),
+        "Wrote {} precursors ({} observations) across {} files to blib",
         n_written,
+        plan_entries.len(),
         config.input_files.len()
     );
     if n_shared > 0 {
