@@ -12,6 +12,8 @@ Working draft for the next release. Append entries here as features and fixes la
 
 - Fixed reconciliation incorrectly keeping peaks at wrong RTs. The `determine_reconcile_action` function used boundary containment (`start_rt <= expected <= end_rt`) to decide whether a peak was at the correct RT. Peaks detected at the wrong RT (e.g., apex 1+ min off consensus) but with wide trailing edges that happened to span the expected RT were classified as "Keep" and never re-scored. Replaced with apex proximity logic using the refined per-file calibration's `local_tolerance`, which reflects actual run-to-run RT variation at each gradient position derived from thousands of consensus peptides. CWT candidate selection also changed from boundary overlap to apex proximity, picking the candidate with the closest apex. Added 2 regression tests.
 
+- Fixed log file not being fully written. The `BufWriter` wrapping the log file was not flushed on exit, causing the last ~8KB of log output to be lost. Now flushes after every log line and at program exit.
+
 ## Performance
 
 <!-- none yet -->
@@ -19,4 +21,3 @@ Working draft for the next release. Append entries here as features and fixes la
 ## Breaking Changes
 
 <!-- none yet -->
-

@@ -118,6 +118,7 @@ impl Log for TwoTierLogger {
             let line = self.format_file(record);
             if let Ok(mut f) = self.file.lock() {
                 let _ = writeln!(f, "{}", line);
+                let _ = f.flush();
             }
         }
 

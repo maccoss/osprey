@@ -374,7 +374,8 @@ fn main() -> Result<()> {
     let elapsed_str = format_duration(elapsed);
     log::info!("Analysis complete in {}", elapsed_str);
 
-    // Flush to ensure the final log line appears on the terminal before the prompt
+    // Flush to ensure all log lines are written to the log file and terminal
+    log::logger().flush();
     let _ = std::io::stderr().flush();
 
     Ok(())
