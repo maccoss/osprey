@@ -584,16 +584,14 @@ fn run_calibration_discovery_windowed(
             log::warn!("Failed to write calibration debug CSV: {}", e);
         }
 
-        // Log S/N filter impact
-        if passing_targets.len() < n_target_wins {
-            log::debug!(
-                "  RT quality filter: {} → {} peptides (removed {} with S/N < {:.1})",
-                n_target_wins,
-                passing_targets.len(),
-                n_target_wins - passing_targets.len(),
-                MIN_SNR_FOR_RT_CAL
-            );
-        }
+        // Log combined LDA + S/N filter result
+        log::info!(
+            "LDA scoring: {} at 1% FDR, {}/{} with S/N >= {:.0}",
+            n_target_wins,
+            passing_targets.len(),
+            n_target_wins,
+            MIN_SNR_FOR_RT_CAL
+        );
 
         // Extract calibration points + mass errors from passing targets
         let mut library_rts_detected: Vec<f64> = Vec::new();
@@ -2476,18 +2474,20 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 let rt_tol = cp.rt_calibration.mad.unwrap_or(0.0) * 1.4826 * 3.0;
                 let ms1_str = if cp.ms1_calibration.calibrated {
                     format!(
-                        ", MS1 {:.2} {}",
+                        ", MS1 shift {:+.2} {} (tol {:.2})",
+                        cp.ms1_calibration.mean,
+                        cp.ms1_calibration.unit,
                         3.0 * cp.ms1_calibration.sd,
-                        cp.ms1_calibration.unit
                     )
                 } else {
                     String::new()
                 };
                 let ms2_str = if cp.ms2_calibration.calibrated {
                     format!(
-                        ", MS2 {:.4} {}",
+                        ", MS2 shift {:+.4} {} (tol {:.4})",
+                        cp.ms2_calibration.mean,
+                        cp.ms2_calibration.unit,
                         3.0 * cp.ms2_calibration.sd,
-                        cp.ms2_calibration.unit
                     )
                 } else {
                     String::new()

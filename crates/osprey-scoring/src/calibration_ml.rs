@@ -126,7 +126,7 @@ pub fn train_and_score_calibration(
         );
     }
 
-    log::info!("LDA scoring complete: {} matches passing 1% FDR", n_passing);
+    log::debug!("LDA scoring complete: {} matches passing 1% FDR", n_passing);
 
     // Log median feature values for diagnostics
     log_median_features(matches, use_isotope_feature);
