@@ -2671,7 +2671,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         .collect();
 
     log::info!(
-        "First-pass FDR: {} precursors at {:.0}% FDR",
+        "First-pass: {} unique precursors pass run-level {:.0}% FDR across all files (compacting for reconciliation)",
         first_pass_base_ids.len(),
         config.run_fdr * 100.0,
     );
