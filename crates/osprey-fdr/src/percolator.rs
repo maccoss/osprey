@@ -230,7 +230,7 @@ pub fn run_percolator(
     if let Some(ref indices) = train_subset {
         let sub_targets = sub_labels.iter().filter(|&&d| !d).count();
         let sub_decoys = sub_labels.iter().filter(|&&d| d).count();
-        log::info!(
+        log::debug!(
             "  Subsampled {} entries ({} targets, {} decoys) from {} for SVM training",
             indices.len(),
             sub_targets,
@@ -286,7 +286,7 @@ pub fn run_percolator(
         .and_then(|names| names.get(best_feat_idx))
         .map(|s| s.as_str())
         .unwrap_or("unknown");
-    log::info!(
+    log::debug!(
         "  Best initial feature: {} ({} targets at {:.0}% FDR)",
         feat_name,
         best_feat_passing,
@@ -309,7 +309,7 @@ pub fn run_percolator(
                 .filter(|&i| fold_assignments[i] == fold)
                 .collect();
 
-            log::info!(
+            log::debug!(
                 "  Fold {}/{}: {} train, {} test",
                 fold + 1,
                 config.n_folds,
@@ -390,7 +390,7 @@ pub fn run_percolator(
         fold_weights.push(best_model.weights().to_vec());
         fold_biases.push(best_model.bias());
         iterations_per_fold.push(*n_iterations);
-        log::info!(
+        log::debug!(
             "    Fold {} best model weights: [{}]",
             fold + 1,
             best_model
@@ -607,7 +607,7 @@ fn train_fold(
         config.train_fdr,
     );
     let mut best_passing = 0usize;
-    log::info!(
+    log::debug!(
         "    Initial feature baseline on training set: {} pass {:.0}% FDR",
         initial_passing,
         config.train_fdr * 100.0
@@ -692,7 +692,7 @@ fn train_fold(
             config.train_fdr,
         );
 
-        log::info!(
+        log::debug!(
             "    Iteration {}: C={:.4}, {} selected targets, {} pass {:.0}% FDR",
             iteration + 1,
             best_c,
@@ -706,10 +706,10 @@ fn train_fold(
             best_passing = n_passing;
             best_iteration = iteration + 1;
             consecutive_no_improve = 0;
-            log::info!("      -> New best: {} passing", best_passing);
+            log::debug!("      -> New best: {} passing", best_passing);
         } else {
             consecutive_no_improve += 1;
-            log::info!(
+            log::debug!(
                 "      -> No improvement (best={} from iter {}, {} consecutive)",
                 best_passing,
                 best_iteration,
@@ -718,13 +718,13 @@ fn train_fold(
         }
 
         if consecutive_no_improve >= 2 {
-            log::info!("    Stopping early: 2 consecutive non-improvements");
+            log::debug!("    Stopping early: 2 consecutive non-improvements");
             break;
         }
     }
 
     let final_iteration = best_iteration.max(1);
-    log::info!(
+    log::debug!(
         "    Fold complete: best iteration {}, {} passing",
         best_iteration,
         best_passing

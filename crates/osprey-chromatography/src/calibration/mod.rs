@@ -59,13 +59,13 @@ impl CalibrationParams {
 
     /// Log calibration summary
     pub fn log_summary(&self) {
-        log::info!("=== Calibration Summary ===");
-        log::info!(
+        log::debug!("=== Calibration Summary ===");
+        log::debug!(
             "Confident peptides: {} (from {} sampled)",
             self.metadata.num_confident_peptides,
             self.metadata.num_sampled_precursors
         );
-        log::info!(
+        log::debug!(
             "MS1 calibration: mean={:.2} {}, median={:.2} {}, SD={:.2} {} (n={})",
             self.ms1_calibration.mean,
             self.ms1_calibration.unit,
@@ -75,7 +75,7 @@ impl CalibrationParams {
             self.ms1_calibration.unit,
             self.ms1_calibration.count
         );
-        log::info!(
+        log::debug!(
             "MS2 calibration: mean={:.4} {}, median={:.4} {}, SD={:.4} {} (n={})",
             self.ms2_calibration.mean,
             self.ms2_calibration.unit,
@@ -86,7 +86,7 @@ impl CalibrationParams {
             self.ms2_calibration.count
         );
         if let Some(mad) = self.rt_calibration.mad {
-            log::info!(
+            log::debug!(
                 "RT calibration: method={:?}, MAD={:.3} min, robust_SD={:.3} min, residual_SD={:.3} min, R²={:.4}",
                 self.rt_calibration.method,
                 mad,
@@ -95,7 +95,7 @@ impl CalibrationParams {
                 self.rt_calibration.r_squared
             );
         } else {
-            log::info!(
+            log::debug!(
                 "RT calibration: method={:?}, residual_SD={:.2} min, R²={:.4}",
                 self.rt_calibration.method,
                 self.rt_calibration.residual_sd,
@@ -217,7 +217,7 @@ impl MzCalibration {
     /// Log ASCII histogram of mass errors
     pub fn log_histogram(&self, label: &str) {
         if let Some(ref hist) = self.histogram {
-            log::info!("--- {} Mass Error Histogram ({}) ---", label, self.unit);
+            log::debug!("--- {} Mass Error Histogram ({}) ---", label, self.unit);
 
             // Find max count for scaling
             let max_count = hist.counts.iter().max().copied().unwrap_or(1);
@@ -240,13 +240,13 @@ impl MzCalibration {
 
                 let bar: String = "█".repeat(bar_width);
                 if is_th {
-                    log::info!("{:>7.3} | {:6} | {}", bin_center, count, bar);
+                    log::debug!("{:>7.3} | {:6} | {}", bin_center, count, bar);
                 } else {
-                    log::info!("{:>7.1} | {:6} | {}", bin_center, count, bar);
+                    log::debug!("{:>7.1} | {:6} | {}", bin_center, count, bar);
                 }
             }
             if is_th {
-                log::info!(
+                log::debug!(
                     "        | mean={:.4}, median={:.4}, SD={:.4} {} (n={})",
                     self.mean,
                     self.median,
@@ -255,7 +255,7 @@ impl MzCalibration {
                     self.count
                 );
             } else {
-                log::info!(
+                log::debug!(
                     "        | mean={:.2}, median={:.2}, SD={:.2} {} (n={})",
                     self.mean,
                     self.median,
