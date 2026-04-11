@@ -2474,10 +2474,30 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             if let Some(ref cp) = cal_params {
                 let n_pep = cp.metadata.num_confident_peptides;
                 let rt_tol = cp.rt_calibration.mad.unwrap_or(0.0) * 1.4826 * 3.0;
+                let ms1_str = if cp.ms1_calibration.calibrated {
+                    format!(
+                        ", MS1 {:.2} {}",
+                        3.0 * cp.ms1_calibration.sd,
+                        cp.ms1_calibration.unit
+                    )
+                } else {
+                    String::new()
+                };
+                let ms2_str = if cp.ms2_calibration.calibrated {
+                    format!(
+                        ", MS2 {:.4} {}",
+                        3.0 * cp.ms2_calibration.sd,
+                        cp.ms2_calibration.unit
+                    )
+                } else {
+                    String::new()
+                };
                 log::info!(
-                    "Calibration: {} peptides, RT tolerance {:.2} min",
+                    "Calibration: {} peptides, RT {:.2} min{}{}",
                     n_pep,
-                    rt_tol
+                    rt_tol,
+                    ms1_str,
+                    ms2_str
                 );
             }
 
