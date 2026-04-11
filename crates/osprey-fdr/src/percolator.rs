@@ -298,6 +298,16 @@ pub fn run_percolator(
     let mut fold_weights: Vec<Vec<f64>> = Vec::new();
     let mut iterations_per_fold: Vec<usize> = Vec::new();
 
+    // Progress bar: n_folds * max_iterations total steps (folds that stop early
+    // skip remaining steps). Shared across parallel folds via Arc.
+    let total_steps = (config.n_folds * config.max_iterations) as u64;
+    let pb = indicatif::ProgressBar::new(total_steps);
+    pb.set_style(
+        indicatif::ProgressStyle::default_bar()
+            .template("{spinner:.green} SVM training [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} fold-iterations")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
     // Train all folds in parallel — each fold is independent
     let fold_results: Vec<(usize, LinearSvm, usize)> = (0..config.n_folds)
         .into_par_iter()
@@ -325,11 +335,14 @@ pub fn run_percolator(
                 &train_indices,
                 &initial_scores,
                 config,
+                Some(&pb),
             );
 
             (fold, best_model, n_iterations)
         })
         .collect();
+
+    pb.finish_and_clear();
 
     // Score ALL entries with trained models
     match &train_subset {
@@ -587,6 +600,7 @@ fn train_fold(
     train_indices: &[usize],
     initial_scores: &[f64],
     config: &PercolatorConfig,
+    progress: Option<&indicatif::ProgressBar>,
 ) -> (LinearSvm, usize) {
     let n_features = std_features.cols;
     let mut current_scores = initial_scores.to_vec();
@@ -607,6 +621,7 @@ fn train_fold(
         config.train_fdr,
     );
     let mut best_passing = 0usize;
+    let mut iterations_completed = 0usize;
     log::debug!(
         "    Initial feature baseline on training set: {} pass {:.0}% FDR",
         initial_passing,
@@ -717,9 +732,22 @@ fn train_fold(
             );
         }
 
+        iterations_completed = iteration + 1;
+        if let Some(pb) = progress {
+            pb.inc(1);
+        }
+
         if consecutive_no_improve >= 2 {
             log::debug!("    Stopping early: 2 consecutive non-improvements");
             break;
+        }
+    }
+
+    // Mark remaining iterations as complete if we stopped early
+    if let Some(pb) = progress {
+        let remaining = config.max_iterations - iterations_completed;
+        if remaining > 0 {
+            pb.inc(remaining as u64);
         }
     }
 
