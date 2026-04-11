@@ -2511,6 +2511,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 &config,
                 &file_name,
                 None,
+                "Scoring",
             )?;
 
             log::info!(
@@ -3088,6 +3089,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     &config,
                     file_name,
                     Some(&boundary_overrides),
+                    "Re-scoring",
                 )?;
 
                 for entry in rescored {
@@ -3114,6 +3116,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     &gap_config,
                     file_name,
                     None,
+                    "Gap-fill CWT",
                 )?;
 
                 // Track which entry_ids got CWT results
@@ -3169,6 +3172,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         &config,
                         file_name,
                         Some(&forced_overrides),
+                        "Gap-fill forced",
                     )?;
 
                     n_gap_forced = forced_results.len();
@@ -5564,6 +5568,7 @@ fn run_search(
     config: &OspreyConfig,
     file_name: &str,
     boundary_overrides: Option<&HashMap<u32, (f64, f64, f64)>>,
+    search_label: &str,
 ) -> Result<Vec<CoelutionScoredEntry>> {
     use osprey_chromatography::{compute_snr, detect_all_xic_peaks, detect_cwt_consensus_peaks};
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
@@ -5713,13 +5718,15 @@ fn run_search(
         SpectralScorer::new().with_tolerance_da(fragment_tolerance.tolerance)
     };
 
-    // Progress bar — one tick per isolation window.
+    // Progress bar — one tick per isolation window, with descriptive label.
     let pb = ProgressBar::new(window_groups.len() as u64);
+    let bar_template = format!(
+        "{{spinner:.green}} {} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} windows",
+        search_label
+    );
     pb.set_style(
         ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} windows",
-            )
+            .template(&bar_template)
             .unwrap()
             .progress_chars("#>-"),
     );
@@ -7785,6 +7792,7 @@ mod tests {
             &config,
             "test.mzML",
             Some(&overrides),
+            "Test",
         )
         .unwrap();
 
@@ -7856,6 +7864,7 @@ mod tests {
             &config,
             "test.mzML",
             None,
+            "Test",
         )
         .unwrap();
         assert!(
@@ -7878,6 +7887,7 @@ mod tests {
             &config,
             "test.mzML",
             Some(&overrides),
+            "Test",
         )
         .unwrap();
 
@@ -7921,6 +7931,7 @@ mod tests {
             &config,
             "test.mzML",
             Some(&overrides),
+            "Test",
         )
         .unwrap();
 
@@ -7990,6 +8001,7 @@ mod tests {
             &config,
             "test.mzML",
             None,
+            "Test",
         )
         .unwrap();
 
@@ -8031,6 +8043,7 @@ mod tests {
             &config,
             "test.mzML",
             Some(&overrides),
+            "Test",
         )
         .unwrap();
 
