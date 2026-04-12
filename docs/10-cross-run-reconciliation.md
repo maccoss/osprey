@@ -96,17 +96,37 @@ For each scored entry (target or decoy), the expected measured RT is predicted f
 expected_rt = refined_calibration.predict(consensus_library_rt)
 ```
 
-Three actions are possible:
+Three actions are possible based on **apex proximity** to the expected RT:
 
 | Action | Condition | What happens |
 |--------|-----------|--------------|
-| **Keep** | Current peak `[start_rt, end_rt]` contains `expected_rt` | No change |
-| **UseCwtPeak** | An alternate stored CWT candidate contains `expected_rt` | Switch to that candidate's boundaries |
-| **ForcedIntegration** | No CWT candidate contains `expected_rt` | Integrate at `expected_rt ± median_peak_width/2` |
+| **Keep** | `|apex_rt - expected_rt| <= rt_tolerance` | No change |
+| **UseCwtPeak** | A CWT candidate has `|cand.apex_rt - expected_rt| <= rt_tolerance` | Switch to the closest-apex candidate |
+| **ForcedIntegration** | Neither current peak nor any CWT candidate has apex within tolerance | Integrate at `expected_rt ± median_peak_width/2` |
+
+### RT Tolerance: Global MAD, Not Local Interpolation
+
+The `rt_tolerance` is computed **once per file** as:
+
+```
+rt_tolerance = max(0.1, 3.0 × MAD × 1.4826)
+```
+
+where `MAD` is the median absolute residual from the refined calibration's training points (thousands of consensus peptides across the gradient). This is a global measure of how tightly the calibration fits, and it is robust to individual outliers because it uses the median, not per-point residuals.
+
+**Why not per-point local tolerance?** An earlier version used `local_tolerance(query_rt)` which interpolated the absolute residual from the nearest training points at the query RT. This created a self-fulfilling prophecy: a peptide with a wrong apex RT contributed a huge residual to the calibration training set, which inflated the local tolerance at that RT, which then allowed the wrong-RT detection to pass the apex proximity check. Using a global MAD eliminates this feedback loop — one bad peptide's residual barely moves the median.
+
+A minimum floor of 0.1 min prevents being too strict when the calibration is exceptionally tight (e.g., very short gradients with highly reproducible LC).
+
+### Apex Proximity vs Boundary Containment
+
+Earlier versions used **boundary containment** (`start_rt <= expected_rt <= end_rt`) to decide Keep vs re-score. That check was too permissive: a peak detected at the wrong RT (e.g., apex 1.2 min off) but with a wide trailing edge that happened to span the expected RT was classified as Keep. The apex proximity check rejects such peaks regardless of their boundary width.
+
+For CWT candidate selection, apex proximity also picks the candidate whose apex is **closest** to the expected RT, not just any candidate whose boundaries overlap. If a wrong peak's boundaries span the expected RT but a better candidate's apex is closer, the better candidate wins.
 
 The CWT candidates are stored during the initial search (configurable, default 5 per precursor) and persisted in the per-file Parquet score cache. During reconciliation planning, only the CWT candidate column is loaded selectively via `load_cwt_candidates_from_parquet()`, avoiding the cost of reloading full entries with all features and fragment data. This lets reconciliation switch to an alternate peak that was already detected but not selected as the best, without requiring a full re-extraction.
 
-`ForcedIntegration` is a last resort — it integrates at the expected position even if no CWT peak was found there, using the median peak width from all detections as the integration window.
+`ForcedIntegration` is a last resort — it integrates at the expected position even if no peak (current or CWT candidate) has its apex within tolerance, using the median peak width from all detections as the integration window.
 
 ---
 
@@ -199,12 +219,14 @@ Weighted median library RT (weight = coelution_sum):
   weights = [8.5, 7.9, 3.1], values = [32.1, 32.0, 38.5]
   consensus_library_rt ≈ 32.1  (file3's outlier point doesn't move the weighted median)
 
-Per-run refined calibration → expected measured RT:
-  file1: predict(32.1) = 25.3 → current peak [25.0, 25.9] contains 25.3 → Keep
-  file2: predict(32.1) = 25.4 → current peak [25.0, 25.9] contains 25.4 → Keep
-  file3: predict(32.1) = 25.2 → current peak [31.2, 32.1] does NOT contain 25.2
-           → check stored CWT candidates...
-             candidate at [25.0, 25.7] contains 25.2 → UseCwtPeak
+Per-run refined calibration → expected measured RT (tolerance ~0.4 min from global MAD):
+  file1: predict(32.1) = 25.3 → |25.3 - 25.3| = 0.00 ≤ 0.4 → Keep
+  file2: predict(32.1) = 25.4 → |25.4 - 25.4| = 0.00 ≤ 0.4 → Keep
+  file3: predict(32.1) = 25.2 → |31.7 - 25.2| = 6.5 > 0.4 → NOT Keep
+           → check stored CWT candidates by apex proximity:
+             candidate 0 apex=25.2 → |25.2 - 25.2| = 0.00 ≤ 0.4 → closest
+             candidate 1 apex=31.7 → |31.7 - 25.2| = 6.5 > 0.4 → rejected
+           → UseCwtPeak (candidate 0, apex=25.2)
              (CWT had found the correct peak but scored it lower than the interferer)
 
 Result:
@@ -213,7 +235,7 @@ Result:
          features recomputed at new boundaries
 ```
 
-If file3 had no CWT candidate near the expected RT (e.g., the peptide was truly not present or below detection), the outcome would be `ForcedIntegration` — boundaries placed at `expected_rt ± median_peak_width/2`. This provides a quantification window for Skyline even when the peptide was not detected in that run.
+If file3 had no CWT candidate with its apex within tolerance (e.g., the peptide was truly not present or below detection), the outcome would be `ForcedIntegration` — boundaries placed at `expected_rt ± median_peak_width/2`. This provides a quantification window for Skyline even when the peptide was not detected in that run.
 
 ---
 

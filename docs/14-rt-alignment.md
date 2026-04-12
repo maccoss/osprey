@@ -131,7 +131,23 @@ Once a consensus library RT exists, Osprey predicts where a peptide should elute
 expected_measured_rt = refined_calibration.predict(consensus_library_rt)
 ```
 
-This is the RT used for reconciliation planning — the system asks "does the current peak contain this expected RT?" If not, it looks for an alternate CWT candidate or imputes boundaries. See [Boundary Overrides & Forced Integration](13-boundary-overrides.md).
+This is the RT used for reconciliation planning — the system asks "is the current peak's apex within `rt_tolerance` of this expected RT?" If not, it looks for an alternate CWT candidate whose apex is close to the expected RT, or imputes boundaries. See [Boundary Overrides & Forced Integration](13-boundary-overrides.md).
+
+## RT Tolerance from Global MAD
+
+The reconciliation apex-proximity check uses a **global per-file tolerance** derived from the refined calibration's residuals:
+
+```
+rt_tolerance = max(0.1, 3.0 × MAD × 1.4826)
+```
+
+where `MAD` is the median absolute residual from the refined calibration's training points (thousands of consensus peptides). This is a single value per file, applied to all peptides in that file during reconciliation planning.
+
+**Why global, not per-point?** The `RTCalibration::local_tolerance()` method interpolates absolute residuals at a query RT, giving a position-specific tolerance. This is appropriate for the initial search (where tolerance varies along the gradient). But for reconciliation it creates a self-fulfilling prophecy: a peptide with a wrong apex RT contributes a large residual to the training set, which inflates the local tolerance at that RT, which then allows the wrong-RT detection to pass the apex proximity check.
+
+Using a global MAD eliminates this feedback loop. One bad peptide's residual barely moves the median over thousands of points, so the tolerance stays tight even if a few training points are outliers. The factor of 3.0 gives approximately 3-sigma coverage (99.7%) under a normal assumption, and the 0.1 min minimum floor prevents being overly strict when the calibration is exceptionally tight.
+
+On a 3-replicate Astral HeLa dataset, the refined calibration MAD was ~0.09 min, giving `rt_tolerance = 3.0 × 0.09 × 1.4826 ≈ 0.40 min`. This flags ~0.3% of peptides (those with apex deviations beyond 0.4 min from the consensus) for re-scoring, which is consistent with the empirical distribution where the 99.7th percentile of apex deviations is near this value.
 
 ## Peak Width for Imputation
 
