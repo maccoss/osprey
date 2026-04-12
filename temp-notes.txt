@@ -1,0 +1,176 @@
+cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hram --report report.parquet
+
+
+cargo run --release -- -i *.mzML -l ../hela-filtered-SkylineAI_spectral_library.tsv -o stellar-ospreyoutput.blib 
+
+
+
+python3 visualize_pin_features.py ../example_test_data/stellar/calibrated-GPF-data/mokapot/Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars.pin --output report-stellar.html
+
+
+Stellar with coelution and Percolator (4/11/2026)
+
+[10:20] === Per-file results (run-level FDR at 1%) ===
+[10:20]   Ste-2024-12-02_HeLa_4mz_sDIA_400-900_20: 28300 precursors, 25983 peptides
+[10:20]   Ste-2024-12-02_HeLa_4mz_sDIA_400-900_21: 28696 precursors, 26311 peptides
+[10:20]   Ste-2024-12-02_HeLa_4mz_sDIA_400-900_22: 28938 precursors, 26558 peptides
+[10:20]
+[10:20] === Experiment-level results (1% FDR) ===
+[10:20]   Experiment: 34941 precursors, 31770 peptides
+[10:21]
+[10:21] Protein-level FDR
+[10:21] Protein parsimony: 6707 proteins, 31770 peptides in bipartite graph
+[10:21] Protein parsimony: 6404 protein groups after identical-set merging
+[10:22] Protein parsimony: 5967 protein groups after subset elimination
+[10:22] Protein parsimony: 30857 unique peptides, 913 shared peptides
+[10:22] Peptide scores for protein FDR: 45656 target peptides, 43282 decoy peptides
+[10:22] Composite scores: 5967 targets (median=56.22, max=2911.60), 899 decoys (median=8.14, max=34.17)
+[10:22] Best quality scores: 5967 targets (median=1.0000, max=1.0000), 899 decoys (median=0.9999, max=1.0000)
+[10:22] Protein FDR: 5967 protein groups scored, 5967 at 1% FDR
+[10:22] Protein FDR: 5967 protein groups at 1% FDR (from 5967 total groups)
+
+
+
+Coelution with Astral data and Percolator
+
+[46:39] Second-pass FDR
+[46:42] Percolator: 240325 entries (147694 targets, 92631 decoys), 21 features, 3-fold CV
+[50:51] WARN:   Fold 1: median decoy score (-1.3633) >= FDR threshold score (-3.1963), skipping calibration
+[50:51] WARN:   Fold 2: median decoy score (-1.3766) >= FDR threshold score (-5.1653), skipping calibration
+[50:51] WARN:   Fold 3: median decoy score (-1.3531) >= FDR threshold score (-3.1765), skipping calibration
+[50:54]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_49: 135407 precursors, 119310 peptides
+[50:54]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_55: 135794 precursors, 119584 peptides
+[50:55]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_60: 134195 precursors, 118259 peptides
+[50:56]
+[50:56] === Experiment-level results (1% FDR) ===
+[50:56]   Experiment: 147558 precursors, 130613 peptides (from 673965 total entries)
+[50:59]
+[50:59] Protein-level FDR
+[51:10] Protein parsimony: 14619 proteins, 130747 peptides in bipartite graph
+[51:10] Protein parsimony: 14230 protein groups after identical-set merging
+[51:43] Protein parsimony: 13724 protein groups after subset elimination
+[51:44] Protein parsimony: 126758 unique peptides, 3989 shared peptides
+[51:44] Peptide scores for protein FDR: 130747 target peptides, 89203 decoy peptides
+[51:44] Composite scores: 13724 targets (median=1.20, max=47.17), 4416 decoys (median=0.00, max=1.45)
+[51:44] Best quality scores: 13724 targets (median=0.8962, max=1.0000), 4416 decoys (median=0.3914, max=0.8598)
+[51:45] Protein FDR: 13724 protein groups scored, 13724 at 1% FDR
+[51:45] Protein FDR: 13724 protein groups at 1% FDR (from 13724 total groups)
+
+
+
+Options:
+  -c, --config <CONFIG>
+          Configuration file (YAML format)
+
+      --generate-config <GENERATE_CONFIG>
+          Generate a template configuration file
+
+  -i, --input <INPUT>...
+          Input mzML file(s)
+
+  -l, --library <LIBRARY>
+          Spectral library file (.tsv for DIA-NN, .blib, or .elib)
+
+  -o, --output <OUTPUT>
+          Output results file (.blib format for Skyline)
+
+      --resolution <RESOLUTION>
+          Resolution mode: unit, hram, auto
+          
+          [default: auto]
+
+      --fragment-tolerance <FRAGMENT_TOLERANCE>
+          Fragment m/z tolerance (e.g., 10 for 10 ppm, or 0.3 for 0.3 Th)
+
+      --fragment-unit <FRAGMENT_UNIT>
+          Fragment tolerance unit: ppm, mz (Thompson)
+
+      --precursor-tolerance <PRECURSOR_TOLERANCE>
+          Precursor m/z tolerance (e.g., 10 for 10 ppm, or 1.0 for 1.0 Th)
+
+      --precursor-unit <PRECURSOR_UNIT>
+          Precursor tolerance unit: ppm, mz (Thompson)
+
+      --rt-tolerance <RT_TOLERANCE>
+          RT tolerance in minutes (fallback when calibration disabled)
+          
+          [default: 2]
+
+      --no-rt-calibration
+          Disable RT calibration (use fixed rt_tolerance instead)
+
+      --lambda <LAMBDA>
+          Fixed regularization parameter lambda
+
+      --max-candidates <MAX_CANDIDATES>
+          Maximum candidates per spectrum (use 0 for unlimited)
+          
+          [default: 5250]
+
+      --run-fdr <RUN_FDR>
+          Run-level FDR threshold
+          
+          [default: 0.01]
+
+      --threads <THREADS>
+          Number of threads (default: all available)
+
+      --report <REPORT>
+          Write TSV report to this file
+
+      --export-coefficients
+          Export coefficient time series to parquet file(s)
+
+      --search-mode <SEARCH_MODE>
+          Search mode: regression (default) or coelution
+          
+          [default: regression]
+
+      --fdr-method <FDR_METHOD>
+          FDR method: percolator (native SVM, default), mokapot (external Python), or simple (no ML)
+          
+          [default: percolator]
+
+      --write-pin
+          Write PIN files for external tools
+
+  -v, --verbose
+          Verbose output
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+
+
+SVM features removed
+fragment_corr_5
+fragment_corr_4
+fragment_corr_3
+fragment_corr_2
+fragment_corr_1
+fragment_corr_0
+fragment_coelution_min
+dot_product_smz_top6
+dot_product_smz_top5
+dot_product_smz_top4
+signal_to_noise
+dot_product_top6
+peptide_length
+elution_weighted_cosine
+dot_product_top5
+dot_product_top4
+dot_product_smz
+dot_product
+peak_symmetry
+missed_cleavages
+n_fragment_pairs
+peak_width
+n_scans
+fragment_coverage
+hyperscore
+sequence_coverage
+median_polish_rsquared
+mass_accuracy_std
