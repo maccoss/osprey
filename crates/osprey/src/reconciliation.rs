@@ -394,6 +394,30 @@ pub fn plan_reconciliation(
                 None => return Vec::new(),
             };
 
+            // Compute a global RT tolerance for this file using the refined calibration's
+            // MAD (median absolute deviation of residuals). This is derived from thousands
+            // of consensus peptides across the RT gradient, so it reflects normal run-to-run
+            // variation without being inflated by individual outliers.
+            //
+            // Previously we used `local_tolerance` which interpolates the per-point
+            // residual at the query RT. This created a self-fulfilling prophecy: a
+            // peptide with a wrong apex RT contributed a huge residual to the training
+            // set, which inflated the local tolerance at that RT, which then allowed
+            // the wrong-RT detection to pass the apex proximity check.
+            //
+            // Using MAD * 1.4826 * 3.0 gives a ~3-sigma tolerance robust to outliers.
+            // A minimum floor of 0.1 min prevents being too strict when calibration is
+            // very tight.
+            let stats = cal.stats();
+            let rt_tolerance = (stats.mad * 1.4826 * 3.0).max(0.1);
+            log::debug!(
+                "Reconciliation RT tolerance for {}: {:.3} min (MAD={:.3}, robust_SD={:.3})",
+                file_name,
+                rt_tolerance,
+                stats.mad,
+                stats.mad * 1.4826,
+            );
+
             let file_cwt = per_file_cwt_candidates.get(file_name).unwrap_or(&empty_cwt);
 
             let mut file_actions = Vec::new();
@@ -417,11 +441,6 @@ pub fn plan_reconciliation(
                 }
 
                 let expected_rt = cal.predict(consensus_entry.consensus_library_rt);
-                let rt_tolerance = cal.local_tolerance(
-                    consensus_entry.consensus_library_rt,
-                    3.0, // 3-sigma coverage
-                    0.1, // minimum floor: 0.1 min (6 sec)
-                );
                 let cwt = file_cwt
                     .get(entry.parquet_index as usize)
                     .map(|v| v.as_slice())
@@ -1359,6 +1378,279 @@ mod tests {
         assert!(
             actions.is_empty(),
             "Non-passing precursors should not be reconciled"
+        );
+    }
+
+    // ---- Global MAD tolerance tests ----
+    //
+    // These tests verify that `plan_reconciliation` uses a global MAD-derived
+    // tolerance (robust to outliers) instead of per-point local interpolation.
+    //
+    // The bug these guard against: previously we used `cal.local_tolerance(query_rt)`
+    // which interpolated abs_residuals at the query RT. A peptide with a wrong apex
+    // contributed a large residual to the calibration training set, inflating the
+    // local tolerance at that RT, which then allowed the wrong-RT detection to pass
+    // the apex proximity check. Using a global MAD eliminates this feedback loop.
+
+    /// Build an RTCalibration with specific abs_residuals for testing.
+    /// The stats().mad = median of abs_residuals.
+    fn make_calibration_with_residuals(abs_residuals: Vec<f64>) -> RTCalibration {
+        let n = abs_residuals.len();
+        let library_rts: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let fitted_rts: Vec<f64> = library_rts.clone();
+        let params = osprey_chromatography::RTModelParams {
+            library_rts,
+            fitted_rts,
+            abs_residuals,
+        };
+        RTCalibration::from_model_params(&params, 0.1).unwrap()
+    }
+
+    #[test]
+    fn test_plan_reconciliation_tolerance_from_global_mad() {
+        // Calibration with tight residuals except for one huge outlier at position 15.
+        // Global MAD (median) should be near 0.05, giving tolerance ≈ 3 × 0.05 × 1.4826 = 0.22 min.
+        let mut residuals = vec![0.05_f64; 30];
+        residuals[15] = 1.50; // One huge outlier at library_rt = 15.0
+        let cal = make_calibration_with_residuals(residuals);
+
+        // Sanity check: MAD is robust to the single outlier
+        let mad = cal.stats().mad;
+        assert!(
+            (mad - 0.05).abs() < 1e-6,
+            "MAD should be 0.05 (median), not affected by single outlier, got {}",
+            mad
+        );
+
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        // Consensus at library RT = 15.0 (exactly where the outlier residual sits)
+        let consensus = vec![PeptideConsensusRT {
+            modified_sequence: "PEPTIDEK".to_string(),
+            is_decoy: false,
+            consensus_library_rt: 15.0,
+            median_peak_width: 0.2,
+            n_runs_detected: 3,
+        }];
+
+        // Entry with apex 0.5 min off from consensus (should FAIL the tight tolerance).
+        // With old local_tolerance: the outlier residual 1.5 at library RT 15 would
+        // be interpolated -> tolerance ~4.5 min -> Keep (wrong).
+        // With global MAD tolerance: ~0.22 min -> 0.5 > 0.22 -> re-score (correct).
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![make_fdr_entry(
+                1, "PEPTIDEK", 2, false, 15.5, 15.4, 15.6, 8.0, 0.005,
+            )],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        // Should be re-scored (not in "Keep" state) because 0.5 min deviation > 0.22 min tolerance
+        assert!(
+            actions.contains_key(&("file1".to_string(), 0)),
+            "Entry 0.5 min off consensus should be flagged for re-scoring with global MAD tolerance"
+        );
+    }
+
+    #[test]
+    fn test_plan_reconciliation_tolerance_minimum_floor() {
+        // Calibration with essentially zero residuals (very tight fit).
+        // Without a floor, tolerance would be ~0, failing legitimate small deviations.
+        // The 0.1 min minimum floor prevents this.
+        let cal = make_calibration_with_residuals(vec![0.001_f64; 30]);
+        assert!(cal.stats().mad < 0.01, "MAD should be near zero");
+
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        let consensus = vec![PeptideConsensusRT {
+            modified_sequence: "PEPTIDEK".to_string(),
+            is_decoy: false,
+            consensus_library_rt: 15.0,
+            median_peak_width: 0.2,
+            n_runs_detected: 3,
+        }];
+
+        // Entry with apex 0.05 min off (within the 0.1 min minimum floor).
+        // Should Keep because 0.05 <= floor(0.1).
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![make_fdr_entry(
+                1, "PEPTIDEK", 2, false, 15.05, 14.95, 15.15, 8.0, 0.005,
+            )],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        // Entry within 0.1 min floor → Keep → not in actions map
+        assert!(
+            actions.is_empty(),
+            "Entry within 0.1 min floor should be kept (actions should be empty)"
+        );
+    }
+
+    #[test]
+    fn test_plan_reconciliation_tolerance_matches_expected_mad_formula() {
+        // Calibration with MAD = 0.1 min -> tolerance = 3 × 0.1 × 1.4826 ≈ 0.445 min
+        // An entry 0.5 min off should fail; an entry 0.4 min off should pass.
+        let cal = make_calibration_with_residuals(vec![0.1_f64; 30]);
+        let mad = cal.stats().mad;
+        assert!((mad - 0.1).abs() < 1e-6, "MAD should be 0.1");
+
+        let expected_tolerance = 3.0 * 0.1 * 1.4826; // ≈ 0.44478
+        assert!(expected_tolerance > 0.4 && expected_tolerance < 0.5);
+
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        let consensus = vec![PeptideConsensusRT {
+            modified_sequence: "PEPTIDEK".to_string(),
+            is_decoy: false,
+            consensus_library_rt: 15.0,
+            median_peak_width: 0.2,
+            n_runs_detected: 3,
+        }];
+
+        // Entry 1: 0.4 min off → within tolerance (0.445) → Keep
+        // Entry 2: 0.5 min off → exceeds tolerance → re-score
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![
+                make_fdr_entry(1, "PEPTIDEK", 2, false, 15.4, 15.3, 15.5, 8.0, 0.005),
+                make_fdr_entry(2, "PEPTIDEK", 3, false, 15.5, 15.4, 15.6, 8.0, 0.005),
+            ],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![], vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        // Entry 0 (0.4 min off): should Keep → not in actions
+        assert!(
+            !actions.contains_key(&("file1".to_string(), 0)),
+            "Entry 0.4 min off should Keep (within tolerance 0.445)"
+        );
+        // Entry 1 (0.5 min off): should be re-scored
+        assert!(
+            actions.contains_key(&("file1".to_string(), 1)),
+            "Entry 0.5 min off should be flagged (exceeds tolerance 0.445)"
+        );
+    }
+
+    #[test]
+    fn test_plan_reconciliation_outliers_in_training_do_not_inflate_tolerance() {
+        // Regression test for the "self-fulfilling tolerance" bug.
+        //
+        // Scenario: the refined calibration training set includes a peptide whose
+        // detection was at the wrong RT (apex 1.2 min off the truth). That point
+        // contributes a large abs_residual (~1.2) to the calibration. Under the
+        // OLD local_tolerance interpolation, the query RT near this bad point
+        // would pick up tolerance ~3.6 min, allowing the 1.2 min deviation to
+        // pass the apex proximity check ("Keep").
+        //
+        // With the NEW global MAD, a single large residual among 30 small ones
+        // barely moves the median, so tolerance stays tight (~0.22 min).
+
+        // 30 tight residuals + 1 huge outlier at position 15
+        let mut residuals = vec![0.05_f64; 30];
+        residuals[15] = 1.20; // simulates a wrong-RT peptide in the training set
+
+        let cal = make_calibration_with_residuals(residuals);
+        let mad = cal.stats().mad;
+        assert!(
+            mad < 0.1,
+            "MAD should be robust to the outlier, got {}",
+            mad
+        );
+
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        // Consensus at library_rt = 15.0 (right at the outlier location)
+        let consensus = vec![PeptideConsensusRT {
+            modified_sequence: "PEPTIDEK".to_string(),
+            is_decoy: false,
+            consensus_library_rt: 15.0,
+            median_peak_width: 0.2,
+            n_runs_detected: 3,
+        }];
+
+        // This entry simulates the bad peptide itself: apex at 16.2 when consensus expects 15.0.
+        // Boundaries are wide enough that old boundary-containment logic would keep it too.
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![make_fdr_entry(
+                1, "PEPTIDEK", 2, false, 16.2, 14.8, 16.3, 8.0, 0.005,
+            )],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        // With global MAD tolerance, this 1.2 min deviation must be caught.
+        assert!(
+            actions.contains_key(&("file1".to_string(), 0)),
+            "Wrong-RT peptide must be flagged for re-scoring — the outlier in the \
+             calibration training set should not inflate the tolerance"
         );
     }
 
