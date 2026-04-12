@@ -10,43 +10,49 @@ python3 visualize_pin_features.py ../example_test_data/stellar/calibrated-GPF-da
 
 Stellar with coelution and Percolator
 
-[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator] === Per-file results (run-level FDR at 1%) ===
-[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars: 53077 precursors, 53077 peptides
-[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_500-600_15-mars: 40766 precursors, 40766 peptides
-[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_600-700_16-mars: 15964 precursors, 15964 peptides
-[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_700-800_17-mars: 30459 precursors, 30459 peptides
-[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_800-900_18-mars: 40145 precursors, 40145 peptides
-[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator] 
-[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator] === Experiment-level results (1% FDR) ===
-[2026-02-16T17:54:53Z INFO  osprey_fdr::percolator]   Experiment: 144709 precursors, 124906 peptides
+[2026-04-10T04:34:42Z INFO  osprey_fdr::percolator] === Per-file results (run-level FDR at 1%) ===
+[2026-04-10T04:34:42Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_4mz_sDIA_400-900_20: 19643 precursors, 17452 peptides
+[2026-04-10T04:34:42Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_4mz_sDIA_400-900_21: 21096 precursors, 18711 peptides
+[2026-04-10T04:34:42Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_4mz_sDIA_400-900_22: 22143 precursors, 19651 peptides
+[2026-04-10T04:34:42Z INFO  osprey_fdr::percolator] 
+[2026-04-10T04:34:42Z INFO  osprey_fdr::percolator] === Experiment-level results (1% FDR) ===
+[2026-04-10T04:34:42Z INFO  osprey_fdr::percolator]   Experiment: 28636 precursors, 25412 peptides
+[2026-04-10T04:34:42Z INFO  osprey::pipeline] Persisting 2nd-pass FDR scores...
+[2026-04-10T04:34:43Z INFO  osprey::pipeline] 
+[2026-04-10T04:34:43Z INFO  osprey::pipeline] === Protein-Level FDR ===
+[2026-04-10T04:34:43Z INFO  osprey_fdr::protein] Protein parsimony: 5817 proteins, 25412 peptides in bipartite graph
+[2026-04-10T04:34:43Z INFO  osprey_fdr::protein] Protein parsimony: 5516 protein groups after identical-set merging
+[2026-04-10T04:34:44Z INFO  osprey_fdr::protein] Protein parsimony: 5117 protein groups after subset elimination
+[2026-04-10T04:34:44Z INFO  osprey_fdr::protein] Protein parsimony: 24632 unique peptides, 780 shared peptides
+[2026-04-10T04:34:44Z INFO  osprey_fdr::protein] Peptide scores for protein FDR: 45656 target peptides, 43282 decoy peptides
+[2026-04-10T04:34:44Z INFO  osprey_fdr::protein] Composite scores: 5117 targets (median=24.52, max=848.90), 588 decoys (median=3.61, max=14.33)
+[2026-04-10T04:34:44Z INFO  osprey_fdr::protein] Best quality scores: 5117 targets (median=1.0000, max=1.0000), 588 decoys (median=0.9934, max=1.0000)
+[2026-04-10T04:34:45Z INFO  osprey_fdr::protein] Protein FDR: 5117 protein groups scored, 5117 at 1% FDR
+[2026-04-10T04:34:45Z INFO  osprey::pipeline] Protein FDR: 5117 protein groups at 1% FDR (from 5117 total groups)
 
 
 
 Coelution with Astral data and Percolator
-[2026-03-30T05:02:52Z INFO  osprey::pipeline] === Per-file results (run-level FDR at 1%) ===
-[2026-03-30T05:02:54Z INFO  osprey_fdr::percolator]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_49: 130396 precursors, 114338 peptides
-[2026-03-30T05:02:54Z INFO  osprey_fdr::percolator]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_55: 130534 precursors, 114435 peptides
-[2026-03-30T05:02:54Z INFO  osprey_fdr::percolator]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_60: 129060 precursors, 113202 peptides
-[2026-03-30T05:02:58Z INFO  osprey_fdr::percolator] 
-[2026-03-30T05:02:58Z INFO  osprey_fdr::percolator] === Experiment-level results (1% FDR) ===
-[2026-03-30T05:02:58Z INFO  osprey_fdr::percolator]   Experiment: 138770 precursors, 122028 peptides (from 4651814 total entries)
 
-
-
-
-
-Coelution with Stellar GPF and Percolator
-[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator] === Per-file results (run-level FDR at 1%) ===
-[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars: 36823 precursors, 36823 peptides
-[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_500-600_15-mars: 31536 precursors, 31536 peptides
-[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_600-700_16-mars: 18605 precursors, 18605 peptides
-[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_700-800_17-mars: 26809 precursors, 26809 peptides
-[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Ste-2024-12-02_HeLa_20msIIT_GPFDIA_800-900_18-mars: 29505 precursors, 29505 peptides
-[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator] 
-[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator] === Experiment-level results (1% FDR) ===
-[2026-02-15T19:52:32Z INFO  osprey_fdr::percolator]   Experiment: 133436 precursors, 118718 peptides
-
-
+[2026-04-10T06:15:50Z INFO  osprey::pipeline] === Per-file results (run-level FDR at 1%) ===
+[2026-04-10T06:15:50Z INFO  osprey_fdr::percolator]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_49: 139015 precursors, 122480 peptides
+[2026-04-10T06:15:51Z INFO  osprey_fdr::percolator]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_55: 139324 precursors, 122741 peptides
+[2026-04-10T06:15:51Z INFO  osprey_fdr::percolator]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_60: 137830 precursors, 121414 peptides
+[2026-04-10T06:15:52Z INFO  osprey_fdr::percolator]
+[2026-04-10T06:15:52Z INFO  osprey_fdr::percolator] === Experiment-level results (1% FDR) ===
+[2026-04-10T06:15:52Z INFO  osprey_fdr::percolator]   Experiment: 147415 precursors, 130473 peptides (from 673965 total entries)
+[2026-04-10T06:15:53Z INFO  osprey::pipeline] Persisting 2nd-pass FDR scores...
+[2026-04-10T06:15:54Z INFO  osprey::pipeline]
+[2026-04-10T06:15:54Z INFO  osprey::pipeline] === Protein-Level FDR ===
+[2026-04-10T06:15:55Z INFO  osprey_fdr::protein] Protein parsimony: 14619 proteins, 130747 peptides in bipartite graph
+[2026-04-10T06:15:55Z INFO  osprey_fdr::protein] Protein parsimony: 14230 protein groups after identical-set merging
+[2026-04-10T06:16:26Z INFO  osprey_fdr::protein] Protein parsimony: 13724 protein groups after subset elimination
+[2026-04-10T06:16:26Z INFO  osprey_fdr::protein] Protein parsimony: 126758 unique peptides, 3989 shared peptides
+[2026-04-10T06:16:26Z INFO  osprey_fdr::protein] Peptide scores for protein FDR: 130747 target peptides, 89203 decoy peptides
+[2026-04-10T06:16:27Z INFO  osprey_fdr::protein] Composite scores: 13723 targets (median=1.25, max=79.26), 3623 decoys (median=0.00, max=1.55)
+[2026-04-10T06:16:27Z INFO  osprey_fdr::protein] Best quality scores: 13723 targets (median=0.9016, max=1.0000), 3623 decoys (median=0.3882, max=0.9824)
+[2026-04-10T06:16:27Z INFO  osprey_fdr::protein] Protein FDR: 13723 protein groups scored, 13723 at 1% FDR
+[2026-04-10T06:16:27Z INFO  osprey::pipeline] Protein FDR: 13723 protein groups at 1% FDR (from 13724 total groups)
 
 
 

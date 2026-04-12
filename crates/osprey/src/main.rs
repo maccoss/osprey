@@ -2,34 +2,14 @@
 
 use anyhow::Result;
 use clap::Parser;
+use log::LevelFilter;
 use osprey::{
     run_analysis, ConfigOverrides, FdrLevel, FdrMethod, OspreyConfig, ResolutionMode,
     SharedPeptideMode, ToleranceUnit,
 };
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Instant;
-
-/// Writer that tees output to both stderr and a log file
-struct TeeWriter {
-    stderr: std::io::Stderr,
-    file: Mutex<std::io::BufWriter<std::fs::File>>,
-}
-
-impl Write for TeeWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stderr.write_all(buf)?;
-        self.file.lock().unwrap().write_all(buf)?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stderr.flush()?;
-        self.file.lock().unwrap().flush()?;
-        Ok(())
-    }
-}
 
 /// Format duration into human-readable string
 fn format_duration(duration: std::time::Duration) -> String {
@@ -187,20 +167,21 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging — tee to both stderr and a log file in the current directory
-    let log_level = if args.verbose { "debug" } else { "info" };
+    // Initialize two-tier logging: clean terminal output + verbose log file.
+    // Terminal shows info-level with elapsed time prefixes by default.
+    // Log file always captures debug-level with full timestamps.
+    // --verbose makes the terminal show everything too.
+    let terminal_level = if args.verbose {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    };
     let log_filename = format!(
         "osprey_{}.log",
         chrono::Local::now().format("%Y-%m-%d_%H%M%S")
     );
     let log_file = std::fs::File::create(&log_filename)?;
-    let tee = TeeWriter {
-        stderr: std::io::stderr(),
-        file: Mutex::new(std::io::BufWriter::new(log_file)),
-    };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
-        .target(env_logger::Target::Pipe(Box::new(tee)))
-        .init();
+    osprey::logging::init(terminal_level, log_file);
 
     // Handle --generate-config
     if let Some(config_path) = args.generate_config {
@@ -393,7 +374,8 @@ fn main() -> Result<()> {
     let elapsed_str = format_duration(elapsed);
     log::info!("Analysis complete in {}", elapsed_str);
 
-    // Flush to ensure the final log line appears on the terminal before the prompt
+    // Flush to ensure all log lines are written to the log file and terminal
+    log::logger().flush();
     let _ = std::io::stderr().flush();
 
     Ok(())

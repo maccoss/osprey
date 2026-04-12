@@ -37,6 +37,7 @@ osprey/
 - **osprey-scoring**: `SpectralScorer`, `DecoyGenerator`, batch scoring
 - **osprey-fdr**: `FdrController`, `MokapotRunner` (PIN file + semi-supervised FDR), `protein` module (parsimony + picked-protein FDR)
 - **osprey-ml**: `LinearSvmClassifier`, `PepEstimator`, `LDA`, matrix operations
+- **osprey** (main): `pipeline::run_analysis`, `reconciliation`, `logging::TwoTierLogger`
 
 ## Build Commands
 
@@ -364,6 +365,11 @@ Osprey uses a tiered disk-backed architecture to scale to 1000+ files:
 - Parquet cache validation: SHA-256 hashes of search/library/reconciliation parameters in Parquet footer metadata
 - Consensus RT fix: only FDR-passing detections included, weighted median peak widths by coelution_sum
 - Safe NAS file writes: all cache writers use `copy_and_verify` pattern (write to local temp, verify, move to final destination)
+- Fixed blib writer row misalignment after compaction: `LightFdr` now carries `parquet_index` for correct Parquet row lookup instead of zipping by Vec position
+- Fixed reconciliation write-back using Vec position instead of `parquet_index` after compaction, causing re-scored entries to overwrite wrong Parquet rows
+- Fixed reconciliation `determine_reconcile_action` to use apex proximity instead of boundary containment. Uses refined per-file calibration's `local_tolerance` (derived from thousands of consensus peptides) to determine whether a peak's apex is at the expected RT. CWT candidate selection also uses apex proximity, picking the closest candidate.
+- Two-tier logging: clean `[M:SS]` terminal output + verbose log file. `--verbose` restores full detail on terminal. `TwoTierLogger` in `logging.rs` replaces `TeeWriter` + `env_logger`.
+- Labeled progress bars: `run_search` accepts `search_label` parameter displayed in progress bar (Scoring, Re-scoring, Gap-fill CWT, Gap-fill forced)
 
 ## Versioning and Release Notes
 

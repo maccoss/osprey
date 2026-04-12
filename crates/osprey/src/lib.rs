@@ -43,6 +43,9 @@ pub use osprey_scoring::{DecoyGenerator, DecoyMethod, Enzyme};
 // Re-export FDR
 pub use osprey_fdr::{FdrController, FdrCounts, MokapotResult, MokapotRunner};
 
+// Two-tier logging (clean terminal + verbose log file)
+pub mod logging;
+
 // Cross-run peak reconciliation
 pub mod reconciliation;
 

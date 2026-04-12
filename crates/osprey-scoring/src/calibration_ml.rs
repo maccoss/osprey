@@ -25,7 +25,7 @@ pub fn train_and_score_calibration(
     }
 
     let n_features = if use_isotope_feature { 5 } else { 4 };
-    log::info!(
+    log::debug!(
         "Training LDA with 3-fold cross-validation on {} calibration matches ({} features)",
         matches.len(),
         n_features
@@ -112,12 +112,12 @@ pub fn train_and_score_calibration(
             .fold(f64::NEG_INFINITY, f64::max);
         let decoy_min = decoy_scores.iter().cloned().fold(f64::INFINITY, f64::min);
 
-        log::info!(
+        log::debug!(
             "  Discriminant scores: target_mean={:.3}, decoy_mean={:.3}",
             target_mean,
             decoy_mean
         );
-        log::info!(
+        log::debug!(
             "  Discriminant ranges: targets=[{:.3}, {:.3}], decoys=[{:.3}, {:.3}]",
             target_min,
             target_max,
@@ -126,7 +126,7 @@ pub fn train_and_score_calibration(
         );
     }
 
-    log::info!("LDA scoring complete: {} matches passing 1% FDR", n_passing);
+    log::debug!("LDA scoring complete: {} matches passing 1% FDR", n_passing);
 
     // Log median feature values for diagnostics
     log_median_features(matches, use_isotope_feature);
@@ -193,7 +193,7 @@ fn train_lda_single_model(
         vec!["correlation", "libcosine", "top6", "xcorr"]
     };
 
-    log::info!(
+    log::debug!(
         "  LDA feature weights (non-negative): {}",
         feature_names
             .iter()
@@ -260,7 +260,7 @@ fn train_lda_with_nonnegative_cv(
     for feat_idx in 0..n_features {
         let feat_scores: Vec<f64> = (0..n_samples).map(|i| features[(i, feat_idx)]).collect();
         let n_pass = count_passing_targets(&feat_scores, decoy_labels, entry_ids, train_fdr);
-        log::info!(
+        log::debug!(
             "  Initial feature '{}': {} pass {:.0}% FDR",
             feature_names[feat_idx],
             n_pass,
@@ -308,7 +308,7 @@ fn train_lda_with_nonnegative_cv(
         .map(|i| features[(i, best_feat_idx)])
         .collect();
 
-    log::info!(
+    log::debug!(
         "  Baseline: '{}' = {} pass {:.0}% FDR",
         feature_names[best_feat_idx],
         best_feat_passing,
@@ -452,7 +452,7 @@ fn train_lda_with_nonnegative_cv(
 
         let n_passing = count_passing_targets(&new_scores, decoy_labels, entry_ids, train_fdr);
 
-        log::info!(
+        log::debug!(
             "  Iteration {}: weights=[{}], selected {} train targets, {} pass {:.0}% FDR",
             iteration + 1,
             feature_names
@@ -474,7 +474,7 @@ fn train_lda_with_nonnegative_cv(
             best_passing = n_passing;
             best_iteration = iteration + 1;
             consecutive_no_improve = 0;
-            log::info!(
+            log::debug!(
                 "    -> New best: {} pass {:.0}% FDR (iteration {})",
                 best_passing,
                 train_fdr * 100.0,
@@ -482,7 +482,7 @@ fn train_lda_with_nonnegative_cv(
             );
         } else {
             consecutive_no_improve += 1;
-            log::info!(
+            log::debug!(
                 "    -> No improvement (best remains {} from iteration {}, {} consecutive non-improvements)",
                 best_passing, best_iteration, consecutive_no_improve
             );
@@ -493,7 +493,7 @@ fn train_lda_with_nonnegative_cv(
 
         // Stop early if 2 consecutive iterations didn't improve
         if consecutive_no_improve >= 2 {
-            log::info!(
+            log::debug!(
                 "  Stopping early: {} consecutive iterations without improvement",
                 consecutive_no_improve
             );
@@ -502,12 +502,12 @@ fn train_lda_with_nonnegative_cv(
     }
 
     // Log final result
-    log::info!(
+    log::debug!(
         "  Iteration history (pass {:.0}% FDR): {:?}",
         train_fdr * 100.0,
         iteration_passing
     );
-    log::info!(
+    log::debug!(
         "  Using iteration {} ({} pass {:.0}% FDR)",
         best_iteration,
         best_passing,
@@ -818,7 +818,7 @@ fn log_median_features(matches: &[CalibrationMatch], use_isotope: bool) {
 
     let mid = matches.len() / 2;
 
-    log::info!(
+    log::debug!(
         "  Median features: corr={:.3}, libcos={:.3}, top6={:.1}, xcorr={:.4}, discrim={:.3}",
         corrs[mid],
         libcos[mid],
@@ -834,7 +834,7 @@ fn log_median_features(matches: &[CalibrationMatch], use_isotope: bool) {
             .collect();
         if !isos.is_empty() {
             isos.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            log::info!("  Median isotope_cosine: {:.3}", isos[isos.len() / 2]);
+            log::debug!("  Median isotope_cosine: {:.3}", isos[isos.len() / 2]);
         }
     }
 }

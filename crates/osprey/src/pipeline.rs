@@ -311,7 +311,7 @@ fn run_calibration_discovery_windowed(
 
         if ranges_similar {
             // Library and mzML are in similar units, use identity mapping
-            log::info!("RT mapping: library and mzML ranges are similar, using identity mapping");
+            log::debug!("RT mapping: library and mzML ranges are similar, using identity mapping");
             (1.0, 0.0, false)
         } else {
             // Linear mapping: expected_rt = slope * lib_rt + intercept
@@ -322,14 +322,14 @@ fn run_calibration_discovery_windowed(
                 1.0
             };
             let intercept = mzml_min_rt - slope * lib_min_rt;
-            log::info!(
+            log::debug!(
                 "RT mapping: linear transform from library ({:.2}-{:.2}) to mzML ({:.2}-{:.2} min)",
                 lib_min_rt,
                 lib_max_rt,
                 mzml_min_rt,
                 mzml_max_rt
             );
-            log::info!(
+            log::debug!(
                 "RT mapping: expected_rt = {:.4} * library_rt + {:.4}",
                 slope,
                 intercept
@@ -348,7 +348,7 @@ fn run_calibration_discovery_windowed(
     let n_decoys = library.iter().filter(|e| e.is_decoy).count();
     let n_with_fragments = library.iter().filter(|e| !e.fragments.is_empty()).count();
 
-    log::info!(
+    log::debug!(
         "Calibration: library has {} targets + {} decoys = {} total (library RT: {:.1}-{:.1}, mzML RT: {:.1}-{:.1} min)",
         n_targets,
         n_decoys,
@@ -366,13 +366,13 @@ fn run_calibration_discovery_windowed(
         );
     }
 
-    log::info!(
+    log::debug!(
         "Initial RT tolerance: {:.1} min ({:.0}% of {:.1} min mzML range)",
         initial_tolerance,
         tolerance_fraction * 100.0,
         mzml_rt_range
     );
-    log::info!(
+    log::debug!(
         "Fragment tolerance: {} {}",
         config.fragment_tolerance.tolerance,
         match config.fragment_tolerance.unit {
@@ -384,7 +384,7 @@ fn run_calibration_discovery_windowed(
     // MS1 spectra were loaded in single pass with MS2 - use them for precursor mass calibration
     let has_ms1 = !ms1_index.is_empty();
     if has_ms1 {
-        log::info!(
+        log::debug!(
             "Using {} MS1 spectra for precursor calibration",
             ms1_index.len()
         );
@@ -419,7 +419,7 @@ fn run_calibration_discovery_windowed(
         };
     let mut current_sample_size = sample_size;
 
-    log::info!(
+    log::debug!(
         "Calibration: library has {} targets, requesting {} per attempt ({} attempt{} max)",
         n_total_targets,
         if current_sample_size == 0 || n_total_targets <= current_sample_size {
@@ -442,7 +442,7 @@ fn run_calibration_discovery_windowed(
         let n_sampled_decoys = calibration_library.len() - n_sampled_targets;
         let used_all = calibration_library.len() == library.len();
 
-        log::info!(
+        log::debug!(
             "Calibration attempt {}/{}: {} targets + {} decoys{}",
             attempt,
             max_attempts,
@@ -502,7 +502,7 @@ fn run_calibration_discovery_windowed(
         }
 
         if attempt > 1 {
-            log::info!(
+            log::debug!(
                 "Accumulated {} new entries, {} improved ({} total unique entries)",
                 n_new,
                 n_improved,
@@ -573,7 +573,7 @@ fn run_calibration_discovery_windowed(
             .filter(|m| m.is_decoy && m.q_value <= calibration_fdr)
             .count();
 
-        log::info!(
+        log::debug!(
             "Competition: {} target wins, {} decoy wins",
             n_target_wins,
             n_decoy_wins
@@ -584,16 +584,14 @@ fn run_calibration_discovery_windowed(
             log::warn!("Failed to write calibration debug CSV: {}", e);
         }
 
-        // Log S/N filter impact
-        if passing_targets.len() < n_target_wins {
-            log::info!(
-                "  RT quality filter: {} → {} peptides (removed {} with S/N < {:.1})",
-                n_target_wins,
-                passing_targets.len(),
-                n_target_wins - passing_targets.len(),
-                MIN_SNR_FOR_RT_CAL
-            );
-        }
+        // Log combined LDA + S/N filter result
+        log::info!(
+            "LDA scoring: {} at 1% FDR, {}/{} with S/N >= {:.0}",
+            n_target_wins,
+            passing_targets.len(),
+            n_target_wins,
+            MIN_SNR_FOR_RT_CAL
+        );
 
         // Extract calibration points + mass errors from passing targets
         let mut library_rts_detected: Vec<f64> = Vec::new();
@@ -630,7 +628,7 @@ fn run_calibration_discovery_windowed(
                 } else {
                     widths[mid]
                 };
-                log::info!(
+                log::debug!(
                     "Measured peak width: median={:.2} min ({:.0} sec) from {} peaks",
                     median,
                     median * 60.0,
@@ -639,7 +637,7 @@ fn run_calibration_discovery_windowed(
             }
         }
 
-        log::info!(
+        log::debug!(
             "Calibration: {} peptides at {:.0}% FDR (from {} target wins, {} decoy wins)",
             num_confident_peptides,
             calibration_fdr * 100.0,
@@ -719,7 +717,7 @@ fn run_calibration_discovery_windowed(
             .max(config.rt_calibration.min_rt_tolerance)
             .min(config.rt_calibration.max_rt_tolerance);
 
-        log::info!(
+        log::debug!(
             "First-pass RT tolerance: {:.2} min (MAD={:.3}, robust_SD={:.3}, residual_SD={:.3}, {} points, R²={:.4})",
             pass1_tolerance,
             rt_stats.mad,
@@ -731,7 +729,7 @@ fn run_calibration_discovery_windowed(
 
         // Only refine if tolerance narrowed significantly (at least 2× tighter)
         if pass1_tolerance < initial_tolerance * 0.5 {
-            log::info!(
+            log::debug!(
                 "Calibration refinement: re-scoring with {:.2} min tolerance (was {:.1} min)",
                 pass1_tolerance,
                 initial_tolerance
@@ -797,7 +795,7 @@ fn run_calibration_discovery_windowed(
                     .max(config.rt_calibration.min_rt_tolerance)
                     .min(config.rt_calibration.max_rt_tolerance);
 
-                log::info!(
+                log::debug!(
                     "Refined RT tolerance: {:.2} min (MAD={:.3}, robust_SD={:.3}, residual_SD={:.3}, {} points, R²={:.4})",
                     refined_tolerance,
                     rt_stats_refined.mad,
@@ -823,14 +821,14 @@ fn run_calibration_discovery_windowed(
                         }
                     }
                 } else {
-                    log::info!(
+                    log::debug!(
                         "Refined calibration not better (R² {:.4} vs {:.4}), keeping original",
                         rt_stats_refined.r_squared,
                         rt_stats.r_squared
                     );
                 }
             } else {
-                log::info!(
+                log::debug!(
                     "Refinement pass: only {} points (need {}), keeping original calibration",
                     n_refined,
                     ABSOLUTE_MIN_CALIBRATION_POINTS
@@ -1298,7 +1296,7 @@ fn write_scores_parquet_with_metadata(
         .map_err(|e| OspreyError::OutputError(format!("Failed to close Parquet writer: {}", e)))?;
 
     osprey_core::copy_and_verify(&tmp_path, path)?;
-    log::info!("Wrote {} scores to {}", n, path.display());
+    log::debug!("Wrote {} scores to {}", n, path.display());
 
     Ok(())
 }
@@ -2293,10 +2291,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     for (file_idx, input_file) in config.input_files.iter().enumerate() {
         log::info!("");
         log::info!(
-            "===== Processing file {}/{}: {} =====",
+            "File #{}/{}: {}",
             file_idx + 1,
             config.input_files.len(),
-            input_file.display()
+            input_file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
         );
 
         let file_name = input_file
@@ -2316,20 +2317,20 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     let pass2 = fdr_scores_path_pass2(input_file);
                     let pass1 = fdr_scores_path_pass1(input_file);
                     if load_fdr_scores_sidecar(&pass2, &mut stubs) {
-                        log::info!(
+                        log::debug!(
                             "Loaded {} cached scores + 2nd-pass SVM scores from {}",
                             stubs.len(),
                             scores_path.display()
                         );
                     } else if load_fdr_scores_sidecar(&pass1, &mut stubs) {
-                        log::info!(
+                        log::debug!(
                             "Loaded {} cached scores + 1st-pass SVM scores from {}",
                             stubs.len(),
                             scores_path.display()
                         );
                     } else {
                         all_scores_loaded = false;
-                        log::info!(
+                        log::debug!(
                             "Loaded {} cached scores from {} (no SVM scores sidecar)",
                             stubs.len(),
                             scores_path.display()
@@ -2430,7 +2431,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         cal_params.rt_calibration.residual_sd,
                     )
                     .ok()?;
-                    log::info!("Reusing cached calibration from {}", cal_path.display());
+                    log::debug!("Reusing cached calibration from {}", cal_path.display());
                     cal_params.log_summary();
                     Some((rt_cal, cal_params))
                 });
@@ -2467,6 +2468,39 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 per_file_calibrations.insert(file_name.clone(), cal.clone());
             }
 
+            // Log one-line calibration summary for terminal
+            if let Some(ref cp) = cal_params {
+                let n_pep = cp.metadata.num_confident_peptides;
+                let rt_tol = cp.rt_calibration.mad.unwrap_or(0.0) * 1.4826 * 3.0;
+                let ms1_str = if cp.ms1_calibration.calibrated {
+                    format!(
+                        ", MS1 shift {:+.2} {} (tol {:.2})",
+                        cp.ms1_calibration.mean,
+                        cp.ms1_calibration.unit,
+                        3.0 * cp.ms1_calibration.sd,
+                    )
+                } else {
+                    String::new()
+                };
+                let ms2_str = if cp.ms2_calibration.calibrated {
+                    format!(
+                        ", MS2 shift {:+.4} {} (tol {:.4})",
+                        cp.ms2_calibration.mean,
+                        cp.ms2_calibration.unit,
+                        3.0 * cp.ms2_calibration.sd,
+                    )
+                } else {
+                    String::new()
+                };
+                log::info!(
+                    "Calibration: {} peptides, RT {:.2} min{}{}",
+                    n_pep,
+                    rt_tol,
+                    ms1_str,
+                    ms2_str
+                );
+            }
+
             // Run coelution search
             let entries = run_search(
                 &library,
@@ -2477,6 +2511,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 &config,
                 &file_name,
                 None,
+                "Scoring",
             )?;
 
             log::info!(
@@ -2543,7 +2578,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     }
 
     let total_scored: usize = per_file_entries.iter().map(|(_, s)| s.len()).sum();
-    log::info!(
+    log::debug!(
         "Coelution analysis complete. {} total scored entries across {} files",
         total_scored,
         config.input_files.len()
@@ -2615,7 +2650,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
 
         // Persist first-pass SVM scores to sidecar files
-        log::info!("Persisting 1st-pass FDR scores...");
+        log::debug!("Persisting 1st-pass FDR scores...");
         persist_fdr_scores(
             &per_file_entries,
             &config,
@@ -2636,7 +2671,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         .collect();
 
     log::info!(
-        "First-pass: {} unique precursors pass run-level {:.0}% FDR in at least one replicate",
+        "First-pass: {} unique precursors pass run-level {:.0}% FDR across all files (compacting for reconciliation)",
         first_pass_base_ids.len(),
         config.run_fdr * 100.0,
     );
@@ -2656,7 +2691,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         let entries_after: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
         let saved_gb =
             ((entries_before - entries_after) as f64 * 128.0) / (1024.0 * 1024.0 * 1024.0);
-        log::info!(
+        log::debug!(
             "Compacted FDR stubs: {} -> {} entries (freed {:.1} GB)",
             entries_before,
             entries_after,
@@ -2669,9 +2704,9 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     let per_file_overlays: RescoreOverlay = HashMap::new();
     if can_skip_fdr {
         log::info!("");
-        log::info!("=== Skipping reconciliation (already complete with matching parameters) ===");
+        log::info!("Skipping reconciliation (cached)");
         // Second-pass FDR: restrict to first-pass passing precursors (same as real pipeline)
-        log::info!(
+        log::debug!(
             "Recomputing second-pass q-values on {} first-pass precursors + paired decoys...",
             first_pass_base_ids.len(),
         );
@@ -2753,7 +2788,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         let total_consensus: usize = per_file_consensus_targets.values().map(|v| v.len()).sum();
         if total_consensus > 0 {
-            log::info!(
+            log::debug!(
                 "Multi-charge consensus: {} entries need re-scoring across all files",
                 total_consensus
             );
@@ -2768,16 +2803,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         if all_already_reconciled {
             log::info!("");
-            log::info!("=== Inter-Replicate Peak Reconciliation ===");
             log::info!(
-                "All {} files already reconciled with matching parameters — skipping",
+                "Reconciliation: all {} files already reconciled, skipping",
                 per_file_cache_paths.len()
             );
             refined_calibrations = HashMap::new();
             per_file_gap_fill = HashMap::new();
         } else if reconciliation_enabled {
             log::info!("");
-            log::info!("=== Inter-Replicate Peak Reconciliation ===");
+            log::info!("Reconciliation");
 
             let consensus = compute_consensus_rts(
                 &per_file_entries,
@@ -2812,7 +2846,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 };
                 let ram_based_batch = (available_ram_mb / 500).max(1); // 500 MB per file with headroom
                 let cwt_batch_size = n_cores.min(ram_based_batch).max(1);
-                log::info!(
+                log::debug!(
                     "CWT batch loading: {} files per batch ({} cores, {} MB available RAM)",
                     cwt_batch_size,
                     n_cores,
@@ -2958,11 +2992,14 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             let n_inter_replicate = reconciliation_targets.len();
             let n_gap_fill = gap_fill_targets.len();
             log::info!(
-                "Re-scoring {} entries in {} [{}/{}] ({} multi-charge consensus, {} inter-replicate reconciliation, {} gap-fill, {} unique rescore after dedup)",
-                all_targets.len() + n_gap_fill * 2, // *2 for target+decoy
-                file_name,
+                "Re-scoring file {}/{}: {}",
                 file_num + 1,
                 n_total_files,
+                file_name,
+            );
+            log::debug!(
+                "  {} entries ({} consensus, {} reconciliation, {} gap-fill, {} unique after dedup)",
+                all_targets.len() + n_gap_fill * 2,
                 n_multi_charge,
                 n_inter_replicate,
                 n_gap_fill,
@@ -3009,7 +3046,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 if cache_path.exists() {
                     match load_spectra_cache(&cache_path) {
                         Ok(result) => {
-                            log::info!(
+                            log::debug!(
                                 "Loaded {} MS2 spectra from cache '{}'",
                                 result.0.len(),
                                 cache_path.display()
@@ -3052,6 +3089,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     &config,
                     file_name,
                     Some(&boundary_overrides),
+                    "Re-scoring",
                 )?;
 
                 for entry in rescored {
@@ -3078,6 +3116,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     &gap_config,
                     file_name,
                     None,
+                    "Gap-fill CWT",
                 )?;
 
                 // Track which entry_ids got CWT results
@@ -3133,6 +3172,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         &config,
                         file_name,
                         Some(&forced_overrides),
+                        "Gap-fill forced",
                     )?;
 
                     n_gap_forced = forced_results.len();
@@ -3166,7 +3206,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             total_rescored += n_existing_rescored + n_gap_cwt + n_gap_forced;
 
             if !all_targets.is_empty() || n_gap_cwt + n_gap_forced > 0 {
-                log::info!(
+                log::debug!(
                     "  {} of {} existing entries re-scored, {} gap-fill ({} CWT, {} forced)",
                     n_existing_rescored,
                     all_targets.len(),
@@ -3254,7 +3294,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         // 4. Single second-pass FDR after all re-scoring
         if total_rescored > 0 {
-            log::info!(
+            log::debug!(
                 "Post-FDR re-scoring complete: {} entries re-scored ({} consensus, {} reconciliation, {} gap-fill [{} CWT, {} forced])",
                 total_rescored,
                 total_consensus,
@@ -3264,10 +3304,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 total_gap_forced,
             );
             log::info!("");
-            log::info!(
-                "Running second-pass FDR on {} first-pass precursors + paired decoys...",
-                first_pass_base_ids.len(),
-            );
+            log::info!("Second-pass FDR");
             match config.fdr_method {
                 FdrMethod::Percolator => {
                     run_percolator_fdr(
@@ -3301,7 +3338,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     if !can_skip_fdr {
         let has_reconciliation = config.reconciliation.enabled && config.input_files.len() > 1;
         if has_reconciliation {
-            log::info!("Persisting 2nd-pass FDR scores...");
+            log::debug!("Persisting 2nd-pass FDR scores...");
             persist_fdr_scores(
                 &per_file_entries,
                 &config,
@@ -3337,7 +3374,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     if let Some(protein_fdr_threshold) = config.protein_fdr {
         use osprey_fdr::protein;
         log::info!("");
-        log::info!("=== Protein-Level FDR ===");
+        log::info!("Protein-level FDR");
 
         let detected_peptides: HashSet<String> = per_file_entries
             .iter()
@@ -3431,7 +3468,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Drop the heavy FdrEntry stubs — frees ~19 GB
     drop(per_file_entries);
     log::info!(
-        "Freed FDR stubs. Loading passing entries from {}/{} files for blib output",
+        "Loading blib data from {}/{} files with passing precursors",
         files_with_passing.len(),
         n_total_files
     );
@@ -3508,7 +3545,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
         if (file_num + 1) % 20 == 0 || file_num + 1 == n_total_files {
             log::info!(
-                "  Loaded {}/{} files ({} passing plan entries so far)",
+                "  Loaded {}/{} files ({} observations so far)",
                 file_num + 1,
                 n_total_files,
                 plan_entries.len()
@@ -3604,7 +3641,7 @@ fn run_percolator_fdr(
 ) -> Result<()> {
     use osprey_fdr::percolator;
 
-    log::info!("Running native Percolator FDR on coelution entries");
+    log::debug!("Running native Percolator FDR on coelution entries");
 
     let total_entries: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
     let n_files = per_file_entries.len();
@@ -3627,7 +3664,7 @@ fn run_percolator_fdr(
 
     if !use_streaming {
         // Direct path: load all features and call run_percolator
-        log::info!(
+        log::debug!(
             "Percolator: loading features for {} entries across {} files",
             total_entries,
             n_files
@@ -3645,7 +3682,7 @@ fn run_percolator_fdr(
     // Memory-efficient: no flat metadata arrays for all entries.
     // Subsamples directly from per_file_entries (~16 MB HashMaps),
     // scores directly to entry.score, computes q-values per-file.
-    log::info!(
+    log::debug!(
         "Percolator streaming: {} entries across {} files (training on {} subset)",
         total_entries,
         n_files,
@@ -3700,7 +3737,7 @@ fn run_percolator_fdr(
     best_observations.sort(); // deterministic order
 
     let dedup_count = best_observations.len();
-    log::info!(
+    log::debug!(
         "  Best-per-precursor: {} entries ({} targets, {} decoys) from {} total",
         dedup_count,
         best_target.len(),
@@ -3779,7 +3816,7 @@ fn run_percolator_fdr(
         .count();
     let sub_decoys = subset.len() - sub_targets;
 
-    log::info!(
+    log::debug!(
         "  Subsampled {} entries ({} targets, {} decoys) for SVM training",
         subset.len(),
         sub_targets,
@@ -3964,12 +4001,12 @@ fn run_percolator_fdr(
                 }
             }
         });
-    log::info!("  Scored {}/{} files", n_files, n_files);
+    log::debug!("  Scored {}/{} files", n_files, n_files);
 
     // Phase 5: Compute q-values and PEP directly from per_file_entries
     // This avoids building any flat metadata arrays (~0 extra memory vs 33 GB before)
-    log::info!("");
-    log::info!(
+    log::debug!("");
+    log::debug!(
         "=== Per-file results (run-level FDR at {:.0}%) ===",
         perc_config.test_fdr * 100.0
     );
@@ -4279,7 +4316,7 @@ fn deduplicate_pairs(entries: Vec<CoelutionScoredEntry>) -> Vec<CoelutionScoredE
     // row ordering, causing non-deterministic gradient updates and model weights.
     all_entries.sort_by_key(|e| e.entry_id);
 
-    log::info!(
+    log::debug!(
         "Deduplicated to {} targets + {} decoys ({} paired, {} total)",
         n_targets,
         n_decoys,
@@ -4333,7 +4370,7 @@ fn select_best_separating_feature(entries: &[CoelutionScoredEntry]) -> Option<(u
     }
 
     let higher_is_better = best_auc > 0.5;
-    log::info!(
+    log::debug!(
         "Coelution target-decoy competition: best feature = {} (ROC AUC = {:.3}, {})",
         feature_names[best_index],
         best_auc,
@@ -4425,7 +4462,7 @@ fn compete_target_decoy_pairs(entries: Vec<CoelutionScoredEntry>) -> Vec<Coeluti
         }
     }
 
-    log::info!(
+    log::debug!(
         "Coelution target-decoy competition: {} target wins, {} decoy wins ({} total)",
         n_target_wins,
         n_decoy_wins,
@@ -4631,7 +4668,7 @@ fn deduplicate_double_counting(
             .filter(|(i, r)| r.load(Ordering::Relaxed) && !entries[*i].is_decoy)
             .count();
         let removed_decoys = removed_count - removed_targets;
-        log::info!(
+        log::debug!(
             "Double-counting deduplication: removed {} entries ({} targets, {} decoys; {} remaining)",
             removed_count,
             removed_targets,
@@ -4888,7 +4925,27 @@ fn write_blib_from_plan(
             writer.add_protein_mapping(ref_id, &lib_entry.protein_ids)?;
         }
 
-        // Write RetentionTimes entries for every run where this precursor was detected
+        // Write RetentionTimes entries for every run where this precursor was detected.
+        // A non-NULL retentionTime produces an ID line in Skyline for that run.
+        // Normally, only runs passing run-level FDR get an ID line. However, after
+        // two-pass FDR, second-pass run q-values can shift slightly above the threshold
+        // even though the precursor passes experiment-level FDR. In that case, the run
+        // with the lowest q-value gets the ID line as a fallback, guaranteeing at least
+        // one ID line per precursor in the blib.
+        let any_passes_run_fdr = group.iter().any(|s| s.run_qvalue <= config.run_fdr);
+        let best_run_file_idx = if !any_passes_run_fdr {
+            // No run passes strict threshold; find the best one for fallback ID line
+            Some(
+                group
+                    .iter()
+                    .min_by(|a, b| a.run_qvalue.total_cmp(&b.run_qvalue))
+                    .unwrap()
+                    .file_name_idx,
+            )
+        } else {
+            None
+        };
+
         for scored in group {
             let run_file_stem = &file_names[scored.file_name_idx as usize];
             let run_file_id = *file_stem_to_id.get(run_file_stem).unwrap_or(&1);
@@ -4901,9 +4958,12 @@ fn write_blib_from_plan(
                 .copied()
                 .unwrap_or((scored.apex_rt, scored.start_rt, scored.end_rt));
 
-            // Show an ID line (non-NULL retentionTime) only if this observation
-            // independently passed run-level FDR
-            let rt_for_id = if scored.run_qvalue <= config.run_fdr {
+            // Show an ID line (non-NULL retentionTime) if:
+            //   1. This run passes run-level FDR, OR
+            //   2. No run passes but this is the best run (fallback)
+            let rt_for_id = if scored.run_qvalue <= config.run_fdr
+                || best_run_file_idx == Some(scored.file_name_idx)
+            {
                 Some(run_apex)
             } else {
                 None
@@ -4955,9 +5015,9 @@ fn write_blib_from_plan(
     writer.finalize()?;
 
     log::info!(
-        "Wrote {} total plan entries for {} precursors across {} files",
-        plan_entries.len(),
+        "Wrote {} precursors ({} observations) across {} files to blib",
         n_written,
+        plan_entries.len(),
         config.input_files.len()
     );
     if n_shared > 0 {
@@ -5508,6 +5568,7 @@ fn run_search(
     config: &OspreyConfig,
     file_name: &str,
     boundary_overrides: Option<&HashMap<u32, (f64, f64, f64)>>,
+    search_label: &str,
 ) -> Result<Vec<CoelutionScoredEntry>> {
     use osprey_chromatography::{compute_snr, detect_all_xic_peaks, detect_cwt_consensus_peaks};
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
@@ -5524,7 +5585,7 @@ fn run_search(
             config.fragment_tolerance.tolerance,
             config.fragment_tolerance.unit,
         );
-        log::info!(
+        log::debug!(
             "Coelution search using calibrated fragment tolerance: {:.4} {}",
             tol_val,
             match tol_unit {
@@ -5553,7 +5614,7 @@ fn run_search(
     // This shifts each centroid by the mean offset so the error distribution is centered at 0
     let calibrated_spectra: Option<Vec<Spectrum>> = calibration.and_then(|cal| {
         if cal.ms2_calibration.calibrated {
-            log::info!(
+            log::debug!(
                 "Applying MS2 calibration: mean error = {:.4} {} → correcting by {:+.4} {} (using 3×SD = {:.3} {} tolerance)",
                 cal.ms2_calibration.mean,
                 cal.ms2_calibration.unit,
@@ -5610,7 +5671,7 @@ fn run_search(
                 method_desc
             );
         } else {
-            log::info!(
+            log::debug!(
                 "Using calibrated RT tolerance: {:.2} min ({})",
                 tol,
                 method_desc
@@ -5618,7 +5679,7 @@ fn run_search(
         }
         tol
     } else {
-        log::info!(
+        log::debug!(
             "Using fallback RT tolerance: {:.2} min",
             config.rt_calibration.fallback_rt_tolerance
         );
@@ -5635,7 +5696,7 @@ fn run_search(
         return Ok(Vec::new());
     }
 
-    log::info!(
+    log::debug!(
         "Coelution search: {} spectra in {} windows, {} library entries",
         spectra_ref.len(),
         window_groups.len(),
@@ -5657,16 +5718,21 @@ fn run_search(
         SpectralScorer::new().with_tolerance_da(fragment_tolerance.tolerance)
     };
 
-    // Progress bar — one tick per isolation window.
+    // Progress bar — one tick per isolation window, with descriptive label.
     let pb = ProgressBar::new(window_groups.len() as u64);
+    let bar_template = format!(
+        "{{spinner:.green}} {} [{{elapsed_precise}}] [{{bar:40.cyan/blue}}] {{pos}}/{{len}} windows",
+        search_label
+    );
     pb.set_style(
         ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} windows",
-            )
+            .template(&bar_template)
             .unwrap()
             .progress_chars("#>-"),
     );
+    // Coordinate with two-tier logger: route log lines through pb.println()
+    // while the progress bar is active to avoid interleaving.
+    crate::logging::set_progress_bar(&pb);
 
     // Process each isolation window — candidates within each window in parallel
     // Use fold/reduce instead of flat_map+collect so results are deduplicated
@@ -6120,8 +6186,9 @@ fn run_search(
         });
 
     pb.finish_with_message("Done");
+    crate::logging::clear_progress_bar();
 
-    log::info!(
+    log::debug!(
         "Coelution search complete: {} scored entries ({} targets, {} decoys)",
         best_by_id.len(),
         best_by_id.values().filter(|e| !e.is_decoy).count(),
@@ -7725,6 +7792,7 @@ mod tests {
             &config,
             "test.mzML",
             Some(&overrides),
+            "Test",
         )
         .unwrap();
 
@@ -7796,6 +7864,7 @@ mod tests {
             &config,
             "test.mzML",
             None,
+            "Test",
         )
         .unwrap();
         assert!(
@@ -7818,6 +7887,7 @@ mod tests {
             &config,
             "test.mzML",
             Some(&overrides),
+            "Test",
         )
         .unwrap();
 
@@ -7861,6 +7931,7 @@ mod tests {
             &config,
             "test.mzML",
             Some(&overrides),
+            "Test",
         )
         .unwrap();
 
@@ -7930,6 +8001,7 @@ mod tests {
             &config,
             "test.mzML",
             None,
+            "Test",
         )
         .unwrap();
 
@@ -7971,6 +8043,7 @@ mod tests {
             &config,
             "test.mzML",
             Some(&overrides),
+            "Test",
         )
         .unwrap();
 

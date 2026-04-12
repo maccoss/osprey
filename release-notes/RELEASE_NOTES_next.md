@@ -17,4 +17,3 @@ Working draft for the next release. Append entries here as features and fixes la
 ## Breaking Changes
 
 <!-- none yet -->
-

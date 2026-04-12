@@ -286,36 +286,50 @@ pub enum ReconcileAction {
 
 /// Determine what reconciliation action to take for an entry given its consensus RT.
 ///
-/// Checks if the entry's current peak or any stored CWT candidate overlaps
-/// the expected measured RT. If not, returns ForcedIntegration.
+/// Uses **apex proximity** to decide whether the current peak is at the right RT.
+/// The tolerance comes from the refined per-file calibration's local residual,
+/// which reflects the actual run-to-run RT variation at that gradient position
+/// (derived from thousands of consensus peptides, not just this one).
+///
+/// Previous versions checked boundary containment (`start_rt <= expected <= end_rt`),
+/// which incorrectly classified peaks with wrong apex but wide tails as "Keep".
 pub fn determine_reconcile_action(
-    start_rt: f64,
-    end_rt: f64,
+    apex_rt: f64,
     cwt_candidates: &[CwtCandidate],
     expected_measured_rt: f64,
-    median_peak_width: f64,
+    rt_tolerance: f64,
+    half_width: f64,
 ) -> ReconcileAction {
-    // Check if the current peak already contains the expected RT
-    if start_rt <= expected_measured_rt && expected_measured_rt <= end_rt {
+    // Check if the current peak's apex is within tolerance of the expected RT
+    if (apex_rt - expected_measured_rt).abs() <= rt_tolerance {
         return ReconcileAction::Keep;
     }
 
-    // Check stored CWT candidates for overlap
-    for (idx, cand) in cwt_candidates.iter().enumerate() {
-        if cand.start_rt <= expected_measured_rt && expected_measured_rt <= cand.end_rt {
-            return ReconcileAction::UseCwtPeak {
-                candidate_idx: idx,
-                start_rt: cand.start_rt,
-                apex_rt: cand.apex_rt,
-                end_rt: cand.end_rt,
-            };
-        }
+    // Check CWT candidates by apex proximity (not boundary overlap).
+    // Pick the candidate whose apex is closest to expected_measured_rt, if within tolerance.
+    let best_cwt = cwt_candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, cand)| (cand.apex_rt - expected_measured_rt).abs() <= rt_tolerance)
+        .min_by(|(_, a), (_, b)| {
+            let da = (a.apex_rt - expected_measured_rt).abs();
+            let db = (b.apex_rt - expected_measured_rt).abs();
+            da.total_cmp(&db)
+        });
+
+    if let Some((idx, cand)) = best_cwt {
+        return ReconcileAction::UseCwtPeak {
+            candidate_idx: idx,
+            start_rt: cand.start_rt,
+            apex_rt: cand.apex_rt,
+            end_rt: cand.end_rt,
+        };
     }
 
-    // No overlap — forced integration
+    // No peak with apex near expected RT — forced integration
     ReconcileAction::ForcedIntegration {
         expected_rt: expected_measured_rt,
-        half_width: median_peak_width / 2.0,
+        half_width,
     }
 }
 
@@ -403,16 +417,21 @@ pub fn plan_reconciliation(
                 }
 
                 let expected_rt = cal.predict(consensus_entry.consensus_library_rt);
+                let rt_tolerance = cal.local_tolerance(
+                    consensus_entry.consensus_library_rt,
+                    3.0, // 3-sigma coverage
+                    0.1, // minimum floor: 0.1 min (6 sec)
+                );
                 let cwt = file_cwt
                     .get(entry.parquet_index as usize)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
                 let action = determine_reconcile_action(
-                    entry.start_rt,
-                    entry.end_rt,
+                    entry.apex_rt,
                     cwt,
                     expected_rt,
-                    consensus_entry.median_peak_width,
+                    rt_tolerance,
+                    consensus_entry.median_peak_width / 2.0,
                 );
 
                 if entry.is_decoy {
@@ -742,26 +761,24 @@ mod tests {
     }
 
     // ---- determine_reconcile_action tests ----
+    //
+    // These tests use the apex-proximity logic: Keep if |apex - expected| <= tolerance,
+    // UseCwtPeak if a CWT candidate's apex is within tolerance, else ForcedIntegration.
 
     #[test]
-    fn test_reconcile_action_keep_when_peak_contains_expected_rt() {
-        let action = determine_reconcile_action(
-            9.0,  // start_rt
-            11.0, // end_rt
-            &[],  // no CWT candidates
-            10.0, // expected RT is within [9, 11]
-            1.0,  // median_peak_width
-        );
+    fn test_reconcile_action_keep_when_apex_near_expected() {
+        // Apex at 10.0, expected at 10.0, tolerance 0.5 -> Keep
+        let action = determine_reconcile_action(10.0, &[], 10.0, 0.5, 0.1);
         assert!(matches!(action, ReconcileAction::Keep));
     }
 
     #[test]
-    fn test_reconcile_action_keep_at_boundary() {
-        // Expected RT exactly at peak start
-        let action = determine_reconcile_action(10.0, 12.0, &[], 10.0, 1.0);
+    fn test_reconcile_action_keep_at_tolerance_boundary() {
+        // Apex exactly at tolerance distance -> Keep
+        let action = determine_reconcile_action(10.5, &[], 10.0, 0.5, 0.1);
         assert!(matches!(action, ReconcileAction::Keep));
-        // Expected RT exactly at peak end
-        let action = determine_reconcile_action(10.0, 12.0, &[], 12.0, 1.0);
+        // Just inside tolerance from the other side
+        let action = determine_reconcile_action(9.5, &[], 10.0, 0.5, 0.1);
         assert!(matches!(action, ReconcileAction::Keep));
     }
 
@@ -785,8 +802,9 @@ mod tests {
                 coelution_score: 0.8,
             },
         ];
-        // Current peak at 10 ± 1, expected RT at 15.0 → CWT candidate 0 overlaps
-        let action = determine_reconcile_action(9.0, 11.0, &cwt, 15.0, 1.0);
+        // Current apex at 10.0, expected at 15.0, tolerance 0.5
+        // Apex is 5.0 away (outside tolerance), CWT candidate 0 has apex 15.0 (within tolerance)
+        let action = determine_reconcile_action(10.0, &cwt, 15.0, 0.5, 0.1);
         match action {
             ReconcileAction::UseCwtPeak {
                 candidate_idx,
@@ -820,8 +838,9 @@ mod tests {
                 coelution_score: 0.8,
             },
         ];
-        // Expected RT at 20.0 → first CWT doesn't overlap, second does
-        let action = determine_reconcile_action(9.0, 11.0, &cwt, 20.0, 1.0);
+        // Expected RT at 20.0, tolerance 0.5. Apex at 10.0 is far away.
+        // CWT 0 (apex 5.0) is 15 min off. CWT 1 (apex 20.0) is within tolerance.
+        let action = determine_reconcile_action(10.0, &cwt, 20.0, 0.5, 0.1);
         match action {
             ReconcileAction::UseCwtPeak {
                 candidate_idx,
@@ -837,7 +856,8 @@ mod tests {
 
     #[test]
     fn test_reconcile_action_forced_integration() {
-        // No CWT candidates overlap expected RT
+        // CWT candidate apex at 5.0, expected at 20.0, tolerance 0.5
+        // Neither current apex (10.0) nor CWT (5.0) is within tolerance of 20.0
         let cwt = vec![CwtCandidate {
             apex_rt: 5.0,
             start_rt: 4.0,
@@ -846,14 +866,14 @@ mod tests {
             snr: 5.0,
             coelution_score: 0.9,
         }];
-        let action = determine_reconcile_action(9.0, 11.0, &cwt, 20.0, 2.0);
+        let action = determine_reconcile_action(10.0, &cwt, 20.0, 0.5, 1.0);
         match action {
             ReconcileAction::ForcedIntegration {
                 expected_rt,
                 half_width,
             } => {
                 assert!((expected_rt - 20.0).abs() < 1e-10);
-                assert!((half_width - 1.0).abs() < 1e-10); // median_peak_width/2 = 2.0/2
+                assert!((half_width - 1.0).abs() < 1e-10);
             }
             other => panic!("Expected ForcedIntegration, got {:?}", other),
         }
@@ -861,16 +881,84 @@ mod tests {
 
     #[test]
     fn test_reconcile_action_forced_when_no_cwt() {
-        let action = determine_reconcile_action(9.0, 11.0, &[], 20.0, 3.0);
+        // Apex at 10.0, expected at 20.0, tolerance 0.5, no CWT -> ForcedIntegration
+        let action = determine_reconcile_action(10.0, &[], 20.0, 0.5, 1.5);
         match action {
             ReconcileAction::ForcedIntegration {
                 expected_rt,
                 half_width,
             } => {
                 assert!((expected_rt - 20.0).abs() < 1e-10);
-                assert!((half_width - 1.5).abs() < 1e-10); // 3.0/2
+                assert!((half_width - 1.5).abs() < 1e-10);
             }
             other => panic!("Expected ForcedIntegration, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reconcile_action_wrong_apex_wide_boundaries() {
+        // Regression test for the Seer dataset bug: peak with apex at 6.72 but
+        // boundaries [6.49, 7.97] that happened to span the expected RT (7.98).
+        // Old boundary-containment logic returned Keep; new apex-proximity logic
+        // correctly returns ForcedIntegration since apex is 1.26 min off.
+        let action = determine_reconcile_action(
+            6.72,  // apex at wrong RT
+            &[],   // no CWT candidates
+            7.98,  // expected RT from consensus
+            0.3,   // tolerance from refined calibration
+            0.075, // half_width (median_peak_width / 2)
+        );
+        match action {
+            ReconcileAction::ForcedIntegration {
+                expected_rt,
+                half_width,
+            } => {
+                assert!((expected_rt - 7.98).abs() < 1e-10);
+                assert!((half_width - 0.075).abs() < 1e-10);
+            }
+            other => panic!(
+                "Expected ForcedIntegration for wrong-apex peak, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_reconcile_action_cwt_picks_closest_apex() {
+        // Two CWT candidates both within tolerance, picks the one with closest apex
+        let cwt = vec![
+            CwtCandidate {
+                apex_rt: 10.3,
+                start_rt: 10.0,
+                end_rt: 10.6,
+                area: 1000.0,
+                snr: 5.0,
+                coelution_score: 0.9,
+            },
+            CwtCandidate {
+                apex_rt: 10.05,
+                start_rt: 9.9,
+                end_rt: 10.2,
+                area: 500.0,
+                snr: 3.0,
+                coelution_score: 0.8,
+            },
+        ];
+        // Current apex at 5.0 (far away), expected at 10.1, tolerance 0.5
+        // CWT 0 apex 10.3 is 0.2 away (within tolerance)
+        // CWT 1 apex 10.05 is 0.05 away (closer, also within tolerance)
+        // Should pick CWT 1 (closest apex)
+        let action = determine_reconcile_action(5.0, &cwt, 10.1, 0.5, 0.1);
+        match action {
+            ReconcileAction::UseCwtPeak {
+                candidate_idx,
+                apex_rt,
+                ..
+            } => {
+                assert_eq!(candidate_idx, 1, "Should pick CWT with closest apex");
+                assert!((apex_rt - 10.05).abs() < 1e-10);
+            }
+            other => panic!("Expected UseCwtPeak(1), got {:?}", other),
         }
     }
 
