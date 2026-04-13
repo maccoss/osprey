@@ -573,6 +573,7 @@ pub struct GapFillTarget {
 /// * `per_file_original_cal` - Original per-file calibrations
 /// * `experiment_fdr` - Experiment-level FDR threshold
 /// * `lib_lookup` - (modified_sequence, charge) → (target_entry_id, decoy_entry_id)
+#[allow(clippy::too_many_arguments)]
 pub fn identify_gap_fill_targets(
     consensus: &[PeptideConsensusRT],
     per_file_entries: &[(String, Vec<FdrEntry>)],
@@ -580,6 +581,8 @@ pub fn identify_gap_fill_targets(
     per_file_original_cal: &HashMap<String, RTCalibration>,
     experiment_fdr: f64,
     lib_lookup: &HashMap<(Arc<str>, u8), (u32, u32)>,
+    lib_precursor_mz: &HashMap<u32, f64>,
+    per_file_isolation_mz: &HashMap<String, Vec<(f64, f64)>>,
 ) -> HashMap<String, Vec<GapFillTarget>> {
     // 1. Build passing precursors: (modified_sequence, charge) for targets passing run-level
     //    FDR in at least one replicate. This ensures gap-fill covers all precursors that
@@ -604,6 +607,7 @@ pub fn identify_gap_fill_targets(
         .collect();
 
     // 3. For each file, find missing precursors and create gap-fill targets
+    let filtered_by_mz = AtomicUsize::new(0);
     let result: HashMap<String, Vec<GapFillTarget>> = per_file_entries
         .par_iter()
         .filter_map(|(file_name, entries)| {
@@ -615,6 +619,15 @@ pub fn identify_gap_fill_targets(
                 Some(c) => c,
                 None => return None,
             };
+
+            // This file's isolation window m/z coverage (list of [lower, upper] intervals).
+            // When available, gap-fill candidates are filtered to only those whose
+            // library precursor m/z falls inside at least one window — otherwise
+            // forcing an integration in this file would land on noise (the precursor's
+            // fragments aren't being selected for MS2 in this m/z range). This is the
+            // general fix for GPF datasets where each file covers a disjoint m/z range,
+            // and also helps normal multi-replicate acquisitions with partial overlap.
+            let iso_windows = per_file_isolation_mz.get(file_name);
 
             // Build set of (modified_sequence, charge) present in this file (targets only)
             let present: HashSet<(Arc<str>, u8)> = entries
@@ -635,6 +648,23 @@ pub fn identify_gap_fill_targets(
                     Some(ids) => *ids,
                     None => continue,
                 };
+
+                // m/z range filter: skip precursors whose m/z is not covered by any
+                // isolation window in this file. Without this, GPF runs would force
+                // integrations at precursors that this file physically cannot observe.
+                if let Some(windows) = iso_windows {
+                    let precursor_mz = match lib_precursor_mz.get(&target_id) {
+                        Some(&mz) => mz,
+                        None => continue,
+                    };
+                    let in_range = windows
+                        .iter()
+                        .any(|&(lo, hi)| precursor_mz >= lo && precursor_mz < hi);
+                    if !in_range {
+                        filtered_by_mz.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
 
                 // Look up consensus RT for this target peptide
                 let consensus_entry = match consensus_map.get(&(mod_seq.as_ref(), false)) {
@@ -667,13 +697,20 @@ pub fn identify_gap_fill_targets(
     // Log summary
     let total_targets: usize = result.values().map(|v| v.len()).sum();
     let n_files_with_gaps = result.len();
-    if total_targets > 0 {
+    let n_filtered = filtered_by_mz.load(Ordering::Relaxed);
+    if total_targets > 0 || n_filtered > 0 {
         log::info!(
             "Gap-fill: {} precursor-file pairs to score across {} files ({} passing precursors, {} files total)",
             total_targets,
             n_files_with_gaps,
             passing_precursors.len(),
             per_file_entries.len(),
+        );
+    }
+    if n_filtered > 0 {
+        log::info!(
+            "Gap-fill: {} candidates skipped because precursor m/z is outside the file's isolation windows (GPF or disjoint m/z ranges)",
+            n_filtered,
         );
     }
 
@@ -1740,6 +1777,8 @@ mod tests {
             &original_cal,
             0.01,
             &lib_lookup,
+            &HashMap::new(),
+            &HashMap::new(),
         );
 
         // file1 has PEPTIDEK → no gap-fill needed
@@ -1816,6 +1855,8 @@ mod tests {
             &original_cal,
             0.01,
             &lib_lookup,
+            &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert!(
@@ -1866,6 +1907,8 @@ mod tests {
             &original_cal,
             0.01,
             &lib_lookup,
+            &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert!(
@@ -1913,6 +1956,8 @@ mod tests {
             &original_cal,
             0.01,
             &lib_lookup,
+            &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert!(
@@ -1997,6 +2042,8 @@ mod tests {
             &original_cal,
             0.01,
             &lib_lookup,
+            &HashMap::new(),
+            &HashMap::new(),
         );
 
         // file1: has both → no gap-fill
@@ -2054,6 +2101,8 @@ mod tests {
             &original_cal,
             0.01,
             &lib_lookup,
+            &HashMap::new(),
+            &HashMap::new(),
         );
 
         // file2 has no calibration → should be skipped entirely
@@ -2099,11 +2148,190 @@ mod tests {
             &original_cal,
             0.01,
             &lib_lookup,
+            &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert!(
             gap_fill.is_empty(),
             "Single file with the precursor → no gaps"
         );
+    }
+
+    #[test]
+    fn test_gap_fill_filters_precursors_outside_isolation_windows() {
+        // GPF-style scenario: 2 files cover disjoint m/z ranges.
+        // file1 covers 400-500, file2 covers 500-600. A precursor detected in
+        // file1 at m/z 450 should NOT generate a gap-fill target in file2,
+        // because file2 cannot observe m/z 450.
+        let cal = make_identity_calibration();
+        let refined_cal: HashMap<String, RTCalibration> = vec![
+            ("file1".to_string(), cal.clone()),
+            ("file2".to_string(), cal.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let original_cal = refined_cal.clone();
+
+        let consensus = vec![
+            PeptideConsensusRT {
+                modified_sequence: "PEPTIDEK".to_string(),
+                is_decoy: false,
+                consensus_library_rt: 15.0,
+                median_peak_width: 1.0,
+                n_runs_detected: 1,
+            },
+            PeptideConsensusRT {
+                modified_sequence: "DECOY_PEPTIDEK".to_string(),
+                is_decoy: true,
+                consensus_library_rt: 15.0,
+                median_peak_width: 1.0,
+                n_runs_detected: 1,
+            },
+        ];
+
+        let per_file_entries = vec![
+            (
+                "file1".to_string(),
+                vec![make_fdr_entry(
+                    1, "PEPTIDEK", 2, false, 15.0, 14.5, 15.5, 8.0, 0.005,
+                )],
+            ),
+            (
+                "file2".to_string(),
+                vec![make_fdr_entry(
+                    2,
+                    "OTHERPEPTIDE",
+                    2,
+                    false,
+                    20.0,
+                    19.5,
+                    20.5,
+                    6.0,
+                    0.003,
+                )],
+            ),
+        ];
+
+        let lib_lookup: HashMap<(Arc<str>, u8), (u32, u32)> =
+            vec![((Arc::from("PEPTIDEK"), 2u8), (1u32, 1 | 0x80000000))]
+                .into_iter()
+                .collect();
+
+        // PEPTIDEK's precursor m/z = 450 (lives in file1's range)
+        let lib_precursor_mz: HashMap<u32, f64> = vec![(1u32, 450.0f64)].into_iter().collect();
+
+        // Disjoint GPF windows: file1 = [400,500), file2 = [500,600)
+        let per_file_isolation_mz: HashMap<String, Vec<(f64, f64)>> = vec![
+            ("file1".to_string(), vec![(400.0, 500.0)]),
+            ("file2".to_string(), vec![(500.0, 600.0)]),
+        ]
+        .into_iter()
+        .collect();
+
+        let gap_fill = identify_gap_fill_targets(
+            &consensus,
+            &per_file_entries,
+            &refined_cal,
+            &original_cal,
+            0.01,
+            &lib_lookup,
+            &lib_precursor_mz,
+            &per_file_isolation_mz,
+        );
+
+        // file2 should have NO gap-fill target for PEPTIDEK (m/z 450 not in [500,600))
+        assert!(
+            !gap_fill.contains_key("file2"),
+            "file2 should not gap-fill a precursor whose m/z is outside its isolation windows"
+        );
+    }
+
+    #[test]
+    fn test_gap_fill_allows_precursors_inside_isolation_windows() {
+        // Counterpart to the GPF test: precursor m/z IS inside file2's
+        // isolation range, so the gap-fill target should be generated.
+        let cal = make_identity_calibration();
+        let refined_cal: HashMap<String, RTCalibration> = vec![
+            ("file1".to_string(), cal.clone()),
+            ("file2".to_string(), cal.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let original_cal = refined_cal.clone();
+
+        let consensus = vec![
+            PeptideConsensusRT {
+                modified_sequence: "PEPTIDEK".to_string(),
+                is_decoy: false,
+                consensus_library_rt: 15.0,
+                median_peak_width: 1.0,
+                n_runs_detected: 1,
+            },
+            PeptideConsensusRT {
+                modified_sequence: "DECOY_PEPTIDEK".to_string(),
+                is_decoy: true,
+                consensus_library_rt: 15.0,
+                median_peak_width: 1.0,
+                n_runs_detected: 1,
+            },
+        ];
+
+        let per_file_entries = vec![
+            (
+                "file1".to_string(),
+                vec![make_fdr_entry(
+                    1, "PEPTIDEK", 2, false, 15.0, 14.5, 15.5, 8.0, 0.005,
+                )],
+            ),
+            (
+                "file2".to_string(),
+                vec![make_fdr_entry(
+                    2,
+                    "OTHERPEPTIDE",
+                    2,
+                    false,
+                    20.0,
+                    19.5,
+                    20.5,
+                    6.0,
+                    0.003,
+                )],
+            ),
+        ];
+
+        let lib_lookup: HashMap<(Arc<str>, u8), (u32, u32)> =
+            vec![((Arc::from("PEPTIDEK"), 2u8), (1u32, 1 | 0x80000000))]
+                .into_iter()
+                .collect();
+
+        // PEPTIDEK's precursor m/z = 450
+        let lib_precursor_mz: HashMap<u32, f64> = vec![(1u32, 450.0f64)].into_iter().collect();
+
+        // Overlapping replicate-style ranges: both files see 400-500
+        let per_file_isolation_mz: HashMap<String, Vec<(f64, f64)>> = vec![
+            ("file1".to_string(), vec![(400.0, 500.0)]),
+            ("file2".to_string(), vec![(400.0, 500.0)]),
+        ]
+        .into_iter()
+        .collect();
+
+        let gap_fill = identify_gap_fill_targets(
+            &consensus,
+            &per_file_entries,
+            &refined_cal,
+            &original_cal,
+            0.01,
+            &lib_lookup,
+            &lib_precursor_mz,
+            &per_file_isolation_mz,
+        );
+
+        // file2 SHOULD gap-fill PEPTIDEK because m/z 450 is inside its window
+        let file2_targets = gap_fill
+            .get("file2")
+            .expect("file2 should gap-fill PEPTIDEK (m/z in range)");
+        assert_eq!(file2_targets.len(), 1);
+        assert_eq!(file2_targets[0].target_entry_id, 1);
     }
 }

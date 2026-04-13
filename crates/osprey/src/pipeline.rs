@@ -2283,6 +2283,10 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     let mut pin_files: HashMap<String, std::path::PathBuf> = HashMap::new();
     // Retain per-file RT calibrations for inter-replicate reconciliation
     let mut per_file_calibrations: HashMap<String, RTCalibration> = HashMap::new();
+    // Per-file isolation window m/z coverage (list of [lower, upper] intervals),
+    // captured from each file's calibration so gap-fill can filter by m/z range.
+    // Essential for GPF datasets where each file covers a disjoint m/z range.
+    let mut per_file_isolation_mz: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
     // Interner for modified_sequence deduplication across files
     let mut seq_interner: HashSet<Arc<str>> = HashSet::new();
     // Track whether all files loaded SVM scores from sidecars (enables skipping Percolator)
@@ -2466,6 +2470,21 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             // Retain RT calibration for inter-replicate reconciliation
             if let Some(ref cal) = rt_cal {
                 per_file_calibrations.insert(file_name.clone(), cal.clone());
+            }
+
+            // Retain isolation window coverage for gap-fill m/z filtering
+            if let Some(ref cp) = cal_params {
+                if let Some(ref scheme) = cp.metadata.isolation_scheme {
+                    let intervals: Vec<(f64, f64)> = scheme
+                        .windows
+                        .iter()
+                        .map(|&(center, width)| {
+                            let half = width / 2.0;
+                            (center - half, center + half)
+                        })
+                        .collect();
+                    per_file_isolation_mz.insert(file_name.clone(), intervals);
+                }
             }
 
             // Log one-line calibration summary for terminal
@@ -2802,6 +2821,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             map
         };
 
+        // entry_id → library precursor m/z, for gap-fill m/z range filtering.
+        let lib_precursor_mz: HashMap<u32, f64> = library
+            .iter()
+            .filter(|e| !e.is_decoy)
+            .map(|e| (e.id, e.precursor_mz))
+            .collect();
+
         // Build file_name → input_file index mapping
         let file_name_to_idx: HashMap<String, usize> = config
             .input_files
@@ -2955,6 +2981,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     &per_file_calibrations,
                     config.run_fdr,
                     &lib_lookup,
+                    &lib_precursor_mz,
+                    &per_file_isolation_mz,
                 );
             } else {
                 refined_calibrations = HashMap::new();
