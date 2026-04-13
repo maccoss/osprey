@@ -17,7 +17,7 @@ FDR Control Workflow:
   5. Posterior error probabilities (PEP) via KDE + isotonic regression
   6. Compact stubs: drop non-passing entries to free ~21 GB (240-file experiments)
   7. Cross-run reconciliation + second-pass FDR
-  8. Protein FDR (optional): picked-protein competition using peptide PEP
+  8. Protein FDR (optional): picked-protein competition using peptide SVM discriminant (Savitski 2015)
   9. Blib output: load lightweight plan entries from Parquet projection
 ```
 
@@ -617,7 +617,34 @@ For each protein group:
 
 Classical protein-level TDC suffers from decoy over-representation: as genuine targets dominate the pool, random decoy matches accumulate disproportionately in the low-scoring region. **Pairwise picking eliminates this through structural symmetry** — each target-decoy pair produces exactly one winner, so the pool of winners is balanced by construction, and classical cumulative FDR on the winner list is well-calibrated.
 
-Osprey's v26.1.2 used a DIA-NN-inspired composite log-likelihood approach which was found to produce artificially low protein q-values (most target groups passing at 1% FDR with very few decoy wins). The switch to true picked-protein in v26.1.3 corrects this calibration.
+Osprey's v26.1.2 used a DIA-NN-inspired composite log-likelihood approach which was found to produce artificially low protein q-values (most target groups passing at 1% FDR with very few decoy wins). The switch to true picked-protein corrects this calibration.
+
+### Why SVM Score (Not q-Value or PEP) — and What Actually Happens in Practice
+
+The ranking score used inside picked-protein is the **maximum peptide SVM discriminant** across the group, after gating targets on peptide q-value. We arrived at SVM by elimination, with an important empirical wrinkle we document honestly at the end.
+
+- **Peptide q-value**: ranking by `min(run_peptide_qvalue)` looks like a literal reading of Savitski's text. It collapses the decoy null distribution — about 99% of decoy peptides have `q = 1.0` because they lost peptide-level TDC, so only the ~1% of decoys that won peptide TDC contribute meaningful scores. On Stellar 3-file HeLa this produced 2 decoy winners out of 6102 (~0.03%); cumulative FDR pinned at ~0.0003 and every target trivially passed 1% FDR.
+
+- **Peptide PEP**: PEP is bounded `[0, 1]` but continuous, so in principle every decoy should contribute a meaningful score. In Osprey it collapses the null distribution too: [`PepEstimator`](../crates/osprey-ml/src/pep.rs) is fit on TDC winners only, its bins cover `[min_winner_score, max_winner_score]`, and `posterior_error()` clamps out-of-range queries to the nearest bin. Losing decoys have SVM scores below the winner range, so they all clamp to `bins[0] ≈ 1.0` regardless of their true density. Applying the estimator to all entries in the percolator code does not help because the clamping is intrinsic to the lookup. Fitting a second PepEstimator over the full entry range was considered but adds a separate PEP model just for protein FDR, and since PEP is a monotone function of SVM score the ranking would be identical to raw SVM anyway.
+
+- **SVM discriminant** (current choice): every entry — target or decoy, TDC winner or loser — has a well-defined SVM score on the same scale. On paper this preserves the decoy null end-to-end.
+
+- **Empirical outcome on Stellar (important)**: on the post-fix Stellar rebuild, SVM-based picked-protein also collapses to **2 decoy winners out of 6099**, producing the same pinned-at-zero cumulative FDR as the q-value and PEP attempts. An earlier Stellar run showed 348 decoy winners (5.8% decoy rate) and was taken as evidence that SVM scoring was well calibrated, but that run preceded the [FDR q-value mapping fix](#known-limitation-protein-level-null-collapses): `run_peptide_qvalue` was pinned at 1.0, compaction rule (a) rejected everything, the compaction pool was small, and Percolator trained on a reduced set → a less-discriminating SVM with genuine target-decoy overlap. With the bug fixed, compaction keeps the correct pool, Percolator trains on the full set, and the resulting SVM separates targets from decoys so sharply that picked-protein's protein-level null has no tail overlap. We kept SVM as the ranking score because it's the least bad option (q-value and PEP both fail for independent structural reasons that are unlikely to be revisited; SVM is at least an honest monotone score over all entries), but **on Osprey's current pipeline picked-protein FDR provides essentially no additional error control beyond peptide-level FDR**. The 6097 target groups passing at 1% are exactly the protein groups with at least one peptide passing peptide-level FDR, and the reported `protein_qvalue` values are all pinned near zero.
+
+The target-side **gate** still uses peptide q-value (`best_qvalue <= qvalue_gate`) so the reportable set matches Savitski's convention; only the ranking within that gate uses SVM.
+
+<a id="known-limitation-protein-level-null-collapses"></a>
+
+### Known Limitation: Protein-Level Null Collapses Because Decoys Are Asymmetric
+
+Savitski's picked-protein FDR works when target and decoy score distributions have tail overlap. On raw search engine scores (Andromeda, XCorr, etc.) that overlap is typically present. On Osprey's Percolator SVM output after a well-posed training run, it is not — and we think this is at least partly because **the target and decoy libraries are not drawn from the same generative process**:
+
+- **Target entries** come from the spectral library and use AI-predicted spectra and AI-predicted retention times (Carafe / equivalent). These are high-quality, learned predictions.
+- **Decoy entries** are produced by `DecoyGenerator::Reverse`: the peptide sequence is reversed, but the fragment spectrum is a *mechanical* reversal of the target's fragments (not an AI-predicted spectrum for the reversed sequence) and the retention time is the *target's* RT carried over unchanged.
+
+The result is that every feature the SVM can key on — RT residual, spectral cosine, fragment co-elution, XCorr — is systematically noisier for decoys than for targets, because the decoy side was never re-predicted by the same model that produced the targets. The SVM learns to exploit this asymmetry, and the separation it achieves is larger than it would be on a truly null decoy pool. Picked-protein FDR assumes the two sides are statistically exchangeable under the null hypothesis, and that assumption is weakened here.
+
+**Future work**: re-predict decoy spectra and retention times from the same model Carafe uses for targets (i.e. run Carafe on the reversed sequence), then use those as decoys. If the SVM can no longer exploit the predict-vs-reverse asymmetry, picked-protein is expected to produce a meaningful tail overlap and a calibrated protein FDR. Until then, the reported protein q-values should be treated as "this protein has a peptide passing peptide-level FDR", not as an independently calibrated probability.
 
 ### Decoy Protein Pairing
 
@@ -633,7 +660,7 @@ When `--protein-fdr` is set, Osprey writes a CSV protein report (`{output}.prote
 | `protein_accessions` | Semicolon-separated protein accessions |
 | `gene_names` | Semicolon-separated gene names (from library) |
 | `protein_qvalue` | Protein group q-value from picked-protein FDR (second-pass, authoritative) |
-| `best_score` | Best peptide SVM score for the group |
+| `best_peptide_score` | Maximum peptide SVM discriminant score among the group's peptides (the picked-protein ranking score) |
 | `n_unique_peptides` | Number of unique (proteotypic) peptides |
 | `n_shared_peptides` | Number of shared peptides |
 | `unique_peptides` | Semicolon-separated unique peptide sequences |

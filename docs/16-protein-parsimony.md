@@ -163,12 +163,13 @@ Runs before the compaction step in `pipeline.rs`. Produces `run_protein_qvalue` 
 1. Build parsimony from peptides passing first-pass peptide FDR.
 2. Call `collect_best_peptide_scores()` on the **full pre-compaction** `per_file_entries` — both targets and decoys, regardless of whether their base_id passed first-pass precursor FDR. This gives symmetric target + decoy pools for the picked-protein competition.
 3. For each protein group:
-   - Compute `target_score = max(SVM score over target peptides passing gate)`.
-   - Compute `decoy_score = max(SVM score over DECOY_-prefixed peptides passing gate)`.
-   - Gate: peptide's `run_peptide_qvalue <= config.run_fdr` (Savitski's 1% convention).
+   - Compute `target_score = max(SVM score over target peptides with run_peptide_qvalue <= config.run_fdr)`. Target side is **gated** by peptide q-value per Savitski's 1% convention — this restricts analysis to "proteins we would actually report".
+   - Compute `decoy_score = max(SVM score over DECOY_-prefixed peptides)`. **Decoys are not gated**: all decoy peptides contribute their SVM score to the null distribution regardless of their own q-value. Gating the decoy side would create survivorship bias (most losing decoys have `q = 1.0` and would be filtered out), eliminating almost the entire decoy null.
 4. **Pairwise picking**: each group produces exactly one winner. Target wins if `target_score >= decoy_score`, else decoy wins.
-5. Sort winners by score descending, compute cumulative FDR = `cum_decoys / max(1, cum_targets)`, backward sweep for monotonicity.
+5. Sort winners by SVM score descending, compute cumulative FDR = `cum_decoys / max(1, cum_targets)`, backward sweep for monotonicity.
 6. Propagate per-group q-values back to peptides (best/lowest across groups a peptide belongs to) and write into `run_protein_qvalue`.
+
+> **Why SVM discriminant and not peptide q-value or PEP?** During development we tried both alternatives and both collapsed the decoy null distribution — q-value because 99% of decoys have `q = 1.0` after losing peptide-level TDC, and PEP because Osprey's `PepEstimator` is fit on TDC winners only and clamps out-of-range scores to `bins[0] ≈ 1.0`. Raw SVM scores avoid both failure modes: every entry (target or decoy, winner or loser) has a score on the same scale, so the null is preserved end-to-end. See `docs/07-fdr-control.md` → "Why SVM Score (Not q-Value or PEP)?" for the full empirical story.
 
 First-pass protein q-values are used by:
 

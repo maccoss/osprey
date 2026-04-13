@@ -1710,7 +1710,13 @@ pub fn compute_fdr_from_stubs(
         }
     }
 
-    // Fit PEP model and apply to winners only (non-winners keep pep = 1.0)
+    // Fit PEP model and apply to winners only (non-winners keep pep = 1.0).
+    // PEP is reported per-precursor in the blib for downstream confidence,
+    // but is NOT used for protein-level FDR — picked-protein ranks by raw
+    // SVM score instead, because the PepEstimator's score range is bounded
+    // by the winner set and clamps losing decoys to ~1.0, collapsing the
+    // protein-level null distribution. See docs/07-fdr-control.md for the
+    // full history of that choice.
     let pep_estimator = PepEstimator::fit_default(&winner_scores, &winner_is_decoy);
     for (i, &(fi, li)) in winner_locations.iter().enumerate() {
         per_file_entries[fi].1[li].pep = pep_estimator.posterior_error(winner_scores[i]);

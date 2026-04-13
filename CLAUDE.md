@@ -192,7 +192,7 @@ Osprey implements **true picked-protein FDR** (Savitski et al. 2015, PMC4563723)
 
 1. **First-pass protein FDR** runs AFTER first-pass peptide FDR but BEFORE compaction. Uses the **full pre-compaction peptide pool** so targets and decoys are symmetric. Writes `run_protein_qvalue` on FdrEntry stubs. This is used as a GATE for protein-aware compaction (rescue borderline peptides from strong proteins) and reconciliation consensus selection.
 
-2. **Compaction** retains a peptide if EITHER `run_peptide_qvalue <= reconciliation_compaction_fdr` (default 0.05) OR `run_protein_qvalue <= config.protein_fdr`. The protein rule is additive and only applies when `--protein-fdr` is set.
+2. **Compaction** retains a peptide if EITHER `run_peptide_qvalue <= reconciliation_compaction_fdr` (default 0.01) OR `run_protein_qvalue <= config.protein_fdr`. The protein rule is additive and only applies when `--protein-fdr` is set.
 
 3. **Reconciliation** uses first-pass protein q-values as an optional rescue gate in `compute_consensus_rts()`. Peptides from strong proteins can anchor consensus even if their own peptide q-value is borderline.
 
@@ -200,7 +200,15 @@ Osprey implements **true picked-protein FDR** (Savitski et al. 2015, PMC4563723)
 
 **CRITICAL**: The first-pass MUST see the full pre-compaction pool. v26.1.2 had a calibration bug where protein FDR only ran after compaction, giving one-sided competition because decoys paired with non-passing targets were dropped. Keeping the first-pass picked-protein FDR before compaction preserves target/decoy symmetry.
 
-**Do NOT use PEP for protein scoring.** Protein-level PEP is intentionally not computed (`ProteinFdrResult` has no `group_pep` field, and `write_protein_report` does not emit a `protein_pep` column). Peptide-level and precursor-level PEP are unaffected.
+**CRITICAL: Ranking score is raw SVM discriminant — and on current Osprey output all three candidates produce a collapsed decoy null.** During development we tried three ranking scores:
+
+- **Peptide q-value**: 99% of decoys have `q = 1.0` because they lost peptide-level TDC, leaving too few with meaningful scores. Produced 2/6102 decoy winners on Stellar — under-calibrated.
+- **Peptide PEP**: `PepEstimator` is fit on TDC winners only and clamps out-of-range scores to `bins[0] ≈ 1.0`. Losing decoys all clamped to ~1.0, same failure mode. Produced 2/6102 decoy winners on Stellar.
+- **SVM discriminant** (current, kept): every entry has a well-defined score on the same scale. An earlier Stellar run showed 348/5988 decoy winners (5.8% decoy rate) and was used to justify this choice, BUT that run preceded the FDR q-value mapping fix. With the bug fixed, compaction keeps the correct pool, Percolator trains on the full set, and the resulting SVM separates targets and decoys so sharply that picked-protein has no tail overlap. Post-fix Stellar produces 2/6099 decoy winners — same failure mode as q-value and PEP. SVM is kept as the least-bad option (honest monotone score over all entries), but **picked-protein FDR on Osprey's current output provides essentially no control beyond peptide-level FDR**. Report protein q-values as "protein has a peptide passing peptide-level FDR", not as independently calibrated probabilities. See `docs/07-fdr-control.md` → "Why SVM Score (Not q-Value or PEP) — and What Actually Happens in Practice" and the "Known Limitation" subsection for the full story.
+
+**Known root cause (deferred): decoy asymmetry.** Target library entries use AI-predicted spectra and RTs (Carafe). `DecoyGenerator::Reverse` produces reversed peptide sequences but keeps the target's RT and does a mechanical reversal of fragments — the decoy side is NOT re-predicted by the same model. Every feature the SVM learns (RT residual, spectral cosine, fragment co-elution, XCorr) is systematically different for decoys than for targets because the generative processes differ. Fixing this would require running the AI predictor on the reversed sequence so target and decoy libraries come from the same model. Until then the tail overlap picked-protein needs cannot be produced. **Do not revisit picked-protein scoring without either fixing decoy generation OR running on real data first and confirming the decoy-winner fraction is meaningful (e.g., > 1% of total winners).**
+
+**Do NOT use protein-level PEP.** Protein-level PEP is intentionally not computed (`ProteinFdrResult` has no `group_pep` field, and `write_protein_report` does not emit a `protein_pep` column). Peptide-level and precursor-level PEP are unaffected and still written to the blib.
 
 **Do NOT revert to single-pass or composite scoring.** v26.1.2's composite log-likelihood approach produced artificially low protein q-values because the aggregation inflated target scores relative to decoys.
 
