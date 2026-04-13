@@ -335,18 +335,33 @@ pub fn build_protein_parsimony(
 ///   contribute (Savitski uses 0.01 = `run_fdr`). Decoy peptides are **not**
 ///   gated — they form the null distribution and must be unbiased.
 ///
-/// ## Scoring: peptide q-value, not SVM discriminant
+/// ## Scoring: peptide PEP, not SVM discriminant, not peptide q-value
 ///
-/// Protein scores are the **minimum peptide q-value** across the group's
-/// peptides, not the maximum SVM discriminant. Osprey's Percolator SVM
-/// scores separate targets and decoys too cleanly at the extreme tails —
-/// the best target proteins have SVM scores orders of magnitude above the
-/// best decoy proteins, which puts all decoy winners at the tail of the
-/// sorted list and collapses cumulative FDR to near zero at any useful
-/// threshold. Peptide q-values are bounded in [0, 1], have natural tie
-/// structure, and are what Savitski 2015 actually uses. Ranking by
-/// `min(peptide_q)` ascending (lowest q first) gives a well-calibrated
+/// Protein scores are the **minimum peptide PEP** (posterior error probability)
+/// across the group's peptides. This is what Savitski 2015 actually uses, and
+/// it avoids two failure modes of the alternatives:
+///
+/// - **SVM discriminant**: Osprey's Percolator SVM scores separate targets
+///   and decoys too cleanly at the extreme tails. Target proteins get huge
+///   scores relative to decoys, so decoy winners pile up far below the top
+///   of the sorted list and cumulative FDR collapses at typical thresholds.
+///
+/// - **Peptide q-value**: q-values are stepped/quantized, and more critically,
+///   about 99% of decoy peptides have q=1.0 (they lost peptide-level TDC).
+///   Those decoys cannot compete at the protein level — only the ~1% of
+///   decoys that won their peptide TDC have meaningful q-values, and that
+///   tiny surviving pool is far too sparse to form a usable null. In
+///   practice this produces near-zero decoy winners and an under-calibrated
+///   (overly permissive) protein FDR.
+///
+/// PEP is **bounded in [0, 1] but continuous**, with a smooth distribution
+/// for both targets and decoys. Every peptide (even a losing decoy) has a
+/// meaningful PEP, so the decoy null distribution is preserved. Ranking by
+/// `min(peptide_pep)` ascending (lowest PEP first) gives a well-calibrated
 /// cumulative FDR on the winner list.
+///
+/// The target-side gate is still based on peptide q-value (`best_qvalue <= qvalue_gate`)
+/// so the set of "reportable" target proteins matches Savitski's convention.
 ///
 /// ## Why the decoy side is not gated
 ///
@@ -371,42 +386,44 @@ pub fn compute_protein_fdr(
     qvalue_gate: f64,
 ) -> ProteinFdrResult {
     // Step 1: For each protein group, compute target and decoy best-peptide
-    // q-values (minimum, i.e. strongest). Scoring is by peptide q-value, not
-    // SVM discriminant; lower q = better.
-    // - Target side: only target peptides with best_qvalue <= qvalue_gate contribute
-    //   (restricts analysis to "proteins we'd actually report").
+    // PEP (minimum, i.e. strongest). Ranking is by PEP; lower PEP = better.
+    // - Target side: only target peptides with best_qvalue <= qvalue_gate
+    //   contribute (restricts analysis to "proteins we'd actually report");
+    //   the gate still uses q-value because that is the reporting cutoff the
+    //   user specified. Ranking among eligible targets uses PEP.
     // - Decoy side: ALL decoy peptides contribute (forms the null distribution).
     //   Gating decoys would create survivorship bias — see doc comment above.
     #[derive(Default, Clone, Copy)]
     struct GroupScore {
-        target_q: Option<f64>,
-        decoy_q: Option<f64>,
+        target_pep: Option<f64>,
+        decoy_pep: Option<f64>,
     }
     let mut group_scores_map: HashMap<ProteinGroupId, GroupScore> = HashMap::new();
 
     for (peptide, group_ids) in &parsimony.peptide_to_groups {
-        // Target side: peptide sequence directly, GATED on peptide q-value
+        // Target side: peptide sequence directly, GATED on peptide q-value,
+        // RANKED by PEP.
         if let Some(ps) = best_scores.get(peptide.as_str()) {
             if !ps.is_decoy && ps.best_qvalue <= qvalue_gate {
                 for &gid in group_ids {
                     let gs = group_scores_map.entry(gid).or_default();
-                    gs.target_q = Some(match gs.target_q {
-                        Some(q) => q.min(ps.best_qvalue),
-                        None => ps.best_qvalue,
+                    gs.target_pep = Some(match gs.target_pep {
+                        Some(p) => p.min(ps.best_pep),
+                        None => ps.best_pep,
                     });
                 }
             }
         }
         // Decoy side: DECOY_-prefixed peptide sequence, NOT GATED.
-        // All decoy peptides contribute to the null distribution.
+        // All decoy peptides contribute their PEP to the null distribution.
         let decoy_key = format!("{}{}", DECOY_PREFIX, peptide);
         if let Some(ps) = best_scores.get(decoy_key.as_str()) {
             if ps.is_decoy {
                 for &gid in group_ids {
                     let gs = group_scores_map.entry(gid).or_default();
-                    gs.decoy_q = Some(match gs.decoy_q {
-                        Some(q) => q.min(ps.best_qvalue),
-                        None => ps.best_qvalue,
+                    gs.decoy_pep = Some(match gs.decoy_pep {
+                        Some(p) => p.min(ps.best_pep),
+                        None => ps.best_pep,
                     });
                 }
             }
@@ -414,12 +431,11 @@ pub fn compute_protein_fdr(
     }
 
     // Step 2: Pair picking. Each protein group produces exactly one winner.
-    // Target wins if target_q <= decoy_q (ties go to target, consistent with
-    // the SVM-score version's `t >= d` behavior).
+    // Target wins if target_pep <= decoy_pep (ties go to target).
     #[derive(Clone, Copy)]
     struct Winner {
         group_id: ProteinGroupId,
-        score: f64, // best peptide q-value for this winner
+        score: f64, // best peptide PEP for this winner
         is_decoy: bool,
     }
     let mut winners: Vec<Winner> = Vec::new();
@@ -429,7 +445,7 @@ pub fn compute_protein_fdr(
             Some(x) => *x,
             None => continue, // no peptides passed the gate for this group
         };
-        match (gs.target_q, gs.decoy_q) {
+        match (gs.target_pep, gs.decoy_pep) {
             (Some(t), Some(d)) => {
                 if t <= d {
                     winners.push(Winner {
@@ -459,10 +475,9 @@ pub fn compute_protein_fdr(
         }
     }
 
-    // Step 3: Classical cumulative FDR on winners, sorted by q ascending
-    // (lowest q = strongest protein = first). Tiebreak by group_id ascending
-    // for determinism — many proteins will share the same minimum peptide
-    // q-value, especially at the top of the list.
+    // Step 3: Classical cumulative FDR on winners, sorted by PEP ascending
+    // (lowest PEP = strongest protein = first). Tiebreak by group_id
+    // ascending for determinism.
     winners.sort_by(|a, b| {
         a.score
             .total_cmp(&b.score)
@@ -569,7 +584,7 @@ pub fn write_protein_report(
     let mut file = std::fs::File::create(path)?;
     writeln!(
         file,
-        "protein_group,protein_accessions,gene_names,protein_qvalue,best_peptide_qvalue,n_unique_peptides,n_shared_peptides,unique_peptides,shared_peptides"
+        "protein_group,protein_accessions,gene_names,protein_qvalue,best_peptide_pep,n_unique_peptides,n_shared_peptides,unique_peptides,shared_peptides"
     )?;
 
     // Collect passing groups, sorted by q-value
@@ -671,8 +686,13 @@ pub struct PeptideScore {
     /// Whether this peptide is a decoy
     pub is_decoy: bool,
     /// Best (lowest) run-level **peptide** q-value for this peptide across all files.
-    /// Used as the gate in picked-protein FDR (Savitski 2015 convention).
+    /// Used as the target-side **gate** in picked-protein FDR (Savitski 2015 convention):
+    /// only targets with `best_qvalue <= gate` are eligible to be winners.
     pub best_qvalue: f64,
+    /// Best (lowest) posterior error probability (PEP) for this peptide across all files.
+    /// Used as the **score** for picked-protein FDR ranking (min across group members);
+    /// PEP is bounded in [0,1] but continuous, avoiding the q-value quantization cliff.
+    pub best_pep: f64,
 }
 
 /// Collect peptide-level scores for protein FDR.
@@ -704,16 +724,18 @@ pub fn collect_best_peptide_scores(
                     if entry.score > ps.score {
                         ps.score = entry.score;
                     }
-                    // Keep the best (lowest) q-value
-                    let qval = entry.run_peptide_qvalue;
-                    if qval < ps.best_qvalue {
-                        ps.best_qvalue = qval;
+                    if entry.run_peptide_qvalue < ps.best_qvalue {
+                        ps.best_qvalue = entry.run_peptide_qvalue;
+                    }
+                    if entry.pep < ps.best_pep {
+                        ps.best_pep = entry.pep;
                     }
                 })
                 .or_insert(PeptideScore {
                     score: entry.score,
                     is_decoy: entry.is_decoy,
                     best_qvalue: entry.run_peptide_qvalue,
+                    best_pep: entry.pep,
                 });
         }
     }
@@ -1080,6 +1102,7 @@ mod tests {
                 score: 5.0,
                 is_decoy: false,
                 best_qvalue: 0.001,
+                best_pep: 0.001,
             },
         );
         best_scores.insert(
@@ -1088,6 +1111,7 @@ mod tests {
                 score: 2.0,
                 is_decoy: true,
                 best_qvalue: 0.5,
+                best_pep: 0.5,
             },
         );
         best_scores.insert(
@@ -1096,6 +1120,7 @@ mod tests {
                 score: 1.0,
                 is_decoy: false,
                 best_qvalue: 0.005,
+                best_pep: 0.005,
             },
         );
         best_scores.insert(
@@ -1104,6 +1129,7 @@ mod tests {
                 score: 3.0,
                 is_decoy: true,
                 best_qvalue: 0.3,
+                best_pep: 0.3,
             },
         );
 
@@ -1141,6 +1167,7 @@ mod tests {
                 score: 10.0,
                 is_decoy: false,
                 best_qvalue: 0.001,
+                best_pep: 0.001,
             },
         );
         best_scores.insert(
@@ -1149,6 +1176,7 @@ mod tests {
                 score: 8.0,
                 is_decoy: false,
                 best_qvalue: 0.001,
+                best_pep: 0.001,
             },
         );
         best_scores.insert(
@@ -1157,6 +1185,7 @@ mod tests {
                 score: 3.0,
                 is_decoy: false,
                 best_qvalue: 0.005,
+                best_pep: 0.005,
             },
         );
         best_scores.insert(
@@ -1165,6 +1194,7 @@ mod tests {
                 score: 1.0,
                 is_decoy: true,
                 best_qvalue: 0.5,
+                best_pep: 0.5,
             },
         );
         best_scores.insert(
@@ -1173,6 +1203,7 @@ mod tests {
                 score: 1.0,
                 is_decoy: true,
                 best_qvalue: 0.5,
+                best_pep: 0.5,
             },
         );
         best_scores.insert(
@@ -1181,6 +1212,7 @@ mod tests {
                 score: 1.0,
                 is_decoy: true,
                 best_qvalue: 0.5,
+                best_pep: 0.5,
             },
         );
 
@@ -1281,12 +1313,17 @@ mod tests {
     // Picked-Protein FDR (Savitski 2015) regression tests
     // ============================================================
 
-    /// Helper to build a PeptideScore with all the boilerplate
+    /// Helper to build a PeptideScore with all the boilerplate. For tests
+    /// written before PEP-based ranking, we set `best_pep = best_qvalue` so
+    /// relative ordering is preserved — the tests exercise the algorithm's
+    /// shape, and whether the rank score is called "q" or "PEP" doesn't
+    /// matter as long as it's consistent.
     fn ps(score: f64, is_decoy: bool, best_qvalue: f64) -> PeptideScore {
         PeptideScore {
             score,
             is_decoy,
             best_qvalue,
+            best_pep: best_qvalue,
         }
     }
 
