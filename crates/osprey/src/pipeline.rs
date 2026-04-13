@@ -4238,11 +4238,10 @@ fn run_percolator_fdr_direct(
                 file_name, entry.modified_sequence, entry.charge, entry.scan_number
             );
             if let Some(result) = result_map.get(psm_id.as_str()) {
-                entry.run_precursor_qvalue =
-                    result.run_precursor_qvalue.max(result.run_peptide_qvalue);
-                entry.experiment_precursor_qvalue = result
-                    .experiment_precursor_qvalue
-                    .max(result.experiment_peptide_qvalue);
+                entry.run_precursor_qvalue = result.run_precursor_qvalue;
+                entry.run_peptide_qvalue = result.run_peptide_qvalue;
+                entry.experiment_precursor_qvalue = result.experiment_precursor_qvalue;
+                entry.experiment_peptide_qvalue = result.experiment_peptide_qvalue;
                 entry.score = result.score;
                 entry.pep = result.pep;
             }
@@ -4347,22 +4346,22 @@ fn run_mokapot_fdr(
                             file_name, entry.modified_sequence, entry.charge, entry.scan_number
                         );
                         if let Some(&(q, score, pep)) = run_qmap.get(&psm_id) {
-                            // Enforce dual FDR: max of precursor and peptide q-values
                             let peptide_q = peptide_qmap
                                 .and_then(|m| m.get(&*entry.modified_sequence))
                                 .copied()
                                 .unwrap_or(1.0);
-                            entry.run_precursor_qvalue = q.max(peptide_q);
+                            entry.run_precursor_qvalue = q;
+                            entry.run_peptide_qvalue = peptide_q;
                             entry.score = score;
                             entry.pep = pep;
                         }
                         if let Some(&q) = experiment_qmap.get(&psm_id) {
-                            // Enforce dual FDR: max of precursor and peptide q-values
                             let peptide_q = exp_peptide_qmap
                                 .get(&*entry.modified_sequence)
                                 .copied()
                                 .unwrap_or(1.0);
-                            entry.experiment_precursor_qvalue = q.max(peptide_q);
+                            entry.experiment_precursor_qvalue = q;
+                            entry.experiment_peptide_qvalue = peptide_q;
                         }
                         if let Some(&(score, pep)) = experiment_score_map.get(&psm_id) {
                             entry.score = score;
