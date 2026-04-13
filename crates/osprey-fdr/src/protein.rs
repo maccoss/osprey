@@ -335,6 +335,19 @@ pub fn build_protein_parsimony(
 ///   contribute (Savitski uses 0.01 = `run_fdr`). Decoy peptides are **not**
 ///   gated — they form the null distribution and must be unbiased.
 ///
+/// ## Scoring: peptide q-value, not SVM discriminant
+///
+/// Protein scores are the **minimum peptide q-value** across the group's
+/// peptides, not the maximum SVM discriminant. Osprey's Percolator SVM
+/// scores separate targets and decoys too cleanly at the extreme tails —
+/// the best target proteins have SVM scores orders of magnitude above the
+/// best decoy proteins, which puts all decoy winners at the tail of the
+/// sorted list and collapses cumulative FDR to near zero at any useful
+/// threshold. Peptide q-values are bounded in [0, 1], have natural tie
+/// structure, and are what Savitski 2015 actually uses. Ranking by
+/// `min(peptide_q)` ascending (lowest q first) gives a well-calibrated
+/// cumulative FDR on the winner list.
+///
 /// ## Why the decoy side is not gated
 ///
 /// A naive implementation would apply the same q-value gate to both sides for
@@ -357,15 +370,17 @@ pub fn compute_protein_fdr(
     best_scores: &HashMap<Arc<str>, PeptideScore>,
     qvalue_gate: f64,
 ) -> ProteinFdrResult {
-    // Step 1: For each protein group, compute target and decoy best-peptide scores.
+    // Step 1: For each protein group, compute target and decoy best-peptide
+    // q-values (minimum, i.e. strongest). Scoring is by peptide q-value, not
+    // SVM discriminant; lower q = better.
     // - Target side: only target peptides with best_qvalue <= qvalue_gate contribute
     //   (restricts analysis to "proteins we'd actually report").
     // - Decoy side: ALL decoy peptides contribute (forms the null distribution).
     //   Gating decoys would create survivorship bias — see doc comment above.
     #[derive(Default, Clone, Copy)]
     struct GroupScore {
-        target_score: Option<f64>,
-        decoy_score: Option<f64>,
+        target_q: Option<f64>,
+        decoy_q: Option<f64>,
     }
     let mut group_scores_map: HashMap<ProteinGroupId, GroupScore> = HashMap::new();
 
@@ -375,9 +390,9 @@ pub fn compute_protein_fdr(
             if !ps.is_decoy && ps.best_qvalue <= qvalue_gate {
                 for &gid in group_ids {
                     let gs = group_scores_map.entry(gid).or_default();
-                    gs.target_score = Some(match gs.target_score {
-                        Some(s) => s.max(ps.score),
-                        None => ps.score,
+                    gs.target_q = Some(match gs.target_q {
+                        Some(q) => q.min(ps.best_qvalue),
+                        None => ps.best_qvalue,
                     });
                 }
             }
@@ -389,9 +404,9 @@ pub fn compute_protein_fdr(
             if ps.is_decoy {
                 for &gid in group_ids {
                     let gs = group_scores_map.entry(gid).or_default();
-                    gs.decoy_score = Some(match gs.decoy_score {
-                        Some(s) => s.max(ps.score),
-                        None => ps.score,
+                    gs.decoy_q = Some(match gs.decoy_q {
+                        Some(q) => q.min(ps.best_qvalue),
+                        None => ps.best_qvalue,
                     });
                 }
             }
@@ -399,10 +414,12 @@ pub fn compute_protein_fdr(
     }
 
     // Step 2: Pair picking. Each protein group produces exactly one winner.
+    // Target wins if target_q <= decoy_q (ties go to target, consistent with
+    // the SVM-score version's `t >= d` behavior).
     #[derive(Clone, Copy)]
     struct Winner {
         group_id: ProteinGroupId,
-        score: f64,
+        score: f64, // best peptide q-value for this winner
         is_decoy: bool,
     }
     let mut winners: Vec<Winner> = Vec::new();
@@ -412,9 +429,9 @@ pub fn compute_protein_fdr(
             Some(x) => *x,
             None => continue, // no peptides passed the gate for this group
         };
-        match (gs.target_score, gs.decoy_score) {
+        match (gs.target_q, gs.decoy_q) {
             (Some(t), Some(d)) => {
-                if t >= d {
+                if t <= d {
                     winners.push(Winner {
                         group_id: group.id,
                         score: t,
@@ -442,11 +459,13 @@ pub fn compute_protein_fdr(
         }
     }
 
-    // Step 3: Classical cumulative FDR on winners, sorted by score descending.
-    // Tiebreak by group_id ascending for determinism.
+    // Step 3: Classical cumulative FDR on winners, sorted by q ascending
+    // (lowest q = strongest protein = first). Tiebreak by group_id ascending
+    // for determinism — many proteins will share the same minimum peptide
+    // q-value, especially at the top of the list.
     winners.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
+        a.score
+            .total_cmp(&b.score)
             .then(a.group_id.cmp(&b.group_id))
     });
 
@@ -550,7 +569,7 @@ pub fn write_protein_report(
     let mut file = std::fs::File::create(path)?;
     writeln!(
         file,
-        "protein_group,protein_accessions,gene_names,protein_qvalue,best_score,n_unique_peptides,n_shared_peptides,unique_peptides,shared_peptides"
+        "protein_group,protein_accessions,gene_names,protein_qvalue,best_peptide_qvalue,n_unique_peptides,n_shared_peptides,unique_peptides,shared_peptides"
     )?;
 
     // Collect passing groups, sorted by q-value
@@ -1273,13 +1292,14 @@ mod tests {
 
     #[test]
     fn test_picked_protein_fdr_target_wins_pair() {
-        // Group with target best-score 2.5 and decoy best-score 1.8 → target wins
+        // Group with target q=0.001 and decoy q=0.01 → target wins
+        // (scoring is by peptide q-value; lower = better)
         let library = vec![make_lib_entry(1, "PEPTIDEA", vec!["P1"], false)];
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         let mut scores = HashMap::new();
-        scores.insert(Arc::from("PEPTIDEA"), ps(2.5, false, 0.005));
-        scores.insert(Arc::from("DECOY_PEPTIDEA"), ps(1.8, true, 0.005));
+        scores.insert(Arc::from("PEPTIDEA"), ps(2.5, false, 0.001));
+        scores.insert(Arc::from("DECOY_PEPTIDEA"), ps(1.8, true, 0.01));
 
         let result = compute_protein_fdr(&parsimony, &scores, 0.01);
 
@@ -1301,19 +1321,18 @@ mod tests {
 
     #[test]
     fn test_picked_protein_fdr_decoy_wins_pair() {
-        // Group with target best-score 0.5 and decoy best-score 1.2 → decoy wins
-        // Target is NOT in group_qvalues (decoy winners are excluded from output)
+        // P1: target q=0.008, decoy q=0.001 → decoy wins (decoy had better peptide q)
+        // P2: target q=0.001, decoy q=0.005 → target wins
+        // Target P1 is NOT in group_qvalues (decoy winners are excluded from output)
         let library = vec![
             make_lib_entry(1, "PEPTIDEA", vec!["P1"], false),
-            make_lib_entry(2, "PEPTIDEB", vec!["P2"], false), // make a second target so we have
-                                                              // at least one target winner and
-                                                              // can get meaningful q-values
+            make_lib_entry(2, "PEPTIDEB", vec!["P2"], false),
         ];
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         let mut scores = HashMap::new();
-        scores.insert(Arc::from("PEPTIDEA"), ps(0.5, false, 0.005));
-        scores.insert(Arc::from("DECOY_PEPTIDEA"), ps(1.2, true, 0.005));
+        scores.insert(Arc::from("PEPTIDEA"), ps(0.5, false, 0.008));
+        scores.insert(Arc::from("DECOY_PEPTIDEA"), ps(1.2, true, 0.001));
         scores.insert(Arc::from("PEPTIDEB"), ps(5.0, false, 0.001));
         scores.insert(Arc::from("DECOY_PEPTIDEB"), ps(0.8, true, 0.005));
 
@@ -1376,10 +1395,10 @@ mod tests {
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         let mut scores = HashMap::new();
-        // Target peptide has a score but FAILS the gate
+        // Target peptide FAILS the 0.01 gate (q=0.05 > 0.01)
         scores.insert(Arc::from("PEPTIDEA"), ps(5.0, false, 0.05));
-        // Decoy peptide also has "high" q-value but is NOT gated
-        scores.insert(Arc::from("DECOY_PEPTIDEA"), ps(1.0, true, 0.05));
+        // Decoy peptide has a reasonable q-value and is NOT gated
+        scores.insert(Arc::from("DECOY_PEPTIDEA"), ps(1.0, true, 0.02));
 
         let result = compute_protein_fdr(&parsimony, &scores, 0.01);
 
@@ -1401,13 +1420,13 @@ mod tests {
         // entire decoy null distribution, producing near-zero decoy winners and
         // a badly calibrated FDR.
         //
-        // This test exercises the case where 10 target proteins compete with
-        // 10 matched decoys. All target peptides pass the gate. All decoy
-        // peptides have q=1.0 (they lost peptide-level TDC and would be filtered
-        // if we gated them). With the old buggy gating, every group would be
-        // "target-only" and no decoys would win. With the correct asymmetric
-        // gate, decoys are all available, and the random-score decoys beat some
-        // of the targets → non-zero decoy winners.
+        // 10 target proteins all pass the gate with q=0.005. Some decoys have
+        // decent q-values (they won their peptide-level TDC and would survive
+        // even under a buggy q <= 0.01 decoy gate); others have q=1.0 (they
+        // lost peptide TDC and would be filtered by a buggy gate). Two of the
+        // decoys (indices 2 and 6) have q-values BETTER than their matched
+        // target's q, so they should beat the target under picked-protein
+        // competition. The test verifies at least one decoy wins.
         let library: Vec<LibraryEntry> = (0..10)
             .map(|i| {
                 make_lib_entry(
@@ -1421,20 +1440,22 @@ mod tests {
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         let mut scores = HashMap::new();
-        // All targets: passing gate (q=0.001), scores [1.0, 1.1, ... 1.9]
+        // All targets: q=0.005 (passing 0.01 gate)
         for i in 0..10 {
             scores.insert(
                 Arc::from(format!("PEP{}", i).as_str()),
-                ps(1.0 + (i as f64) * 0.1, false, 0.001),
+                ps(1.0, false, 0.005),
             );
         }
-        // All decoys: FAILING the peptide-level gate (q=1.0) with random-ish scores.
-        // A few decoys outscore some targets.
-        let decoy_svm_scores = [0.5, 0.7, 2.5, 0.9, 1.15, 0.3, 2.0, 1.05, 0.2, 0.8];
-        for (i, &decoy_score) in decoy_svm_scores.iter().enumerate() {
+        // Decoys: mostly q=1.0 (lost peptide TDC), but two have q < 0.005
+        // (they won their peptide TDC and their q beats the target's q).
+        // Decoy P2 q=0.001 beats target P2 q=0.005.
+        // Decoy P6 q=0.002 beats target P6 q=0.005.
+        let decoy_qvalues = [1.0, 1.0, 0.001, 1.0, 0.01, 1.0, 0.002, 0.01, 1.0, 1.0];
+        for (i, &decoy_q) in decoy_qvalues.iter().enumerate() {
             scores.insert(
                 Arc::from(format!("DECOY_PEP{}", i).as_str()),
-                ps(decoy_score, true, 1.0),
+                ps(0.5, true, decoy_q),
             );
         }
 
@@ -1444,28 +1465,19 @@ mod tests {
         // that got beaten by their decoy (absent from group_qvalues).
         let target_winners = result.group_qvalues.len();
 
-        // Decoys at scores 2.5 (> T3 1.3) and 2.0 (> T7 1.7) should win their pairs.
-        // Target P2 (score 1.2 vs decoy 2.5) → decoy wins
-        // Target P6 (score 1.6 vs decoy 2.0) → decoy wins
-        // Target P4 (score 1.4 vs decoy 1.15) → target wins (1.4 > 1.15)
-        // Expected: ~8 target winners, ~2 decoy winners
-        assert!(
-            target_winners < 10,
-            "at least one decoy should have won its pair (got {} target winners out of 10)",
-            target_winners
-        );
-        assert!(
-            target_winners >= 5,
-            "most targets should still win (got {} target winners)",
-            target_winners
+        // P2 and P6 should have decoys winning their pairs → 8 target winners.
+        assert_eq!(
+            target_winners, 8,
+            "exactly two decoys should win their pairs (P2, P6) → 8 target winners"
         );
     }
 
     #[test]
     fn test_picked_protein_fdr_best_not_sum() {
-        // A protein with 5 target peptides at scores [0.5, 1.0, 1.5, 2.0, 2.5] uses
-        // the MAX (2.5) as its score, not the sum (7.5). This is the key Savitski
-        // property: no length bias.
+        // A protein with 5 target peptides at q-values [0.05, 0.02, 0.01, 0.008, 0.005]
+        // uses the MIN (0.005) as its score, not the sum. This is the key Savitski
+        // property: no length bias — a protein with many weak peptides does not
+        // accumulate a better score than a protein with one strong peptide.
         let library = vec![
             make_lib_entry(1, "PEP1", vec!["P1"], false),
             make_lib_entry(2, "PEP2", vec!["P1"], false),
@@ -1476,13 +1488,13 @@ mod tests {
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         let mut scores = HashMap::new();
-        scores.insert(Arc::from("PEP1"), ps(0.5, false, 0.005));
-        scores.insert(Arc::from("PEP2"), ps(1.0, false, 0.005));
-        scores.insert(Arc::from("PEP3"), ps(1.5, false, 0.005));
-        scores.insert(Arc::from("PEP4"), ps(2.0, false, 0.005));
+        scores.insert(Arc::from("PEP1"), ps(0.5, false, 0.05));
+        scores.insert(Arc::from("PEP2"), ps(1.0, false, 0.02));
+        scores.insert(Arc::from("PEP3"), ps(1.5, false, 0.01));
+        scores.insert(Arc::from("PEP4"), ps(2.0, false, 0.008));
         scores.insert(Arc::from("PEP5"), ps(2.5, false, 0.005));
 
-        let result = compute_protein_fdr(&parsimony, &scores, 0.01);
+        let result = compute_protein_fdr(&parsimony, &scores, 0.1);
 
         let p1 = parsimony
             .groups
@@ -1491,15 +1503,16 @@ mod tests {
             .unwrap();
         let score = result.group_scores[&p1.id];
         assert!(
-            (score - 2.5).abs() < 1e-10,
-            "score should be 2.5 (max), not 7.5 (sum), got {}",
+            (score - 0.005).abs() < 1e-10,
+            "score should be 0.005 (min q), not sum or anything else, got {}",
             score
         );
     }
 
     #[test]
     fn test_picked_protein_fdr_monotonic() {
-        // Q-values must be non-decreasing as score decreases (monotonicity)
+        // Q-values must be non-decreasing as protein score (peptide q-value) increases
+        // — i.e. the strongest protein (lowest q) has the smallest protein q-value.
         let library = vec![
             make_lib_entry(1, "PA", vec!["P1"], false),
             make_lib_entry(2, "PB", vec!["P2"], false),
@@ -1509,16 +1522,16 @@ mod tests {
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         let mut scores = HashMap::new();
-        // 4 targets with decreasing scores
-        scores.insert(Arc::from("PA"), ps(5.0, false, 0.005));
-        scores.insert(Arc::from("PB"), ps(4.0, false, 0.005));
-        scores.insert(Arc::from("PC"), ps(3.0, false, 0.005));
-        scores.insert(Arc::from("PD"), ps(2.0, false, 0.005));
-        // 4 decoys with low scores
-        scores.insert(Arc::from("DECOY_PA"), ps(1.0, true, 0.005));
-        scores.insert(Arc::from("DECOY_PB"), ps(1.5, true, 0.005));
-        scores.insert(Arc::from("DECOY_PC"), ps(2.5, true, 0.005));
-        scores.insert(Arc::from("DECOY_PD"), ps(0.5, true, 0.005));
+        // 4 targets with ascending peptide q-values (PA is strongest)
+        scores.insert(Arc::from("PA"), ps(5.0, false, 0.001));
+        scores.insert(Arc::from("PB"), ps(4.0, false, 0.002));
+        scores.insert(Arc::from("PC"), ps(3.0, false, 0.003));
+        scores.insert(Arc::from("PD"), ps(2.0, false, 0.004));
+        // 4 decoys with high q-values — they all lose to their targets
+        scores.insert(Arc::from("DECOY_PA"), ps(1.0, true, 0.5));
+        scores.insert(Arc::from("DECOY_PB"), ps(1.5, true, 0.5));
+        scores.insert(Arc::from("DECOY_PC"), ps(2.5, true, 0.5));
+        scores.insert(Arc::from("DECOY_PD"), ps(0.5, true, 0.5));
 
         let result = compute_protein_fdr(&parsimony, &scores, 0.01);
 
@@ -1545,21 +1558,21 @@ mod tests {
 
     #[test]
     fn test_picked_protein_fdr_cumulative() {
-        // Controlled setup: 3 targets with scores [10, 8, 6] all winning their pairs.
-        // 1 decoy winner at score 7 (pair with a target at score 5).
+        // Controlled q-value setup:
+        //   P1: target q=0.001, decoy q=1.0   → target wins at q_score=0.001
+        //   P2: target q=0.002, decoy q=1.0   → target wins at q_score=0.002
+        //   P3: target q=0.005, decoy q=0.003 → decoy wins at q_score=0.003
+        //   P4: target q=0.004, decoy q=1.0   → target wins at q_score=0.004
         //
-        // Sorted winners (descending): T@10, T@8, D@7, T@6, (decoy@5 excluded)
+        // Sorted winners ascending by q (lowest = best):
+        //   T@0.001, T@0.002, D@0.003, T@0.004
         // Cumulative:
-        //   T@10: cum_t=1, cum_d=0, raw_q = 0/1 = 0
-        //   T@8:  cum_t=2, cum_d=0, raw_q = 0/2 = 0
-        //   D@7:  cum_t=2, cum_d=1, raw_q = 1/2 = 0.5
-        //   T@6:  cum_t=3, cum_d=1, raw_q = 1/3 ≈ 0.333
-        // After backward sweep for monotonicity:
-        //   T@6:  min_q(1/3) = 0.333
-        //   D@7:  min_q(0.333, 0.5) = 0.333
-        //   T@8:  min_q(0.333, 0) = 0
-        //   T@10: min_q(0, 0) = 0
-        // Target winners in group_qvalues: T@10=0, T@8=0, T@6=0.333
+        //   T@0.001: cum_t=1, cum_d=0, raw_q = 0/1 = 0
+        //   T@0.002: cum_t=2, cum_d=0, raw_q = 0/2 = 0
+        //   D@0.003: cum_t=2, cum_d=1, raw_q = 1/2 = 0.5
+        //   T@0.004: cum_t=3, cum_d=1, raw_q = 1/3 ≈ 0.333
+        // Backward sweep: T@0.004=0.333, D@0.003=0.333, T@0.002=0, T@0.001=0
+        // Target winners in group_qvalues: P1=0, P2=0, P4=0.333, P3 excluded.
         let library = vec![
             make_lib_entry(1, "PA", vec!["P1"], false),
             make_lib_entry(2, "PB", vec!["P2"], false),
@@ -1569,18 +1582,15 @@ mod tests {
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         let mut scores = HashMap::new();
-        // T@10, decoy doesn't beat it
-        scores.insert(Arc::from("PA"), ps(10.0, false, 0.005));
-        scores.insert(Arc::from("DECOY_PA"), ps(2.0, true, 0.005));
-        // T@8, decoy doesn't beat it
-        scores.insert(Arc::from("PB"), ps(8.0, false, 0.005));
-        scores.insert(Arc::from("DECOY_PB"), ps(3.0, true, 0.005));
-        // T@5 loses to D@7
+        scores.insert(Arc::from("PA"), ps(10.0, false, 0.001));
+        scores.insert(Arc::from("DECOY_PA"), ps(2.0, true, 1.0));
+        scores.insert(Arc::from("PB"), ps(8.0, false, 0.002));
+        scores.insert(Arc::from("DECOY_PB"), ps(3.0, true, 1.0));
+        // P3 target loses: decoy q (0.003) beats target q (0.005)
         scores.insert(Arc::from("PC"), ps(5.0, false, 0.005));
-        scores.insert(Arc::from("DECOY_PC"), ps(7.0, true, 0.005));
-        // T@6 wins
-        scores.insert(Arc::from("PD"), ps(6.0, false, 0.005));
-        scores.insert(Arc::from("DECOY_PD"), ps(1.0, true, 0.005));
+        scores.insert(Arc::from("DECOY_PC"), ps(7.0, true, 0.003));
+        scores.insert(Arc::from("PD"), ps(6.0, false, 0.004));
+        scores.insert(Arc::from("DECOY_PD"), ps(1.0, true, 1.0));
 
         let result = compute_protein_fdr(&parsimony, &scores, 0.01);
 
@@ -1630,12 +1640,12 @@ mod tests {
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         let mut scores = HashMap::new();
-        scores.insert(Arc::from("PA"), ps(3.0, false, 0.005));
-        scores.insert(Arc::from("PB"), ps(2.0, false, 0.005));
-        scores.insert(Arc::from("PC"), ps(1.0, false, 0.005));
-        scores.insert(Arc::from("DECOY_PA"), ps(0.5, true, 0.005));
-        scores.insert(Arc::from("DECOY_PB"), ps(0.5, true, 0.005));
-        scores.insert(Arc::from("DECOY_PC"), ps(0.5, true, 0.005));
+        scores.insert(Arc::from("PA"), ps(3.0, false, 0.001));
+        scores.insert(Arc::from("PB"), ps(2.0, false, 0.002));
+        scores.insert(Arc::from("PC"), ps(1.0, false, 0.003));
+        scores.insert(Arc::from("DECOY_PA"), ps(0.5, true, 0.5));
+        scores.insert(Arc::from("DECOY_PB"), ps(0.5, true, 0.5));
+        scores.insert(Arc::from("DECOY_PC"), ps(0.5, true, 0.5));
 
         let first = compute_protein_fdr(&parsimony, &scores, 0.01);
         for _ in 0..10 {
@@ -1657,9 +1667,9 @@ mod tests {
     #[test]
     fn test_picked_protein_fdr_shared_peptide_contributes_to_all() {
         // Shared peptide in All mode contributes to every protein it belongs to.
-        // P1 has unique PA (score 1.0) + shared SH (score 5.0)
-        // P2 has unique PB (score 1.0) + shared SH (score 5.0)
-        // Both proteins should get SH's score of 5.0 as a candidate for their best.
+        // P1 has unique PA (q=0.01) + shared SH (q=0.001)
+        // P2 has unique PB (q=0.01) + shared SH (q=0.001)
+        // Both proteins should get SH's q=0.001 as their best (min).
         let library = vec![
             make_lib_entry(1, "PA", vec!["P1"], false),
             make_lib_entry(2, "SH", vec!["P1", "P2"], false),
@@ -1668,12 +1678,12 @@ mod tests {
         let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
 
         let mut scores = HashMap::new();
-        scores.insert(Arc::from("PA"), ps(1.0, false, 0.005));
-        scores.insert(Arc::from("PB"), ps(1.0, false, 0.005));
-        scores.insert(Arc::from("SH"), ps(5.0, false, 0.005));
-        scores.insert(Arc::from("DECOY_PA"), ps(0.5, true, 0.005));
-        scores.insert(Arc::from("DECOY_PB"), ps(0.5, true, 0.005));
-        scores.insert(Arc::from("DECOY_SH"), ps(0.5, true, 0.005));
+        scores.insert(Arc::from("PA"), ps(1.0, false, 0.01));
+        scores.insert(Arc::from("PB"), ps(1.0, false, 0.01));
+        scores.insert(Arc::from("SH"), ps(5.0, false, 0.001));
+        scores.insert(Arc::from("DECOY_PA"), ps(0.5, true, 0.5));
+        scores.insert(Arc::from("DECOY_PB"), ps(0.5, true, 0.5));
+        scores.insert(Arc::from("DECOY_SH"), ps(0.5, true, 0.5));
 
         let result = compute_protein_fdr(&parsimony, &scores, 0.01);
 
@@ -1688,17 +1698,17 @@ mod tests {
             .find(|g| g.accessions.contains(&"P2".to_string()))
             .unwrap();
 
-        // Both groups should have score 5.0 (from shared peptide)
+        // Both groups should have score 0.001 (min q from shared peptide)
         let p1_score = result.group_scores[&p1.id];
         let p2_score = result.group_scores[&p2.id];
         assert!(
-            (p1_score - 5.0).abs() < 1e-10,
-            "P1 best-peptide score should be 5.0 from shared peptide, got {}",
+            (p1_score - 0.001).abs() < 1e-10,
+            "P1 best-peptide q should be 0.001 from shared peptide, got {}",
             p1_score
         );
         assert!(
-            (p2_score - 5.0).abs() < 1e-10,
-            "P2 best-peptide score should be 5.0 from shared peptide, got {}",
+            (p2_score - 0.001).abs() < 1e-10,
+            "P2 best-peptide q should be 0.001 from shared peptide, got {}",
             p2_score
         );
     }
