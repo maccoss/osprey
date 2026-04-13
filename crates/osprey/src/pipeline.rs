@@ -44,8 +44,8 @@ use osprey_chromatography::{
 };
 use osprey_core::{
     CoelutionFeatureSet, CoelutionScoredEntry, CwtCandidate, DecoyMethod as CoreDecoyMethod,
-    FdrEntry, FdrMethod, FragmentToleranceConfig, LibraryEntry, LibraryFragment, MS1Spectrum,
-    OspreyConfig, OspreyError, Result, Spectrum, ToleranceUnit, XICPeakBounds,
+    FdrEntry, FdrLevel, FdrMethod, FragmentToleranceConfig, LibraryEntry, LibraryFragment,
+    MS1Spectrum, OspreyConfig, OspreyError, Result, Spectrum, ToleranceUnit, XICPeakBounds,
 };
 use osprey_fdr::{
     get_pin_feature_names, percolator, pin_feature_value, MokapotRunner, NUM_PIN_FEATURES,
@@ -2659,24 +2659,91 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         );
     }
 
-    // Collect first-pass passing base_ids: any precursor passing run-level FDR
-    // in at least one replicate. The second-pass FDR will be restricted to only
-    // these precursors (+ paired decoys), ensuring complete gap-fill coverage
-    // for all final passing precursors.
+    // First-pass protein FDR (picked-protein, Savitski 2015).
+    //
+    // Runs on the full pre-compaction peptide pool so target and decoy proteins
+    // have a symmetric set of competitors. Without this, compaction would drop
+    // decoys paired with non-passing targets, leaving picked-protein with a
+    // one-sided comparison.
+    //
+    // Produces run_protein_qvalue on every FdrEntry stub. Used downstream for:
+    //   (a) protein-aware compaction (rescue borderline peptides from strong proteins)
+    //   (b) reconciliation consensus selection (strong proteins anchor consensus)
+    if !can_skip_fdr && config.protein_fdr.is_some() {
+        use osprey_fdr::protein;
+        log::info!("");
+        log::info!("First-pass protein FDR");
+
+        // Build parsimony from peptides that pass first-pass peptide FDR.
+        let detected_peptides: HashSet<String> = per_file_entries
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .filter(|e| !e.is_decoy && e.run_peptide_qvalue <= config.run_fdr)
+            .map(|e| e.modified_sequence.to_string())
+            .collect();
+        let parsimony = protein::build_protein_parsimony(
+            &library,
+            config.shared_peptides,
+            Some(&detected_peptides),
+        );
+
+        // Collect best peptide scores from the full pre-compaction pool.
+        let peptide_scores = protein::collect_best_peptide_scores(&per_file_entries);
+
+        // Run picked-protein FDR at 1 x run_fdr gate (Savitski convention).
+        let protein_fdr_result =
+            protein::compute_protein_fdr(&parsimony, &peptide_scores, config.run_fdr);
+
+        // Write first-pass protein q-values into FdrEntry.run_protein_qvalue.
+        // Do not set experiment_protein_qvalue yet — second-pass will overwrite it.
+        protein::propagate_protein_qvalues(
+            &mut per_file_entries,
+            &protein_fdr_result,
+            true,  // set_run
+            false, // set_experiment
+        );
+
+        let n_at_1pct = protein_fdr_result
+            .group_qvalues
+            .values()
+            .filter(|&&q| q <= config.run_fdr)
+            .count();
+        log::info!(
+            "First-pass protein FDR: {} target groups at {:.0}% FDR",
+            n_at_1pct,
+            config.run_fdr * 100.0,
+        );
+    }
+
+    // Collect first-pass passing base_ids for compaction.
+    //
+    // Protein-aware compaction: a peptide survives if EITHER
+    //   (a) its peptide-level q-value <= reconciliation_compaction_fdr (default 0.01), OR
+    //   (b) its first-pass protein q-value <= config.protein_fdr (typically 0.01)
+    // Rule (b) lets strong protein evidence rescue borderline peptides whose
+    // own peptide q-value is above the compaction gate. When --protein-fdr is
+    // not set, only rule (a) applies.
+    let peptide_compaction_gate = config.reconciliation_compaction_fdr;
+    let protein_compaction_gate = config.protein_fdr.unwrap_or(0.0);
     let first_pass_base_ids: HashSet<u32> = per_file_entries
         .iter()
         .flat_map(|(_, entries)| entries.iter())
-        .filter(|e| !e.is_decoy && e.run_precursor_qvalue <= config.run_fdr)
+        .filter(|e| {
+            !e.is_decoy
+                && (e.run_peptide_qvalue <= peptide_compaction_gate
+                    || (protein_compaction_gate > 0.0
+                        && e.run_protein_qvalue <= protein_compaction_gate))
+        })
         .map(|e| e.entry_id & 0x7FFF_FFFF)
         .collect();
 
     log::info!(
-        "First-pass: {} unique precursors pass run-level {:.0}% FDR across all files (compacting for reconciliation)",
+        "First-pass: {} unique precursors pass peptide-level FDR <= {:.0}% (or protein rescue)",
         first_pass_base_ids.len(),
-        config.run_fdr * 100.0,
+        peptide_compaction_gate * 100.0,
     );
 
-    // Compact FDR stubs: drop entries for precursors that didn't pass first-pass FDR.
+    // Compact FDR stubs: drop entries for precursors that didn't pass compaction.
     // Keeps passing targets + their paired decoys (by base_id).
     // The parquet_index field preserves the original row index for CWT/feature lookup.
     if !can_skip_fdr {
@@ -2817,6 +2884,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 &per_file_entries,
                 &per_file_calibrations,
                 config.reconciliation.consensus_fdr,
+                config.protein_fdr.unwrap_or(0.0),
             );
 
             if !consensus.is_empty() {
@@ -3348,38 +3416,38 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // Determine which precursors pass experiment-level FDR from lightweight FdrEntry stubs
-    let passing_precursors: HashSet<(Arc<str>, u8)> = per_file_entries
-        .iter()
-        .flat_map(|(_, entries)| entries.iter())
-        .filter(|e| !e.is_decoy && e.experiment_precursor_qvalue <= config.experiment_fdr)
-        .map(|e| (e.modified_sequence.clone(), e.charge))
-        .collect();
-
-    // Compute best experiment q-value per precursor
-    let mut best_exp_q: HashMap<(Arc<str>, u8), f64> = HashMap::new();
-    for (_, entries) in per_file_entries.iter() {
-        for e in entries {
-            if !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge))
-            {
-                best_exp_q
-                    .entry((e.modified_sequence.clone(), e.charge))
-                    .and_modify(|q| *q = q.min(e.experiment_precursor_qvalue))
-                    .or_insert(e.experiment_precursor_qvalue);
-            }
-        }
-    }
-
-    // Protein-level FDR (if enabled via --protein-fdr)
-    if let Some(protein_fdr_threshold) = config.protein_fdr {
+    // Protein parsimony (always runs) + optional second-pass picked-protein FDR.
+    //
+    // Parsimony is a cheap deterministic graph analysis: bipartite graph
+    // construction, identical-set merging, subset elimination, and razor
+    // assignment. It always runs because the protein group assignments are
+    // useful for downstream interpretation.
+    //
+    // Second-pass picked-protein FDR runs when `--protein-fdr` is set. Unlike
+    // first-pass protein FDR (which used the full pre-compaction pool for gating),
+    // this pass uses the reconciled + second-pass-scored peptides to produce
+    // AUTHORITATIVE experiment_protein_qvalue values that feed FdrLevel::Protein
+    // filtering and the protein CSV report.
+    {
         use osprey_fdr::protein;
         log::info!("");
-        log::info!("Protein-level FDR");
+        log::info!("Protein parsimony");
 
+        // Build the protein parsimony bipartite graph from peptides that pass at
+        // the peptide level. Use peptide-level FDR as the broader gate when
+        // --fdr-level is protein (protein q-values haven't been computed yet
+        // at this point in the second pass either).
+        let peptide_gate_level = match config.fdr_level {
+            FdrLevel::Protein => FdrLevel::Peptide,
+            other => other,
+        };
         let detected_peptides: HashSet<String> = per_file_entries
             .iter()
             .flat_map(|(_, entries)| entries.iter())
-            .filter(|e| !e.is_decoy && e.experiment_precursor_qvalue <= config.experiment_fdr)
+            .filter(|e| {
+                !e.is_decoy
+                    && e.effective_experiment_qvalue(peptide_gate_level) <= config.experiment_fdr
+            })
             .map(|e| e.modified_sequence.to_string())
             .collect();
 
@@ -3389,36 +3457,92 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             Some(&detected_peptides),
         );
 
-        // Collect best SVM scores from compacted stubs (after second-pass FDR)
-        let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
+        // Optional second-pass picked-protein FDR (Savitski)
+        if let Some(protein_fdr_threshold) = config.protein_fdr {
+            log::info!("Second-pass protein FDR");
+            // Collect best peptide scores from compacted + reconciled + second-pass-scored stubs
+            let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
 
-        let protein_qvalue_gate = config.run_fdr * 2.0;
-        let protein_fdr_result =
-            protein::compute_protein_fdr(&parsimony, &best_scores, protein_qvalue_gate);
+            // Savitski gate: 1 x run_fdr (same as peptide-level threshold)
+            let protein_fdr_result =
+                protein::compute_protein_fdr(&parsimony, &best_scores, config.run_fdr);
 
-        let n_passing = protein_fdr_result
-            .group_qvalues
-            .values()
-            .filter(|&&q| q <= protein_fdr_threshold)
-            .count();
-        log::info!(
-            "Protein FDR: {} protein groups at {:.0}% FDR (from {} total groups)",
-            n_passing,
-            protein_fdr_threshold * 100.0,
-            parsimony.groups.len()
-        );
+            let n_passing = protein_fdr_result
+                .group_qvalues
+                .values()
+                .filter(|&&q| q <= protein_fdr_threshold)
+                .count();
+            log::info!(
+                "Second-pass protein FDR: {} protein groups at {:.0}% FDR (from {} total groups)",
+                n_passing,
+                protein_fdr_threshold * 100.0,
+                parsimony.groups.len()
+            );
 
-        protein::propagate_protein_qvalues(&mut per_file_entries, &protein_fdr_result, false, true);
+            // Propagate protein q-values into FdrEntry stubs — experiment side only.
+            // The run side was already set by first-pass protein FDR and is used
+            // only as a gate (not for final output).
+            protein::propagate_protein_qvalues(
+                &mut per_file_entries,
+                &protein_fdr_result,
+                false, // set_run: leave first-pass values in place
+                true,  // set_experiment: AUTHORITATIVE
+            );
 
-        let protein_report_path = config.output_blib.with_extension("proteins.csv");
-        if let Err(e) = protein::write_protein_report(
-            &protein_report_path,
-            &parsimony,
-            &protein_fdr_result,
-            protein_fdr_threshold,
-            &library,
-        ) {
-            log::warn!("Failed to write protein report: {}", e);
+            let protein_report_path = config.output_blib.with_extension("proteins.csv");
+            if let Err(e) = protein::write_protein_report(
+                &protein_report_path,
+                &parsimony,
+                &protein_fdr_result,
+                protein_fdr_threshold,
+                &library,
+            ) {
+                log::warn!("Failed to write protein report: {}", e);
+            }
+        } else {
+            log::info!("  {} protein groups (no FDR)", parsimony.groups.len());
+            if matches!(config.fdr_level, FdrLevel::Protein) {
+                log::warn!(
+                    "--fdr-level protein requires --protein-fdr; falling back to peptide-level filtering"
+                );
+            }
+        }
+    }
+
+    // Determine which precursors pass experiment-level FDR from lightweight FdrEntry stubs.
+    // Uses the effective q-value for the configured FDR level:
+    //   Precursor → experiment_precursor_qvalue
+    //   Peptide   → experiment_peptide_qvalue    (default, typically most meaningful)
+    //   Protein   → experiment_protein_qvalue    (requires --protein-fdr)
+    //   Both      → max(precursor, peptide)      (most conservative)
+    //
+    // If the user selected --fdr-level protein but did not enable --protein-fdr,
+    // fall back to peptide-level filtering (warning logged above).
+    let effective_level = match (config.fdr_level, config.protein_fdr) {
+        (FdrLevel::Protein, None) => FdrLevel::Peptide,
+        (level, _) => level,
+    };
+    let passing_precursors: HashSet<(Arc<str>, u8)> = per_file_entries
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .filter(|e| {
+            !e.is_decoy && e.effective_experiment_qvalue(effective_level) <= config.experiment_fdr
+        })
+        .map(|e| (e.modified_sequence.clone(), e.charge))
+        .collect();
+
+    // Compute best experiment q-value per precursor (at the configured FDR level)
+    let mut best_exp_q: HashMap<(Arc<str>, u8), f64> = HashMap::new();
+    for (_, entries) in per_file_entries.iter() {
+        for e in entries {
+            if !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge))
+            {
+                let eq = e.effective_experiment_qvalue(effective_level);
+                best_exp_q
+                    .entry((e.modified_sequence.clone(), e.charge))
+                    .and_modify(|q| *q = q.min(eq))
+                    .or_insert(eq);
+            }
         }
     }
 
@@ -3441,8 +3565,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             let fdr_values: Vec<LightFdr> = entries
                 .iter()
                 .map(|e| LightFdr {
-                    run_qvalue: e.run_precursor_qvalue,
-                    experiment_qvalue: e.experiment_precursor_qvalue,
+                    run_qvalue: e.effective_run_qvalue(effective_level),
+                    experiment_qvalue: e.effective_experiment_qvalue(effective_level),
                     is_decoy: e.is_decoy,
                     modified_sequence: e.modified_sequence.clone(),
                     charge: e.charge,

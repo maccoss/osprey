@@ -184,22 +184,27 @@ Test data should be placed in a `example_test_data/` directory (not committed):
 
 This applies to: `percolator.rs` (fold assignment, subsampling), `calibration_ml.rs` (LDA fold assignment), and any future code that partitions entries for cross-validation.
 
-### Protein FDR Scoring
+### Protein FDR Scoring (Two-Pass Picked-Protein, Savitski 2015)
 
-**CRITICAL**: Protein FDR must use **second-pass SVM scores** collected from the compacted stubs AFTER reconciliation and second-pass Percolator FDR. The pipeline has two Percolator passes:
+Osprey implements **true picked-protein FDR** (Savitski et al. 2015, PMC4563723) in `crates/osprey-fdr/src/protein.rs::compute_protein_fdr`. Each protein is scored by its **single best peptide** (max SVM score), not by a sum — sum aggregation is length-biased (Savitski explicitly tested and rejected it). Target and decoy sides compete via **pairwise picking**: each group produces exactly one winner. Only target winners are exposed in `group_qvalues`; decoy winners are statistical machinery for cumulative FDR.
 
-1. **First-pass**: scores all entries, identifies passing precursors
-2. **Compaction**: drops non-passing entries (but keeps both target + paired decoy for each passing base_id)
-3. **Reconciliation**: corrects peak boundaries for BOTH targets and decoys
-4. **Second-pass**: re-scores all compacted entries with reconciliation-corrected features
+**Two-pass architecture** (in `pipeline.rs`):
 
-Protein FDR scores each protein group by the best SVM score among its peptides (target group) vs the best SVM score among the DECOY_ versions (decoy group). The winner enters a ranked list for TDC q-value computation.
+1. **First-pass protein FDR** runs AFTER first-pass peptide FDR but BEFORE compaction. Uses the **full pre-compaction peptide pool** so targets and decoys are symmetric. Writes `run_protein_qvalue` on FdrEntry stubs. This is used as a GATE for protein-aware compaction (rescue borderline peptides from strong proteins) and reconciliation consensus selection.
 
-**Do NOT collect protein scores before compaction.** First-pass scores do not reflect reconciliation corrections. The compacted stubs after second-pass have the correct final scores for both targets and decoys.
+2. **Compaction** retains a peptide if EITHER `run_peptide_qvalue <= reconciliation_compaction_fdr` (default 0.05) OR `run_protein_qvalue <= config.protein_fdr`. The protein rule is additive and only applies when `--protein-fdr` is set.
 
-**Do NOT use PEP for protein scoring.** PEP is estimated for peptide-level competition winners using the decoy distribution as a null model. It is only meaningful for targets. In `compute_fdr_from_stubs`, winning decoys also receive PEP values from the same estimator, giving them artificially low PEP values. Use the raw SVM discriminant score, which is on the same scale for both targets and decoys.
+3. **Reconciliation** uses first-pass protein q-values as an optional rescue gate in `compute_consensus_rts()`. Peptides from strong proteins can anchor consensus even if their own peptide q-value is borderline.
 
-This applies to: `protein.rs` (`collect_best_peptide_scores`, `compute_protein_fdr`) and `pipeline.rs` (protein FDR block placement).
+4. **Second-pass protein FDR** runs AFTER second-pass peptide FDR on the compacted + reconciled + second-pass-scored pool. Writes `experiment_protein_qvalue` (AUTHORITATIVE). Feeds `FdrLevel::Protein` filtering and the protein CSV report.
+
+**CRITICAL**: The first-pass MUST see the full pre-compaction pool. v26.1.2 had a calibration bug where protein FDR only ran after compaction, giving one-sided competition because decoys paired with non-passing targets were dropped. Keeping the first-pass picked-protein FDR before compaction preserves target/decoy symmetry.
+
+**Do NOT use PEP for protein scoring.** Protein-level PEP is intentionally not computed (`ProteinFdrResult` has no `group_pep` field, and `write_protein_report` does not emit a `protein_pep` column). Peptide-level and precursor-level PEP are unaffected.
+
+**Do NOT revert to single-pass or composite scoring.** v26.1.2's composite log-likelihood approach produced artificially low protein q-values because the aggregation inflated target scores relative to decoys.
+
+See `docs/16-protein-parsimony.md` for the full algorithm, `docs/07-fdr-control.md` for the pipeline integration, and the `test_picked_protein_fdr_*` regression tests in `protein.rs`.
 
 ## Code Style
 
@@ -354,7 +359,7 @@ Osprey uses a tiered disk-backed architecture to scale to 1000+ files:
 - Removed unused config settings: `max_candidates_per_spectrum`, `memory_limit_gb`, `custom_bin_width`, `initial_tolerance_fraction`, `use_percentile_tolerance`
 - Removed expensive unused `elution_weighted_cosine` feature computation (set to 0.0, not in PIN)
 - Split FdrEntry q-value fields: `run_qvalue`/`experiment_qvalue` replaced by 6 separate fields (run/experiment x precursor/peptide/protein) with `effective_*_qvalue(FdrLevel)` methods
-- Added `FdrLevel` enum (Precursor, Peptide, Both) for configurable output filtering via `--fdr-level`
+- Added `FdrLevel` enum (Precursor, Peptide, Protein, Both) for configurable output filtering via `--fdr-level`. Default is `Peptide`.
 - Added `SharedPeptideMode` enum (All, Razor, Unique) for protein-level shared peptide handling via `--shared-peptides`
 - Added native Rust protein parsimony in `osprey-fdr/src/protein.rs`: bipartite graph, identical-set grouping, subset elimination, greedy razor assignment, picked-protein FDR with TDC q-values
 - Added `--protein-fdr` CLI flag and `protein_fdr` config for optional protein-level FDR control
@@ -368,6 +373,10 @@ Osprey uses a tiered disk-backed architecture to scale to 1000+ files:
 - Fixed blib writer row misalignment after compaction: `LightFdr` now carries `parquet_index` for correct Parquet row lookup instead of zipping by Vec position
 - Fixed reconciliation write-back using Vec position instead of `parquet_index` after compaction, causing re-scored entries to overwrite wrong Parquet rows
 - Fixed reconciliation `determine_reconcile_action` to use apex proximity instead of boundary containment. Uses refined per-file calibration's `local_tolerance` (derived from thousands of consensus peptides) to determine whether a peak's apex is at the expected RT. CWT candidate selection also uses apex proximity, picking the closest candidate.
+- Fixed reconciliation self-fulfilling tolerance: replaced `local_tolerance` interpolation with global per-file MAD-based tolerance (`3.0 * MAD * 1.4826`, floor 0.1 min). Outlier peptides no longer inflate the tolerance at their own RT.
+- Protein parsimony now always runs (not gated by `--protein-fdr`). Only picked-protein q-value computation is optional. Peptide-to-protein-group mapping is always available for downstream filtering and interpretation. See `docs/16-protein-parsimony.md`.
+- `SharedPeptideMode::Razor` now uses an iterative greedy set cover that picks the globally-best protein group at each step, processes its claimed shared peptides in sorted order, and repeats. Deterministic (path-independent) regardless of HashMap iteration order.
+- `FdrLevel` now has a `Protein` variant (in addition to `Precursor`, `Peptide`, `Both`) and defaults to `Peptide`. When `--fdr-level protein` is selected, `passing_precursors` and `best_exp_q` read `experiment_protein_qvalue`, filtering the blib output by protein-level FDR. Requires `--protein-fdr` to be enabled; warns and falls back to peptide-level if not.
 - Two-tier logging: clean `[M:SS]` terminal output + verbose log file. `--verbose` restores full detail on terminal. `TwoTierLogger` in `logging.rs` replaces `TeeWriter` + `env_logger`.
 - Labeled progress bars: `run_search` accepts `search_label` parameter displayed in progress bar (Scoring, Re-scoring, Gap-fill CWT, Gap-fill forced)
 

@@ -104,6 +104,19 @@ When the same precursor is detected in two overlapping DIA windows, the entry wi
 
 Per-file score caches (`.scores.parquet`) are written once after scoring and reloaded on-demand for FDR, reconciliation, and blib output. The Parquet format preserves exact floating-point values (no rounding), so entries rehydrated from Parquet are bit-identical to the original in-memory entries. Column ordering and row ordering in the Parquet file match the deterministic entry order established by the sort-after-collect patterns above.
 
+### 9. Iterative Greedy Set Cover for Razor Peptide Assignment
+
+The `SharedPeptideMode::Razor` shared-peptide assignment (`crates/osprey-fdr/src/protein.rs`) resolves shared peptides to a single protein group each. A naive single-pass implementation over a `HashMap<peptide, groups>` would be non-deterministic because the iteration order leaks into the assignment order, and each assignment mutates the group's unique count that later iterations depend on.
+
+Osprey uses an **iterative greedy set cover** that makes the decision globally at each step:
+
+1. Collect shared peptides up-front and **sort alphabetically**
+2. At each round, find the protein group with the most unique peptides that still has at least one unassigned shared peptide (tiebreak: lowest group ID)
+3. That group claims **all** its unassigned shared peptides in one batch, processed in sorted order
+4. Repeat until no shared peptides remain
+
+This is path-independent: the same input always produces the same output, regardless of HashMap hashing or iteration order. Verified by `test_shared_peptides_razor_deterministic` which runs parsimony 10 times on the same input and asserts byte-identical assignments. See [16-protein-parsimony.md](16-protein-parsimony.md) for the full algorithm.
+
 ---
 
 ## Checklist for New Code
@@ -157,6 +170,7 @@ When adding new code to Osprey, verify these invariants:
 | `pipeline.rs` | Parquet round-trip preserves f64 values | No floating-point drift across reload |
 | `pipeline.rs` | Sequential re-scoring (`iter_mut()`) | Avoids nondeterministic parallel float accumulation + OOM |
 | `pipeline.rs:rt_mz_index` | Entries sorted by expected_rt within m/z bins | Binary search reproducibility |
+| `protein.rs` | Iterative greedy set cover for Razor mode | Path-independent shared peptide assignment |
 
 ---
 
@@ -179,3 +193,4 @@ diff <(sqlite3 run1.blib "SELECT * FROM RetentionTimes ORDER BY 1,2") \
 | `crates/osprey/src/pipeline.rs` | All sort-after-collect patterns, window group sorting, dedup tiebreaking |
 | `crates/osprey-scoring/src/calibration_ml.rs` | Fold assignment, competition sorting |
 | `crates/osprey-fdr/src/lib.rs` | Percolator seed, fold grouping |
+| `crates/osprey-fdr/src/protein.rs` | Iterative greedy set cover, sorted peptide processing |

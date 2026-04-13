@@ -36,7 +36,8 @@ Osprey v0.1.0 features:
 | [12 - Intermediate File Formats](12-intermediate-files.md) | Calibration JSON, spectra cache, Parquet scores, blib output |
 | [13 - Boundary Overrides & Forced Integration](13-boundary-overrides.md) | How `run_search()` handles override boundaries for consensus and reconciliation |
 | [14 - RT Alignment & Consensus Library RT](14-rt-alignment.md) | LOWESS calibration, inverse prediction, weighted median consensus RT, peak imputation |
-| [15 - Protein FDR](07-fdr-control.md#protein-level-fdr) | Protein parsimony, picked-protein FDR, shared peptide modes, protein PEP |
+| [15 - BLAS Vectorization](15-blas-vectorization.md) | Matrix operations with BLAS for performance-critical paths |
+| [16 - Protein Parsimony](16-protein-parsimony.md) | Bipartite graph, identical-set merging, subset elimination, iterative greedy razor |
 
 ---
 

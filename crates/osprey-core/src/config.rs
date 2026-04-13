@@ -76,6 +76,18 @@ pub struct OspreyConfig {
     /// FDR filtering level for output
     #[serde(default)]
     pub fdr_level: FdrLevel,
+    /// Peptide q-value threshold for compaction. Peptides with first-pass
+    /// peptide q-value at or below this threshold survive compaction and are
+    /// available for reconciliation and second-pass FDR. Default 0.01 matches
+    /// `run_fdr`. Loosening this (e.g., to 0.05) broadens the reconciliation
+    /// pool but risks FDR inflation in second-pass because Percolator re-trains
+    /// on an enriched set and may produce sharper discrimination than warranted.
+    ///
+    /// When `protein_fdr` is set, peptides whose protein group passes first-pass
+    /// protein FDR are additionally rescued through compaction regardless of
+    /// this threshold.
+    #[serde(default = "default_compaction_fdr")]
+    pub reconciliation_compaction_fdr: f64,
 
     // Performance
     /// Number of threads to use
@@ -104,6 +116,7 @@ impl Default for OspreyConfig {
             protein_fdr: None,
             shared_peptides: SharedPeptideMode::default(),
             fdr_level: FdrLevel::default(),
+            reconciliation_compaction_fdr: default_compaction_fdr(),
             n_threads: num_cpus(),
         }
     }
@@ -111,6 +124,10 @@ impl Default for OspreyConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_compaction_fdr() -> f64 {
+    0.01
 }
 
 /// Get the number of CPUs available
@@ -608,16 +625,26 @@ impl std::fmt::Display for FdrMethod {
 
 /// FDR filtering level for output
 ///
-/// Controls whether precursors must pass FDR at the precursor level,
-/// peptide level, or both.
+/// Controls whether precursors must pass FDR at the precursor, peptide,
+/// protein, or combined level. This affects:
+/// - Which precursors appear in the blib output
+/// - Which peptides feed into protein parsimony
+/// - Which entries are used for reconciliation consensus selection
+///
+/// **Default: `Peptide`** — peptide-level FDR is typically stricter than precursor
+/// level (a peptide with multiple charge states gets only one competition
+/// opportunity at the peptide level, vs one per charge at the precursor level),
+/// making it a more conservative default for biological interpretation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FdrLevel {
     /// Filter by precursor-level q-value only (modified_sequence + charge)
     Precursor,
-    /// Filter by peptide-level q-value only (modified_sequence)
-    Peptide,
-    /// Filter by max(precursor, peptide) q-value (default, most conservative)
+    /// Filter by peptide-level q-value only (modified_sequence). **Default.**
     #[default]
+    Peptide,
+    /// Filter by protein-level q-value only (requires --protein-fdr to be enabled)
+    Protein,
+    /// Filter by max(precursor, peptide) q-value — most conservative
     Both,
 }
 

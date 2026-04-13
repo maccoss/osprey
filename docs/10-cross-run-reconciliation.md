@@ -34,14 +34,25 @@ After per-run FDR (first pass):
 
 ## Step 1: Consensus Peptide Selection
 
-Target peptides passing `consensus_fdr` (default 1%) at **experiment-level FDR** are collected. Their paired decoys (DECOY_ prefix) are included so target-decoy competition remains fair in the second FDR pass.
+Target peptides qualify for consensus RT computation if they pass `consensus_fdr` (default 1%) at **run-level peptide FDR** in at least one replicate. Their paired decoys (DECOY_ prefix) are included so target-decoy competition remains fair in the second FDR pass.
 
 ```
-targets: {PEPTIDEK, ANOTHERR, ...}     ← pass experiment-level FDR
+targets: {PEPTIDEK, ANOTHERR, ...}     ← pass peptide-level FDR
 decoys:  {DECOY_PEPTIDEK, DECOY_ANOTHERR, ...}  ← paired decoys included
 ```
 
 Both sides get independent consensus RTs — decoy consensus RTs are computed from decoy detections (not from target detections) to avoid any information leakage.
+
+### Protein FDR Rescue Gate
+
+When `--protein-fdr` is set, `compute_consensus_rts()` accepts an additional `protein_fdr_threshold` parameter. A target peptide qualifies for consensus RT computation if EITHER:
+
+1. Its peptide-level q-value is ≤ `consensus_fdr`, OR
+2. Its first-pass protein group's q-value is ≤ `protein_fdr_threshold`
+
+Rule (2) lets peptides from strong proteins contribute to consensus RT computation even when their individual peptide q-values are borderline. This is particularly valuable for peptides that are weakly scored on their own but belong to a protein with many other strong peptides — the protein evidence "rescues" them into the consensus anchor set.
+
+First-pass protein FDR runs before compaction and reconciliation (see [07-fdr-control.md](07-fdr-control.md#two-pass-picked-protein-fdr-savitski-2015)), so `run_protein_qvalue` is already populated by the time `compute_consensus_rts()` is called. When `--protein-fdr` is not set, rule (2) is disabled (`protein_fdr_threshold = 0.0`).
 
 ---
 

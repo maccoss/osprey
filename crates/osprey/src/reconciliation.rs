@@ -44,16 +44,32 @@ pub struct PeptideConsensusRT {
 /// * `per_file_entries` - Per-file scored entries (after first-pass FDR)
 /// * `per_file_calibrations` - Per-file RT calibrations for inverse prediction
 /// * `consensus_fdr` - FDR threshold for selecting consensus peptides (typically 0.01)
+/// * `protein_fdr_threshold` - If > 0, rescue borderline peptides whose first-pass
+///   protein q-value is <= this threshold. Lets peptides from strong proteins
+///   contribute to consensus RT computation even if their own peptide q-value is
+///   borderline. Typically set to `config.protein_fdr`. Pass 0.0 to disable.
 pub fn compute_consensus_rts(
     per_file_entries: &[(String, Vec<FdrEntry>)],
     per_file_calibrations: &HashMap<String, RTCalibration>,
     consensus_fdr: f64,
+    protein_fdr_threshold: f64,
 ) -> Vec<PeptideConsensusRT> {
-    // 1. Collect target peptides passing run-level FDR in at least one replicate
+    // A peptide qualifies for consensus RT computation if EITHER:
+    //   (a) it passes peptide-level FDR at consensus_fdr, OR
+    //   (b) its first-pass protein group passes protein-level FDR
+    let qualifies = |entry: &FdrEntry| -> bool {
+        if entry.is_decoy {
+            return false;
+        }
+        entry.effective_run_qvalue(FdrLevel::Both) <= consensus_fdr
+            || (protein_fdr_threshold > 0.0 && entry.run_protein_qvalue <= protein_fdr_threshold)
+    };
+
+    // 1. Collect target peptides passing run-level FDR (or rescued by protein FDR)
     let mut target_peptides: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.effective_run_qvalue(FdrLevel::Both) <= consensus_fdr {
+            if qualifies(entry) {
                 target_peptides.insert(entry.modified_sequence.clone());
             }
         }
@@ -100,17 +116,17 @@ pub fn compute_consensus_rts(
     );
 
     // Collect detections for consensus peptides.
-    // For targets: only include detections that pass run-level FDR in that replicate.
-    // This ensures the consensus RT and peak width are computed from actual good
-    // detections, not noise peaks in replicates where the peptide wasn't confidently found.
+    // For targets: only include detections that qualify for consensus (pass peptide
+    // FDR or rescued by protein FDR). This ensures the consensus RT and peak width
+    // are computed from actual good detections, not noise peaks in replicates where
+    // the peptide wasn't confidently found.
     // For decoys: include all (paired to passing targets for reconciliation planning).
     for (file_name, entries) in per_file_entries {
         for entry in entries {
             let include = if entry.is_decoy {
                 decoy_peptides.contains(&*entry.modified_sequence)
             } else {
-                target_peptides.contains(&*entry.modified_sequence)
-                    && entry.effective_run_qvalue(FdrLevel::Both) <= consensus_fdr
+                target_peptides.contains(&*entry.modified_sequence) && qualifies(entry)
             };
 
             if include {
@@ -1031,7 +1047,7 @@ mod tests {
             ),
         ];
 
-        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01);
+        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01, 0.0);
 
         // Should have consensus for target and decoy
         assert_eq!(consensus.len(), 2);
@@ -1061,7 +1077,7 @@ mod tests {
             ],
         )];
 
-        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01);
+        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01, 0.0);
         assert!(
             consensus.is_empty(),
             "Non-passing peptides should be excluded"
@@ -1103,7 +1119,7 @@ mod tests {
             ),
         ];
 
-        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01);
+        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01, 0.0);
         let target = consensus.iter().find(|c| !c.is_decoy).unwrap();
         // Weighted median should be near 15.0, not pulled to 30.0
         assert!(
@@ -1149,7 +1165,7 @@ mod tests {
             ),
         ];
 
-        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01);
+        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01, 0.0);
         let target = consensus.iter().find(|c| !c.is_decoy).unwrap();
         // Bad detection excluded — only 0.2 min peaks contribute
         assert!(
