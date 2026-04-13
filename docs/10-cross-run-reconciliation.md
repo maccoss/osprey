@@ -84,6 +84,16 @@ PeptideConsensusRT {
 
 Working in library RT space is important: it decouples the consensus from run-specific RT drift. The consensus library RT can then be mapped into any run's measured RT space using that run's calibration.
 
+### Multi-Charge Reconciliation Is Inherently Cross-Run
+
+Consensus grouping keys are `(modified_sequence, is_decoy)` — **charge is not part of the key**. All detections of a peptide across every file and every charge state contribute to one shared `PeptideConsensusRT`. This has two important consequences:
+
+1. **A peptide's charge states reinforce each other across files.** If PEPTIDEK is detected as 2⁺ in file1 and 3⁺ in file2, both detections contribute (weighted by their respective `coelution_sum`) to a single consensus library RT. During planning, each `(peptide, charge, file)` triple then derives its own expected measured RT from that shared consensus via the file's refined calibration.
+
+2. **Gas-phase fractionation (GPF) is handled automatically.** In GPF each file covers a disjoint precursor m/z range, so a peptide's different charge states land in different files — its 2⁺ may only be visible in file1 and its 3⁺ only in file3. Because consensus is charge-agnostic, file1's 2⁺ detection still anchors the consensus RT that file3's 3⁺ detection is checked against, and vice versa. There is no separate "intra-file multi-charge consensus" step in GPF mode — the cross-run consensus IS the multi-charge alignment.
+
+The per-file `select_post_fdr_consensus()` function that handles multi-charge alignment within a single replicate (standard DIA case) is effectively a no-op in GPF because each file holds at most one charge state per peptide. That is correct behavior, not a bug: the inter-replicate consensus path covers the GPF case by construction.
+
 ---
 
 ## Step 3: Calibration Refit
@@ -190,6 +200,51 @@ After reconciliation, FDR is recomputed on the updated entry set:
 
 ---
 
+## Gap-Fill
+
+Reconciliation planning only acts on entries that were actually scored in each file during the first pass. If a precursor passed FDR in one replicate but was never scored in another (either because its signal fell below the pre-filter or because the scoring pass simply missed it), reconciliation alone would leave that file with no integration for that precursor, and the blib output would be missing a per-file boundary. Gap-fill closes this hole.
+
+### Identification
+
+`identify_gap_fill_targets()` walks the set of precursors `(modified_sequence, charge)` passing run-level FDR in at least one replicate, and for each file determines which of those precursors have no corresponding FdrEntry. For each missing precursor in each file it emits a `GapFillTarget` carrying:
+
+- `target_entry_id` / `decoy_entry_id` — library IDs for the target and its paired decoy
+- `expected_rt` — consensus library RT mapped through this file's refined calibration
+- `half_width` — half the consensus `median_peak_width`
+- `modified_sequence`, `charge` — for downstream routing
+
+Both target and decoy are included together so the second-pass FDR pass sees symmetric competition.
+
+### Isolation Window m/z Filter (GPF-Aware)
+
+Naively forcing an integration at every missing precursor is wrong for gas-phase fractionation. In GPF each file covers a disjoint precursor m/z range, so for many "missing" precursors the peptide is not merely below the detection threshold — the file **physically cannot observe** that m/z because no isolation window selects it for MS2. Forcing integration there would land on noise and inflate the null distribution with meaningless features.
+
+Gap-fill therefore filters candidates by per-file isolation window coverage. Each file's isolation scheme (captured from its first MS2 cycle during the calibration step) is stored as a list of `[lower_mz, upper_mz]` intervals. A candidate survives the filter only if its library precursor m/z falls inside at least one of the target file's intervals:
+
+```
+precursor_mz = library[target_entry_id].precursor_mz
+in_range = any(lo <= precursor_mz < hi for (lo, hi) in file_windows)
+if not in_range:
+    skip this candidate (filtered_by_mz += 1)
+```
+
+Skipped candidates are counted and logged at INFO level:
+
+```
+Gap-fill: 18423 candidates skipped because precursor m/z is outside
+the file's isolation windows (GPF or disjoint m/z ranges)
+```
+
+When a file has no stored isolation scheme (e.g., older calibration caches), filtering is disabled for that file as a graceful fallback — the pipeline reverts to the old "fill every missing precursor" behavior rather than silently dropping everything.
+
+The same filter also helps non-GPF acquisitions where different replicates happen to have partially disjoint isolation schemes: a precursor whose m/z lands in a gap between the target file's windows is correctly skipped even in standard DIA runs.
+
+### Scoring
+
+Surviving gap-fill targets are re-scored via `run_search()` with `boundary_overrides` set from `(expected_rt - half_width, expected_rt, expected_rt + half_width)`, using the same parallel-window path as reconciliation re-scoring. New entries are written back into `per_file_entries` and feed into the second-pass FDR computation.
+
+---
+
 ## Configuration
 
 ```yaml
@@ -262,12 +317,13 @@ If file3 had no CWT candidate with its apex within tolerance (e.g., the peptide 
 
 | File | Function | Purpose |
 |------|----------|---------|
-| `crates/osprey/src/reconciliation.rs` | `compute_consensus_rts()` | Collect detections from FdrEntry stubs, compute weighted median library RTs |
+| `crates/osprey/src/reconciliation.rs` | `compute_consensus_rts()` | Collect detections from FdrEntry stubs, compute weighted median library RTs (charge-agnostic grouping) |
 | `crates/osprey/src/reconciliation.rs` | `refit_calibration_with_consensus()` | Refit per-run LOESS from consensus points |
 | `crates/osprey/src/reconciliation.rs` | `plan_reconciliation()` | Determine Keep/UseCwtPeak/ForcedIntegration per entry |
 | `crates/osprey/src/reconciliation.rs` | `determine_reconcile_action()` | Single-entry action determination |
+| `crates/osprey/src/reconciliation.rs` | `identify_gap_fill_targets()` | Find precursors missing from each file; filter by per-file isolation window m/z coverage |
 | `crates/osprey/src/pipeline.rs` | `run_search()` | Reused for re-scoring with `boundary_overrides` parameter |
-| `crates/osprey/src/pipeline.rs` | `select_post_fdr_consensus()` | Multi-charge consensus target selection (merged with reconciliation targets) |
+| `crates/osprey/src/pipeline.rs` | `select_post_fdr_consensus()` | Intra-file multi-charge consensus (no-op in GPF; cross-run consensus handles GPF instead) |
 | `crates/osprey/src/pipeline.rs` | `load_cwt_candidates_from_parquet()` | Selective CWT-only Parquet column reader |
 | `crates/osprey/src/pipeline.rs` | reconciliation orchestration | Build overrides, load spectra, call `run_search()`, second-pass FDR |
 
@@ -279,6 +335,9 @@ If file3 had no CWT candidate with its apex within tolerance (e.g., the peptide 
 | `test_weighted_median_equal_weights` | Equal weights → regular median |
 | `test_weighted_median_skewed_weights` | Heavy weight pulls consensus toward that run |
 | `test_simple_median_odd/even` | Median computation for odd/even counts |
+| `test_gap_fill_identifies_missing_precursors` | Precursor in file1 but not file2 → file2 gets a gap-fill target |
+| `test_gap_fill_filters_precursors_outside_isolation_windows` | GPF disjoint ranges: precursor visible in file1 is NOT gap-filled in file2 when its m/z is outside file2's isolation windows |
+| `test_gap_fill_allows_precursors_inside_isolation_windows` | Overlapping replicate-style ranges: same precursor IS gap-filled in file2 when m/z falls inside the shared window |
 
 ---
 
