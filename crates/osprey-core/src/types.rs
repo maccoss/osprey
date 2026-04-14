@@ -778,11 +778,13 @@ impl FdrEntry {
     ///
     /// - `Precursor`: returns run_precursor_qvalue
     /// - `Peptide`: returns run_peptide_qvalue
+    /// - `Protein`: returns run_protein_qvalue
     /// - `Both`: returns max(run_precursor_qvalue, run_peptide_qvalue)
     pub fn effective_run_qvalue(&self, level: FdrLevel) -> f64 {
         match level {
             FdrLevel::Precursor => self.run_precursor_qvalue,
             FdrLevel::Peptide => self.run_peptide_qvalue,
+            FdrLevel::Protein => self.run_protein_qvalue,
             FdrLevel::Both => self.run_precursor_qvalue.max(self.run_peptide_qvalue),
         }
     }
@@ -791,11 +793,13 @@ impl FdrEntry {
     ///
     /// - `Precursor`: returns experiment_precursor_qvalue
     /// - `Peptide`: returns experiment_peptide_qvalue
+    /// - `Protein`: returns experiment_protein_qvalue
     /// - `Both`: returns max(experiment_precursor_qvalue, experiment_peptide_qvalue)
     pub fn effective_experiment_qvalue(&self, level: FdrLevel) -> f64 {
         match level {
             FdrLevel::Precursor => self.experiment_precursor_qvalue,
             FdrLevel::Peptide => self.experiment_peptide_qvalue,
+            FdrLevel::Protein => self.experiment_protein_qvalue,
             FdrLevel::Both => self
                 .experiment_precursor_qvalue
                 .max(self.experiment_peptide_qvalue),

@@ -514,71 +514,67 @@ pub fn run_percolator(
 
         log::info!("");
         log::info!(
-            "=== Per-file results (run-level FDR at {:.0}%) ===",
+            "=== Per-file results at {:.0}% run-level FDR ===",
             config.test_fdr * 100.0
         );
         for file_name in &sorted_files {
             let indices = &file_groups[file_name];
-            let passing: Vec<usize> = indices
+            // Count precursors passing precursor-level FDR
+            let precursor_count = indices
                 .iter()
                 .copied()
                 .filter(|&i| {
-                    !entries[i].is_decoy
-                        && results[i]
-                            .run_precursor_qvalue
-                            .max(results[i].run_peptide_qvalue)
-                            <= config.test_fdr
+                    !entries[i].is_decoy && results[i].run_precursor_qvalue <= config.test_fdr
                 })
-                .collect();
-            let precursor_count = passing
-                .iter()
-                .map(|&i| (entries[i].peptide.as_str(), entries[i].charge))
+                .map(|i| (entries[i].peptide.as_str(), entries[i].charge))
                 .collect::<HashSet<_>>()
                 .len();
-            let peptide_count = passing
+            // Count unique peptides passing peptide-level FDR
+            let peptide_count = indices
                 .iter()
-                .map(|&i| entries[i].peptide.as_str())
+                .copied()
+                .filter(|&i| {
+                    !entries[i].is_decoy && results[i].run_peptide_qvalue <= config.test_fdr
+                })
+                .map(|i| entries[i].peptide.as_str())
                 .collect::<HashSet<_>>()
                 .len();
             log::info!(
-                "  {}: {} precursors, {} peptides",
+                "  {}: {} precursors (precursor FDR), {} peptides (peptide FDR)",
                 file_name,
                 precursor_count,
                 peptide_count
             );
         }
 
-        // Log experiment-level statistics (using effective q-value = max of precursor and peptide)
-        let exp_passing: Vec<usize> = (0..results.len())
+        // Log experiment-level statistics: report precursor and peptide counts
+        // at their respective FDR levels independently, matching the two-level
+        // FDR controls applied by Percolator.
+        let exp_precursors = (0..results.len())
             .filter(|&i| {
-                !entries[i].is_decoy
-                    && results[i]
-                        .experiment_precursor_qvalue
-                        .max(results[i].experiment_peptide_qvalue)
-                        <= config.test_fdr
+                !entries[i].is_decoy && results[i].experiment_precursor_qvalue <= config.test_fdr
             })
-            .collect();
-        let exp_precursors = exp_passing
-            .iter()
-            .map(|&i| (entries[i].peptide.as_str(), entries[i].charge))
+            .map(|i| (entries[i].peptide.as_str(), entries[i].charge))
             .collect::<HashSet<_>>()
             .len();
-        let exp_peptides = exp_passing
-            .iter()
-            .map(|&i| entries[i].peptide.as_str())
+        let exp_peptides = (0..results.len())
+            .filter(|&i| {
+                !entries[i].is_decoy && results[i].experiment_peptide_qvalue <= config.test_fdr
+            })
+            .map(|i| entries[i].peptide.as_str())
             .collect::<HashSet<_>>()
             .len();
 
         log::info!("");
         log::info!(
-            "=== Experiment-level results ({:.0}% FDR) ===",
+            "=== Experiment-level results at {:.0}% FDR ===",
             config.test_fdr * 100.0
         );
         log::info!(
-            "  Experiment: {} precursors, {} peptides",
-            exp_precursors,
-            exp_peptides
+            "  {} precursors passing precursor-level FDR",
+            exp_precursors
         );
+        log::info!("  {} peptides passing peptide-level FDR", exp_peptides);
     }
 
     Ok(PercolatorResults {
@@ -1565,61 +1561,57 @@ pub fn compute_fdr_from_scores(
 
     log::info!("");
     log::info!(
-        "=== Per-file results (run-level FDR at {:.0}%) ===",
+        "=== Per-file results at {:.0}% run-level FDR ===",
         test_fdr * 100.0
     );
     for file_name in &sorted_files {
         let indices = &file_groups[file_name];
-        let passing: Vec<usize> = indices
+        // Precursors passing precursor-level FDR
+        let precursor_count = indices
             .iter()
             .copied()
-            .filter(|&i| {
-                !labels[i] && run_precursor_qvalues[i].max(run_peptide_qvalues[i]) <= test_fdr
-            })
-            .collect();
-        let precursor_count = passing
-            .iter()
-            .map(|&i| (peptides[i].as_str(), entry_ids[i] & 0x7FFFFFFF))
+            .filter(|&i| !labels[i] && run_precursor_qvalues[i] <= test_fdr)
+            .map(|i| (peptides[i].as_str(), entry_ids[i] & 0x7FFFFFFF))
             .collect::<HashSet<_>>()
             .len();
-        let peptide_count = passing
+        // Peptides passing peptide-level FDR
+        let peptide_count = indices
             .iter()
-            .map(|&i| peptides[i].as_str())
+            .copied()
+            .filter(|&i| !labels[i] && run_peptide_qvalues[i] <= test_fdr)
+            .map(|i| peptides[i].as_str())
             .collect::<HashSet<_>>()
             .len();
         log::info!(
-            "  {}: {} precursors, {} peptides",
+            "  {}: {} precursors (precursor FDR), {} peptides (peptide FDR)",
             file_name,
             precursor_count,
             peptide_count
         );
     }
 
-    // Experiment-level stats
-    let exp_passing: Vec<usize> = (0..n)
-        .filter(|&i| !labels[i] && exp_precursor_qvalues[i].max(exp_peptide_qvalues[i]) <= test_fdr)
-        .collect();
-    let exp_precursors = exp_passing
-        .iter()
-        .map(|&i| (peptides[i].as_str(), entry_ids[i] & 0x7FFFFFFF))
+    // Experiment-level stats: precursor and peptide counts at their respective FDR levels
+    let exp_precursors = (0..n)
+        .filter(|&i| !labels[i] && exp_precursor_qvalues[i] <= test_fdr)
+        .map(|i| (peptides[i].as_str(), entry_ids[i] & 0x7FFFFFFF))
         .collect::<HashSet<_>>()
         .len();
-    let exp_peptides = exp_passing
-        .iter()
-        .map(|&i| peptides[i].as_str())
+    let exp_peptides = (0..n)
+        .filter(|&i| !labels[i] && exp_peptide_qvalues[i] <= test_fdr)
+        .map(|i| peptides[i].as_str())
         .collect::<HashSet<_>>()
         .len();
 
     log::info!("");
     log::info!(
-        "=== Experiment-level results ({:.0}% FDR) ===",
+        "=== Experiment-level results at {:.0}% FDR ===",
         test_fdr * 100.0
     );
     log::info!(
-        "  Experiment: {} precursors, {} peptides",
-        exp_precursors,
-        exp_peptides
+        "  {} precursors passing precursor-level FDR",
+        exp_precursors
     );
+    log::info!("  {} peptides passing peptide-level FDR", exp_peptides);
 
     // Build results
     (0..n)
@@ -1718,7 +1710,13 @@ pub fn compute_fdr_from_stubs(
         }
     }
 
-    // Fit PEP model and apply to winners only (non-winners keep pep = 1.0)
+    // Fit PEP model and apply to winners only (non-winners keep pep = 1.0).
+    // PEP is reported per-precursor in the blib for downstream confidence,
+    // but is NOT used for protein-level FDR — picked-protein ranks by raw
+    // SVM score instead, because the PepEstimator's score range is bounded
+    // by the winner set and clamps losing decoys to ~1.0, collapsing the
+    // protein-level null distribution. See docs/07-fdr-control.md for the
+    // full history of that choice.
     let pep_estimator = PepEstimator::fit_default(&winner_scores, &winner_is_decoy);
     for (i, &(fi, li)) in winner_locations.iter().enumerate() {
         per_file_entries[fi].1[li].pep = pep_estimator.posterior_error(winner_scores[i]);
@@ -1999,35 +1997,36 @@ pub fn compute_fdr_from_stubs(
         }
     }
 
-    // Log experiment-level stats
+    // Log experiment-level stats: precursor and peptide counts at their respective
+    // FDR levels independently. Most users should look at the peptide count for
+    // a conservative estimate, since peptide-level FDR is typically stricter.
     let total_entries: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
-    let exp_passing: Vec<&FdrEntry> = per_file_entries
+    let exp_precursors = per_file_entries
         .iter()
         .flat_map(|(_, entries)| entries.iter())
-        .filter(|e| !e.is_decoy && e.effective_experiment_qvalue(FdrLevel::Both) <= test_fdr)
-        .collect();
-    let exp_precursors = exp_passing
-        .iter()
+        .filter(|e| !e.is_decoy && e.experiment_precursor_qvalue <= test_fdr)
         .map(|e| (&*e.modified_sequence, e.entry_id & 0x7FFF_FFFF))
         .collect::<HashSet<_>>()
         .len();
-    let exp_peptides = exp_passing
+    let exp_peptides = per_file_entries
         .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .filter(|e| !e.is_decoy && e.experiment_peptide_qvalue <= test_fdr)
         .map(|e| &*e.modified_sequence)
         .collect::<HashSet<_>>()
         .len();
 
     log::info!("");
     log::info!(
-        "=== Experiment-level results ({:.0}% FDR) ===",
-        test_fdr * 100.0
-    );
-    log::info!(
-        "  Experiment: {} precursors, {} peptides (from {} total entries)",
-        exp_precursors,
-        exp_peptides,
+        "=== Experiment-level results at {:.0}% FDR (from {} total entries) ===",
+        test_fdr * 100.0,
         total_entries
     );
+    log::info!(
+        "  {} precursors passing precursor-level FDR",
+        exp_precursors
+    );
+    log::info!("  {} peptides passing peptide-level FDR", exp_peptides);
 }
 
 #[cfg(test)]

@@ -138,7 +138,8 @@ struct Args {
     #[arg(long, default_value = "percolator")]
     fdr_method: String,
 
-    /// FDR filtering level: precursor, peptide, or both (default)
+    /// FDR filtering level: precursor, peptide (default), protein, or both.
+    /// Controls which q-value gates the blib output. 'protein' requires --protein-fdr.
     #[arg(long)]
     fdr_level: Option<String>,
 
@@ -255,10 +256,11 @@ fn main() -> Result<()> {
         .map(|s| match s.to_lowercase().as_str() {
             "precursor" => FdrLevel::Precursor,
             "peptide" => FdrLevel::Peptide,
+            "protein" => FdrLevel::Protein,
             "both" => FdrLevel::Both,
             other => {
-                log::warn!("Unknown FDR level '{}', defaulting to both", other);
-                FdrLevel::Both
+                log::warn!("Unknown FDR level '{}', defaulting to peptide", other);
+                FdrLevel::Peptide
             }
         });
 

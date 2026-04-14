@@ -29,7 +29,8 @@ The numbered docs roughly follow the Osprey pipeline (5 phases), with some cross
 | Doc | Summary |
 |-----|---------|
 | [06-multi-charge-consensus.md](06-multi-charge-consensus.md) | Forces charge states of the same peptide to share peak boundaries; best SVM-scoring charge state leads |
-| [07-fdr-control.md](07-fdr-control.md) | Two-level FDR (run + experiment), three methods (Percolator SVM, Mokapot, simple TDC), dual precursor+peptide q-values |
+| [07-fdr-control.md](07-fdr-control.md) | Two-level FDR (run + experiment), three methods (Percolator SVM, Mokapot, simple TDC), dual precursor+peptide q-values, `FdrLevel` filtering (precursor/peptide/protein/both) |
+| [16-protein-parsimony.md](16-protein-parsimony.md) | Always-on parsimony: bipartite graph, identical-set merging, subset elimination, iterative greedy razor set cover; optional picked-protein FDR |
 
 ### Phase 5: Cross-Run Reconciliation (multi-file)
 

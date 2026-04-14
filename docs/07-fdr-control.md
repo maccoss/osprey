@@ -17,7 +17,7 @@ FDR Control Workflow:
   5. Posterior error probabilities (PEP) via KDE + isotonic regression
   6. Compact stubs: drop non-passing entries to free ~21 GB (240-file experiments)
   7. Cross-run reconciliation + second-pass FDR
-  8. Protein FDR (optional): picked-protein competition using peptide PEP
+  8. Protein FDR (optional): picked-protein competition using peptide SVM discriminant (Savitski 2015)
   9. Blib output: load lightweight plan entries from Parquet projection
 ```
 
@@ -506,27 +506,28 @@ If FDR results are significantly higher than expected:
 
 ## FDR Filtering Level
 
-Osprey computes q-values at both precursor level (modified_sequence + charge) and peptide level (modified_sequence only), at both run and experiment scope. The `fdr_level` setting controls which level is used for output filtering.
+Osprey computes q-values at precursor level (modified_sequence + charge), peptide level (modified_sequence), and protein level (when `--protein-fdr` is enabled), at both run and experiment scope. The `fdr_level` setting controls which level is used for output filtering.
 
 ### Configuration
 
-CLI: `--fdr-level <precursor|peptide|both>`
+CLI: `--fdr-level <precursor|peptide|protein|both>`
 
 YAML:
 
 ```yaml
-fdr_level: Both  # default
+fdr_level: Peptide  # default
 ```
 
 ### Modes
 
 | Mode | Filter applied | Description |
 |------|---------------|-------------|
-| `Precursor` | precursor q-value only | Filters on modified_sequence + charge. Less conservative. |
-| `Peptide` | peptide q-value only | Filters on modified_sequence (ignoring charge). |
-| `Both` (default) | max(precursor, peptide) | A precursor must pass at both levels. Most conservative. |
+| `Precursor` | precursor q-value only | Filters on modified_sequence + charge. Least conservative. |
+| `Peptide` (default) | peptide q-value only | Filters on modified_sequence. Typically the most biologically meaningful — a peptide with multiple charges gets only one competition opportunity at peptide level, making it stricter than precursor. |
+| `Protein` | protein q-value only | Filters on protein group. Requires `--protein-fdr` to be enabled. |
+| `Both` | max(precursor, peptide) | A precursor must pass at both levels. Most conservative dual FDR. |
 
-The `Both` mode is the most conservative and matches the behavior of Percolator and Mokapot, which enforce dual precursor + peptide level FDR. Use `Precursor` if you want charge-state-specific filtering without the peptide-level constraint.
+The default is `Peptide` because peptide-level FDR produces biologically meaningful identifications — you want to know which peptides are present in the sample, not which (peptide, charge) combinations. `Both` is the most conservative and matches the behavior of Percolator/Mokapot when enforcing dual precursor + peptide FDR. Use `Precursor` if you want charge-state-specific filtering without the peptide-level constraint. Use `Protein` when you need all output to be gated by protein-level FDR (e.g., for downstream protein quantification workflows).
 
 ### How q-values are stored
 
@@ -537,96 +538,117 @@ Each `FdrEntry` stores six q-value fields:
 
 The `effective_run_qvalue(level)` and `effective_experiment_qvalue(level)` methods return the appropriate value based on the configured `fdr_level`.
 
-## Protein-Level FDR
+## Protein Parsimony and Protein-Level FDR
 
-Osprey supports optional protein-level FDR control using native Rust protein parsimony and the picked-protein approach.
+**Protein parsimony always runs** — bipartite graph construction, identical-set merging, subset elimination, and shared-peptide assignment are inexpensive deterministic steps that produce the authoritative peptide-to-protein-group mapping. Protein q-values (picked-protein FDR) are computed only when `--protein-fdr` is set.
+
+See [16-protein-parsimony.md](16-protein-parsimony.md) for the full parsimony algorithm, including the iterative greedy set cover used for `Razor` mode.
 
 ### Configuration
 
 CLI:
 
 ```bash
-# Enable protein FDR at 1%
+# Parsimony runs automatically; shared peptide mode defaults to All
+osprey -i *.mzML -l library.tsv -o results.blib
+
+# Enable protein FDR at 1% (parsimony still runs; picked-protein q-values computed)
 osprey -i *.mzML -l library.tsv -o results.blib --protein-fdr 0.01
 
 # With razor peptide assignment
 osprey -i *.mzML -l library.tsv -o results.blib --protein-fdr 0.01 --shared-peptides razor
+
+# Filter the blib output by protein-level FDR (requires --protein-fdr)
+osprey -i *.mzML -l library.tsv -o results.blib --protein-fdr 0.01 --fdr-level protein
 ```
 
 YAML:
 
 ```yaml
-protein_fdr: 0.01       # Enable protein-level FDR at 1%
+protein_fdr: 0.01       # Optional: enable picked-protein FDR at 1%
 shared_peptides: All     # Options: All (default), Razor, Unique
+fdr_level: Peptide       # Default; also accepts Precursor, Protein, Both
 ```
 
-When `protein_fdr` is not set (the default), protein-level FDR is disabled and all peptides passing precursor/peptide FDR are included in the output.
+When `protein_fdr` is not set, parsimony still runs (producing the peptide-to-protein-group mapping) but no protein q-values are computed and the blib output is gated by the selected `fdr_level` (defaults to peptide-level).
 
-### Protein Parsimony Algorithm
+### Two-Pass Picked-Protein FDR (Savitski 2015)
 
-Protein inference runs once on the spectral library at startup. Protein accessions come from `LibraryEntry.protein_ids` (loaded from DIA-NN TSV, elib, or blib libraries). No FASTA file is required.
+Osprey implements **true picked-protein FDR** (Savitski et al. 2015, PMC4563723). The algorithm runs twice in a two-pass architecture: first-pass is used for protein-aware gating during compaction and reconciliation, second-pass is authoritative for output.
 
-```
-Protein Parsimony Steps:
-  1. Build bipartite graph: peptide <-> protein from target library entries
-  2. Group proteins with identical peptide sets into protein groups
-  3. Subset elimination: remove groups whose peptides are a strict subset of another
-  4. Classify peptides as unique (1 group) or shared (2+ groups)
-  5. Apply shared peptide mode (All, Razor, or Unique)
-```
+**First-pass protein FDR** (runs before compaction, when `--protein-fdr` is set):
 
-### Shared Peptide Modes
+1. Build the parsimony graph from peptides passing first-pass peptide FDR.
+2. Call `collect_best_peptide_scores()` on the **full pre-compaction** `per_file_entries`. This gives symmetric target + decoy peptide pools for picked-protein competition. No compaction survivorship bias.
+3. Run `compute_protein_fdr()` with `qvalue_gate = config.run_fdr` (Savitski's 1% convention).
+4. Propagate protein q-values into `FdrEntry.run_protein_qvalue` via `propagate_protein_qvalues()`.
 
-| Mode | Behavior | Use case |
-|------|----------|----------|
-| `All` (default) | Shared peptides contribute to all their protein groups. Each peptide inherits the best (lowest) protein q-value among its groups. | Maximum sensitivity. |
-| `Razor` | Shared peptides assigned exclusively to the protein group with the most unique peptides (tiebreak: lowest group ID). After assignment, treated as unique. | Balanced approach. Matches MaxQuant's razor peptide logic. |
-| `Unique` | Shared peptides excluded from protein scoring and output entirely. Only unique peptides are used. | Most conservative. |
+**Protein-aware compaction** (uses first-pass protein q-values):
 
-### Protein-Level FDR (DIA-NN-style composite scoring)
+A peptide survives compaction if EITHER its peptide-level q-value is ≤ `reconciliation_compaction_fdr` (default 0.05, loosened from the old 0.01 run_fdr) OR its first-pass protein group q-value is ≤ `config.protein_fdr`. Rule (b) rescues borderline peptides whose protein has strong evidence. The loosened peptide gate alone already broadens the compaction pool; the protein rule is additive.
 
-After reconciliation and second-pass FDR, protein-level FDR is computed using a two-metric approach inspired by DIA-NN's `calculate_protein_qvalues`. Each target and decoy protein group is scored independently on two complementary metrics, and the final protein q-value is the minimum of the two metric q-values.
+**Reconciliation consensus** (uses first-pass protein q-values):
 
-**Metric 1: Composite log-likelihood (sum across peptides)**
+`compute_consensus_rts()` includes a peptide in the consensus RT computation if it passes peptide-level FDR directly OR if its first-pass protein group passes protein-level FDR. Peptides from strong proteins can anchor the consensus even if their individual peptide q-values are borderline.
 
-For each protein group, sum across its detected peptides:
-```
-score += -log(max(EPSILON, min(1.0, peptide_err * n_proteotypic_peptides)))
-```
-This naturally favors proteins with multiple confident peptides. False proteins (from ~1% peptide FDR) typically have only 1 peptide and accumulate low composite scores. True proteins with many peptides accumulate high scores. `peptide_err` is derived from the SVM discriminant score via a logistic transform: `err = 1 / (1 + exp(score))`.
+**Second-pass protein FDR** (runs after second-pass peptide FDR — AUTHORITATIVE):
 
-**Metric 2: Best peptide quality**
+1. Build the parsimony graph from peptides passing second-pass peptide FDR (at experiment level).
+2. Call `collect_best_peptide_scores()` on the compacted + reconciled + second-pass-scored `per_file_entries`. These are the reconciliation-corrected scores.
+3. Run `compute_protein_fdr()` with `qvalue_gate = config.run_fdr`.
+4. Propagate into `FdrEntry.experiment_protein_qvalue` (leaves `run_protein_qvalue` alone from first-pass).
+5. Write the protein CSV report.
+
+### Picked-Protein Algorithm (Savitski 2015)
 
 For each protein group:
-```
-best_quality = max(0, 1 - peptide_err) across all peptides
-```
-Captures the confidence of the single best-scoring peptide.
 
-**Q-value computation**
+1. **Score by best peptide**: `target_score = max(SVM score over target peptides passing gate)`, `decoy_score = max(SVM score over DECOY_-prefixed peptides passing gate)`. Uses the **single best peptide** per side, not a sum — Savitski explicitly rejected sum aggregation as length-biased.
 
-For each metric independently:
-1. Sort all target protein scores and decoy protein scores
-2. For each target protein at score s: q = n_decoys_with_score >= s / max(1, n_targets_with_score >= s)
-3. Backward sweep for monotonicity
+2. **Pairwise picking**: each group produces exactly one winner. `target_score >= decoy_score` → target wins; otherwise → decoy wins. Groups with only a target side win as target; only a decoy side win as decoy; no peptides → skip.
 
-Final protein q-value = min(q_composite, q_best_quality).
+3. **Cumulative FDR on winners**: sort by score descending (tiebreak: group_id ascending), `q = cum_decoys / max(1, cum_targets)` at each position, backward sweep for monotonicity.
 
-**Q-value gate**: Only peptides with run-level q-value <= 2x `run_fdr` contribute to protein scoring (mirrors DIA-NN's `ProteinQCalcQvalue`).
+4. **Target winners only** are exposed in `group_qvalues`. Decoy winners are statistical machinery for the FDR computation and are not written to output.
 
-**CRITICAL: Protein FDR must use second-pass SVM scores.** Reconciliation corrects peak boundaries for both targets and decoys. The second-pass Percolator re-scores all compacted entries with these corrected features. First-pass scores are stale after reconciliation. The compacted stubs contain both targets and their paired decoys (compaction preserves both sides of each base_id), so the picked-protein competition has access to both populations.
+5. **Peptide propagation**: each peptide's q-value is the best (lowest) across the protein groups it belongs to. Important for shared peptides in `SharedPeptideMode::All`.
 
-**Do NOT use PEP for protein scoring.** PEP (posterior error probability) is estimated using the decoy distribution as a null model. It is only meaningful for target entries. In `compute_fdr_from_stubs`, winning decoys also receive PEP values from the same estimator, giving them artificially low PEP that corrupts protein-level competition.
+### Why Picked-Protein?
 
-**Do NOT collect scores before compaction.** Earlier code did this as a workaround but it captures first-pass scores that don't reflect reconciliation corrections. The correct approach is to collect from the compacted stubs after the second-pass FDR has applied the final reconciliation-corrected SVM scores.
+Classical protein-level TDC suffers from decoy over-representation: as genuine targets dominate the pool, random decoy matches accumulate disproportionately in the low-scoring region. **Pairwise picking eliminates this through structural symmetry** — each target-decoy pair produces exactly one winner, so the pool of winners is balanced by construction, and classical cumulative FDR on the winner list is well-calibrated.
 
-Protein FDR is computed at experiment level (across all files) and the protein q-values are propagated to the `experiment_protein_qvalue` field on each FdrEntry stub.
+Osprey's v26.1.2 used a DIA-NN-inspired composite log-likelihood approach which was found to produce artificially low protein q-values (most target groups passing at 1% FDR with very few decoy wins). The switch to true picked-protein corrects this calibration.
 
-> **Known limitation**: With the current SVM-based scoring, target and decoy protein group score distributions separate too cleanly (the SVM is trained to maximize target/decoy separation at the precursor level, and aggregating to proteins amplifies the gap). This produces artificially low protein q-values where most target groups pass at 1% FDR. The protein report still includes meaningful per-group statistics (composite score, best quality, peptide counts), but the q-value column should be treated with caution. A follow-up release will refine the scoring metric to use a calibrated peptide error rate rather than a logistic transform of the SVM discriminant.
+### Why SVM Score (Not q-Value or PEP) — and What Actually Happens in Practice
+
+The ranking score used inside picked-protein is the **maximum peptide SVM discriminant** across the group, after gating targets on peptide q-value. We arrived at SVM by elimination, with an important empirical wrinkle we document honestly at the end.
+
+- **Peptide q-value**: ranking by `min(run_peptide_qvalue)` looks like a literal reading of Savitski's text. It collapses the decoy null distribution — about 99% of decoy peptides have `q = 1.0` because they lost peptide-level TDC, so only the ~1% of decoys that won peptide TDC contribute meaningful scores. On Stellar 3-file HeLa this produced 2 decoy winners out of 6102 (~0.03%); cumulative FDR pinned at ~0.0003 and every target trivially passed 1% FDR.
+
+- **Peptide PEP**: PEP is bounded `[0, 1]` but continuous, so in principle every decoy should contribute a meaningful score. In Osprey it collapses the null distribution too: [`PepEstimator`](../crates/osprey-ml/src/pep.rs) is fit on TDC winners only, its bins cover `[min_winner_score, max_winner_score]`, and `posterior_error()` clamps out-of-range queries to the nearest bin. Losing decoys have SVM scores below the winner range, so they all clamp to `bins[0] ≈ 1.0` regardless of their true density. Applying the estimator to all entries in the percolator code does not help because the clamping is intrinsic to the lookup. Fitting a second PepEstimator over the full entry range was considered but adds a separate PEP model just for protein FDR, and since PEP is a monotone function of SVM score the ranking would be identical to raw SVM anyway.
+
+- **SVM discriminant** (current choice): every entry — target or decoy, TDC winner or loser — has a well-defined SVM score on the same scale. On paper this preserves the decoy null end-to-end.
+
+- **Empirical outcome on Stellar (important)**: on the post-fix Stellar rebuild, SVM-based picked-protein also collapses to **2 decoy winners out of 6099**, producing the same pinned-at-zero cumulative FDR as the q-value and PEP attempts. An earlier Stellar run showed 348 decoy winners (5.8% decoy rate) and was taken as evidence that SVM scoring was well calibrated, but that run preceded the [FDR q-value mapping fix](#known-limitation-protein-level-null-collapses): `run_peptide_qvalue` was pinned at 1.0, compaction rule (a) rejected everything, the compaction pool was small, and Percolator trained on a reduced set → a less-discriminating SVM with genuine target-decoy overlap. With the bug fixed, compaction keeps the correct pool, Percolator trains on the full set, and the resulting SVM separates targets from decoys so sharply that picked-protein's protein-level null has no tail overlap. We kept SVM as the ranking score because it's the least bad option (q-value and PEP both fail for independent structural reasons that are unlikely to be revisited; SVM is at least an honest monotone score over all entries), but **on Osprey's current pipeline picked-protein FDR provides essentially no additional error control beyond peptide-level FDR**. The 6097 target groups passing at 1% are exactly the protein groups with at least one peptide passing peptide-level FDR, and the reported `protein_qvalue` values are all pinned near zero.
+
+The target-side **gate** still uses peptide q-value (`best_qvalue <= qvalue_gate`) so the reportable set matches Savitski's convention; only the ranking within that gate uses SVM.
+
+<a id="known-limitation-protein-level-null-collapses"></a>
+
+### Known Limitation: Protein-Level Null Collapses Because Decoys Are Asymmetric
+
+Savitski's picked-protein FDR works when target and decoy score distributions have tail overlap. On raw search engine scores (Andromeda, XCorr, etc.) that overlap is typically present. On Osprey's Percolator SVM output after a well-posed training run, it is not — and we think this is at least partly because **the target and decoy libraries are not drawn from the same generative process**:
+
+- **Target entries** come from the spectral library and use AI-predicted spectra and AI-predicted retention times (Carafe / equivalent). These are high-quality, learned predictions.
+- **Decoy entries** are produced by `DecoyGenerator::Reverse`: the peptide sequence is reversed, but the fragment spectrum is a *mechanical* reversal of the target's fragments (not an AI-predicted spectrum for the reversed sequence) and the retention time is the *target's* RT carried over unchanged.
+
+The result is that every feature the SVM can key on — RT residual, spectral cosine, fragment co-elution, XCorr — is systematically noisier for decoys than for targets, because the decoy side was never re-predicted by the same model that produced the targets. The SVM learns to exploit this asymmetry, and the separation it achieves is larger than it would be on a truly null decoy pool. Picked-protein FDR assumes the two sides are statistically exchangeable under the null hypothesis, and that assumption is weakened here.
+
+**Future work**: re-predict decoy spectra and retention times from the same model Carafe uses for targets (i.e. run Carafe on the reversed sequence), then use those as decoys. If the SVM can no longer exploit the predict-vs-reverse asymmetry, picked-protein is expected to produce a meaningful tail overlap and a calibrated protein FDR. Until then, the reported protein q-values should be treated as "this protein has a peptide passing peptide-level FDR", not as an independently calibrated probability.
 
 ### Decoy Protein Pairing
 
-Osprey's `DecoyGenerator` prefixes each decoy protein accession with `DECOY_` (e.g., target `P12345` becomes decoy `DECOY_P12345`). The picked-protein approach pairs target and decoy proteins by stripping this prefix, so each target protein group competes against its decoy counterpart.
+Osprey's `DecoyGenerator` prefixes each decoy protein accession with `DECOY_` (e.g., target `P12345` becomes decoy `DECOY_P12345`). The picked-protein algorithm pairs target and decoy at the **peptide** level: for each peptide in the parsimony graph, it looks up the `DECOY_`-prefixed version in the peptide score map to compute the decoy-side score for each protein group the peptide belongs to.
 
 ### Protein Report Output
 
@@ -637,15 +659,16 @@ When `--protein-fdr` is set, Osprey writes a CSV protein report (`{output}.prote
 | `protein_group` | Numeric group ID |
 | `protein_accessions` | Semicolon-separated protein accessions |
 | `gene_names` | Semicolon-separated gene names (from library) |
-| `protein_qvalue` | Protein group q-value from picked-protein TDC |
-| `protein_pep` | Protein group posterior error probability |
-| `best_score` | Best peptide SVM score for the group |
+| `protein_qvalue` | Protein group q-value from picked-protein FDR (second-pass, authoritative) |
+| `best_peptide_score` | Maximum peptide SVM discriminant score among the group's peptides (the picked-protein ranking score) |
 | `n_unique_peptides` | Number of unique (proteotypic) peptides |
 | `n_shared_peptides` | Number of shared peptides |
 | `unique_peptides` | Semicolon-separated unique peptide sequences |
 | `shared_peptides` | Semicolon-separated shared peptide sequences |
 
-Protein q-values are also propagated to each FdrEntry stub's `experiment_protein_qvalue` field for downstream filtering.
+Protein q-values are also propagated to each FdrEntry stub's `experiment_protein_qvalue` field for downstream filtering (used by `--fdr-level protein`).
+
+> **Note**: Protein-level posterior error probability (PEP) is intentionally not computed. Peptide-level and precursor-level PEP (used internally by Percolator) are unaffected and remain available.
 
 ## References
 
