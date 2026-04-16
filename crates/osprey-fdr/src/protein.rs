@@ -120,7 +120,7 @@ pub fn build_protein_parsimony(
         peptide_set_to_accessions.into_iter().collect();
 
     // Sort by peptide count descending for subset elimination
-    groups.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.0.len()));
 
     log::info!(
         "Protein parsimony: {} protein groups after identical-set merging",
