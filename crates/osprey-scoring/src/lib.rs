@@ -1967,9 +1967,7 @@ impl SpectralScorer {
                         // y-ion of ordinal n covers site seq_len - n - 1 (0-indexed)
                         match frag.annotation.ion_type {
                             IonType::B => {
-                                if ordinal <= n_sites {
-                                    covered[ordinal - 1] = true;
-                                }
+                                covered[ordinal - 1] = true;
                             }
                             IonType::Y => {
                                 let site = seq_len - ordinal - 1;
