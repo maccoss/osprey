@@ -428,10 +428,8 @@ fn strip_modifications(modified: &str) -> String {
             ']' => in_bracket = false,
             '(' => in_paren = true,
             ')' => in_paren = false,
-            _ if !in_bracket && !in_paren => {
-                if c.is_ascii_alphabetic() {
-                    result.push(c);
-                }
+            _ if !in_bracket && !in_paren && c.is_ascii_alphabetic() => {
+                result.push(c);
             }
             _ => {}
         }

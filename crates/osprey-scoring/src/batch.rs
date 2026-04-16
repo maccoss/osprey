@@ -1507,12 +1507,7 @@ pub fn sample_library_for_calibration(
         .flat_map(|row| row.iter())
         .filter(|cell| !cell.is_empty())
         .count();
-    let per_cell = if n_occupied > 0 {
-        sample_size / n_occupied
-    } else {
-        1
-    };
-    let per_cell = per_cell.max(1);
+    let per_cell = sample_size.checked_div(n_occupied).unwrap_or(1).max(1);
 
     // Deterministic stride sampling from each cell
     let offset = seed as usize;
