@@ -1,6 +1,13 @@
 # Osprey
 
+[![CI](https://github.com/maccoss/osprey/actions/workflows/ci.yml/badge.svg)](https://github.com/maccoss/osprey/actions/workflows/ci.yml)
+[![Release](https://github.com/maccoss/osprey/actions/workflows/release.yml/badge.svg)](https://github.com/maccoss/osprey/actions/workflows/release.yml)
+[![Latest Release](https://img.shields.io/github/v/release/maccoss/osprey?display_name=tag&sort=semver)](https://github.com/maccoss/osprey/releases/latest)
+[![License: Apache 2.0](https://img.shields.io/github/license/maccoss/osprey)](LICENSE)
+[![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org)
 [![GitHub Downloads](https://img.shields.io/github/downloads/maccoss/osprey/total)](https://github.com/maccoss/osprey/releases)
+[![Last Commit](https://img.shields.io/github/last-commit/maccoss/osprey)](https://github.com/maccoss/osprey/commits)
+[![GitHub Stars](https://img.shields.io/github/stars/maccoss/osprey?style=flat)](https://github.com/maccoss/osprey/stargazers)
 
 **Open-Source Peptide-Centric Search Tool Designed for Skyline Integration**
 
