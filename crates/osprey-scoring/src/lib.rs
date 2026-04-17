@@ -1680,26 +1680,40 @@ impl SpectralScorer {
             return SpectralScore::default();
         }
 
-        // L2 normalize for cosine
+        // L2 normalize for cosine. When either norm is too small (no matched
+        // observed intensity, or the library has no non-zero intensities in
+        // range) the cosine is undefined; treat that as zero but still
+        // populate the presence/counting features below. Tying all features
+        // to the norm gate caused short/low-signal peptides to report zero
+        // matches even when match_fragments clearly found some.
         let lib_norm = lib_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
         let obs_norm = obs_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
 
-        if lib_norm < 1e-10 || obs_norm < 1e-10 {
-            return SpectralScore::default();
-        }
+        let cosine_ok = lib_norm >= 1e-10 && obs_norm >= 1e-10;
 
-        let dot_product: f64 = lib_preprocessed
-            .iter()
-            .zip(obs_preprocessed.iter())
-            .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
-            .sum();
+        let dot_product: f64 = if cosine_ok {
+            lib_preprocessed
+                .iter()
+                .zip(obs_preprocessed.iter())
+                .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
+                .sum()
+        } else {
+            0.0
+        };
 
         // Pearson and Spearman use sqrt-preprocessed intensities including zeros
         // for unmatched fragments. The zeros are essential — they penalize missing
         // matches. Without them, a decoy with 2 random matches would score higher
-        // than a target with 6 matches but some noise.
-        let pearson_correlation = Self::pearson_correlation(&lib_preprocessed, &obs_preprocessed);
-        let spearman_correlation = Self::spearman_correlation(&lib_preprocessed, &obs_preprocessed);
+        // than a target with 6 matches but some noise. Gated on norm availability
+        // for the same reason cosine is.
+        let (pearson_correlation, spearman_correlation) = if cosine_ok {
+            (
+                Self::pearson_correlation(&lib_preprocessed, &obs_preprocessed),
+                Self::spearman_correlation(&lib_preprocessed, &obs_preprocessed),
+            )
+        } else {
+            (0.0, 0.0)
+        };
 
         // Counting metrics use matched fragments only (presence-based)
         let n_matched = matches.len() as u32;
@@ -2076,21 +2090,31 @@ impl SpectralScorer {
         // Apply sliding window subtraction (fast XCorr preprocessing)
         let xcorr_preprocessed = self.apply_sliding_window(&windowed);
 
-        // XCorr = sum of preprocessed experimental values at fragment bin positions
-        // This matches Comet exactly: score = sum(experimental_preprocessed[frag_bins]) * 0.005
-        // Directly sum at fragment positions — O(n_fragments) instead of O(n_bins)
-        let xcorr_raw: f32 = library
-            .fragments
-            .iter()
-            .filter_map(|frag| self.bin_config.mz_to_bin(frag.mz))
-            .map(|bin| xcorr_preprocessed[bin])
-            .sum();
+        // XCorr = sum of preprocessed experimental values at UNIQUE fragment
+        // bin positions. When two library fragments fall into the same bin,
+        // the bin's contribution must count once, not twice -- the Comet
+        // theoretical spectrum uses unit intensity per bin (see
+        // preprocess_library_for_xcorr, which sets binned[bin] = 1.0 per
+        // unique bin). Summing preprocessed[bin] once per fragment instead
+        // of once per unique bin double-counts collisions and over-scores
+        // dense fragment lists.
+        let n_bins = xcorr_preprocessed.len();
+        let mut visited = vec![false; n_bins];
+        let mut xcorr_raw: f64 = 0.0;
+        for frag in &library.fragments {
+            if let Some(bin) = self.bin_config.mz_to_bin(frag.mz) {
+                if !visited[bin] {
+                    visited[bin] = true;
+                    xcorr_raw += xcorr_preprocessed[bin] as f64;
+                }
+            }
+        }
 
         // Scale XCorr (pyXcorrDIA uses 0.005 for spectrum-centric)
-        let xcorr_scaled = xcorr_raw * 0.005f32;
+        let xcorr_scaled = xcorr_raw * 0.005;
 
         SpectralScore {
-            xcorr: xcorr_scaled as f64,
+            xcorr: xcorr_scaled,
             ..lib_cosine_score
         }
     }
@@ -2355,13 +2379,21 @@ impl SpectralScorer {
             return 0.0;
         }
         let preprocessed = self.preprocess_spectrum_for_xcorr(spectrum);
-        let xcorr_raw: f32 = library
-            .fragments
-            .iter()
-            .filter_map(|frag| self.bin_config.mz_to_bin(frag.mz))
-            .map(|bin| preprocessed[bin])
-            .sum();
-        (xcorr_raw * 0.005) as f64
+        // Unique fragment bins only (Comet theoretical spectrum uses unit
+        // intensity per bin; see preprocess_library_for_xcorr). Matches
+        // the scorer.xcorr() dedup.
+        let n_bins = preprocessed.len();
+        let mut visited = vec![false; n_bins];
+        let mut xcorr_raw: f64 = 0.0;
+        for frag in &library.fragments {
+            if let Some(bin) = self.bin_config.mz_to_bin(frag.mz) {
+                if !visited[bin] {
+                    visited[bin] = true;
+                    xcorr_raw += preprocessed[bin] as f64;
+                }
+            }
+        }
+        xcorr_raw * 0.005
     }
 
     /// Preprocess a library entry for XCorr (Comet-style)
@@ -4625,6 +4657,161 @@ mod tests {
             "Direct XCorr ({}) should match preprocessed XCorr ({})",
             direct_score.xcorr,
             xcorr_preprocessed
+        );
+    }
+
+    /// Regression guard: the low-norm gate in `lib_cosine` must NOT zero out
+    /// the presence/counting features (n_matched, consecutive_ions,
+    /// explained_intensity, fragment_coverage). Those features are derived
+    /// from `match_fragments` which runs before the norm computation; they
+    /// are independent of whether the cosine itself is computable.
+    ///
+    /// A prior implementation returned `SpectralScore::default()` as soon as
+    /// `lib_norm < 1e-10 || obs_norm < 1e-10`, silently dropping counting
+    /// features alongside the undefined cosine. This showed up as rows where
+    /// `mass_accuracy` indicated fragment matches were present but
+    /// `consecutive_ions` and `explained_intensity` reported zero — the bug
+    /// affected short/low-signal peptides in cross-implementation validation.
+    #[test]
+    fn lib_cosine_counting_features_survive_zero_norm() {
+        let scorer = SpectralScorer::new();
+
+        // Library with a b2/b3/b4 run but all zero intensities -> lib_norm = 0.
+        let mk_frag = |mz: f64, ordinal: u8| LibraryFragment {
+            mz,
+            relative_intensity: 0.0,
+            annotation: FragmentAnnotation {
+                ion_type: IonType::B,
+                ordinal,
+                charge: 1,
+                neutral_loss: None,
+            },
+        };
+        let mut entry = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
+        entry.fragments = vec![mk_frag(200.0, 2), mk_frag(300.0, 3), mk_frag(400.0, 4)];
+
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![200.0, 300.0, 400.0],
+            intensities: vec![100.0, 100.0, 100.0],
+        };
+
+        let score = scorer.lib_cosine(&spectrum, &entry);
+
+        // Cosine + correlation features are undefined with lib_norm = 0
+        // and must zero out.
+        assert_eq!(score.lib_cosine, 0.0, "cosine undefined when lib_norm = 0");
+        assert_eq!(score.pearson_correlation, 0.0);
+        assert_eq!(score.spearman_correlation, 0.0);
+
+        // Presence/counting features are independent of the cosine norm and
+        // must still reflect match_fragments output. If these are zero the
+        // caller has re-introduced the early `return SpectralScore::default()`
+        // that silently dropped counting features alongside cosine.
+        assert_eq!(
+            score.n_matched, 3,
+            "n_matched must populate independent of the norm gate"
+        );
+        assert_eq!(
+            score.consecutive_ions, 3,
+            "consecutive_ions (b2-b3-b4) must populate independent of the norm gate"
+        );
+        assert!(
+            score.fragment_coverage > 0.99,
+            "fragment_coverage must reflect matches (3/3), got {}",
+            score.fragment_coverage
+        );
+        assert!(
+            score.explained_intensity > 0.99,
+            "explained_intensity must reflect matches (3 of 3 obs peaks matched), got {}",
+            score.explained_intensity
+        );
+    }
+
+    /// Regression guard for the XCorr fragment-bin dedup invariant.
+    ///
+    /// Comet XCorr scores the dot product of an experimental preprocessed
+    /// spectrum against a theoretical spectrum with unit intensity per
+    /// bin. When two library fragments fall into the same bin, the bin's
+    /// contribution must count ONCE, not twice. The fast path
+    /// `preprocess_library_for_xcorr` + `xcorr_from_preprocessed` handles
+    /// this correctly by assigning `binned[bin] = 1.0` per unique bin.
+    /// The direct `scorer.xcorr()` / `xcorr_at_scan()` paths used to
+    /// iterate `library.fragments` and sum `preprocessed[bin]` once per
+    /// fragment, double-counting collisions.
+    ///
+    /// This test constructs a library with two fragments that land in the
+    /// same unit-resolution bin and asserts the direct path and the fast
+    /// (preprocessed) path agree. If direct double-counts again, it will
+    /// be larger than the fast path and this test panics.
+    #[test]
+    fn xcorr_dedups_fragment_bin_collisions() {
+        let scorer = SpectralScorer::new();
+
+        // Unit bins are ~1.0005 Th wide. Fragments at 500.0 and 500.5 both
+        // land in bin 500 (BIN(mass) = (int)(mass / 1.0005079 + 0.6)).
+        // Sanity-check the assumption so the test fails loudly if BinConfig
+        // ever changes bin width or offset in a way that breaks it.
+        let bin_500_0 = scorer.bin_config.mz_to_bin(500.0).unwrap();
+        let bin_500_5 = scorer.bin_config.mz_to_bin(500.5).unwrap();
+        assert_eq!(
+            bin_500_0, bin_500_5,
+            "test setup expects 500.0 and 500.5 to collide in one bin"
+        );
+
+        let mut entry = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
+        entry.fragments = vec![
+            LibraryFragment {
+                mz: 500.0,
+                relative_intensity: 100.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 500.5, // same bin as 500.0 on unit-resolution
+                relative_intensity: 50.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            // One more fragment in a distinct bin so the test exercises the
+            // mixed case (one colliding pair + one non-colliding fragment).
+            LibraryFragment {
+                mz: 400.0,
+                relative_intensity: 75.0,
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![200.0, 300.0, 400.0, 500.0, 600.0],
+            intensities: vec![500.0, 1000.0, 750.0, 1200.0, 250.0],
+        };
+
+        // Direct XCorr (the path being tested).
+        let direct_xcorr = scorer.xcorr(&spectrum, &entry).xcorr;
+
+        // Canonical preprocessed path: preprocess_library_for_xcorr assigns
+        // binned[bin] = 1.0 per unique bin (dedup by assignment), so this
+        // path is correct by construction.
+        let lib_preprocessed = scorer.preprocess_library_for_xcorr(&entry);
+        let spec_preprocessed = scorer.preprocess_spectrum_for_xcorr(&spectrum);
+        let canonical_xcorr =
+            SpectralScorer::xcorr_from_preprocessed(&spec_preprocessed, &lib_preprocessed);
+
+        assert!(
+            (direct_xcorr - canonical_xcorr).abs() < 1e-6,
+            "direct XCorr ({}) must match the preprocessed/canonical XCorr \
+             ({}). If direct is roughly canonical + preprocessed[bin_500], \
+             someone re-introduced the per-fragment sum that double-counts \
+             colliding-bin fragments. Comet XCorr counts unit intensity per \
+             bin, not per fragment.",
+            direct_xcorr,
+            canonical_xcorr,
         );
     }
 }

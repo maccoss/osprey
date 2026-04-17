@@ -1600,8 +1600,15 @@ const MAX_DIA_WINDOW_WIDTH: f64 = 25.0;
 /// which filters out alignment/zoom scans used in dynamic DIA methods.
 ///
 /// Returns: Vec of ((lower_bound, upper_bound), spectrum_indices)
+#[allow(clippy::type_complexity)]
 pub fn group_spectra_by_isolation_window(spectra: &[Spectrum]) -> Vec<((f64, f64), Vec<usize>)> {
-    let mut windows: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+    // Keyed by truncated (0.1 m/z) bounds so floating-point noise on the
+    // isolation-window center/bounds does not split one window across multiple
+    // buckets. The value carries the full-precision bounds so downstream
+    // precursor-m/z filtering uses the real boundary, not the truncated grid.
+    // (A prior implementation emitted the truncated values as the bounds,
+    // which misplaced entries sitting at the boundary into the wrong window.)
+    let mut windows: HashMap<(i64, i64), ((f64, f64), Vec<usize>)> = HashMap::new();
     let mut n_wide_skipped = 0usize;
 
     for (idx, spec) in spectra.iter().enumerate() {
@@ -1613,11 +1620,16 @@ pub fn group_spectra_by_isolation_window(spectra: &[Spectrum]) -> Vec<((f64, f64
             continue;
         }
 
+        let lower = iso.lower_bound();
+        let upper = iso.upper_bound();
         // Round window bounds to avoid floating point issues (0.1 m/z precision)
-        let lower_key = (iso.lower_bound() * 10.0) as i64;
-        let upper_key = (iso.upper_bound() * 10.0) as i64;
+        let lower_key = (lower * 10.0) as i64;
+        let upper_key = (upper * 10.0) as i64;
 
-        windows.entry((lower_key, upper_key)).or_default().push(idx);
+        let entry = windows
+            .entry((lower_key, upper_key))
+            .or_insert_with(|| ((lower, upper), Vec::new()));
+        entry.1.push(idx);
     }
 
     if n_wide_skipped > 0 {
@@ -1628,11 +1640,11 @@ pub fn group_spectra_by_isolation_window(spectra: &[Spectrum]) -> Vec<((f64, f64
         );
     }
 
-    // Convert back to f64 windows with spectrum indices, sorted by lower bound
+    // Emit full-precision bounds (preserved per-bucket) sorted by lower bound
     // for deterministic ordering regardless of HashMap iteration order.
     let mut result: Vec<((f64, f64), Vec<usize>)> = windows
         .into_iter()
-        .map(|((lower, upper), indices)| ((lower as f64 / 10.0, upper as f64 / 10.0), indices))
+        .map(|(_, (bounds, indices))| (bounds, indices))
         .collect();
     result.sort_by(|a, b| a.0 .0.total_cmp(&b.0 .0).then(a.0 .1.total_cmp(&b.0 .1)));
     result
@@ -3349,5 +3361,49 @@ mod tests {
         assert_eq!(groups[0].1.len(), 2); // 400-402: spectra 3,4
         assert_eq!(groups[1].1.len(), 1); // 500-502: spectrum 5
         assert_eq!(groups[2].1.len(), 2); // 600-602: spectra 1,2
+    }
+
+    /// Regression guard for DIA isolation-window bounds preservation.
+    ///
+    /// `group_spectra_by_isolation_window` uses truncated 0.1 m/z keys to
+    /// bucket spectra so floating-point noise on identical windows cannot
+    /// split them apart. The emitted bounds MUST be the original full-
+    /// precision values, not the truncated key reconstructed back to f64.
+    /// A prior implementation emitted the truncated values; downstream
+    /// entry-to-window filtering then used those instead of the real
+    /// bounds, and entries at the boundary (precursor m/z falling between
+    /// the truncated and real boundary) were silently misplaced into the
+    /// neighboring window.
+    #[test]
+    fn test_group_spectra_preserves_full_precision_bounds() {
+        use osprey_core::types::{IsolationWindow, Spectrum};
+
+        // symmetric(center=500.05, halfwidth=5.0) -> bounds [495.05, 505.05].
+        // Truncating each bound to 0.1 m/z (the hash key) would give back
+        // [495.0, 505.0]; the regression is visible when the two disagree.
+        let spectra = vec![
+            Spectrum::new(1, 10.0, IsolationWindow::symmetric(500.05, 5.0)),
+            Spectrum::new(2, 10.5, IsolationWindow::symmetric(500.05, 5.0)),
+        ];
+
+        let groups = group_spectra_by_isolation_window(&spectra);
+        assert_eq!(groups.len(), 1);
+        let ((lower, upper), indices) = &groups[0];
+
+        assert!(
+            (*lower - 495.05).abs() < 1e-9,
+            "expected lower = 495.05 (full precision), got {}; if this is \
+             495.0, group_spectra_by_isolation_window is emitting the \
+             truncated 0.1 m/z key instead of the per-bucket full-precision \
+             bounds, and downstream precursor-m/z filtering will misplace \
+             entries at the boundary",
+            lower
+        );
+        assert!(
+            (*upper - 505.05).abs() < 1e-9,
+            "expected upper = 505.05 (full precision), got {}",
+            upper
+        );
+        assert_eq!(indices.len(), 2);
     }
 }

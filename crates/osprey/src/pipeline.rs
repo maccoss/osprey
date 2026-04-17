@@ -266,6 +266,32 @@ fn extract_isolation_scheme(spectra: &[Spectrum]) -> Option<IsolationScheme> {
     })
 }
 
+/// Build the XCorr scorer used during calibration LDA.
+///
+/// Always uses unit-resolution bins (~2K) regardless of instrument
+/// resolution mode. Calibration only needs to discriminate target/decoy
+/// for LDA training, and unit bins are ~50x cheaper than HRAM bins
+/// (2001 vs ~100K bins per spectrum). This matches the design documented
+/// in `docs/02-calibration.md` ("Comet-style XCorr (unit resolution,
+/// BLAS sdot)") and the sibling function
+/// `osprey_scoring::batch::run_xcorr_calibration_scoring`.
+///
+/// Main search (`run_search`) is unaffected and still picks the
+/// resolution-mode-appropriate scorer: `SpectralScorer::hram()` on HRAM,
+/// `SpectralScorer::new()` on unit-resolution data.
+///
+/// The if/else remains because the two branches still differ in
+/// tolerance unit (ppm for HRAM, Da for unit-resolution); only the bin
+/// choice is unconditional.
+fn calibration_xcorr_scorer(config: &OspreyConfig) -> SpectralScorer {
+    let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
+    if is_hram {
+        SpectralScorer::new().with_tolerance_ppm(config.fragment_tolerance.tolerance)
+    } else {
+        SpectralScorer::new().with_tolerance_da(config.fragment_tolerance.tolerance)
+    }
+}
+
 /// Run the complete Osprey analysis pipeline
 fn run_calibration_discovery_windowed(
     library: &[LibraryEntry],
@@ -394,19 +420,7 @@ fn run_calibration_discovery_windowed(
         );
     }
 
-    // Set up XCorr scorer for calibration LDA. Always use unit-resolution
-    // bins (~2K) -- calibration only needs to discriminate target/decoy
-    // and the unit-bin XCorr is dramatically cheaper than HRAM (2001 vs
-    // 100K bins per spectrum). Matches the intent in
-    // run_xcorr_calibration_scoring's "Always use unit resolution bins
-    // for calibration XCorr" comment. Main search (run_search) still
-    // uses the resolution-mode bins.
-    let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
-    let xcorr_scorer = if is_hram {
-        SpectralScorer::new().with_tolerance_ppm(config.fragment_tolerance.tolerance)
-    } else {
-        SpectralScorer::new().with_tolerance_da(config.fragment_tolerance.tolerance)
-    };
+    let xcorr_scorer = calibration_xcorr_scorer(config);
 
     // Calibration sampling with retry loop
     // Attempt 1: sample calibration_sample_size targets
@@ -8214,5 +8228,54 @@ mod tests {
                 width
             );
         }
+    }
+
+    // Regression guard for the calibration XCorr bin spec in
+    // docs/02-calibration.md: "Comet-style XCorr (unit resolution, BLAS
+    // sdot)". An earlier revision of run_calibration_discovery_windowed
+    // picked SpectralScorer::hram() on HRAM data, allocating 100K bins
+    // per spectrum instead of 2001. These tests fail loudly if anyone
+    // reverts that choice in calibration_xcorr_scorer.
+
+    #[test]
+    fn calibration_scorer_uses_unit_bins_for_hram() {
+        let config = OspreyConfig {
+            resolution_mode: osprey_core::ResolutionMode::HRAM,
+            fragment_tolerance: osprey_core::FragmentToleranceConfig::hram(10.0),
+            ..Default::default()
+        };
+
+        let scorer = calibration_xcorr_scorer(&config);
+
+        assert_eq!(
+            scorer.num_bins(),
+            SpectralScorer::new().num_bins(),
+            "calibration XCorr must use unit-resolution bins on HRAM data \
+             (see docs/02-calibration.md)"
+        );
+        assert_ne!(
+            scorer.num_bins(),
+            SpectralScorer::hram().num_bins(),
+            "calibration XCorr must NOT use HRAM bins -- if this fails, \
+             someone put SpectralScorer::hram() back in \
+             calibration_xcorr_scorer"
+        );
+    }
+
+    #[test]
+    fn calibration_scorer_uses_unit_bins_for_unit_resolution() {
+        let config = OspreyConfig {
+            resolution_mode: osprey_core::ResolutionMode::UnitResolution,
+            fragment_tolerance: osprey_core::FragmentToleranceConfig::unit_resolution(0.5),
+            ..Default::default()
+        };
+
+        let scorer = calibration_xcorr_scorer(&config);
+
+        assert_eq!(
+            scorer.num_bins(),
+            SpectralScorer::new().num_bins(),
+            "calibration XCorr on unit-resolution data should stay unit bins"
+        );
     }
 }
