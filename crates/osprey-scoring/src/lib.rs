@@ -1680,26 +1680,40 @@ impl SpectralScorer {
             return SpectralScore::default();
         }
 
-        // L2 normalize for cosine
+        // L2 normalize for cosine. When either norm is too small (no matched
+        // observed intensity, or the library has no non-zero intensities in
+        // range) the cosine is undefined; treat that as zero but still
+        // populate the presence/counting features below. Tying all features
+        // to the norm gate caused short/low-signal peptides to report zero
+        // matches even when match_fragments clearly found some.
         let lib_norm = lib_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
         let obs_norm = obs_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
 
-        if lib_norm < 1e-10 || obs_norm < 1e-10 {
-            return SpectralScore::default();
-        }
+        let cosine_ok = lib_norm >= 1e-10 && obs_norm >= 1e-10;
 
-        let dot_product: f64 = lib_preprocessed
-            .iter()
-            .zip(obs_preprocessed.iter())
-            .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
-            .sum();
+        let dot_product: f64 = if cosine_ok {
+            lib_preprocessed
+                .iter()
+                .zip(obs_preprocessed.iter())
+                .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
+                .sum()
+        } else {
+            0.0
+        };
 
         // Pearson and Spearman use sqrt-preprocessed intensities including zeros
         // for unmatched fragments. The zeros are essential — they penalize missing
         // matches. Without them, a decoy with 2 random matches would score higher
-        // than a target with 6 matches but some noise.
-        let pearson_correlation = Self::pearson_correlation(&lib_preprocessed, &obs_preprocessed);
-        let spearman_correlation = Self::spearman_correlation(&lib_preprocessed, &obs_preprocessed);
+        // than a target with 6 matches but some noise. Gated on norm availability
+        // for the same reason cosine is.
+        let (pearson_correlation, spearman_correlation) = if cosine_ok {
+            (
+                Self::pearson_correlation(&lib_preprocessed, &obs_preprocessed),
+                Self::spearman_correlation(&lib_preprocessed, &obs_preprocessed),
+            )
+        } else {
+            (0.0, 0.0)
+        };
 
         // Counting metrics use matched fragments only (presence-based)
         let n_matched = matches.len() as u32;
@@ -4625,6 +4639,77 @@ mod tests {
             "Direct XCorr ({}) should match preprocessed XCorr ({})",
             direct_score.xcorr,
             xcorr_preprocessed
+        );
+    }
+
+    /// Regression guard: the low-norm gate in `lib_cosine` must NOT zero out
+    /// the presence/counting features (n_matched, consecutive_ions,
+    /// explained_intensity, fragment_coverage). Those features are derived
+    /// from `match_fragments` which runs before the norm computation; they
+    /// are independent of whether the cosine itself is computable.
+    ///
+    /// A prior implementation returned `SpectralScore::default()` as soon as
+    /// `lib_norm < 1e-10 || obs_norm < 1e-10`, silently dropping counting
+    /// features alongside the undefined cosine. This showed up as rows where
+    /// `mass_accuracy` indicated fragment matches were present but
+    /// `consecutive_ions` and `explained_intensity` reported zero — the bug
+    /// affected short/low-signal peptides in cross-implementation validation.
+    #[test]
+    fn lib_cosine_counting_features_survive_zero_norm() {
+        let scorer = SpectralScorer::new();
+
+        // Library with a b2/b3/b4 run but all zero intensities -> lib_norm = 0.
+        let mk_frag = |mz: f64, ordinal: u8| LibraryFragment {
+            mz,
+            relative_intensity: 0.0,
+            annotation: FragmentAnnotation {
+                ion_type: IonType::B,
+                ordinal,
+                charge: 1,
+                neutral_loss: None,
+            },
+        };
+        let mut entry = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
+        entry.fragments = vec![mk_frag(200.0, 2), mk_frag(300.0, 3), mk_frag(400.0, 4)];
+
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![200.0, 300.0, 400.0],
+            intensities: vec![100.0, 100.0, 100.0],
+        };
+
+        let score = scorer.lib_cosine(&spectrum, &entry);
+
+        // Cosine + correlation features are undefined with lib_norm = 0
+        // and must zero out.
+        assert_eq!(score.lib_cosine, 0.0, "cosine undefined when lib_norm = 0");
+        assert_eq!(score.pearson_correlation, 0.0);
+        assert_eq!(score.spearman_correlation, 0.0);
+
+        // Presence/counting features are independent of the cosine norm and
+        // must still reflect match_fragments output. If these are zero the
+        // caller has re-introduced the early `return SpectralScore::default()`
+        // that silently dropped counting features alongside cosine.
+        assert_eq!(
+            score.n_matched, 3,
+            "n_matched must populate independent of the norm gate"
+        );
+        assert_eq!(
+            score.consecutive_ions, 3,
+            "consecutive_ions (b2-b3-b4) must populate independent of the norm gate"
+        );
+        assert!(
+            score.fragment_coverage > 0.99,
+            "fragment_coverage must reflect matches (3/3), got {}",
+            score.fragment_coverage
+        );
+        assert!(
+            score.explained_intensity > 0.99,
+            "explained_intensity must reflect matches (3 of 3 obs peaks matched), got {}",
+            score.explained_intensity
         );
     }
 }
