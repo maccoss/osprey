@@ -1895,22 +1895,20 @@ impl SpectralScorer {
     }
 
     /// Find longest consecutive b or y ion series
-    fn longest_consecutive_ions(&self, library: &LibraryEntry, matches: &[FragmentMatch]) -> u32 {
-        // Build sets of matched b and y ion ordinals
+    fn longest_consecutive_ions(&self, _library: &LibraryEntry, matches: &[FragmentMatch]) -> u32 {
+        // Each FragmentMatch carries its own ordinal so the attribution is
+        // unambiguous. A prior implementation reverse-looked-up the library
+        // by m/z and broke on first hit, silently mis-attributing an ordinal
+        // whenever two library fragments shared a near-identical m/z (e.g.
+        // an incidental b_n / y_m collision).
         let mut matched_b: Vec<u8> = Vec::new();
         let mut matched_y: Vec<u8> = Vec::new();
 
         for m in matches {
-            // Find the corresponding library fragment annotation
-            for frag in &library.fragments {
-                if (frag.mz - m.lib_mz).abs() < 0.001 {
-                    match frag.annotation.ion_type {
-                        IonType::B => matched_b.push(frag.annotation.ordinal),
-                        IonType::Y => matched_y.push(frag.annotation.ordinal),
-                        _ => {}
-                    }
-                    break;
-                }
+            match m.ion_type {
+                IonType::B => matched_b.push(m.ordinal),
+                IonType::Y => matched_y.push(m.ordinal),
+                _ => {}
             }
         }
 
@@ -2243,6 +2241,7 @@ impl SpectralScorer {
                     lib_intensity: frag.relative_intensity,
                     obs_intensity: obs_intensity as f32,
                     ion_type: frag.annotation.ion_type,
+                    ordinal: frag.annotation.ordinal,
                 });
             }
         }
@@ -2479,6 +2478,12 @@ pub struct FragmentMatch {
     pub obs_intensity: f32,
     /// Ion type of the matched fragment (for hyperscore b/y counting)
     pub ion_type: IonType,
+    /// Ordinal of the matched fragment (e.g. 5 for b5/y5). Needed to attribute
+    /// the correct series position when two library fragments share a near-
+    /// identical m/z — previously `longest_consecutive_ions` reverse-looked-up
+    /// the library by m/z and broke on first hit, silently dropping the second
+    /// fragment's ordinal.
+    pub ordinal: u8,
 }
 
 /// Spectrum aggregator for combining spectra across peak apex region
@@ -4625,6 +4630,45 @@ mod tests {
             "Direct XCorr ({}) should match preprocessed XCorr ({})",
             direct_score.xcorr,
             xcorr_preprocessed
+        );
+    }
+
+    /// Regression guard for the ordinal-attribution fix in
+    /// `longest_consecutive_ions`. A prior implementation reverse-looked-up
+    /// the library by m/z and broke on first hit, silently mis-attributing
+    /// ordinals whenever two library fragments shared a near-identical m/z
+    /// (incidental b_n / y_m collision).
+    ///
+    /// This test constructs FragmentMatch instances with ordinals set
+    /// directly and an **empty** library. If anyone reverts to the library
+    /// m/z lookup, the empty library will drop every ordinal and the test
+    /// returns 0 instead of 4.
+    #[test]
+    fn longest_consecutive_ions_uses_match_ordinal_not_library_lookup() {
+        let scorer = SpectralScorer::new();
+        let lib = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
+        // library.fragments intentionally left empty.
+        let mk = |ordinal: u8, ion_type: IonType| FragmentMatch {
+            lib_mz: 0.0,
+            obs_mz: 0.0,
+            lib_intensity: 1.0,
+            obs_intensity: 1.0,
+            ion_type,
+            ordinal,
+        };
+        let matches = vec![
+            mk(2, IonType::B),
+            mk(3, IonType::B),
+            mk(4, IonType::B),
+            mk(5, IonType::B),
+            mk(7, IonType::Y),
+        ];
+        assert_eq!(
+            scorer.longest_consecutive_ions(&lib, &matches),
+            4,
+            "expected b2..b5 consecutive run of length 4; if this returns 0 \
+             longest_consecutive_ions is falling back to library m/z lookup \
+             instead of using FragmentMatch.ordinal"
         );
     }
 }
