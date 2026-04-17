@@ -394,10 +394,16 @@ fn run_calibration_discovery_windowed(
         );
     }
 
-    // Set up XCorr scorer with appropriate binning for calibration LDA
+    // Set up XCorr scorer for calibration LDA. Always use unit-resolution
+    // bins (~2K) -- calibration only needs to discriminate target/decoy
+    // and the unit-bin XCorr is dramatically cheaper than HRAM (2001 vs
+    // 100K bins per spectrum). Matches the intent in
+    // run_xcorr_calibration_scoring's "Always use unit resolution bins
+    // for calibration XCorr" comment. Main search (run_search) still
+    // uses the resolution-mode bins.
     let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
     let xcorr_scorer = if is_hram {
-        SpectralScorer::hram().with_tolerance_ppm(config.fragment_tolerance.tolerance)
+        SpectralScorer::new().with_tolerance_ppm(config.fragment_tolerance.tolerance)
     } else {
         SpectralScorer::new().with_tolerance_da(config.fragment_tolerance.tolerance)
     };
