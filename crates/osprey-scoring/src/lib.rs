@@ -2074,21 +2074,31 @@ impl SpectralScorer {
         // Apply sliding window subtraction (fast XCorr preprocessing)
         let xcorr_preprocessed = self.apply_sliding_window(&windowed);
 
-        // XCorr = sum of preprocessed experimental values at fragment bin positions
-        // This matches Comet exactly: score = sum(experimental_preprocessed[frag_bins]) * 0.005
-        // Directly sum at fragment positions — O(n_fragments) instead of O(n_bins)
-        let xcorr_raw: f32 = library
-            .fragments
-            .iter()
-            .filter_map(|frag| self.bin_config.mz_to_bin(frag.mz))
-            .map(|bin| xcorr_preprocessed[bin])
-            .sum();
+        // XCorr = sum of preprocessed experimental values at UNIQUE fragment
+        // bin positions. When two library fragments fall into the same bin,
+        // the bin's contribution must count once, not twice -- the Comet
+        // theoretical spectrum uses unit intensity per bin (see
+        // preprocess_library_for_xcorr, which sets binned[bin] = 1.0 per
+        // unique bin). Summing preprocessed[bin] once per fragment instead
+        // of once per unique bin double-counts collisions and over-scores
+        // dense fragment lists.
+        let n_bins = xcorr_preprocessed.len();
+        let mut visited = vec![false; n_bins];
+        let mut xcorr_raw: f64 = 0.0;
+        for frag in &library.fragments {
+            if let Some(bin) = self.bin_config.mz_to_bin(frag.mz) {
+                if !visited[bin] {
+                    visited[bin] = true;
+                    xcorr_raw += xcorr_preprocessed[bin] as f64;
+                }
+            }
+        }
 
         // Scale XCorr (pyXcorrDIA uses 0.005 for spectrum-centric)
-        let xcorr_scaled = xcorr_raw * 0.005f32;
+        let xcorr_scaled = xcorr_raw * 0.005;
 
         SpectralScore {
-            xcorr: xcorr_scaled as f64,
+            xcorr: xcorr_scaled,
             ..lib_cosine_score
         }
     }
@@ -2354,13 +2364,21 @@ impl SpectralScorer {
             return 0.0;
         }
         let preprocessed = self.preprocess_spectrum_for_xcorr(spectrum);
-        let xcorr_raw: f32 = library
-            .fragments
-            .iter()
-            .filter_map(|frag| self.bin_config.mz_to_bin(frag.mz))
-            .map(|bin| preprocessed[bin])
-            .sum();
-        (xcorr_raw * 0.005) as f64
+        // Unique fragment bins only (Comet theoretical spectrum uses unit
+        // intensity per bin; see preprocess_library_for_xcorr). Matches
+        // the scorer.xcorr() dedup.
+        let n_bins = preprocessed.len();
+        let mut visited = vec![false; n_bins];
+        let mut xcorr_raw: f64 = 0.0;
+        for frag in &library.fragments {
+            if let Some(bin) = self.bin_config.mz_to_bin(frag.mz) {
+                if !visited[bin] {
+                    visited[bin] = true;
+                    xcorr_raw += preprocessed[bin] as f64;
+                }
+            }
+        }
+        xcorr_raw * 0.005
     }
 
     /// Preprocess a library entry for XCorr (Comet-style)
@@ -4669,6 +4687,90 @@ mod tests {
             "expected b2..b5 consecutive run of length 4; if this returns 0 \
              longest_consecutive_ions is falling back to library m/z lookup \
              instead of using FragmentMatch.ordinal"
+        );
+    }
+
+    /// Regression guard for the XCorr fragment-bin dedup invariant.
+    ///
+    /// Comet XCorr scores the dot product of an experimental preprocessed
+    /// spectrum against a theoretical spectrum with unit intensity per
+    /// bin. When two library fragments fall into the same bin, the bin's
+    /// contribution must count ONCE, not twice. The fast path
+    /// `preprocess_library_for_xcorr` + `xcorr_from_preprocessed` handles
+    /// this correctly by assigning `binned[bin] = 1.0` per unique bin.
+    /// The direct `scorer.xcorr()` / `xcorr_at_scan()` paths used to
+    /// iterate `library.fragments` and sum `preprocessed[bin]` once per
+    /// fragment, double-counting collisions.
+    ///
+    /// This test constructs a library with two fragments that land in the
+    /// same unit-resolution bin and asserts the direct path and the fast
+    /// (preprocessed) path agree. If direct double-counts again, it will
+    /// be larger than the fast path and this test panics.
+    #[test]
+    fn xcorr_dedups_fragment_bin_collisions() {
+        let scorer = SpectralScorer::new();
+
+        // Unit bins are ~1.0005 Th wide. Fragments at 500.0 and 500.5 both
+        // land in bin 500 (BIN(mass) = (int)(mass / 1.0005079 + 0.6)).
+        // Sanity-check the assumption so the test fails loudly if BinConfig
+        // ever changes bin width or offset in a way that breaks it.
+        let bin_500_0 = scorer.bin_config.mz_to_bin(500.0).unwrap();
+        let bin_500_5 = scorer.bin_config.mz_to_bin(500.5).unwrap();
+        assert_eq!(
+            bin_500_0, bin_500_5,
+            "test setup expects 500.0 and 500.5 to collide in one bin"
+        );
+
+        let mut entry = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
+        entry.fragments = vec![
+            LibraryFragment {
+                mz: 500.0,
+                relative_intensity: 100.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 500.5, // same bin as 500.0 on unit-resolution
+                relative_intensity: 50.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            // One more fragment in a distinct bin so the test exercises the
+            // mixed case (one colliding pair + one non-colliding fragment).
+            LibraryFragment {
+                mz: 400.0,
+                relative_intensity: 75.0,
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![200.0, 300.0, 400.0, 500.0, 600.0],
+            intensities: vec![500.0, 1000.0, 750.0, 1200.0, 250.0],
+        };
+
+        // Direct XCorr (the path being tested).
+        let direct_xcorr = scorer.xcorr(&spectrum, &entry).xcorr;
+
+        // Canonical preprocessed path: preprocess_library_for_xcorr assigns
+        // binned[bin] = 1.0 per unique bin (dedup by assignment), so this
+        // path is correct by construction.
+        let lib_preprocessed = scorer.preprocess_library_for_xcorr(&entry);
+        let spec_preprocessed = scorer.preprocess_spectrum_for_xcorr(&spectrum);
+        let canonical_xcorr =
+            SpectralScorer::xcorr_from_preprocessed(&spec_preprocessed, &lib_preprocessed);
+
+        assert!(
+            (direct_xcorr - canonical_xcorr).abs() < 1e-6,
+            "direct XCorr ({}) must match the preprocessed/canonical XCorr \
+             ({}). If direct is roughly canonical + preprocessed[bin_500], \
+             someone re-introduced the per-fragment sum that double-counts \
+             colliding-bin fragments. Comet XCorr counts unit intensity per \
+             bin, not per fragment.",
+            direct_xcorr,
+            canonical_xcorr,
         );
     }
 }
