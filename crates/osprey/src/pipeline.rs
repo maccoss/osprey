@@ -6307,14 +6307,26 @@ fn run_search(
 
                                 // Gaussian RT penalty: peaks far from the calibration-
                                 // predicted RT are downweighted. A peak at the expected
-                                // position gets penalty=1.0; a peak 3-sigma away gets
+                                // position gets penalty=1.0; a peak 5-sigma away gets
                                 // penalty~0.01.
                                 let peak_apex_rt = ref_xic[bp.apex_index].0;
                                 let rt_residual = (peak_apex_rt - expected_rt).abs();
                                 let rt_penalty =
                                     (-rt_residual.powi(2) / (2.0 * rt_sigma.powi(2))).exp();
 
-                                (bp, coelution_score, coelution_score * rt_penalty)
+                                // Intensity tiebreaker: when two CWT candidates from
+                                // the same chromatographic peak (main peak vs shoulder)
+                                // have nearly identical coelution, the more intense peak
+                                // should win. Using log(1 + apex_intensity) keeps intensity
+                                // as a secondary factor that breaks ties without dominating.
+                                let apex_intensity = ref_xic[bp.apex_index].1;
+                                let intensity_weight = (1.0 + apex_intensity).ln();
+
+                                (
+                                    bp,
+                                    coelution_score,
+                                    coelution_score * rt_penalty * intensity_weight,
+                                )
                             })
                             .collect();
                         // Sort by RT-penalized score (third element)
