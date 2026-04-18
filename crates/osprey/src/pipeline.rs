@@ -3557,35 +3557,90 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // Determine which precursors pass experiment-level FDR from lightweight FdrEntry stubs.
-    // Uses the effective q-value for the configured FDR level:
-    //   Precursor → experiment_precursor_qvalue
-    //   Peptide   → experiment_peptide_qvalue    (default, typically most meaningful)
-    //   Protein   → experiment_protein_qvalue    (requires --protein-fdr)
-    //   Both      → max(precursor, peptide)      (most conservative)
+    // Two-stage blib output gate.
     //
-    // If the user selected --fdr-level protein but did not enable --protein-fdr,
-    // fall back to peptide-level filtering (warning logged above).
+    // Stage 1 (peptide gate): the configured --fdr-level determines which
+    // peptide identities are eligible for output.
+    //   Precursor → peptides with at least one charge state at experiment_precursor_qvalue <= threshold
+    //   Peptide   → peptides with experiment_peptide_qvalue <= threshold (default)
+    //   Protein   → peptides with experiment_protein_qvalue <= threshold
+    //   Both      → peptides with max(precursor, peptide) <= threshold
+    //
+    // Stage 2 (precursor gate): within each eligible peptide, include only
+    // charge states that individually pass experiment_precursor_qvalue <= threshold.
+    // If NO charge state of a peptide passes precursor-level FDR (possible because
+    // peptide-level FDR aggregates across charges), include the best charge state
+    // (lowest experiment_precursor_qvalue) as a representative.
+    //
+    // This prevents phantom charge states (which never passed precursor FDR)
+    // from appearing in the blib. Prior to this fix, commit 53e6a0e replaced
+    // the original FdrLevel::Both gate with config.fdr_level, letting all charge
+    // states of a peptide-level-passing peptide through regardless of their
+    // precursor-level q-value.
     let effective_level = match (config.fdr_level, config.protein_fdr) {
         (FdrLevel::Protein, None) => FdrLevel::Peptide,
         (level, _) => level,
     };
-    let passing_precursors: HashSet<(Arc<str>, u8)> = per_file_entries
+
+    // Stage 1: which peptides pass the configured FDR level?
+    let passing_peptides: HashSet<Arc<str>> = per_file_entries
         .iter()
         .flat_map(|(_, entries)| entries.iter())
         .filter(|e| {
             !e.is_decoy && e.effective_experiment_qvalue(effective_level) <= config.experiment_fdr
         })
-        .map(|e| (e.modified_sequence.clone(), e.charge))
+        .map(|e| e.modified_sequence.clone())
         .collect();
 
-    // Compute best experiment q-value per precursor (at the configured FDR level)
+    // Stage 2: within passing peptides, admit only precursors that pass
+    // precursor-level FDR, with a fallback to the best charge state per peptide.
+    let mut precursor_passing: HashSet<(Arc<str>, u8)> = HashSet::new();
+    let mut best_per_peptide: HashMap<Arc<str>, (u8, f64)> = HashMap::new();
+    for (_, entries) in per_file_entries.iter() {
+        for e in entries {
+            if e.is_decoy || !passing_peptides.contains(&e.modified_sequence) {
+                continue;
+            }
+            if e.experiment_precursor_qvalue <= config.experiment_fdr {
+                precursor_passing.insert((e.modified_sequence.clone(), e.charge));
+            }
+            best_per_peptide
+                .entry(e.modified_sequence.clone())
+                .and_modify(|(best_charge, best_q)| {
+                    if e.experiment_precursor_qvalue < *best_q {
+                        *best_charge = e.charge;
+                        *best_q = e.experiment_precursor_qvalue;
+                    }
+                })
+                .or_insert((e.charge, e.experiment_precursor_qvalue));
+        }
+    }
+    // Fallback: peptides with no precursor-passing charge state keep their best
+    let mut n_fallback = 0usize;
+    for peptide in &passing_peptides {
+        let has_passing = precursor_passing.iter().any(|(ms, _)| ms == peptide);
+        if !has_passing {
+            if let Some(&(charge, _)) = best_per_peptide.get(peptide) {
+                precursor_passing.insert((peptide.clone(), charge));
+                n_fallback += 1;
+            }
+        }
+    }
+    if n_fallback > 0 {
+        log::info!(
+            "{} peptides had no charge state passing precursor-level FDR; best charge state kept as fallback",
+            n_fallback
+        );
+    }
+    let passing_precursors = precursor_passing;
+
+    // Compute best experiment q-value per precursor (precursor-level, for blib output)
     let mut best_exp_q: HashMap<(Arc<str>, u8), f64> = HashMap::new();
     for (_, entries) in per_file_entries.iter() {
         for e in entries {
             if !e.is_decoy && passing_precursors.contains(&(e.modified_sequence.clone(), e.charge))
             {
-                let eq = e.effective_experiment_qvalue(effective_level);
+                let eq = e.experiment_precursor_qvalue;
                 best_exp_q
                     .entry((e.modified_sequence.clone(), e.charge))
                     .and_modify(|q| *q = q.min(eq))
@@ -3613,8 +3668,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             let fdr_values: Vec<LightFdr> = entries
                 .iter()
                 .map(|e| LightFdr {
-                    run_qvalue: e.effective_run_qvalue(effective_level),
-                    experiment_qvalue: e.effective_experiment_qvalue(effective_level),
+                    run_qvalue: e.effective_run_qvalue(FdrLevel::Both),
+                    experiment_qvalue: e.effective_experiment_qvalue(FdrLevel::Both),
                     is_decoy: e.is_decoy,
                     modified_sequence: e.modified_sequence.clone(),
                     charge: e.charge,

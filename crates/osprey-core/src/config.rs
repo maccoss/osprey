@@ -631,16 +631,16 @@ impl std::fmt::Display for FdrMethod {
 /// - Which peptides feed into protein parsimony
 /// - Which entries are used for reconciliation consensus selection
 ///
-/// **Default: `Peptide`** — peptide-level FDR is typically stricter than precursor
-/// level (a peptide with multiple charge states gets only one competition
-/// opportunity at the peptide level, vs one per charge at the precursor level),
-/// making it a more conservative default for biological interpretation.
+/// **Default: `Precursor`** — precursor-level FDR controls which charge states
+/// appear in the blib output. The two-stage blib gate always enforces
+/// precursor-level FDR within each eligible peptide regardless of this setting;
+/// `--fdr-level` controls which peptide identities are eligible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FdrLevel {
-    /// Filter by precursor-level q-value only (modified_sequence + charge)
-    Precursor,
-    /// Filter by peptide-level q-value only (modified_sequence). **Default.**
+    /// Filter by precursor-level q-value only (modified_sequence + charge). **Default.**
     #[default]
+    Precursor,
+    /// Filter by peptide-level q-value only (modified_sequence).
     Peptide,
     /// Filter by protein-level q-value only (requires --protein-fdr to be enabled)
     Protein,
