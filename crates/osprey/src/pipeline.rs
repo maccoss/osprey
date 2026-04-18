@@ -8317,6 +8317,251 @@ mod tests {
         );
     }
 
+    /// Regression test: blib output must enforce precursor-level FDR within
+    /// each eligible peptide, not just the configured --fdr-level gate.
+    ///
+    /// Commit 53e6a0e replaced FdrLevel::Both with config.fdr_level in the
+    /// passing_precursors gate, which with the default FdrLevel::Peptide let
+    /// charge states that fail precursor-level FDR into the blib. On Stellar
+    /// this inflated the blib from ~50K to ~58K precursors with some having
+    /// no ID line in any replicate.
+    ///
+    /// This test creates a peptide with two charge states: 2+ passes both
+    /// precursor and peptide FDR, 3+ fails precursor FDR but passes peptide
+    /// FDR (same peptide_q, different precursor_q). Under the two-stage gate,
+    /// only the 2+ should be included. The 3+ should NOT appear.
+    #[test]
+    fn test_blib_gate_excludes_charge_states_failing_precursor_fdr() {
+        let per_file_entries: Vec<(String, Vec<FdrEntry>)> = vec![(
+            "file1".to_string(),
+            vec![
+                // PEPTIDEK+2: passes both precursor (0.005) and peptide (0.003)
+                FdrEntry {
+                    entry_id: 1,
+                    parquet_index: 0,
+                    is_decoy: false,
+                    charge: 2,
+                    scan_number: 100,
+                    apex_rt: 10.0,
+                    start_rt: 9.5,
+                    end_rt: 10.5,
+                    coelution_sum: 8.0,
+                    score: 3.0,
+                    run_precursor_qvalue: 0.005,
+                    run_peptide_qvalue: 0.003,
+                    run_protein_qvalue: 1.0,
+                    experiment_precursor_qvalue: 0.005,
+                    experiment_peptide_qvalue: 0.003,
+                    experiment_protein_qvalue: 1.0,
+                    pep: 0.005,
+                    modified_sequence: Arc::from("PEPTIDEK"),
+                },
+                // PEPTIDEK+3: FAILS precursor (0.05) but passes peptide (0.003)
+                FdrEntry {
+                    entry_id: 2,
+                    parquet_index: 1,
+                    is_decoy: false,
+                    charge: 3,
+                    scan_number: 100,
+                    apex_rt: 10.1,
+                    start_rt: 9.6,
+                    end_rt: 10.6,
+                    coelution_sum: 2.0,
+                    score: 1.0,
+                    run_precursor_qvalue: 0.05,
+                    run_peptide_qvalue: 0.003,
+                    run_protein_qvalue: 1.0,
+                    experiment_precursor_qvalue: 0.05,
+                    experiment_peptide_qvalue: 0.003,
+                    experiment_protein_qvalue: 1.0,
+                    pep: 0.05,
+                    modified_sequence: Arc::from("PEPTIDEK"),
+                },
+            ],
+        )];
+
+        let experiment_fdr = 0.01;
+
+        // Stage 1: peptides passing the configured level (Peptide)
+        let effective_level = FdrLevel::Peptide;
+        let passing_peptides: HashSet<Arc<str>> = per_file_entries
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .filter(|e| {
+                !e.is_decoy && e.effective_experiment_qvalue(effective_level) <= experiment_fdr
+            })
+            .map(|e| e.modified_sequence.clone())
+            .collect();
+
+        // PEPTIDEK passes peptide-level (experiment_peptide_qvalue = 0.003 <= 0.01)
+        assert!(
+            passing_peptides.contains(&Arc::from("PEPTIDEK") as &Arc<str>),
+            "PEPTIDEK should pass peptide-level FDR"
+        );
+
+        // Stage 2: within passing peptides, only precursor-passing charge states
+        let mut precursor_passing: HashSet<(Arc<str>, u8)> = HashSet::new();
+        let mut best_per_peptide: HashMap<Arc<str>, (u8, f64)> = HashMap::new();
+        for (_, entries) in per_file_entries.iter() {
+            for e in entries {
+                if e.is_decoy || !passing_peptides.contains(&e.modified_sequence) {
+                    continue;
+                }
+                if e.experiment_precursor_qvalue <= experiment_fdr {
+                    precursor_passing.insert((e.modified_sequence.clone(), e.charge));
+                }
+                best_per_peptide
+                    .entry(e.modified_sequence.clone())
+                    .and_modify(|(best_charge, best_q)| {
+                        if e.experiment_precursor_qvalue < *best_q {
+                            *best_charge = e.charge;
+                            *best_q = e.experiment_precursor_qvalue;
+                        }
+                    })
+                    .or_insert((e.charge, e.experiment_precursor_qvalue));
+            }
+        }
+        for peptide in &passing_peptides {
+            let has_passing = precursor_passing.iter().any(|(ms, _)| ms == peptide);
+            if !has_passing {
+                if let Some(&(charge, _)) = best_per_peptide.get(peptide) {
+                    precursor_passing.insert((peptide.clone(), charge));
+                }
+            }
+        }
+
+        // 2+ should be in (passes precursor FDR)
+        assert!(
+            precursor_passing.contains(&(Arc::from("PEPTIDEK"), 2u8)),
+            "PEPTIDEK+2 should pass the two-stage gate (precursor_q=0.005 <= 0.01)"
+        );
+        // 3+ should NOT be in (fails precursor FDR at 0.05 > 0.01)
+        assert!(
+            !precursor_passing.contains(&(Arc::from("PEPTIDEK"), 3u8)),
+            "PEPTIDEK+3 should be excluded (precursor_q=0.05 > 0.01) — \
+             this was the regression from commit 53e6a0e"
+        );
+    }
+
+    /// Regression test: when no charge state of a peptide passes precursor-level
+    /// FDR but the peptide passes peptide-level FDR, the best charge state should
+    /// be kept as a fallback representative.
+    #[test]
+    fn test_blib_gate_fallback_keeps_best_charge_state() {
+        let per_file_entries: Vec<(String, Vec<FdrEntry>)> = vec![(
+            "file1".to_string(),
+            vec![
+                // WEAKPEPTIDE+2: fails precursor (0.02) but passes peptide (0.008)
+                FdrEntry {
+                    entry_id: 1,
+                    parquet_index: 0,
+                    is_decoy: false,
+                    charge: 2,
+                    scan_number: 100,
+                    apex_rt: 10.0,
+                    start_rt: 9.5,
+                    end_rt: 10.5,
+                    coelution_sum: 5.0,
+                    score: 2.0,
+                    run_precursor_qvalue: 0.02,
+                    run_peptide_qvalue: 0.008,
+                    run_protein_qvalue: 1.0,
+                    experiment_precursor_qvalue: 0.02,
+                    experiment_peptide_qvalue: 0.008,
+                    experiment_protein_qvalue: 1.0,
+                    pep: 0.02,
+                    modified_sequence: Arc::from("WEAKPEPTIDE"),
+                },
+                // WEAKPEPTIDE+3: also fails precursor (0.04), worse than 2+
+                FdrEntry {
+                    entry_id: 2,
+                    parquet_index: 1,
+                    is_decoy: false,
+                    charge: 3,
+                    scan_number: 100,
+                    apex_rt: 10.1,
+                    start_rt: 9.6,
+                    end_rt: 10.6,
+                    coelution_sum: 2.0,
+                    score: 1.0,
+                    run_precursor_qvalue: 0.04,
+                    run_peptide_qvalue: 0.008,
+                    run_protein_qvalue: 1.0,
+                    experiment_precursor_qvalue: 0.04,
+                    experiment_peptide_qvalue: 0.008,
+                    experiment_protein_qvalue: 1.0,
+                    pep: 0.04,
+                    modified_sequence: Arc::from("WEAKPEPTIDE"),
+                },
+            ],
+        )];
+
+        let experiment_fdr = 0.01;
+        let effective_level = FdrLevel::Peptide;
+
+        let passing_peptides: HashSet<Arc<str>> = per_file_entries
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .filter(|e| {
+                !e.is_decoy && e.effective_experiment_qvalue(effective_level) <= experiment_fdr
+            })
+            .map(|e| e.modified_sequence.clone())
+            .collect();
+
+        assert!(passing_peptides.contains(&Arc::from("WEAKPEPTIDE") as &Arc<str>));
+
+        let mut precursor_passing: HashSet<(Arc<str>, u8)> = HashSet::new();
+        let mut best_per_peptide: HashMap<Arc<str>, (u8, f64)> = HashMap::new();
+        for (_, entries) in per_file_entries.iter() {
+            for e in entries {
+                if e.is_decoy || !passing_peptides.contains(&e.modified_sequence) {
+                    continue;
+                }
+                if e.experiment_precursor_qvalue <= experiment_fdr {
+                    precursor_passing.insert((e.modified_sequence.clone(), e.charge));
+                }
+                best_per_peptide
+                    .entry(e.modified_sequence.clone())
+                    .and_modify(|(best_charge, best_q)| {
+                        if e.experiment_precursor_qvalue < *best_q {
+                            *best_charge = e.charge;
+                            *best_q = e.experiment_precursor_qvalue;
+                        }
+                    })
+                    .or_insert((e.charge, e.experiment_precursor_qvalue));
+            }
+        }
+        // Fallback: no charge state passes, keep the best
+        for peptide in &passing_peptides {
+            let has_passing = precursor_passing.iter().any(|(ms, _)| ms == peptide);
+            if !has_passing {
+                if let Some(&(charge, _)) = best_per_peptide.get(peptide) {
+                    precursor_passing.insert((peptide.clone(), charge));
+                }
+            }
+        }
+
+        // 2+ should be the fallback (lower precursor_q = 0.02 vs 0.04)
+        assert!(
+            precursor_passing.contains(&(Arc::from("WEAKPEPTIDE"), 2u8)),
+            "WEAKPEPTIDE+2 should be kept as fallback (best precursor_q=0.02)"
+        );
+        // 3+ should NOT be included (it's not the best fallback)
+        assert!(
+            !precursor_passing.contains(&(Arc::from("WEAKPEPTIDE"), 3u8)),
+            "WEAKPEPTIDE+3 should not be in fallback (worse precursor_q=0.04)"
+        );
+        // Total: exactly 1 precursor for this peptide
+        let n = precursor_passing
+            .iter()
+            .filter(|(ms, _)| ms.as_ref() == "WEAKPEPTIDE")
+            .count();
+        assert_eq!(
+            n, 1,
+            "exactly one charge state should survive for WEAKPEPTIDE"
+        );
+    }
+
     #[test]
     fn calibration_scorer_uses_unit_bins_for_unit_resolution() {
         let config = OspreyConfig {
