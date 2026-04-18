@@ -4,7 +4,7 @@ Working draft for the next release. Append entries here as features and fixes la
 
 ## New Features
 
-<!-- none yet -->
+- **Added Gaussian RT penalty to CWT peak selection.** Peak candidates are now ranked by `coelution_score * rt_penalty` instead of `coelution_score` alone. The RT penalty is a Gaussian centered on the calibration-predicted RT with sigma derived from the calibration MAD (`3 * MAD * 1.4826`, floored at 0.1 min). A peak at the expected RT gets penalty 1.0 (full score); a peak 3-sigma away gets penalty ~0.01 (effectively eliminated). This prevents strong interferer peaks at the wrong RT from being selected over the correct peak when their fragment co-elution is marginally better. On the Stellar 3-file HeLa dataset, this fixes peptides like GGGNQVSLLNVVMDLK where an interferer at +1.07 min from the expected RT was selected in 2 of 3 replicates because its coelution was slightly higher, corrupting the consensus RT and causing reconciliation to "correct" the good replicate to match the wrong position. The stored CWT candidates for reconciliation retain their raw coelution_score (not RT-penalized) since reconciliation has its own consensus-based RT tolerance logic. Falls back to the search RT tolerance when no calibration MAD is available.
 
 ## Bug Fixes
 

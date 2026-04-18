@@ -6264,9 +6264,17 @@ fn run_search(
                             return None;
                         }
 
-                        // Score each candidate by mean pairwise fragment correlation
+                        // Score each candidate by mean pairwise fragment correlation,
+                        // penalized by distance from calibration-predicted RT. The RT
+                        // penalty prevents strong interferers at the wrong RT from
+                        // beating the correct peak on coelution alone.
+                        let rt_sigma = calibration
+                            .and_then(|cal| cal.rt_calibration.mad)
+                            .map(|mad| (mad * 1.4826 * 3.0).max(0.1))
+                            .unwrap_or(rt_tolerance);
+
                         let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
-                        let mut scored_candidates: Vec<(&XICPeakBounds, f64)> = candidates
+                        let mut scored_candidates: Vec<(&XICPeakBounds, f64, f64)> = candidates
                             .iter()
                             .map(|bp| {
                                 let si = bp.start_index;
@@ -6297,17 +6305,29 @@ fn run_search(
                                     0.0
                                 };
 
-                                (bp, coelution_score)
+                                // Gaussian RT penalty: peaks far from the calibration-
+                                // predicted RT are downweighted. A peak at the expected
+                                // position gets penalty=1.0; a peak 3-sigma away gets
+                                // penalty~0.01.
+                                let peak_apex_rt = ref_xic[bp.apex_index].0;
+                                let rt_residual = (peak_apex_rt - expected_rt).abs();
+                                let rt_penalty =
+                                    (-rt_residual.powi(2) / (2.0 * rt_sigma.powi(2))).exp();
+
+                                (bp, coelution_score, coelution_score * rt_penalty)
                             })
                             .collect();
-                        scored_candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+                        // Sort by RT-penalized score (third element)
+                        scored_candidates.sort_by(|a, b| b.2.total_cmp(&a.2));
 
-                        // Store top-N CWT candidates for inter-replicate reconciliation
+                        // Store top-N CWT candidates for inter-replicate reconciliation.
+                        // Use raw coelution_score (not RT-penalized) since reconciliation
+                        // has its own RT tolerance logic via consensus RT comparison.
                         let top_n = config.reconciliation.top_n_peaks;
                         let cwt_top_n: Vec<CwtCandidate> = scored_candidates
                             .iter()
                             .take(top_n)
-                            .map(|(bp, score)| {
+                            .map(|(bp, raw_score, _penalized)| {
                                 let si = bp.start_index;
                                 let ei = bp.end_index;
                                 let area = trapezoidal_area(&ref_xic[si..=ei]);
@@ -6324,13 +6344,13 @@ fn run_search(
                                     end_rt: ref_xic[ei].0,
                                     area,
                                     snr,
-                                    coelution_score: *score,
+                                    coelution_score: *raw_score,
                                 }
                             })
                             .collect();
 
-                        // Build peak from best candidate
-                        let (best_bp, _) = scored_candidates[0];
+                        // Build peak from best candidate (best by RT-penalized score)
+                        let (best_bp, _, _) = scored_candidates[0];
                         let si = best_bp.start_index;
                         let ei = best_bp.end_index;
                         let (apex_idx, apex_val) = ref_xic[si..=ei]
