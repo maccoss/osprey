@@ -1483,6 +1483,7 @@ name = "osprey-core"
 version = "26.3.0"
 dependencies = [
  "approx",
+ "log",
  "serde",
  "serde_yaml",
  "sha2",

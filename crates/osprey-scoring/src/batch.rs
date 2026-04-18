@@ -1509,6 +1509,24 @@ pub fn sample_library_for_calibration(
         .count();
     let per_cell = sample_size.checked_div(n_occupied).unwrap_or(1).max(1);
 
+    crate::diagnostics::dump_cal_sample_setup(
+        &targets,
+        &decoys,
+        bins_per_axis,
+        rt_min,
+        rt_max,
+        mz_min,
+        mz_max,
+        rt_range,
+        mz_range,
+        rt_bin_width,
+        mz_bin_width,
+        n_occupied,
+        per_cell,
+        seed,
+        &grid,
+    );
+
     // Deterministic stride sampling from each cell
     let offset = seed as usize;
     let mut sampled_ids: HashSet<u32> = HashSet::new();
@@ -1586,6 +1604,8 @@ pub fn sample_library_for_calibration(
         bins_per_axis,
         n_occupied,
     );
+
+    crate::diagnostics::dump_cal_sample_entries(&sampled);
 
     sampled
 }
@@ -2471,6 +2491,11 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
     rt_tolerance: f64,
     expected_rt_fn: Option<&(dyn Fn(f64) -> f64 + Sync)>,
     xcorr_scorer: Option<&SpectralScorer>,
+    // Optional fitted LOESS calibration for the per-entry XIC diagnostic dump
+    // (`OSPREY_DIAG_XIC_ENTRY_ID`). Pass `None` on pass 1 (no fit yet) and
+    // `Some(&rt_calibration)` on pass 2 so the dump can record LOESS stats
+    // alongside the chromatogram.
+    rt_calibration_for_diag: Option<&osprey_chromatography::RTCalibration>,
 ) -> Vec<CalibrationMatch> {
     // Group spectra by isolation window
     let window_groups = group_spectra_by_isolation_window(spectra);
@@ -2516,6 +2541,9 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             .progress_chars("#>-"),
     );
 
+    let current_pass: u32 = if expected_rt_fn.is_some() { 2 } else { 1 };
+    let xic_entry_dump = crate::diagnostics::CalXicEntryDump::new(current_pass);
+
     // Inner function: score one library entry using fragment co-elution
     // Returns Option<CalibrationMatch>
     let score_entry = |entry: &LibraryEntry,
@@ -2526,9 +2554,27 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
             return None;
         }
 
+        // Per-entry chromatogram dump header (target entry only).
+        if xic_entry_dump.is_active_for(entry.id) {
+            let dump_expected_rt = match expected_rt_fn {
+                Some(pf) => pf(entry.retention_time),
+                None => entry.retention_time,
+            };
+            xic_entry_dump.dump_header(
+                entry,
+                dump_expected_rt,
+                rt_tolerance,
+                candidate_spectra,
+                rt_calibration_for_diag,
+            );
+        }
+
         // Extract XICs for top 6 fragments
         let xics =
             super::extract_fragment_xics(&entry.fragments, candidate_spectra, tol_da, tol_ppm, 6);
+
+        // Append EXTRACTED XICS section + exit if this is the diagnostic target.
+        xic_entry_dump.dump_xics_and_exit(entry, &xics);
 
         if xics.len() < 2 {
             return None; // Need at least 2 fragment XICs for co-elution
@@ -2756,6 +2802,12 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
     };
 
     // Process each window in parallel
+    let window_dump = crate::diagnostics::dump_cal_windows_init(library.len());
+    let window_dump_ref = window_dump.as_ref();
+
+    let prefilter_dump = crate::diagnostics::dump_cal_prefilter_init(library.len());
+    let prefilter_dump_ref = prefilter_dump.as_ref();
+
     let all_matches: Vec<CalibrationMatch> = window_groups
         .par_iter()
         .flat_map(|((lower, upper), spectrum_indices)| {
@@ -2766,6 +2818,30 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
 
             if window_entries.is_empty() {
                 return Vec::new();
+            }
+
+            // Diagnostic: record one row per (entry, window) pair BEFORE filtering.
+            if let Some(mtx) = window_dump_ref {
+                let mut local_rows: Vec<String> = Vec::with_capacity(window_entries.len());
+                for entry in &window_entries {
+                    let expected_rt = match expected_rt_fn {
+                        Some(f) => f(entry.retention_time),
+                        None => entry.retention_time,
+                    };
+                    let rt_lo = expected_rt - rt_tolerance;
+                    let rt_hi = expected_rt + rt_tolerance;
+                    local_rows.push(crate::diagnostics::dump_cal_windows_row(
+                        entry,
+                        *lower,
+                        *upper,
+                        expected_rt,
+                        rt_lo,
+                        rt_hi,
+                    ));
+                }
+                if let Ok(mut g) = mtx.lock() {
+                    g.extend(local_rows);
+                }
             }
 
             let window_spectra: Vec<&Spectrum> =
@@ -2800,6 +2876,19 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
                     })
                     .map(|(idx, spec)| (idx, *spec))
                     .collect();
+
+                // Diagnostic: record per-entry prefilter result before any
+                // additional logic. Even if candidate_pairs is empty, we want
+                // to record n=0 so the dump has one row per (entry, window).
+                if let Some(mtx) = prefilter_dump_ref {
+                    let mut scans: Vec<u32> =
+                        candidate_pairs.iter().map(|(_, s)| s.scan_number).collect();
+                    scans.sort();
+                    let row = crate::diagnostics::dump_cal_prefilter_row(entry, &scans);
+                    if let Ok(mut g) = mtx.lock() {
+                        g.push(row);
+                    }
+                }
 
                 if candidate_pairs.is_empty() {
                     pb.inc(1);
@@ -2864,6 +2953,10 @@ pub fn run_coelution_calibration_scoring<M: MS1SpectrumLookup>(
         targets,
         decoys
     );
+
+    crate::diagnostics::dump_cal_windows_finalize(window_dump);
+    crate::diagnostics::dump_cal_prefilter_finalize(prefilter_dump);
+    crate::diagnostics::dump_cal_match(library, &results);
 
     results
 }

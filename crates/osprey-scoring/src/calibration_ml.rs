@@ -83,6 +83,8 @@ pub fn train_and_score_calibration(
         m.q_value = q_values[i];
     }
 
+    crate::diagnostics::dump_lda_scores(matches);
+
     // 9. Sort by discriminant score descending (best matches first)
     matches.sort_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
 

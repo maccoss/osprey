@@ -9,6 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+log = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
