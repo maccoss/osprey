@@ -410,29 +410,46 @@ pub fn plan_reconciliation(
                 None => return Vec::new(),
             };
 
-            // Compute a global RT tolerance for this file using the refined calibration's
-            // MAD (median absolute deviation of residuals). This is derived from thousands
-            // of consensus peptides across the RT gradient, so it reflects normal run-to-run
-            // variation without being inflated by individual outliers.
+            // Compute a global RT tolerance for this file from the refined
+            // calibration's residuals, with two safeguards against wrong-peak
+            // contamination:
             //
-            // Previously we used `local_tolerance` which interpolates the per-point
-            // residual at the query RT. This created a self-fulfilling prophecy: a
-            // peptide with a wrong apex RT contributed a huge residual to the training
-            // set, which inflated the local tolerance at that RT, which then allowed
-            // the wrong-RT detection to pass the apex proximity check.
+            // 1. **Sigma-clipped MAD**: the raw MAD (P50 of absolute residuals)
+            //    is inflated when wrong-peak detections feed their bad apex_rt
+            //    into the refit calibration. We compute an initial 3-sigma clip
+            //    threshold from the raw MAD, discard outlier residuals above it,
+            //    then recompute MAD from the survivors. This gives a tolerance
+            //    based on the well-calibrated majority, not the contaminated tail.
             //
-            // Using MAD * 1.4826 * 3.0 gives a ~3-sigma tolerance robust to outliers.
-            // A minimum floor of 0.1 min prevents being too strict when calibration is
-            // very tight.
-            let stats = cal.stats();
-            let rt_tolerance = (stats.mad * 1.4826 * 3.0).max(0.1);
-            log::debug!(
-                "Reconciliation RT tolerance for {}: {:.3} min (MAD={:.3}, robust_SD={:.3})",
-                file_name,
-                rt_tolerance,
-                stats.mad,
-                stats.mad * 1.4826,
-            );
+            // 2. **Original-calibration cap**: the reconciliation tolerance must
+            //    never exceed the first-pass calibration tolerance. Each
+            //    successive calibration pass (initial -> first-pass -> refined
+            //    consensus) should only tighten the tolerance. If the refined
+            //    tolerance is wider than the original, the refit is contaminated
+            //    and should not be trusted for tolerance purposes.
+            let rt_tolerance = {
+                let raw_mad = cal.stats().mad;
+                let clip_threshold = raw_mad * 1.4826 * 3.0;
+                let clipped_mad = sigma_clipped_mad(cal.abs_residuals(), clip_threshold);
+                let refined_tolerance = (clipped_mad * 1.4826 * 3.0).max(0.1);
+
+                // Cap at original calibration tolerance (monotonicity invariant)
+                let original_cal_for_cap = per_file_original_cal.get(file_name);
+                let cap = original_cal_for_cap
+                    .map(|oc| (oc.stats().mad * 1.4826 * 3.0).max(0.1))
+                    .unwrap_or(refined_tolerance);
+
+                let final_tol = refined_tolerance.min(cap);
+                log::debug!(
+                    "Reconciliation RT tolerance for {}: {:.3} min (raw_MAD={:.3}, clipped_MAD={:.3}, original_cap={:.3})",
+                    file_name,
+                    final_tol,
+                    raw_mad,
+                    clipped_mad,
+                    cap,
+                );
+                final_tol
+            };
 
             let file_cwt = per_file_cwt_candidates.get(file_name).unwrap_or(&empty_cwt);
 
@@ -717,6 +734,31 @@ pub fn identify_gap_fill_targets(
     result
 }
 
+/// Compute MAD from absolute residuals after sigma-clipping outliers.
+///
+/// Removes residuals above `clip_threshold`, then returns the median of the
+/// survivors. If fewer than 20 points survive the clip, returns the raw
+/// median of all residuals as a fallback (avoids unstable estimates from
+/// tiny samples).
+fn sigma_clipped_mad(abs_residuals: &[f64], clip_threshold: f64) -> f64 {
+    if abs_residuals.is_empty() {
+        return 0.0;
+    }
+    let mut clipped: Vec<f64> = abs_residuals
+        .iter()
+        .copied()
+        .filter(|&r| r <= clip_threshold)
+        .collect();
+    if clipped.len() < 20 {
+        // Too few survivors; fall back to raw median
+        let mut all: Vec<f64> = abs_residuals.to_vec();
+        all.sort_by(|a, b| a.total_cmp(b));
+        return all[all.len() / 2];
+    }
+    clipped.sort_by(|a, b| a.total_cmp(b));
+    clipped[clipped.len() / 2]
+}
+
 /// Compute weighted median of (value, weight) pairs.
 ///
 /// Sorts by value, accumulates weights until cumulative >= total/2,
@@ -752,6 +794,80 @@ mod tests {
     use super::*;
     use osprey_chromatography::RTCalibration;
     use osprey_core::CwtCandidate;
+
+    // ---- sigma_clipped_mad tests ----
+
+    #[test]
+    fn test_sigma_clipped_mad_no_outliers() {
+        // All residuals are small and tightly distributed
+        let residuals = vec![
+            0.05, 0.08, 0.10, 0.03, 0.07, 0.12, 0.06, 0.09, 0.04, 0.11, 0.05, 0.08, 0.10, 0.03,
+            0.07, 0.12, 0.06, 0.09, 0.04, 0.11,
+        ];
+        let raw_mad = {
+            let mut s = residuals.clone();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            s[s.len() / 2]
+        };
+        let clip_threshold = raw_mad * 1.4826 * 3.0;
+        let clipped = sigma_clipped_mad(&residuals, clip_threshold);
+        // No outliers so clipped MAD should equal raw MAD
+        assert!(
+            (clipped - raw_mad).abs() < 1e-10,
+            "clipped={}, raw={}",
+            clipped,
+            raw_mad
+        );
+    }
+
+    #[test]
+    fn test_sigma_clipped_mad_with_outliers() {
+        // 80 inlier residuals at ~0.05 min, 20 outlier residuals at ~2.0 min
+        let mut residuals: Vec<f64> = (0..80).map(|i| 0.03 + (i as f64) * 0.001).collect();
+        residuals.extend(vec![2.0; 20]);
+        let raw_mad = {
+            let mut s = residuals.clone();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            s[s.len() / 2]
+        };
+        // Raw MAD is pulled toward outliers (P50 of 100 values, ~0.06)
+        let clip_threshold = raw_mad * 1.4826 * 3.0;
+        let clipped = sigma_clipped_mad(&residuals, clip_threshold);
+        // Clipped MAD should be close to the inlier distribution (~0.05)
+        assert!(
+            clipped < 0.08,
+            "clipped MAD should be near inlier level (~0.05), got {}",
+            clipped
+        );
+        // Outliers at 2.0 should not affect the clipped MAD
+        assert!(
+            clipped < raw_mad,
+            "clipped MAD ({}) should be <= raw MAD ({})",
+            clipped,
+            raw_mad
+        );
+    }
+
+    #[test]
+    fn test_sigma_clipped_mad_too_few_survivors() {
+        // >80% outliers: 5 inliers at 0.05, 95 outliers at 2.0
+        let mut residuals: Vec<f64> = vec![0.05; 5];
+        residuals.extend(vec![2.0; 95]);
+        let raw_mad = {
+            let mut s = residuals.clone();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            s[s.len() / 2]
+        };
+        let clip_threshold = raw_mad * 1.4826 * 3.0;
+        let clipped = sigma_clipped_mad(&residuals, clip_threshold);
+        // Fewer than 20 inliers survive the clip so falls back to raw MAD
+        assert!(
+            (clipped - raw_mad).abs() < 1e-10,
+            "should fall back to raw MAD ({}) when too few survivors, got {}",
+            raw_mad,
+            clipped
+        );
+    }
 
     // ---- Helper: create an identity RTCalibration (library RT = measured RT) ----
     fn make_identity_calibration() -> RTCalibration {
