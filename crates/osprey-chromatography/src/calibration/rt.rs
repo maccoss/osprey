@@ -634,6 +634,11 @@ impl RTCalibration {
         (min, max)
     }
 
+    /// Get the absolute residuals from the calibration fit.
+    pub fn abs_residuals(&self) -> &[f64] {
+        &self.abs_residuals
+    }
+
     /// Get calibration statistics
     pub fn stats(&self) -> RTCalibrationStats {
         let n = self.library_rts.len();

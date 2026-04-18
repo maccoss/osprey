@@ -6,14 +6,27 @@ Cross-run reconciliation aligns peak integration boundaries across replicate fil
 
 Without reconciliation, each file's per-window search finds peaks independently using CWT peak detection and pairwise coelution scoring. For a given peptide, the search may confidently find the correct peak in most runs but select a completely different peak — a co-eluting interferer, a noise spike, or an isomer — in one or more runs where the signal is weaker or the interference is stronger.
 
+### RT-Penalized Peak Selection
+
+To mitigate wrong-peak selection, CWT candidate peaks are ranked by `coelution_score * rt_penalty` rather than by `coelution_score` alone. The RT penalty is a Gaussian centered on the calibration-predicted RT:
+
 ```
-Peptide PEPTIDEK:
-  file1.mzML: coelution_sum=8.5  → apex=25.3 (correct peak)
-  file2.mzML: coelution_sum=7.9  → apex=25.4 (correct peak)
-  file3.mzML: coelution_sum=3.1  → apex=31.7 (wrong peak — low-signal run picked an interferer)
+rt_penalty = exp(-residual^2 / (2 * sigma^2))
 ```
 
-In this case, file3 has detected a completely different peptide or artifact. Cross-run reconciliation uses the high-confidence runs (file1, file2) to establish where PEPTIDEK actually elutes, then goes back to file3 and either finds an alternate CWT candidate at that RT or imputes the integration boundaries at the expected position.
+where `residual = |peak_apex - expected_rt|` and `sigma = max(3 * MAD * 1.4826, 0.1)` from the per-file calibration. A peak at the expected position gets penalty 1.0; a peak 3-sigma away gets penalty ~0.01. This prevents interferer peaks at the wrong RT from winning on coelution alone — the coelution advantage must overcome the RT penalty, which drops exponentially with distance.
+
+Without this penalty, a common failure mode on multi-replicate experiments is: an interferer with slightly better fragment co-elution than the correct peak gets selected in multiple replicates, corrupting the downstream consensus RT and causing reconciliation to "correct" the good replicates to the wrong position.
+
+```
+Peptide PEPTIDEK (with RT penalty):
+  file1.mzML: coelution=8.5, rt_penalty=1.0  → score=8.5  → apex=25.3 (correct, wins)
+  file2.mzML: coelution=7.9, rt_penalty=1.0  → score=7.9  → apex=25.4 (correct, wins)
+  file3.mzML: correct peak coelution=3.1, rt_penalty=1.0  → score=3.1
+              interferer    coelution=4.2, rt_penalty=0.0  → score=0.0  → correct peak wins
+```
+
+Cross-run reconciliation uses the high-confidence runs to establish where PEPTIDEK actually elutes, then goes back to files where the selected peak is wrong and either finds an alternate CWT candidate at that RT or imputes the integration boundaries at the expected position.
 
 ---
 
