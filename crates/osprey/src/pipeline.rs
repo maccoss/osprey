@@ -6270,7 +6270,7 @@ fn run_search(
                         // beating the correct peak on coelution alone.
                         let rt_sigma = calibration
                             .and_then(|cal| cal.rt_calibration.mad)
-                            .map(|mad| (mad * 1.4826 * 3.0).max(0.1))
+                            .map(|mad| (mad * 1.4826 * 5.0).max(0.1))
                             .unwrap_or(rt_tolerance);
 
                         let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
