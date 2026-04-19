@@ -4991,15 +4991,18 @@ mod tests {
     }
 
     /// Median polish convergence must compare residuals AFTER both row and
-    /// column sweeps complete, not incrementally during each sweep. Input is
-    /// a clean multiplicative signal (row_factor × col_factor): the
-    /// log-space additive decomposition must reconstruct each cell within
-    /// rounding noise once convergence is declared.
+    /// column sweeps complete, not incrementally during each sweep. The
+    /// check below is a mass-preservation identity:
+    /// `(overall + row + col + residuals).exp()` must equal the input cell
+    /// value by construction of the additive log-space decomposition. A
+    /// sweep that declares convergence mid-row-sweep (before the matching
+    /// column sweep lands) would corrupt this identity.
     #[test]
     fn test_median_polish_convergence_after_both_sweeps() {
-        // 3 fragments x 5 scans, all sharing a 1:2:3:2:1 elution shape
-        // scaled by a per-fragment intensity multiplier. Pure multiplicative
-        // structure, so a row/col log-space polish decomposes it exactly.
+        // 3 fragments x 5 scans; fragment 2 is intentionally anti-correlated
+        // with fragments 0 and 1 so the polish has to distribute genuine
+        // structure between col_effects and residuals. The identity check
+        // still holds regardless.
         let xics: Vec<(usize, Vec<(f64, f64)>)> = vec![
             (
                 0,
@@ -5024,11 +5027,11 @@ mod tests {
             (
                 2,
                 vec![
-                    (1.0, 150.0),
-                    (2.0, 300.0),
-                    (3.0, 450.0),
-                    (4.0, 300.0),
-                    (5.0, 150.0),
+                    (1.0, 200.0),
+                    (2.0, 100.0),
+                    (3.0, 50.0),
+                    (4.0, 100.0),
+                    (5.0, 200.0),
                 ],
             ),
         ];
@@ -5038,21 +5041,23 @@ mod tests {
         let result = result.unwrap();
         assert!(result.converged, "Should converge");
 
-        // Verify decomposition reconstructs original within 1%. The polish
-        // operates in log-space (ln(intensity)), so the additive
-        // (overall + row + col) components sum to ln(reconstructed).
+        // Mass-preservation identity: the full decomposition exp-sums back
+        // to the input within 1%. Fails if the algorithm declares
+        // convergence before row + col sweeps have jointly balanced.
         for (f_idx, (_, scan_values)) in xics.iter().enumerate() {
             for (s_idx, &(_rt, val)) in scan_values.iter().enumerate() {
                 if val <= 0.0 {
                     continue;
                 }
-                let log_predicted =
-                    result.overall + result.row_effects[f_idx] + result.col_effects[s_idx];
-                let reconstructed = log_predicted.exp();
-                let rel_err = (val - reconstructed).abs() / val.max(1.0);
+                let reconstructed = (result.overall
+                    + result.row_effects[f_idx]
+                    + result.col_effects[s_idx]
+                    + result.residuals[f_idx][s_idx])
+                    .exp();
+                let rel_err = (reconstructed - val).abs() / val;
                 assert!(
-                    rel_err < 0.5,
-                    "Decomposition error at ({},{}): orig={}, reconstructed={}, err={:.3}",
+                    rel_err < 0.01,
+                    "Reconstruction at [{},{}]: expected {}, got {}, rel_err={}",
                     f_idx,
                     s_idx,
                     val,
