@@ -92,6 +92,18 @@ pub struct OspreyConfig {
     // Performance
     /// Number of threads to use
     pub n_threads: usize,
+
+    // HPC scoring split (--no-join / --join-only)
+    /// When true, run Stages 1-4 only and exit. Each input mzML produces a
+    /// `{stem}.scores.parquet`; no FDR is run and no blib is written. Set by
+    /// the `--no-join` CLI flag. Mutually exclusive with `input_scores`.
+    #[serde(default)]
+    pub no_join: bool,
+    /// When set, skip Stages 1-4 entirely and load these per-file scoring
+    /// caches as the starting point for Stage 5+. Set by `--join-only`
+    /// + `--input-scores`. When this is `Some`, `input_files` is ignored.
+    #[serde(default)]
+    pub input_scores: Option<Vec<PathBuf>>,
 }
 
 impl Default for OspreyConfig {
@@ -118,6 +130,8 @@ impl Default for OspreyConfig {
             fdr_level: FdrLevel::default(),
             reconciliation_compaction_fdr: default_compaction_fdr(),
             n_threads: num_cpus(),
+            no_join: false,
+            input_scores: None,
         }
     }
 }
