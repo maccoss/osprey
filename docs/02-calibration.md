@@ -34,6 +34,26 @@ For large libraries (millions of entries), scoring all entries is unnecessary. O
 
 Matches accumulate across attempts — FDR runs on the combined set. If the library has fewer targets than the sample size, all entries are used and retries are skipped.
 
+#### Stratified Grid Sampling
+
+Instead of drawing the sample uniformly at random (which would concentrate in the densely-populated regions of the library), Osprey uses **stratified grid sampling** across the (RT × precursor_mz) plane. This guarantees the calibration training set covers the full gradient and m/z range uniformly.
+
+1. Compute `bins_per_axis = ceil(sqrt(sample_size) / 2)` (clamped to ≥5). For the default 100,000 sample this is 159, giving a 159×159 = 25,281-cell grid.
+2. Compute the (RT, precursor_mz) bounding box from the library's targets and divide each axis into `bins_per_axis` equal-width bins.
+3. Assign each library target to its 2D grid cell based on its library RT and precursor m/z.
+4. Count non-empty cells (`n_occupied`). Most grids are sparse — for a 3M-entry human library this is typically 20,000–25,000 occupied cells out of 25,281 possible.
+5. Compute `per_cell = max(1, sample_size / n_occupied)` — typically ~4 entries per occupied cell for the default sample size.
+6. **First pass** (deterministic stride): from each occupied cell, pick `per_cell` entries using `(seed_offset + j × stride) % cell_size`. Each picked target brings its paired decoy.
+7. **Second pass** (top-up): if fewer than `sample_size` unique targets were collected (sparse grid), loop through cells again picking additional unsampled entries until the quota is met.
+
+The stratification log line shows both the grid shape and the occupancy:
+
+```
+Calibration sampling: 100000 targets + 100000 decoys from 3131286 total (159×159 grid, 24490 occupied cells)
+```
+
+Without stratification, random sampling would oversample the abundant mid-RT / mid-m/z region and undersample the early-RT / late-RT tails — causing LOESS to have poor extrapolation behavior at the gradient ends. Grid stratification fixes this without any quality filter on the sampled entries (quality comes later via the LDA + FDR + S/N filter).
+
 ### Co-Elution Scoring
 
 Each sampled peptide is scored using fragment XIC co-elution, not simple XCorr:
@@ -137,6 +157,7 @@ RT calibration uses LOESS (Locally Estimated Scatterplot Smoothing) to fit (libr
 | `degree` | 1 | Local polynomial degree (linear) |
 | `min_points` | 20 | Minimum calibration points required |
 | `robustness_iter` | 2 | Bisquare robustness iterations |
+| `classical_robust_iterations` | `true` | Refresh residuals each iteration (Cleveland 1979) |
 
 **Algorithm:**
 
@@ -145,10 +166,21 @@ RT calibration uses LOESS (Locally Estimated Scatterplot Smoothing) to fit (libr
 3. Weight neighbors by tricube kernel: `w(u) = (1 - u³)³` for normalized distance u
 4. Fit weighted linear regression (2×2 system)
 5. Compute residuals
-6. Robustness iterations: downweight outliers using bisquare function
+6. Robustness iterations (`robustness_iter` passes): downweight outliers using bisquare function
    - Scale: `s = 6 × MAD` (median absolute deviation)
    - Weight: `(1 - (r/s)²)²` if |r/s| < 1, else 0
 7. Final refit with robustness weights
+
+#### Classical vs Legacy Robust Iterations
+
+The bisquare weights at each iteration depend on an estimate of the residuals. Osprey supports two modes:
+
+- **Classical Cleveland 1979 (default)**: residuals are refreshed from the current fit at the top of each iteration. Each successive iteration sees a tighter residual distribution, which tightens the bisquare weights and produces a cleaner final fit. This is the algorithm described in Cleveland's original LOWESS paper.
+- **Legacy single-refresh**: residuals from the initial unweighted fit are reused across every iteration. Regardless of `robustness_iter`, this effectively produces only one weighted refinement because the weights never get updated. Kept for reproducibility with older Osprey outputs.
+
+The classical mode typically produces calibrations with 10–20% smaller residual SD on datasets with outliers (wrong-peak detections that survived the first-pass FDR). It is the default as of v26.3.1.
+
+**Environment override**: set `OSPREY_LOESS_CLASSICAL_ROBUST=0` to revert to the legacy single-refresh behavior. Any other value (or unset) uses the classical algorithm. The same env var is honored by OspreySharp for cross-implementation validation.
 
 ### Prediction and Interpolation
 
