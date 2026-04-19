@@ -46,6 +46,9 @@ pub use osprey_fdr::{FdrController, FdrCounts, MokapotResult, MokapotRunner};
 // Two-tier logging (clean terminal + verbose log file)
 pub mod logging;
 
+// Cross-implementation bisection diagnostic dumps
+pub mod diagnostics;
+
 // Cross-run peak reconciliation
 pub mod reconciliation;
 
