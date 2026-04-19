@@ -145,7 +145,9 @@ struct Args {
     #[arg(long)]
     fdr_level: Option<String>,
 
-    /// Protein-level FDR threshold (enables protein parsimony and picked-protein FDR)
+    /// Protein-level FDR threshold [default: 0.01]. Protein parsimony and
+    /// picked-protein FDR always run; this sets the cutoff for reporting and
+    /// for the compaction/reconciliation rescue rule.
     #[arg(long)]
     protein_fdr: Option<f64>,
 

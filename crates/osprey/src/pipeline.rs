@@ -2728,7 +2728,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Produces run_protein_qvalue on every FdrEntry stub. Used downstream for:
     //   (a) protein-aware compaction (rescue borderline peptides from strong proteins)
     //   (b) reconciliation consensus selection (strong proteins anchor consensus)
-    if !can_skip_fdr && config.protein_fdr.is_some() {
+    if !can_skip_fdr {
         use osprey_fdr::protein;
         log::info!("");
         log::info!("First-pass protein FDR");
@@ -2778,20 +2778,18 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     //
     // Protein-aware compaction: a peptide survives if EITHER
     //   (a) its peptide-level q-value <= reconciliation_compaction_fdr (default 0.01), OR
-    //   (b) its first-pass protein q-value <= config.protein_fdr (typically 0.01)
+    //   (b) its first-pass protein q-value <= config.protein_fdr (default 0.01)
     // Rule (b) lets strong protein evidence rescue borderline peptides whose
-    // own peptide q-value is above the compaction gate. When --protein-fdr is
-    // not set, only rule (a) applies.
+    // own peptide q-value is above the compaction gate.
     let peptide_compaction_gate = config.reconciliation_compaction_fdr;
-    let protein_compaction_gate = config.protein_fdr.unwrap_or(0.0);
+    let protein_compaction_gate = config.protein_fdr;
     let first_pass_base_ids: HashSet<u32> = per_file_entries
         .iter()
         .flat_map(|(_, entries)| entries.iter())
         .filter(|e| {
             !e.is_decoy
                 && (e.run_peptide_qvalue <= peptide_compaction_gate
-                    || (protein_compaction_gate > 0.0
-                        && e.run_protein_qvalue <= protein_compaction_gate))
+                    || e.run_protein_qvalue <= protein_compaction_gate)
         })
         .map(|e| e.entry_id & 0x7FFF_FFFF)
         .collect();
@@ -2950,7 +2948,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 &per_file_entries,
                 &per_file_calibrations,
                 config.reconciliation.consensus_fdr,
-                config.protein_fdr.unwrap_or(0.0),
+                config.protein_fdr,
             );
 
             if !consensus.is_empty() {
@@ -3525,55 +3523,48 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             Some(&detected_peptides),
         );
 
-        // Optional second-pass picked-protein FDR (Savitski)
-        if let Some(protein_fdr_threshold) = config.protein_fdr {
-            log::info!("Second-pass protein FDR");
-            // Collect best peptide scores from compacted + reconciled + second-pass-scored stubs
-            let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
+        // Second-pass picked-protein FDR (Savitski). Always runs; the threshold
+        // comes from config.protein_fdr (default 0.01).
+        let protein_fdr_threshold = config.protein_fdr;
+        log::info!("Second-pass protein FDR");
+        // Collect best peptide scores from compacted + reconciled + second-pass-scored stubs
+        let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
 
-            // Savitski gate: 1 x run_fdr (same as peptide-level threshold)
-            let protein_fdr_result =
-                protein::compute_protein_fdr(&parsimony, &best_scores, config.run_fdr);
+        // Savitski gate: 1 x run_fdr (same as peptide-level threshold)
+        let protein_fdr_result =
+            protein::compute_protein_fdr(&parsimony, &best_scores, config.run_fdr);
 
-            let n_passing = protein_fdr_result
-                .group_qvalues
-                .values()
-                .filter(|&&q| q <= protein_fdr_threshold)
-                .count();
-            log::info!(
-                "Second-pass protein FDR: {} protein groups at {:.0}% FDR (from {} total groups)",
-                n_passing,
-                protein_fdr_threshold * 100.0,
-                parsimony.groups.len()
-            );
+        let n_passing = protein_fdr_result
+            .group_qvalues
+            .values()
+            .filter(|&&q| q <= protein_fdr_threshold)
+            .count();
+        log::info!(
+            "Second-pass protein FDR: {} protein groups at {:.0}% FDR (from {} total groups)",
+            n_passing,
+            protein_fdr_threshold * 100.0,
+            parsimony.groups.len()
+        );
 
-            // Propagate protein q-values into FdrEntry stubs — experiment side only.
-            // The run side was already set by first-pass protein FDR and is used
-            // only as a gate (not for final output).
-            protein::propagate_protein_qvalues(
-                &mut per_file_entries,
-                &protein_fdr_result,
-                false, // set_run: leave first-pass values in place
-                true,  // set_experiment: AUTHORITATIVE
-            );
+        // Propagate protein q-values into FdrEntry stubs — experiment side only.
+        // The run side was already set by first-pass protein FDR and is used
+        // only as a gate (not for final output).
+        protein::propagate_protein_qvalues(
+            &mut per_file_entries,
+            &protein_fdr_result,
+            false, // set_run: leave first-pass values in place
+            true,  // set_experiment: AUTHORITATIVE
+        );
 
-            let protein_report_path = config.output_blib.with_extension("proteins.csv");
-            if let Err(e) = protein::write_protein_report(
-                &protein_report_path,
-                &parsimony,
-                &protein_fdr_result,
-                protein_fdr_threshold,
-                &library,
-            ) {
-                log::warn!("Failed to write protein report: {}", e);
-            }
-        } else {
-            log::info!("  {} protein groups (no FDR)", parsimony.groups.len());
-            if matches!(config.fdr_level, FdrLevel::Protein) {
-                log::warn!(
-                    "--fdr-level protein requires --protein-fdr; falling back to peptide-level filtering"
-                );
-            }
+        let protein_report_path = config.output_blib.with_extension("proteins.csv");
+        if let Err(e) = protein::write_protein_report(
+            &protein_report_path,
+            &parsimony,
+            &protein_fdr_result,
+            protein_fdr_threshold,
+            &library,
+        ) {
+            log::warn!("Failed to write protein report: {}", e);
         }
     }
 
@@ -3597,10 +3588,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // the original FdrLevel::Both gate with config.fdr_level, letting all charge
     // states of a peptide-level-passing peptide through regardless of their
     // precursor-level q-value.
-    let effective_level = match (config.fdr_level, config.protein_fdr) {
-        (FdrLevel::Protein, None) => FdrLevel::Peptide,
-        (level, _) => level,
-    };
+    let effective_level = config.fdr_level;
 
     // Stage 1: which peptides pass the configured FDR level?
     let passing_peptides: HashSet<Arc<str>> = per_file_entries

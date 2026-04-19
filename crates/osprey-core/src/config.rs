@@ -67,9 +67,11 @@ pub struct OspreyConfig {
     pub prefilter_enabled: bool,
 
     // Protein FDR
-    /// Protein-level FDR threshold (enables protein parsimony and picked-protein FDR)
-    #[serde(default)]
-    pub protein_fdr: Option<f64>,
+    /// Protein-level FDR threshold. Protein parsimony and picked-protein FDR
+    /// always run; this threshold controls the cutoff for reporting and for
+    /// the compaction/reconciliation rescue rule.
+    #[serde(default = "default_protein_fdr")]
+    pub protein_fdr: f64,
     /// How to handle shared peptides for protein inference
     #[serde(default)]
     pub shared_peptides: SharedPeptideMode,
@@ -83,9 +85,8 @@ pub struct OspreyConfig {
     /// pool but risks FDR inflation in second-pass because Percolator re-trains
     /// on an enriched set and may produce sharper discrimination than warranted.
     ///
-    /// When `protein_fdr` is set, peptides whose protein group passes first-pass
-    /// protein FDR are additionally rescued through compaction regardless of
-    /// this threshold.
+    /// Peptides whose protein group passes first-pass protein FDR are
+    /// additionally rescued through compaction regardless of this threshold.
     #[serde(default = "default_compaction_fdr")]
     pub reconciliation_compaction_fdr: f64,
 
@@ -113,7 +114,7 @@ impl Default for OspreyConfig {
             decoys_in_library: false,
             reconciliation: ReconciliationConfig::default(),
             prefilter_enabled: true,
-            protein_fdr: None,
+            protein_fdr: default_protein_fdr(),
             shared_peptides: SharedPeptideMode::default(),
             fdr_level: FdrLevel::default(),
             reconciliation_compaction_fdr: default_compaction_fdr(),
@@ -127,6 +128,10 @@ fn default_true() -> bool {
 }
 
 fn default_compaction_fdr() -> f64 {
+    0.01
+}
+
+fn default_protein_fdr() -> f64 {
     0.01
 }
 
@@ -312,7 +317,7 @@ n_threads: 0  # 0 = auto-detect
             self.fdr_level = level;
         }
         if let Some(fdr) = args.protein_fdr {
-            self.protein_fdr = Some(fdr);
+            self.protein_fdr = fdr;
         }
         if let Some(mode) = args.shared_peptides {
             self.shared_peptides = mode;

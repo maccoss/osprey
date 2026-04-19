@@ -185,8 +185,12 @@ osprey -i sample.mzML -l library.tsv -o results.blib --resolution unit
 # Filter output at precursor-level FDR only (less conservative than default)
 osprey -i sample.mzML -l library.tsv -o results.blib --fdr-level precursor
 
-# Enable protein-level FDR at 1% with razor peptide assignment
-osprey -i *.mzML -l library.tsv -o results.blib --protein-fdr 0.01 --shared-peptides razor
+# Protein-level FDR always runs at 0.01 by default. Change threshold or
+# use razor peptide assignment:
+osprey -i *.mzML -l library.tsv -o results.blib --protein-fdr 0.05 --shared-peptides razor
+
+# Filter blib output to only peptides from protein groups passing protein FDR:
+osprey -i *.mzML -l library.tsv -o results.blib --fdr-level protein
 ```
 
 ### Using configuration files
@@ -232,9 +236,9 @@ decoy_method: Reverse  # Options: Reverse, Shuffle, FromLibrary
 decoys_in_library: false
 fdr_level: Precursor    # Output filtering level: Precursor (default), Peptide, Protein, or Both
 
-# Protein-level FDR (optional)
-# protein_fdr: 0.01       # Uncomment to enable protein-level FDR at 1%
-# shared_peptides: All     # How to handle shared peptides: All (default), Razor, or Unique
+# Protein-level FDR (always runs)
+protein_fdr: 0.01         # Protein-level FDR threshold (default 0.01)
+shared_peptides: All       # How to handle shared peptides: All (default), Razor, or Unique
 ```
 
 ## Command-line Options
@@ -294,16 +298,17 @@ Options:
           FDR filtering level for output: precursor, peptide, protein, or both [default: precursor]
           - precursor: filter on precursor-level q-values (peptide + charge)
           - peptide: filter on peptide-level q-values (peptide sequence only)
-          - protein: filter on protein-level q-values (requires --protein-fdr)
+          - protein: filter on protein-level q-values
           - both: filter on max(precursor, peptide) q-values (most conservative)
           Note: the blib output always enforces precursor-level FDR within each
           eligible peptide regardless of this setting; --fdr-level controls which
           peptide identities are admitted.
 
       --protein-fdr <THRESHOLD>
-          Protein-level FDR threshold. Enables protein parsimony and
-          picked-protein FDR. Only peptides from passing protein groups
-          are included in the output.
+          Protein-level FDR threshold [default: 0.01]. Protein parsimony and
+          picked-protein FDR always run; this sets the cutoff for reporting
+          and for the compaction/reconciliation rescue rule. Use --fdr-level
+          protein to restrict the blib output to protein-FDR-passing groups.
 
       --shared-peptides <MODE>
           How to handle peptides mapping to multiple protein groups: all, razor,
