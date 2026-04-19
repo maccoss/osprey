@@ -1823,6 +1823,170 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_plan_reconciliation_tolerance_capped_by_original_calibration() {
+        // Regression test: the reconciliation tolerance must never exceed the
+        // original (first-pass) calibration tolerance. If the refined calibration
+        // is contaminated by wrong-peak detections, its MAD is inflated. The cap
+        // at the original tolerance prevents the contamination from disabling
+        // reconciliation entirely.
+        //
+        // Refined calibration: huge residuals → raw MAD ~1.0, sigma-clipped MAD
+        //   still large. Without the cap, tolerance would be ~4.5 min.
+        // Original calibration: tight residuals → MAD ~0.05, tolerance ~0.22 min.
+        // The cap restricts the tolerance to 0.22 min.
+
+        let refined_residuals = vec![1.0_f64; 30]; // all large (contaminated)
+        let refined_cal = make_calibration_with_residuals(refined_residuals);
+        let original_cal = make_calibration_with_residuals(vec![0.05_f64; 30]);
+
+        let refined_cals: HashMap<String, RTCalibration> = vec![("file1".to_string(), refined_cal)]
+            .into_iter()
+            .collect();
+        let original_cals: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), original_cal)]
+                .into_iter()
+                .collect();
+
+        let consensus = vec![PeptideConsensusRT {
+            modified_sequence: "PEPTIDEK".to_string(),
+            is_decoy: false,
+            consensus_library_rt: 15.0,
+            median_peak_width: 0.2,
+            n_runs_detected: 3,
+        }];
+
+        // Entry at 15.5 — 0.5 min from expected. With the uncapped refined
+        // tolerance (~4.5 min) this would be Keep. With the original-calibration
+        // cap (~0.22 min) it must be flagged for re-scoring.
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![make_fdr_entry(
+                1, "PEPTIDEK", 2, false, 15.5, 15.0, 16.0, 8.0, 0.005,
+            )],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cals,
+            &original_cals,
+            0.01,
+        );
+
+        assert!(
+            actions.contains_key(&("file1".to_string(), 0)),
+            "Entry 0.5 min from expected must be flagged when original calibration \
+             tolerance is ~0.22 min, even though refined tolerance would allow it"
+        );
+    }
+
+    #[test]
+    fn test_plan_reconciliation_wrong_peak_1min_off_is_caught() {
+        // Regression test: a peak 1.0 min from the consensus-predicted RT must
+        // be flagged for re-scoring, not classified as Keep. This guards against
+        // the tolerance inflation bug that allowed 36% of files on the Seer
+        // dataset to have tolerances > 0.4 min (some up to 2.3 min).
+
+        let cal = make_calibration_with_residuals(vec![0.05_f64; 30]);
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        let consensus = vec![PeptideConsensusRT {
+            modified_sequence: "PEPTIDEK".to_string(),
+            is_decoy: false,
+            consensus_library_rt: 15.0,
+            median_peak_width: 0.5,
+            n_runs_detected: 3,
+        }];
+
+        // Peak at 16.0 — 1.0 min from expected (15.0). Clearly wrong.
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![make_fdr_entry(
+                1, "PEPTIDEK", 2, false, 16.0, 15.5, 16.5, 8.0, 0.005,
+            )],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        assert!(
+            actions.contains_key(&("file1".to_string(), 0)),
+            "Peak 1.0 min from expected must be flagged for re-scoring — \
+             this was the core reconciliation failure on multi-replicate data"
+        );
+    }
+
+    #[test]
+    fn test_plan_reconciliation_correct_peak_near_expected_is_kept() {
+        // Counterpart to the wrong-peak test: a peak 0.05 min from expected
+        // should be classified as Keep, not re-scored. Guards against the
+        // tolerance being too tight and re-scoring correct peaks.
+
+        let cal = make_calibration_with_residuals(vec![0.05_f64; 30]);
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        let consensus = vec![PeptideConsensusRT {
+            modified_sequence: "PEPTIDEK".to_string(),
+            is_decoy: false,
+            consensus_library_rt: 15.0,
+            median_peak_width: 0.5,
+            n_runs_detected: 3,
+        }];
+
+        // Peak at 15.05 — 0.05 min from expected. Should be kept.
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![make_fdr_entry(
+                1, "PEPTIDEK", 2, false, 15.05, 14.8, 15.3, 8.0, 0.005,
+            )],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        assert!(
+            !actions.contains_key(&("file1".to_string(), 0)),
+            "Peak 0.05 min from expected should be Keep (within tolerance)"
+        );
+    }
+
     // ---- identify_gap_fill_targets tests ----
 
     #[test]
