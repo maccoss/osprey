@@ -26,6 +26,15 @@ pub struct RTCalibratorConfig {
     /// and the fit is repeated on the clean data (mirrors DIA-NN's map_RT approach).
     /// Set to 1.0 to disable outlier removal.
     pub outlier_retention: f64,
+    /// When false (default), `residuals` is captured from the initial fit BEFORE
+    /// the robustness loop and reused across all iterations. This produces a
+    /// single refinement regardless of `robustness_iter >= 1` — the historical
+    /// behavior of this crate. When true, each iteration recomputes residuals
+    /// from the current fit, which is the classical Cleveland (1979) robust
+    /// LOESS algorithm. Default false preserves backward compatibility; the
+    /// `OSPREY_LOESS_CLASSICAL_ROBUST=1` env var flips to classical mode for
+    /// cross-implementation validation (OspreySharp honors the same env var).
+    pub classical_robust_iterations: bool,
 }
 
 impl Default for RTCalibratorConfig {
@@ -36,6 +45,7 @@ impl Default for RTCalibratorConfig {
             min_points: 20,
             robustness_iter: 2,
             outlier_retention: 0.8, // Keep best 80%, remove worst 20% (DIA-NN default)
+            classical_robust_iterations: false,
         }
     }
 }
@@ -116,20 +126,35 @@ impl RTCalibrator {
         // Compute initial LOESS fit
         let fitted = self.loess_fit(&x, &y, None)?;
 
-        // Compute residuals
-        let residuals: Vec<f64> = y
+        // Compute residuals from the INITIAL fit. In the default
+        // (non-classical) mode these residuals are reused unchanged across
+        // every iteration of the robustness loop — the historical behavior
+        // of this crate, which produces a single refinement regardless of
+        // `robustness_iter >= 1`. In classical mode (Cleveland 1979),
+        // residuals are refreshed from the current fit at the top of each
+        // iteration, producing the expected multi-pass robust LOESS.
+        // OspreySharp mirrors both modes via the same
+        // OSPREY_LOESS_CLASSICAL_ROBUST env var so the two implementations
+        // stay bit-identical in either configuration.
+        let mut abs_residuals: Vec<f64> = y
             .iter()
             .zip(fitted.iter())
-            .map(|(obs, pred)| obs - pred)
+            .map(|(obs, pred)| (obs - pred).abs())
             .collect();
 
         // Robustness iterations
         let mut weights: Vec<f64> = vec![1.0; x.len()];
         let mut final_fitted = fitted;
 
-        for _ in 0..self.config.robustness_iter {
+        for iter in 0..self.config.robustness_iter {
+            if self.config.classical_robust_iterations && iter > 0 {
+                // Refresh residuals from the current fit (classical Cleveland 1979)
+                for (i, (yv, fv)) in y.iter().zip(final_fitted.iter()).enumerate() {
+                    abs_residuals[i] = (yv - fv).abs();
+                }
+            }
+
             // Compute robust weights using bisquare function
-            let abs_residuals: Vec<f64> = residuals.iter().map(|r| r.abs()).collect();
             let median_abs_residual = median(&abs_residuals);
             let s = 6.0 * median_abs_residual; // MAD scale estimate
 
