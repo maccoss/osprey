@@ -6,9 +6,8 @@
 //! `_ONLY` companion env var exit the process after writing for fast
 //! cycle-time during bisection.
 //!
-//! See `osprey-core::diagnostics` for shared primitives and
-//! [`ai/scripts/OspreySharp/DIAGNOSTICS.md`] in the workspace for the full
-//! env-var reference.
+//! See `osprey-core::diagnostics` for shared primitives and the env-var
+//! gating convention.
 
 use osprey_core::diagnostics::{exit_if_only, is_dump_enabled};
 use osprey_core::{LibraryEntry, Spectrum, XICPeakBounds};
@@ -27,7 +26,19 @@ pub fn dump_loess_input(library_rts_detected: &[f64], measured_rts_detected: &[f
         return;
     }
 
+    let n_lib = library_rts_detected.len();
+    let n_meas = measured_rts_detected.len();
+    if n_lib != n_meas {
+        log::warn!(
+            "LOESS input length mismatch: library_rts={} measured_rts={} (zip will truncate to {})",
+            n_lib,
+            n_meas,
+            n_lib.min(n_meas)
+        );
+    }
+
     if let Ok(mut f) = std::fs::File::create("rust_loess_input.txt") {
+        writeln!(f, "# n_library_rts={} n_measured_rts={}", n_lib, n_meas).ok();
         writeln!(f, "idx\tlib_rt\tmeasured_rt").ok();
         let mut pairs: Vec<(f64, f64)> = library_rts_detected
             .iter()
@@ -81,15 +92,21 @@ pub fn dump_xcorr_scan(
         apex_spectrum.scan_number, entry.modified_sequence
     )
     .ok();
-    writeln!(f, "# nbins={} xcorr_scaled={}", pre_vec.len(), xcorr_scaled).ok();
+    writeln!(
+        f,
+        "# nbins={} xcorr_scaled={:.10}",
+        pre_vec.len(),
+        xcorr_scaled
+    )
+    .ok();
     let psum: f64 = pre_vec.iter().map(|&v| v as f64).sum();
     let pnz = pre_vec.iter().filter(|&&v| v != 0.0).count();
-    writeln!(f, "# preprocessed_sum={} nonzero={}", psum, pnz).ok();
+    writeln!(f, "# preprocessed_sum={:.10} nonzero={}", psum, pnz).ok();
     // First 20 nonzero preprocessed bins
     let mut dumped = 0;
     for (i, &v) in pre_vec.iter().enumerate() {
         if v != 0.0 {
-            writeln!(f, "pre\t{}\t{}", i, v).ok();
+            writeln!(f, "pre\t{}\t{:.10}", i, v).ok();
             dumped += 1;
         }
         if dumped >= 20 {
@@ -108,7 +125,7 @@ pub fn dump_xcorr_scan(
             .unwrap_or(0.0);
         writeln!(
             f,
-            "frag\t{}\tmz={}\tbin={:?}\tpre_val={}\tlib_val={}",
+            "frag\t{}\tmz={:.10}\tbin={:?}\tpre_val={:.10}\tlib_val={:.10}",
             fi, frag.mz, bin, pre_val, lib_val
         )
         .ok();
@@ -118,13 +135,8 @@ pub fn dump_xcorr_scan(
 /// Write a median polish diagnostic block to `rust_mp_diag.txt`.
 ///
 /// Gated by `OSPREY_DIAG_MP_SCAN=<scan_number>` matching
-/// `apex_spectrum.scan_number`. Currently scoped to the
-/// `DECOY_ALQFAQWWK` peptide (target hardcoded at the call site for a
-/// specific historical bisection); the env var only triggers the dump
-/// when both the scan and modified-sequence match.
-///
-/// Writes the row/col effects, grand mean, convergence info, and the
-/// input matrix that the polish was run on.
+/// `apex_spectrum.scan_number`. Writes the row/col effects, grand mean,
+/// convergence info, and the input matrix that the polish was run on.
 #[allow(clippy::too_many_arguments)]
 pub fn dump_mp_diag(
     apex_spectrum: &Spectrum,
@@ -140,8 +152,7 @@ pub fn dump_mp_diag(
     let Ok(diag_scan) = std::env::var("OSPREY_DIAG_MP_SCAN") else {
         return;
     };
-    let scan_str = format!("{}", apex_spectrum.scan_number);
-    if scan_str != diag_scan || !entry.modified_sequence.contains("DECOY_ALQFAQWWK") {
+    if format!("{}", apex_spectrum.scan_number) != diag_scan {
         return;
     }
     let Ok(mut f) = std::fs::File::create("rust_mp_diag.txt") else {
@@ -190,7 +201,6 @@ pub fn dump_mp_diag(
         }
     }
     log::info!("[BISECT] Wrote median polish diagnostic: rust_mp_diag.txt");
-    let _ = exit_if_only; // not used here -- mp_diag has no _ONLY variant
 }
 
 // --------------------------------------------------------------------------
@@ -200,10 +210,11 @@ pub fn dump_mp_diag(
 /// State for the per-entry main-search XIC diagnostic dump.
 ///
 /// Reads `OSPREY_DIAG_SEARCH_ENTRY_IDS=<id1,id2,...>` once at construction.
-/// Unlike [`super::diagnostics::CalXicEntryDump`], this dump does NOT exit
-/// after writing — it accumulates rust_search_xic_entry_<id>.txt files for
-/// every listed entry id encountered during the main search and lets the
-/// pipeline run to completion so downstream analysis is also available.
+/// Unlike `osprey_scoring::diagnostics::CalXicEntryDump`, this dump does
+/// NOT exit after writing -- it accumulates rust_search_xic_entry_<id>.txt
+/// files for every listed entry id encountered during the main search and
+/// lets the pipeline run to completion so downstream analysis is also
+/// available.
 pub struct SearchXicDump {
     target_ids: Option<std::collections::HashSet<u32>>,
 }

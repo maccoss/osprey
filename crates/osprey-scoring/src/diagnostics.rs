@@ -5,9 +5,8 @@
 //! dump (`cs_*.txt`). Dumps that have an `_ONLY` companion env var exit
 //! the process after writing for fast cycle-time during bisection.
 //!
-//! See `osprey-core::diagnostics` for shared primitives and
-//! [`ai/scripts/OspreySharp/DIAGNOSTICS.md`] in the workspace for the full
-//! env-var reference.
+//! See `osprey-core::diagnostics` for shared primitives and the env-var
+//! gating convention.
 
 use crate::batch::CalibrationMatch;
 use osprey_core::diagnostics::{exit_if_only, is_dump_enabled};
@@ -20,7 +19,9 @@ use std::io::Write;
 /// Writes a TSV row per library entry (target or decoy) with match status,
 /// apex scan number when matched, and the four LDA features (correlation,
 /// libcosine, top6, xcorr) plus signal-to-noise. Sorted by entry_id for a
-/// stable diff against C#'s `cs_cal_match.txt`.
+/// stable diff against C#'s `cs_cal_match.txt`. The `scan` column is a
+/// Rust-only extension: C# leaves it blank, Rust populates it from
+/// `CalibrationMatch::scan_number`.
 ///
 /// Gated by `OSPREY_DUMP_CAL_MATCH=1`. When `OSPREY_CAL_MATCH_ONLY=1` is
 /// also set, the process exits after writing for fast cycle-time during
@@ -38,7 +39,6 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
     if let Ok(mut f) = std::fs::File::create(dump_path) {
         // 11 columns. snr is the signal-to-noise the S/N filter gates on
         // (matches entering LOESS must have snr >= MIN_SNR_FOR_RT_CAL=5.0).
-        // scan column intentionally left blank by C#; Rust populates it.
         writeln!(
             f,
             "entry_id\tis_decoy\tcharge\thas_match\tscan\tapex_rt\tcorrelation\tlibcosine\ttop6\txcorr\tsnr"

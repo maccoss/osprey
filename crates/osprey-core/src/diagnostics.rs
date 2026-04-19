@@ -15,9 +15,11 @@
 //!
 //! ## Numeric formatting
 //!
-//! All dumped floating-point values use F10 (1e-10) fixed precision via
-//! [`format_f10`]. Rust's `{:.10}` format spec rounds half-to-even
-//! (banker's). The C# side mirrors this in
+//! Most dumped floating-point values use F10 (1e-10) fixed precision via
+//! [`format_f10`] or an inline `{:.10}` format spec. A few dumps that need
+//! full-bit fidelity (e.g., LOESS input pairs) intentionally use `{:.17}`
+//! or full-precision default formatting. Rust's `{:.N}` format spec rounds
+//! half-to-even (banker's). The C# side mirrors this in
 //! `pwiz.OspreySharp.OspreyDiagnostics.F10()` (which forces half-to-even
 //! via `Math.Round(MidpointRounding.ToEven)`) so the formatted strings
 //! diff cleanly.
