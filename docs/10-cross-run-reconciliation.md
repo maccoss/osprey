@@ -22,13 +22,13 @@ A peak at the expected position gets penalty 1.0; a peak 1 sigma away gets ~0.61
 
 An earlier 3-sigma version was too aggressive — it could downweight the correct peak enough that a nearby shoulder won. The 5-sigma widening in v26.3.1 preserves the interferer-rejection benefit while leaving room for legitimate peptide-specific RT deviations from the LOESS prediction.
 
-**Intensity tiebreaker** — log-scaled peak height:
+**Intensity weight** — log-scaled peak height:
 
 ```
 intensity_weight = log(1 + apex_intensity)
 ```
 
-When two CWT candidates from the same chromatographic peak (main peak vs shoulder) have nearly identical coelution scores and similar RT penalties, the more intense peak wins. Log scaling keeps intensity as a secondary factor that breaks ties without dominating the coelution-based ranking.
+Peak intensity is a multiplicative factor in the score, always contributing alongside coelution and the RT penalty. Log scaling compresses the dynamic range (a 100× intensity difference is only ~1.5× in score) so intensity doesn't dominate the coelution ranking, but it's still meaningful enough to disambiguate candidates that would otherwise score similarly — most importantly, a narrow low-intensity shoulder of a main peak.
 
 Without these modifiers, a common failure mode on multi-replicate experiments is: an interferer with slightly better fragment co-elution than the correct peak gets selected in multiple replicates, corrupting the downstream consensus RT and causing reconciliation to "correct" the good replicates to the wrong position.
 

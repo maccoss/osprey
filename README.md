@@ -478,7 +478,7 @@ cargo doc --open
 - BiblioSpec blib library loading
 - Fragment XIC co-elution analysis with ppm-based fragment matching
 - CWT consensus peak detection (Mexican Hat wavelet, median across transitions)
-- RT-penalized, intensity-weighted peak selection: coelution × Gaussian RT penalty × log(apex_intensity) so interferers at the wrong RT and narrow shoulders near the correct RT both lose to the main peak
+- RT-penalized, intensity-weighted peak selection: score = coelution × Gaussian RT penalty × log(1 + apex_intensity); interferers at the wrong RT lose via the RT penalty, narrow low-intensity shoulders lose via the log-intensity factor
 - Tukey median polish for robust peak boundaries and fragment scoring
 - Signal pre-filter for ~30% speedup on HRAM data (disable with `--no-prefilter`)
 - RT calibration with LOESS regression (classical Cleveland 1979 robust iterations) and (RT × precursor m/z) stratified sampling
