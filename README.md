@@ -22,7 +22,7 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 - **Decoy generation**: Enzyme-aware sequence reversal with fragment m/z recalculation
 - **Skyline integration**: Outputs BiblioSpec (.blib) format for seamless quantification in Skyline
 - **FDR control**: Built-in Percolator-style semi-supervised SVM with two-level FDR (run + experiment) at precursor and peptide levels
-- **Protein FDR**: Native protein parsimony with picked-protein FDR, shared peptide handling (All/Razor/Unique), and protein PEP estimation
+- **Protein FDR**: Native protein parsimony with true picked-protein FDR (Savitski 2015), shared peptide handling (All/Razor/Unique), and two-pass architecture (first-pass protein q-values gate compaction and reconciliation consensus; second-pass q-values are authoritative)
 - **Cross-run reconciliation**: Consensus RT alignment across replicates with peak boundary imputation for missing detections
 - **Flexible input**: Supports DIA-NN TSV, EncyclopeDIA elib, and BiblioSpec blib libraries
 - **Scalable**: Disk-backed memory architecture with automatic cache invalidation; tested on 240-file experiments
@@ -227,11 +227,11 @@ run_fdr: 0.01
 experiment_fdr: 0.01
 decoy_method: Reverse  # Options: Reverse, Shuffle, FromLibrary
 decoys_in_library: false
-fdr_level: Both         # Output filtering level: Precursor, Peptide, or Both (default)
+fdr_level: Precursor    # Output filtering level: Precursor (default), Peptide, Protein, or Both
 
 # Protein-level FDR (optional)
-# protein_fdr: 0.01    # Uncomment to enable protein-level FDR at 1%
-# shared_peptides: All  # How to handle shared peptides: All (default), Razor, or Unique
+# protein_fdr: 0.01       # Uncomment to enable protein-level FDR at 1%
+# shared_peptides: All     # How to handle shared peptides: All (default), Razor, or Unique
 ```
 
 ## Command-line Options
@@ -288,10 +288,14 @@ Options:
           or simple (no ML) [default: percolator]
 
       --fdr-level <LEVEL>
-          FDR filtering level for output: precursor, peptide, or both [default: both]
+          FDR filtering level for output: precursor, peptide, protein, or both [default: precursor]
           - precursor: filter on precursor-level q-values (peptide + charge)
           - peptide: filter on peptide-level q-values (peptide sequence only)
+          - protein: filter on protein-level q-values (requires --protein-fdr)
           - both: filter on max(precursor, peptide) q-values (most conservative)
+          Note: the blib output always enforces precursor-level FDR within each
+          eligible peptide regardless of this setting; --fdr-level controls which
+          peptide identities are admitted.
 
       --protein-fdr <THRESHOLD>
           Protein-level FDR threshold. Enables protein parsimony and
@@ -354,15 +358,15 @@ Optional human-readable report with peptide detections, scores, and peak boundar
 
 Each file gets **independent calibration** because LC conditions may vary between files:
 
-1. Sample library peptides (default 100K targets, 2D stratified by RT × m/z)
+1. Sample library peptides (default 100K targets, 2D stratified on a (RT × precursor m/z) grid for uniform gradient coverage)
 2. Assume linear relationship: library RT range ≈ mzML RT range
 3. Wide initial tolerance (20-30% of gradient range)
 4. Score peptides and detect peaks via co-elution search
 5. Record (library_RT, measured_apex_RT) pairs
-6. Fit LOESS calibration curve
-7. Calculate residual standard deviation → tight RT tolerance (3× residual SD)
+6. Fit LOESS calibration curve using classical Cleveland (1979) robust iterations — residuals are refreshed at each iteration so the bisquare weights progressively tighten (set `OSPREY_LOESS_CLASSICAL_ROBUST=0` for the legacy single-refresh behavior)
+7. Calculate residual statistics — tight RT tolerance (3× MAD × 1.4826) used for the main search
 
-Calibration results are saved to JSON per file for reuse on subsequent runs.
+Calibration results are saved to JSON per file for reuse on subsequent runs. See [Calibration](docs/02-calibration.md) for the full algorithm including two-pass refinement.
 
 ### Candidate Selection
 
@@ -394,9 +398,13 @@ Following the [pyXcorrDIA](https://github.com/maccoss/pyXcorrDIA) approach:
 For each candidate precursor:
 1. Extract fragment XICs across the chromatographic dimension
 2. Compute pairwise fragment co-elution correlations
-3. Detect peaks in the co-elution signal
-4. Score using spectral matching (dot product, XCorr, hyperscore) at the apex
-5. Extract 21 features per precursor for machine learning scoring via built-in Percolator SVM (or optionally Mokapot)
+3. Detect candidate peaks via CWT consensus (Mexican Hat wavelet across transitions)
+4. Rank candidates by `coelution_score × rt_penalty × log(1 + apex_intensity)`:
+   - `coelution_score`: mean pairwise Pearson correlation of fragment XICs within the peak
+   - `rt_penalty`: Gaussian centered on calibration-predicted RT, sigma = 5 × MAD × 1.4826 (downweights peaks far from expected RT without eliminating them)
+   - `log(1 + apex_intensity)`: intensity tiebreaker so the main peak beats its own shoulder when coelution scores are comparable
+5. Score the selected peak using spectral matching (dot product, XCorr, hyperscore) at the apex
+6. Extract 21 features per precursor for machine learning scoring via built-in Percolator SVM (or optionally Mokapot)
 
 ### Cross-Run Peak Reconciliation
 
@@ -441,7 +449,7 @@ osprey/
 - **osprey-chromatography**: `PeakDetector`, `RTCalibrator`, `RTStratifiedSampler`
 - **osprey-scoring**: `DecoyGenerator`, `FeatureExtractor`
 - **osprey-fdr**: `FdrController`, `MokapotRunner`
-- **osprey-ml**: `LinearSvmClassifier`, `PepEstimator`
+- **osprey-ml**: `LinearSvmClassifier`, `PepEstimator` (peptide-level PEP only; protein PEP is intentionally not computed — see `docs/07-fdr-control.md`)
 
 ### Build and test
 
@@ -470,22 +478,26 @@ cargo doc --open
 - BiblioSpec blib library loading
 - Fragment XIC co-elution analysis with ppm-based fragment matching
 - CWT consensus peak detection (Mexican Hat wavelet, median across transitions)
+- RT-penalized, intensity-weighted peak selection: coelution × Gaussian RT penalty × log(apex_intensity) so interferers at the wrong RT and narrow shoulders near the correct RT both lose to the main peak
 - Tukey median polish for robust peak boundaries and fragment scoring
 - Signal pre-filter for ~30% speedup on HRAM data (disable with `--no-prefilter`)
-- RT calibration with LOESS regression and stratified sampling
+- RT calibration with LOESS regression (classical Cleveland 1979 robust iterations) and (RT × precursor m/z) stratified sampling
 - MS1/MS2 mass calibration
 - Enzyme-aware decoy generation with fragment recalculation
 - 21-feature extraction per precursor for machine learning scoring
 - Built-in Percolator-style semi-supervised SVM for FDR control (no Python required)
 - Two-level FDR control (run + experiment level) with dual precursor + peptide level FDR
+- Two-stage blib output gate: `--fdr-level` determines eligible peptide identities; precursor-level FDR is always enforced within each eligible peptide (fallback to best charge state if no charge passes)
+- Native protein parsimony with true picked-protein FDR (Savitski 2015), two-pass architecture, and protein-aware compaction + reconciliation consensus rescue
 - Optional Mokapot integration with parallel workers and progress streaming
-- Cross-run peak reconciliation: aligns integration boundaries across replicates using consensus RTs
+- Cross-run peak reconciliation: aligns integration boundaries across replicates using consensus RTs; sigma-clipped MAD + original-calibration cap prevent tolerance inflation from wrong-peak detections
 - Multi-file observation propagation: all per-file observations for passing precursors included in output
 - Disk-backed memory architecture with per-file Parquet caching for 1000+ file experiments
 - Intelligent cache invalidation via SHA-256 parameter hashing in Parquet metadata
 - FDR score sidecar caching — skips Percolator SVM training on reruns with same parameters
 - Streaming blib output via lightweight plan entries — avoids loading full entries into memory
 - Binary spectra cache for faster second-pass mzML loading
+- Cross-implementation bisection diagnostics for validation against OspreySharp (env-var gated; zero overhead when unused)
 - Fragment co-elution scoring
 - Mass accuracy features (ppm-level)
 - MS1 isotope envelope and precursor co-elution features
