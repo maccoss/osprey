@@ -165,6 +165,157 @@ fn validate_scores_cache(path: &std::path::Path, config: &OspreyConfig) -> Cache
     CacheValidity::ValidFirstPass
 }
 
+/// Parse a `MAJOR.MINOR.PATCH` version string. Returns `None` if the
+/// string isn't in the expected shape. Used by `check_parquet_metadata`
+/// to compare versions; patch differences warn, minor/major differences
+/// abort.
+fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.splitn(3, '.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts.next()?.parse::<u32>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Pure helper that checks one parquet's footer metadata against the
+/// expected hashes. Separated from the IO so it's unit-testable without
+/// constructing real parquet files. Returns `Ok(warning_message)` on
+/// success (warning may be empty) or `Err(message)` naming the file
+/// + offending field.
+fn check_parquet_metadata(
+    file_label: &str,
+    cached_version: Option<&str>,
+    cached_search: Option<&str>,
+    cached_library: Option<&str>,
+    expected_search: &str,
+    expected_library: &str,
+    current_version: &str,
+) -> std::result::Result<Option<String>, String> {
+    // Version: warn on patch drift, abort on minor/major drift.
+    let cached_v = cached_version
+        .ok_or_else(|| format!("{}: parquet has no `osprey.version` metadata", file_label))?;
+    let warning = match (parse_version(cached_v), parse_version(current_version)) {
+        (Some((cm, cmn, cp)), Some((rm, rmn, rp))) => {
+            if cm != rm || cmn != rmn {
+                return Err(format!(
+                    "{}: osprey version mismatch: parquet was scored with {} but current binary is {} (incompatible major/minor)",
+                    file_label, cached_v, current_version
+                ));
+            }
+            if cp != rp {
+                Some(format!(
+                    "{}: osprey patch-version drift (parquet={}, current={}); proceeding",
+                    file_label, cached_v, current_version
+                ))
+            } else {
+                None
+            }
+        }
+        _ => Some(format!(
+            "{}: could not parse osprey version (parquet={:?}, current={:?}); proceeding",
+            file_label, cached_v, current_version
+        )),
+    };
+
+    let cached_s = cached_search.ok_or_else(|| {
+        format!(
+            "{}: parquet has no `osprey.search_hash` metadata",
+            file_label
+        )
+    })?;
+    if cached_s != expected_search {
+        return Err(format!(
+            "{}: search_hash mismatch: parquet was scored with search_hash={} but current config hashes to {}",
+            file_label, cached_s, expected_search
+        ));
+    }
+
+    let cached_l = cached_library.ok_or_else(|| {
+        format!(
+            "{}: parquet has no `osprey.library_hash` metadata",
+            file_label
+        )
+    })?;
+    if cached_l != expected_library {
+        return Err(format!(
+            "{}: library_hash mismatch: parquet was scored with library_hash={} but --library hashes to {}",
+            file_label, cached_l, expected_library
+        ));
+    }
+
+    Ok(warning)
+}
+
+/// Open each `.scores.parquet` in `paths` and assert its footer metadata
+/// matches `config`'s search and library hashes. Aborts on the first
+/// per-file failure (with a message naming the file + field). Used at
+/// the start of `--join-only` mode so the operator gets a clear error
+/// if they accidentally point the merge node at parquets from a
+/// different search or library.
+fn validate_scores_parquet_group(
+    paths: &[std::path::PathBuf],
+    config: &OspreyConfig,
+) -> Result<()> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let expected_search = config.search_parameter_hash();
+    let expected_library = config.library_identity_hash();
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    for path in paths {
+        let label = path.display().to_string();
+        let file = std::fs::File::open(path).map_err(|e| {
+            OspreyError::ConfigError(format!("{}: cannot open parquet: {}", label, e))
+        })?;
+        let reader = SerializedFileReader::new(file).map_err(|e| {
+            OspreyError::ConfigError(format!("{}: cannot read parquet metadata: {}", label, e))
+        })?;
+        let kv = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .ok_or_else(|| {
+                OspreyError::ConfigError(format!(
+                    "{}: parquet has no key-value metadata (pre-hash cache)",
+                    label
+                ))
+            })?
+            .clone();
+
+        let get = |key: &str| -> Option<String> {
+            kv.iter()
+                .find(|kv| kv.key == key)
+                .and_then(|kv| kv.value.clone())
+        };
+
+        let cached_v = get(META_OSPREY_VERSION);
+        let cached_s = get(META_SEARCH_HASH);
+        let cached_l = get(META_LIBRARY_HASH);
+
+        match check_parquet_metadata(
+            &label,
+            cached_v.as_deref(),
+            cached_s.as_deref(),
+            cached_l.as_deref(),
+            &expected_search,
+            &expected_library,
+            current_version,
+        ) {
+            Ok(Some(warn)) => log::warn!("{}", warn),
+            Ok(None) => {}
+            Err(msg) => return Err(OspreyError::ConfigError(msg)),
+        }
+    }
+
+    log::info!(
+        "--join-only: validated {} parquet(s) against current config (search_hash={}..., library_hash={}...)",
+        paths.len(),
+        &expected_search[..8],
+        &expected_library[..8]
+    );
+    Ok(())
+}
+
 /// Build Parquet key-value metadata for a first-pass scores cache.
 fn build_scores_metadata(config: &OspreyConfig) -> Vec<parquet::file::metadata::KeyValue> {
     vec![
@@ -2354,6 +2505,10 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // Side data (RT calibration, FDR sidecars) is loaded best-effort
         // when the worker preserved sibling files next to each parquet.
         let parquets = config.input_scores.as_ref().unwrap();
+        // Guard: hash check against current --library and search params.
+        // Aborts with a clear, file-named error if the operator points
+        // the merge node at parquets from a different scoring run.
+        validate_scores_parquet_group(parquets, &config)?;
         log::info!(
             "--join-only: loading {} per-file score parquet(s)",
             parquets.len()
@@ -8784,5 +8939,112 @@ mod tests {
             SpectralScorer::new().num_bins(),
             "calibration XCorr on unit-resolution data should stay unit bins"
         );
+    }
+
+    // -- Phase 3 (HPC scoring split) parquet group validation -----------
+    // Tests for the pure helpers behind validate_scores_parquet_group.
+    // The IO wrapper (which actually opens parquets) is exercised by the
+    // Stellar round-trip smoke tests, not unit tests, since constructing
+    // real parquets in-memory is too heavy for a unit test.
+
+    const VALID_SEARCH: &str = "search-hash-aaa";
+    const VALID_LIB: &str = "lib-hash-bbb";
+    const CURRENT_VERSION: &str = "26.3.0";
+
+    fn check_md(
+        cached_v: Option<&str>,
+        cached_s: Option<&str>,
+        cached_l: Option<&str>,
+    ) -> std::result::Result<Option<String>, String> {
+        check_parquet_metadata(
+            "test.scores.parquet",
+            cached_v,
+            cached_s,
+            cached_l,
+            VALID_SEARCH,
+            VALID_LIB,
+            CURRENT_VERSION,
+        )
+    }
+
+    #[test]
+    fn parse_version_round_trip() {
+        assert_eq!(parse_version("26.3.0"), Some((26, 3, 0)));
+        assert_eq!(parse_version("0.0.1"), Some((0, 0, 1)));
+        assert_eq!(parse_version("100.200.300"), Some((100, 200, 300)));
+    }
+
+    #[test]
+    fn parse_version_rejects_bad_input() {
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("26.3"), None);
+        assert_eq!(parse_version("v26.3.0"), None);
+        assert_eq!(parse_version("26.3.x"), None);
+    }
+
+    #[test]
+    fn metadata_happy_path_no_warning() {
+        let res = check_md(Some("26.3.0"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap();
+        assert!(res.is_none(), "no warning expected, got {:?}", res);
+    }
+
+    #[test]
+    fn metadata_patch_drift_warns_but_succeeds() {
+        let res = check_md(Some("26.3.5"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap();
+        let warn = res.expect("expected a warning");
+        assert!(warn.contains("patch-version drift"), "got: {}", warn);
+    }
+
+    #[test]
+    fn metadata_minor_version_drift_aborts() {
+        let err = check_md(Some("26.4.0"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("major/minor"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_major_version_drift_aborts() {
+        let err = check_md(Some("27.0.0"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("major/minor"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_missing_version_aborts() {
+        let err = check_md(None, Some(VALID_SEARCH), Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("osprey.version"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_missing_search_hash_aborts() {
+        let err = check_md(Some("26.3.0"), None, Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("osprey.search_hash"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_missing_library_hash_aborts() {
+        let err = check_md(Some("26.3.0"), Some(VALID_SEARCH), None).unwrap_err();
+        assert!(err.contains("osprey.library_hash"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_search_hash_mismatch_names_field_and_file() {
+        let err = check_md(Some("26.3.0"), Some("wrong-hash"), Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("search_hash mismatch"), "got: {}", err);
+        assert!(err.contains("test.scores.parquet"), "got: {}", err);
+        assert!(err.contains("wrong-hash"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_library_hash_mismatch_names_field_and_file() {
+        let err = check_md(Some("26.3.0"), Some(VALID_SEARCH), Some("wrong-lib")).unwrap_err();
+        assert!(err.contains("library_hash mismatch"), "got: {}", err);
+        assert!(err.contains("test.scores.parquet"), "got: {}", err);
+        assert!(err.contains("wrong-lib"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_unparseable_version_warns_but_proceeds() {
+        let res = check_md(Some("garbage"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap();
+        let warn = res.expect("expected a warning");
+        assert!(warn.contains("could not parse"), "got: {}", warn);
     }
 }
