@@ -4,7 +4,7 @@ XCorr (cross-correlation) is a spectral similarity score originally developed fo
 
 ## Overview
 
-```
+```text
 XCorr Calculation Flow:
 
   Experimental Spectrum              Theoretical Spectrum
@@ -42,7 +42,7 @@ XCorr Calculation Flow:
 
 Both experimental and theoretical spectra are binned using Comet's BIN macro:
 
-```
+```text
 BIN(mass) = (int)(mass / bin_width + (1 - offset))
           = (int)(mass / bin_width + 0.6)    // with offset = 0.4
 ```
@@ -121,6 +121,7 @@ fn apply_windowing_normalization(spectrum: &[f64]) -> Vec<f64> {
 ```
 
 **Why windowing?**
+
 - Prevents high-intensity peaks from dominating the score
 - Gives equal weight to different mass regions
 - The 5% threshold removes noise peaks
@@ -184,6 +185,7 @@ fn apply_sliding_window(spectrum: &[f64]) -> Vec<f64> {
 This reduces sliding window from O(n × 151) to O(n), critical for HRAM bins where n ≈ 100,000.
 
 **Why flanking subtraction?**
+
 - Enhances peaks that stand out from their local background
 - Reduces contribution from broad, noisy regions
 - Creates positive values where peaks are higher than surroundings
@@ -210,6 +212,7 @@ fn preprocess_library_for_xcorr(entry: &LibraryEntry) -> Vec<f64> {
 ```
 
 **Why no preprocessing for theoretical?**
+
 - Comet's XCorr is designed as a lookup: sum the preprocessed experimental values at fragment positions
 - Applying windowing would multiply values by ~50, inflating scores
 - The theoretical spectrum serves as a "selector" for which bins to sum
@@ -250,6 +253,7 @@ xcorr *= 0.005;
 ### Scaling Factor (0.005)
 
 The 0.005 scaling factor comes from Comet's normalization:
+
 - Windowing normalizes to max=50 per window
 - 0.005 = 1/(50 × 4) approximately normalizes scores to a reasonable range
 - Typical good XCorr values: 0.5-5.0
@@ -300,7 +304,7 @@ During the coelution search (Phase 3), `run_search()` processes each DIA isolati
 
 A typical DIA window contains ~200 spectra and hundreds of candidate precursors. Naive per-candidate preprocessing would preprocess the same spectrum hundreds of times:
 
-```
+```text
 Window [400, 403] → 200 spectra, 300 candidates
 Without optimization:  300 × 200 = 60,000 preprocessing calls
 With optimization:                  200 preprocessing calls
@@ -346,6 +350,7 @@ xcorr *= 0.005;
 ### Memory Impact
 
 Each preprocessed vector has `n_bins` entries of 4 bytes (f32):
+
 - **Unit resolution**: 2,001 bins × 4 bytes = ~8 KB per spectrum
 - **HRAM**: 100,000 bins × 4 bytes = ~400 KB per spectrum
 
@@ -370,7 +375,7 @@ HRAM-resolution bins (0.02 Da, 100K bins) are used during the main search phase 
 
 ## Example
 
-```
+```text
 Peptide: PEPTIDEK (charge 2+)
 Fragments: y3(391.2), y4(504.3), y5(605.3), y6(702.4), y7(831.4)
 
@@ -435,6 +440,7 @@ return raw_dot_product * 0.005;
 ## Implementation
 
 Key files:
+
 - `crates/osprey-scoring/src/lib.rs` - SpectralScorer with XCorr methods
 - `crates/osprey/src/pipeline.rs` - Integration in calibration workflow
 
@@ -464,4 +470,4 @@ let xcorr = SpectralScorer::xcorr_from_preprocessed(&exp_preprocessed, &theo_pre
 - Comet source code: `CometPreprocess.cpp` (MakeCorrData, FastXcorrPreprocessing)
 - Comet source code: `CometSearch.cpp` (XcorrScore function)
 - Eng, J.K., et al. (2013). "Comet: An open-source MS/MS sequence database search tool"
-- pyXcorrDIA: https://github.com/maccoss/pyXcorrDIA
+- pyXcorrDIA: <https://github.com/maccoss/pyXcorrDIA>

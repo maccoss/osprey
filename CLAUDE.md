@@ -12,7 +12,7 @@ Osprey is a Rust-based peptide-centric DIA (Data-Independent Acquisition) analys
 
 ### Workspace Structure
 
-```
+```text
 osprey/
 ├── Cargo.toml                    # Workspace root
 ├── crates/
@@ -108,6 +108,7 @@ CLI arguments override config file values.
 - **chrono**: Timestamps
 
 External:
+
 - **mokapot**: Semi-supervised FDR (Python, `pip install mokapot`)
 
 ## Current Status
@@ -165,6 +166,7 @@ fragment_coverage, hyperscore, sequence_coverage, mass_accuracy_std, median_poli
 ## Testing
 
 Test data should be placed in a `example_test_data/` directory (not committed):
+
 - `*.mzML` - DIA mass spec files
 - `*.tsv` - DIA-NN format spectral libraries
 - `*.elib` - EncyclopeDIA spectral libraries
@@ -226,11 +228,13 @@ See `docs/16-protein-parsimony.md` for the full algorithm, `docs/07-fdr-control.
 ### evaluate_calibration.py
 
 Generate HTML report from calibration JSON:
+
 ```bash
 python scripts/evaluate_calibration.py calibration.json --output report.html
 ```
 
 Features:
+
 - RT calibration curve with residuals
 - MS1/MS2 mass error histograms
 - Candidate density heatmap (optimized with binary search)
@@ -238,6 +242,7 @@ Features:
 ### inspect_mokapot_weights.py
 
 View Mokapot feature weights to identify important features:
+
 ```bash
 python scripts/inspect_mokapot_weights.py mokapot.model.pkl
 ```
@@ -263,6 +268,7 @@ This is enforced via: `effective_qvalue = max(precursor_qvalue, peptide_qvalue)`
 - `max(0.003, 0.008) = 0.008 < 0.01` → accepted (both pass)
 
 The max is applied at both run and experiment levels:
+
 - `run_qvalue = max(run_precursor_qvalue, run_peptide_qvalue)`
 - `experiment_qvalue = max(experiment_precursor_qvalue, experiment_peptide_qvalue)`
 
@@ -271,6 +277,7 @@ For Mokapot: `mokapot.psms.txt` provides precursor-level q-values; `mokapot.pept
 ### Multi-File Observation Propagation
 
 After experiment-level FDR determines which precursors pass, **all per-file target observations** for those precursors are included in the output (blib and report). This ensures:
+
 - Each file gets its own RT boundaries for a passing precursor
 - The best experiment_qvalue is propagated to all observations of that precursor
 - Skyline can use per-file peak boundaries for quantification across replicates/GPF files
@@ -278,6 +285,7 @@ After experiment-level FDR determines which precursors pass, **all per-file targ
 ### Blib RetentionTimes: Nullable retentionTime for Skyline ID Lines
 
 In the RetentionTimes table, `retentionTime` controls Skyline's ID line display:
+
 - **Set to apex RT**: When the precursor passes run-level FDR in that file → Skyline shows an ID line
 - **Set to NULL**: When the precursor did NOT pass run-level FDR in that file (but passed experiment-level FDR via another replicate) → Skyline uses `startTime`/`endTime` for quantification boundaries without showing an ID line
 

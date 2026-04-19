@@ -36,7 +36,7 @@ Each library entry and each spectrum is preprocessed into a fixed-length vector 
 
 This converts spectral matching into a matrix multiplication:
 
-```
+```text
 scores = library_matrix @ spectra_matrix.T
 
   (n_library × n_bins) · (n_bins × n_spectra) → (n_library × n_spectra)
@@ -57,7 +57,7 @@ The f32 data type is deliberate: it halves memory relative to f64, doubles SIMD 
 
 ### Dependency Chain
 
-```
+```text
 ndarray (with "blas" feature)
   └── blas-src (with "openblas" feature)
        └── openblas-src (with "system" and "cblas" features)

@@ -6,7 +6,7 @@ Osprey uses spectral similarity scoring during calibration discovery. Multiple s
 
 The scoring system computes multiple features during calibration, which are combined by LDA for FDR:
 
-```
+```text
 Calibration Workflow:
   1. Co-elution search with CWT peak detection → find best peak per peptide
   2. At apex, compute XCorr, libcosine, fragment correlation, top-6 matches
@@ -25,7 +25,7 @@ XCorr uses Comet-style preprocessing for cross-correlation scoring. It is calcul
 
 Calibration XCorr always uses **unit resolution bins** (2001 bins, 1.0005 m/z) regardless of whether the data is unit resolution or HRAM. This provides ~50x faster scoring for HRAM data while maintaining sufficient discriminating power for calibration.
 
-```
+```text
 Experimental Spectrum Preprocessing:
   1. Bin into discrete bins (Comet BIN macro: bin_width = 1.0005079 Da, offset = 0.4)
   2. Apply sqrt transformation
@@ -48,7 +48,7 @@ Scoring:
 
 Osprey computes Comet-style E-values from the XCorr survival function for each peptide:
 
-```
+```text
 E-value calculation:
   1. Collect ALL XCorr scores in RT window (~700 spectra typically)
   2. Sort scores descending, build survival function
@@ -62,7 +62,7 @@ Lower E-value = better statistical significance. Note: E-value is computed and s
 
 After XCorr selects the best spectrum, Osprey collects MS2 mass errors from the top-3 most intense library fragments using binary search:
 
-```
+```text
 For the best XCorr spectrum:
   1. Find top 3 library fragments by intensity
   2. Binary search each in sorted observed m/z array
@@ -79,7 +79,7 @@ These mass errors feed into MS2 mass calibration for the main search phase.
 
 The isotope cosine score compares the observed MS1 isotope envelope to the theoretical distribution calculated from the peptide's exact elemental composition:
 
-```
+```text
 1. Calculate elemental composition from peptide sequence:
    - Sum amino acid compositions (C, H, N, O, S)
    - Add terminal H2O
@@ -98,6 +98,7 @@ The isotope cosine score compares the observed MS1 isotope envelope to the theor
 ```
 
 **Why exact elemental composition?**
+
 - More accurate than averagine approximation
 - Sulfur-containing peptides (Cys, Met) have distinct M+2 patterns
 - Enables confident MS1-level validation
@@ -107,6 +108,7 @@ The isotope cosine score compares the observed MS1 isotope envelope to the theor
 Before XCorr scoring, candidates are filtered using the `has_top3_fragment_match` function — a fast binary search check that requires at least 1 of the top-3 most intense library fragments to be present in the observed spectrum. This eliminates candidates with no spectral evidence before expensive XCorr preprocessing.
 
 **Tolerance modes:**
+
 - **ppm tolerance**: 10-20 ppm (HRAM instruments - Orbitrap, TOF)
 - **Da tolerance**: 0.5 Da (unit resolution instruments)
 
@@ -114,7 +116,7 @@ Before XCorr scoring, candidates are filtered using the `has_top3_fragment_match
 
 During calibration, each target competes against its paired decoy using the LDA discriminant score (not E-value):
 
-```
+```text
 Target-decoy pairing: decoy_id = target_id | 0x80000000
 
 LDA features (normalized to 0–1):
@@ -139,7 +141,7 @@ See [Calibration](02-calibration.md) for full LDA training details.
 
 ## Scoring Flow Summary
 
-```
+```text
 Per peptide (target or decoy):
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. Filter by RT tolerance + top-3 fragment match            │
@@ -192,6 +194,7 @@ Spectral scoring populates these fields in CalibrationMatch:
 ## Implementation
 
 Key files:
+
 - `crates/osprey-scoring/src/lib.rs` - SpectralScorer (XCorr preprocessing), `top3_fragment_match_with_errors`
 - `crates/osprey-scoring/src/batch.rs` - E-value calculation, calibration batch scoring
 - `crates/osprey-core/src/isotope.rs` - Isotope distribution calculations
@@ -269,7 +272,7 @@ if envelope.has_m0() {
 
 ## Example
 
-```
+```text
 Peptide: PEPTIDEK (charge 2+)
 Library fragments: y3(348.2), y4(461.3), y5(576.3), b3(357.2), b4(458.2)
 Top-3 by intensity: y3, y4, y5

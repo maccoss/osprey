@@ -15,6 +15,7 @@ pip install -r scripts/requirements.txt
 Generates an interactive HTML report from Osprey calibration JSON files. Useful for inspecting calibration quality before trusting main search results.
 
 **Report contents:**
+
 - MS1 and MS2 mass accuracy histograms
 - RT calibration curve and RT shift plot
 - Per-file calibration metrics

@@ -89,7 +89,7 @@ A raw binary dump of all decoded MS1 and MS2 spectra from an mzML file. Created 
 
 ### Format (little-endian)
 
-```
+```text
 Header (20 bytes):
   [magic:   8 bytes  "OSPRSPC\0"]
   [version: u32      currently 1]

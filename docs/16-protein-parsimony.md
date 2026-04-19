@@ -10,7 +10,7 @@ This is the classic **minimum set cover** problem, solved here with a combinatio
 
 ## Algorithm
 
-```
+```text
 Input: library entries with protein_ids; optionally a detected-peptide set
 Output: ProteinParsimonyResult {
     groups: Vec<ProteinGroup>,
@@ -29,6 +29,7 @@ Steps:
 ### Step 1: Bipartite Graph
 
 For each library entry with `protein_ids = [P1, P2, ...]`:
+
 - Add edges peptide ↔ P1, peptide ↔ P2, ...
 
 If a `detected_peptides` set is provided (typically peptides passing peptide-level FDR at experiment scope), only peptides in that set are added to the graph. This ensures protein groups reflect actual observations, not theoretical library content.
@@ -37,7 +38,7 @@ If a `detected_peptides` set is provided (typically peptides passing peptide-lev
 
 Proteins with identical peptide sets are indistinguishable based on the detected evidence. These are collapsed into a single **protein group** (with multiple `accessions`). For example:
 
-```
+```text
 P1 peptides: {A, B, C}
 P2 peptides: {A, B, C}  ← identical to P1
 P3 peptides: {A, B}
@@ -50,7 +51,7 @@ Group 2: accessions=[P3],     peptides={A, B}
 
 A protein group whose peptides are a strict subset of another group can be explained by that larger group — it provides no additional evidence. These subset groups are removed.
 
-```
+```text
 Group 2 (peptides {A, B}) is a strict subset of Group 1 (peptides {A, B, C})
 → Group 2 is eliminated
 ```
@@ -58,6 +59,7 @@ Group 2 (peptides {A, B}) is a strict subset of Group 1 (peptides {A, B, C})
 ### Step 4: Unique vs Shared Classification
 
 For each remaining peptide:
+
 - **Unique**: belongs to exactly 1 group (proteotypic)
 - **Shared**: belongs to 2+ groups
 
@@ -75,7 +77,7 @@ Three modes control what happens to shared peptides:
 
 Razor mode resolves shared peptides to a single protein group each. Osprey uses a textbook iterative greedy algorithm:
 
-```
+```text
 while any shared peptides remain unassigned:
     find the group G with the MOST unique peptides that still has
         at least one unassigned shared peptide (tiebreak: lowest group ID)
@@ -88,7 +90,7 @@ while any shared peptides remain unassigned:
 
 Consider three groups:
 
-```
+```text
 Group 1: unique={A, B, C}, shared={X, Y}
 Group 2: unique={D},        shared={X}
 Group 3: unique={E},        shared={Y}
@@ -97,6 +99,7 @@ Group 3: unique={E},        shared={Y}
 Naive single-pass razor might iterate shared peptides in arbitrary order and assign each to "the group with the most unique peptides right now." But the order of iteration matters — assigning X first bumps Group 1's unique count from 3 to 4, which could affect Y's decision.
 
 The iterative greedy looks at the **global state** at every step. In this example:
+
 - **Round 1**: Group 1 has 3 unique, Group 2 and Group 3 each have 1. Group 1 wins. It claims both X and Y in one batch. Result: Group 1 has {A, B, C, X, Y}, Groups 2 and 3 unchanged.
 
 A single-pass approach could have produced a different result (e.g., X → Group 2 if X was processed before Group 1 had been strengthened). The iterative approach is path-independent.
@@ -116,7 +119,7 @@ This means running the same parsimony on the same input always produces byte-ide
 
 ### Example 1: Simple isoforms
 
-```
+```text
 P1 peptides: {A, B, C, X}
 P2 peptides: {D, X}
 
@@ -131,7 +134,7 @@ Unique mode: X excluded
 
 ### Example 2: Cascading razor
 
-```
+```text
 P1 peptides: {A, B, C, X, Y}
 P2 peptides: {D, X, Z}
 P3 peptides: {E, Y, Z}
@@ -145,7 +148,7 @@ Done.
 
 ### Example 3: No shared peptides
 
-```
+```text
 P1 peptides: {A, B}
 P2 peptides: {C, D}
 

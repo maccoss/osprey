@@ -18,12 +18,14 @@ In a parallel Rust pipeline, four sources can break determinism:
 Every time results are collected from a `HashMap`, they are immediately sorted into a deterministic order.
 
 **Where this applies:**
+
 - `deduplicate_pairs()`: Groups entries by `base_id` using HashMap, then sorts results by `entry_id` (`pipeline.rs`)
 - `select_consensus_peaks()`: Groups entries by `modified_sequence` using HashMap, result sorted by `(entry_id, scan_number)` (`pipeline.rs`)
 - `compete_calibration_pairs()`: Collects winners from HashMap, sorts by `(score, base_id)` (`calibration_ml.rs`)
 - Best-per-precursor subsampling: Collects best target/decoy per `base_id` from HashMap, sorts `best_observations` by `(file_idx, local_idx)`, sorts peptide groups alphabetically before subsampling (`pipeline.rs`)
 
 **Pattern:**
+
 ```rust
 let mut groups: HashMap<K, Vec<V>> = HashMap::new();
 // ... populate ...
@@ -36,11 +38,13 @@ results.sort_by_key(|e| e.some_deterministic_key);
 After any `par_iter()` that produces results, sort the output before further processing.
 
 **Where this applies:**
+
 - Main search: `all_entries` collected from parallel per-window processing, sorted by `entry_id` before FDR (`pipeline.rs`)
 - Overlapping-window dedup: `deduped` sorted by `(entry_id, scan_number)` after HashMap-based dedup (`pipeline.rs`)
 - Multi-charge consensus: Results re-sorted by `(entry_id, scan_number)` after merging kept and re-scored entries (`pipeline.rs`)
 
 **Pattern:**
+
 ```rust
 let results: Vec<T> = entries.par_iter().flat_map(|e| process(e)).collect();
 let mut sorted = results;
@@ -52,6 +56,7 @@ sorted.sort_by(|a, b| a.key.cmp(&b.key));
 All random operations use a fixed seed for reproducibility.
 
 **Where this applies:**
+
 - Percolator SVM cross-validation: seed=42 for fold assignment and weight initialization (`percolator.rs`)
 - Library subsampling: Deterministic selection based on entry_id hash, not random sampling
 
@@ -60,6 +65,7 @@ All random operations use a fixed seed for reproducibility.
 When comparing floating-point values, ties must be broken deterministically. Osprey uses multi-level sort keys:
 
 **Pattern:**
+
 ```rust
 // Sort by score descending, then entry_id ascending for deterministic tiebreaking
 entries.sort_by(|a, b| {
@@ -123,30 +129,36 @@ This is path-independent: the same input always produces the same output, regard
 
 When adding new code to Osprey, verify these invariants:
 
-### If you use a HashMap or HashSet:
+### If you use a HashMap or HashSet
+
 - [ ] Results collected from the map are sorted before use
 - [ ] The sort key is based on stable identifiers (`entry_id`, `modified_sequence`), not memory addresses or insertion order
 
-### If you use `par_iter()` or `par_bridge()`:
+### If you use `par_iter()` or `par_bridge()`
+
 - [ ] Collected results are sorted into deterministic order before downstream use
 - [ ] No parallel floating-point reduction (use sequential sum, or sort-then-sum)
 
-### If you compare floating-point values:
+### If you compare floating-point values
+
 - [ ] Use `total_cmp` instead of `partial_cmp` for sort comparisons
 - [ ] Add tiebreaker keys when scores can be equal (e.g., `.then(a.entry_id.cmp(&b.entry_id))`)
 - [ ] Check for NaN: any division should guard against zero denominators
 
-### If you sample or shuffle:
+### If you sample or shuffle
+
 - [ ] Use a seeded RNG (seed=42 by convention)
 - [ ] Document the seed location so it can be overridden if needed
 
-### If you add cross-validation or fold splitting:
+### If you add cross-validation or fold splitting
+
 - [ ] Target-decoy pairs must stay together (same `base_id`)
 - [ ] Same peptide, different charge states must stay together
 - [ ] Subsampling operates on paired groups, not individual entries
 - [ ] See [FDR Control](07-fdr-control.md) for the full grouping invariant
 
-### If you write/read Parquet caches:
+### If you write/read Parquet caches
+
 - [ ] Entries are written in a deterministic order (sorted before writing)
 - [ ] Reloaded entries are used in the same order as they were written
 - [ ] No floating-point rounding is introduced by the serialize/deserialize round-trip
@@ -179,6 +191,7 @@ When adding new code to Osprey, verify these invariants:
 The test `test_deduplicate_pairs_deterministic` in `pipeline.rs` verifies that `deduplicate_pairs()` produces deterministic output despite HashMap internals. This catches the most common source of non-determinism (HashMap iteration order affecting downstream row ordering for SVM training).
 
 To verify full-pipeline determinism, run Osprey twice on the same input and compare outputs:
+
 ```bash
 diff <(sqlite3 run1.blib "SELECT * FROM RetentionTimes ORDER BY 1,2") \
      <(sqlite3 run2.blib "SELECT * FROM RetentionTimes ORDER BY 1,2")

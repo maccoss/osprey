@@ -4,7 +4,7 @@ Osprey uses two-level FDR (False Discovery Rate) control to ensure high-quality 
 
 ## Overview
 
-```
+```text
 FDR Control Workflow:
   1. Extract features per precursor (21 PIN features written to per-file Parquet cache)
   2. Convert to FdrEntry stubs (~128 bytes each, Arc<str>-interned peptide sequences)
@@ -40,7 +40,7 @@ FDR Control Workflow:
 
 Osprey generates decoys using enzyme-aware sequence reversal:
 
-```
+```text
 Target:  K.PEPTIDEK.R  (tryptic)
 Decoy:   K.KEDITPEP.R  (reversed, preserving cleavage sites)
 ```
@@ -51,7 +51,7 @@ Each target has a paired decoy with the same precursor m/z, charge state, and li
 
 The target-decoy competition approach assumes that decoys model the distribution of incorrect matches. Targets are a mixture of correct and incorrect matches. By competing each target against its paired decoy, incorrect targets are removed at roughly the same rate as decoys, and the remaining decoys estimate the residual false discovery rate:
 
-```
+```text
 FDR = (decoys + 1) / targets       (conservative formula)
 ```
 
@@ -73,7 +73,7 @@ This distinction is critical: mokapot's FDR estimates are only valid when it rec
 
 When pre-competing for mokapot, the best-separating feature is selected by **ROC AUC** (area under the receiver operating characteristic curve), computed via the Mann-Whitney U statistic:
 
-```
+```text
 AUC = P(target_score > decoy_score)
 ```
 
@@ -89,7 +89,7 @@ For each target-decoy pair, the entry with the better value on the selected feat
 
 The native Percolator implements the semi-supervised learning approach of Käll et al. (2007), using a linear SVM trained iteratively via cross-validation. Both targets and their paired decoys enter the algorithm — no upstream competition is performed.
 
-```
+```text
 Native Percolator Workflow:
   1. Standardize all features to zero mean, unit variance
   2. Assign folds: group by target peptide (base_id), keeping pairs together
@@ -118,7 +118,7 @@ Fold assignment groups all entries by their **target peptide** via `base_id`:
 3. All entries sharing a target peptide (all charge states + their decoys) → same fold
 4. Round-robin assignment across folds, sorted alphabetically for determinism
 
-```
+```text
 Example with 3 folds:
   PEPTIDEK z=2 (target, base_id=1)  → group "PEPTIDEK" → fold 0
   KEDITPEP z=2 (decoy,  base_id=1)  → group "PEPTIDEK" → fold 0
@@ -131,6 +131,7 @@ Example with 3 folds:
 This matches the approach of both mokapot (groups by spectrum) and C++ Percolator (groups by scan number). In precursor-centric DIA, the equivalent of a spectrum is the target-decoy pair identified by `base_id`.
 
 **CRITICAL INVARIANT**: Target-decoy pairs and same-peptide charge states must ALWAYS stay together in any data partitioning — fold assignment, subsampling, or any other split. If pairs are separated:
+
 - Unpaired targets in a training fold auto-win competition, inflating the positive training set
 - The SVM becomes too permissive, silently corrupting FDR estimates
 - This invariant applies to ALL cross-validation code: `percolator.rs`, `calibration_ml.rs`, and any future partitioning
@@ -222,13 +223,13 @@ For single-file runs, experiment-level q-values equal run-level q-values (no sep
 
 A precursor must pass FDR at **both** the precursor level (modified_sequence + charge) and the peptide level (modified_sequence only). This is enforced by taking the max of the two q-values:
 
-```
+```text
 effective_qvalue = max(precursor_qvalue, peptide_qvalue)
 ```
 
 This is applied at both run and experiment levels:
 
-```
+```text
 run_qvalue        = max(run_precursor_qvalue,        run_peptide_qvalue)
 experiment_qvalue = max(experiment_precursor_qvalue,  experiment_peptide_qvalue)
 ```
@@ -289,6 +290,7 @@ mokapot file1.pin file2.pin file3.pin \
 ```
 
 Without `--aggregate`, mokapot:
+
 - Trains ONE model on PSMs from all files
 - Reports separate results for each file
 - Saves the trained model for reuse
@@ -306,6 +308,7 @@ mokapot file1.pin file2.pin file3.pin \
 ```
 
 With `--aggregate`, mokapot:
+
 - Loads the model from Step 1 (no retraining)
 - Combines all files for experiment-level FDR
 - Reports a single combined result
@@ -313,6 +316,7 @@ With `--aggregate`, mokapot:
 #### Single File Handling
 
 When only one mzML file is provided:
+
 - Only Step 1 runs (no aggregation needed)
 - Run-level q-values are used as experiment-level q-values
 
@@ -320,7 +324,7 @@ When only one mzML file is provided:
 
 Osprey writes one PIN file per mzML file with 21 feature columns. PIN files contain **only competition winners** (pre-competed using the best feature by ROC AUC).
 
-```
+```text
 SpecId  Label  ScanNr  ChargeState  peak_apex  peak_area  ...  Peptide  Proteins
 psm_001    1    1234           2       0.85      12.3  ...  -.PEPTIDEK.-  PROT1
 psm_002   -1    5678           3       0.12       1.1  ...  -.KEDITPEP.-  DECOY_PROT1
@@ -407,7 +411,7 @@ Each passing precursor has:
 
 After experiment-level FDR determines which precursors pass, **all per-file target observations** for those passing precursors are included in the blib output. This is critical for multi-file experiments (replicates, GPF runs):
 
-```
+```text
 FDR Pipeline Flow (Multi-File):
 
   1. Score each file: write full entries to Parquet, convert to FdrEntry stubs
@@ -424,6 +428,7 @@ FDR Pipeline Flow (Multi-File):
 ```
 
 **Why this matters:**
+
 - Each file gets its own RT boundaries for a passing precursor
 - Skyline uses per-file peak boundaries for quantification across replicates
 - A precursor detected in 3 out of 5 files produces 3 blib entries with the same experiment_qvalue
@@ -431,7 +436,7 @@ FDR Pipeline Flow (Multi-File):
 
 **Example:**
 
-```
+```text
 Precursor PEPTIDEK+2 detected in 3 files:
   file1.mzML: score=2.5, experiment_qvalue=0.003  ← best observation
   file2.mzML: score=1.8, experiment_qvalue=0.012
@@ -446,7 +451,7 @@ All 3 observations written to blib with experiment_qvalue = 0.003
 
 ### Terminal Output
 
-```
+```text
 === Per-file results (1% FDR) ===
   file1.mzML: 1234 precursors, 987 peptides
   file2.mzML: 1456 precursors, 1123 peptides
@@ -483,7 +488,7 @@ Key files:
 
 ### Mokapot Not Found
 
-```
+```text
 Error: Failed to run mokapot: No such file or directory
 ```
 
@@ -492,6 +497,7 @@ Install Mokapot: `pip install mokapot`
 ### Too Few Targets Passing
 
 If FDR filtering is too aggressive:
+
 1. Check calibration quality (RT tolerance may be too tight)
 2. Verify decoy generation is working (should be ~50% decoy wins at random)
 3. Inspect feature weights — some features may be hurting performance
@@ -500,6 +506,7 @@ If FDR filtering is too aggressive:
 ### Inflated FDR Results
 
 If FDR results are significantly higher than expected:
+
 1. Verify that target-decoy pairs are being kept in the same fold (check Percolator logs)
 2. For mokapot: ensure pre-competition is running before PIN writing
 3. Check that the best separating feature has high ROC AUC (logged at competition time)

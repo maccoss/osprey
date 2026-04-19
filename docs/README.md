@@ -5,6 +5,7 @@ This folder contains detailed documentation of the algorithms used in Osprey, a 
 ## Current Status (Working Prototype)
 
 Osprey v0.1.0 features:
+
 - Parse mzML files with DIA data
 - Load spectral libraries (DIA-NN TSV, EncyclopeDIA elib, BiblioSpec blib)
 - Generate enzyme-aware decoys
@@ -45,7 +46,7 @@ Osprey v0.1.0 features:
 
 Osprey's pipeline has five major phases.
 
-```
+```text
 INPUT
   mzML files (DIA data) + Spectral Library (predicted spectra)
   |
@@ -186,7 +187,7 @@ HRAM only; 0.0 for unit resolution or when MS1 data is unavailable:
 | Feature | Description |
 |---------|-------------|
 | `median_polish_cosine` | Cosine similarity between data-derived fragment intensities (row effects) and library intensities, sqrt preprocessing |
-| `median_polish_residual_ratio` | Fraction of total signal unexplained by the model: sum|obs-pred| / sum(obs) in linear space. Lower = cleaner co-elution. |
+| `median_polish_residual_ratio` | Fraction of total signal unexplained by the model: `sum(\|obs-pred\|) / sum(obs)` in linear space. Lower = cleaner co-elution. |
 
 ### SG-Weighted Multi-Scan (4)
 
@@ -218,7 +219,7 @@ These features are still in the `CoelutionFeatureSet` struct but are **not writt
 
 The Tukey median polish decomposes the fragment XIC matrix into an additive model:
 
-```
+```text
 ln(Observed[f,s]) = mu + alpha_f + beta_s + epsilon_fs
 
   f = fragment index (1..6, top 6 by library intensity)
@@ -230,6 +231,7 @@ ln(Observed[f,s]) = mu + alpha_f + beta_s + epsilon_fs
 ```
 
 The algorithm iterates (max 20 iterations, convergence tolerance 1e-4):
+
 1. **Row sweep**: subtract nanmedian of each row from residuals
 2. **Column sweep**: subtract nanmedian of each column from residuals
 3. Check convergence: max(|change|) < tolerance
@@ -256,18 +258,21 @@ Osprey uses **two-level FDR control** with three available methods (`--fdr-metho
 - **Simple**: Direct target-decoy competition on the best single feature.
 
 ### Run-Level FDR
+
 - Per-file target-decoy competition and q-value computation
 - PIN features loaded on-demand from per-file Parquet caches (not held in memory)
 - Q-values assigned at both precursor and peptide level
 - Effective q-value: `max(precursor_qvalue, peptide_qvalue)` — must pass both
 
 ### Experiment-Level FDR
+
 - Takes the **single best-scoring observation** per precursor (modified_sequence + charge) across all files
 - Target-decoy competition on this deduplicated set at both precursor and peptide level
 - Effective q-value: `max(precursor_qvalue, peptide_qvalue)`
 - Single replicate skips experiment-level (uses run-level directly)
 
 ### Multi-File Observation Propagation
+
 - After experiment-level FDR determines passing precursors, **all per-file target observations** for those precursors are included in the blib output
 - Each file gets its own RT boundaries; best experiment_qvalue is propagated to all observations
 - This enables Skyline to use per-file peak boundaries for quantification across replicates/GPF files
@@ -333,7 +338,7 @@ The calibration phase is a **fast scoring pass** designed to establish RT and ma
 
 5. **LDA scoring** (FDR): Linear Discriminant Analysis on 4 features (correlation, libcosine, top6_matched, xcorr). Produces a discriminant score used for paired target-decoy competition. See [Calibration](02-calibration.md).
 
-5. **MS1 isotope envelope** (at best XCorr spectrum): Extract monoisotopic peak from nearest MS1 spectrum. Returns MS1 mass error (ppm) for precursor mass calibration.
+6. **MS1 isotope envelope** (at best XCorr spectrum): Extract monoisotopic peak from nearest MS1 spectrum. Returns MS1 mass error (ppm) for precursor mass calibration.
 
 See: [Spectral Scoring](03-spectral-scoring.md), [XCorr Scoring](04-xcorr-scoring.md)
 
@@ -422,6 +427,7 @@ For multi-file experiments, cross-run reconciliation aligns peak boundaries acro
 See: [Cross-Run Reconciliation](10-cross-run-reconciliation.md)
 
 **Final two-level FDR with dual precursor+peptide control**:
+
 1. **Run-level**: Per-file FDR at both precursor and peptide level
 2. **Experiment-level**: Best observation per precursor across all files, FDR at both levels
 3. **Effective q-value**: `max(precursor_qvalue, peptide_qvalue)` at each level
@@ -457,6 +463,7 @@ Unlike spectrum-centric approaches (e.g., Comet, MSFragger) that identify each s
 ### Why Coelution Search?
 
 DIA spectra are mixed spectra containing fragments from multiple precursors. The coelution approach:
+
 - Extracts fragment XICs and measures how well they co-elute (pairwise correlations)
 - Fragments from the same peptide should rise and fall together
 - Robust to interference because co-elution metrics are computed pairwise across fragments
@@ -470,7 +477,7 @@ Library retention times may be predicted by deep learning models (Prosit, DeepLC
 
 ## Crate Architecture
 
-```
+```text
 osprey/
 +-- osprey-core/              # Core types, config, errors, traits
 |   +-- config.rs             # YAML configuration structures (incl. ReconciliationConfig)
@@ -516,7 +523,7 @@ osprey/
 
 ## Utility Scripts
 
-```
+```text
 scripts/
 +-- evaluate_calibration.py      # Generate HTML report from calibration JSON
 +-- inspect_mokapot_weights.py   # Display Mokapot feature weights/importance
@@ -525,6 +532,7 @@ scripts/
 ### evaluate_calibration.py
 
 Generates an interactive HTML report visualizing calibration quality:
+
 - RT calibration curve with residuals
 - MS1/MS2 mass error histograms
 - Candidate density heatmap (RT x m/z)
@@ -594,7 +602,7 @@ reconciliation:
 
 ## References
 
-- pyXcorrDIA: https://github.com/maccoss/pyXcorrDIA
-- Comet: https://comet-ms.sourceforge.io/
-- Mokapot: https://github.com/wfondrie/mokapot
+- pyXcorrDIA: <https://github.com/maccoss/pyXcorrDIA>
+- Comet: <https://comet-ms.sourceforge.io/>
+- Mokapot: <https://github.com/wfondrie/mokapot>
 - LOESS: Cleveland, W.S. (1979). "Robust locally weighted regression and smoothing scatterplots"

@@ -24,11 +24,12 @@ The key insight: **library RT space is run-independent**. By mapping measured RT
 
 During calibration discovery, Osprey fits a LOESS (locally estimated scatterplot smoothing) curve mapping library RT → measured RT:
 
-```
+```text
 calibration.predict(library_rt) → expected_measured_rt
 ```
 
 This is fit from high-confidence calibration targets (LDA scoring with target-decoy competition, 1% FDR) with:
+
 - Bandwidth: 0.3 (default)
 - Minimum points: 50
 - Outlier retention: based on residual SD
@@ -37,7 +38,7 @@ This is fit from high-confidence calibration targets (LDA scoring with target-de
 
 The LOESS calibrator also supports **inverse prediction** — mapping measured RT back to library RT space:
 
-```
+```text
 calibration.inverse_predict(measured_rt) → estimated_library_rt
 ```
 
@@ -57,12 +58,14 @@ refit_calibration_with_consensus(
 ```
 
 Parameters:
+
 - Points: `(consensus_library_rt → measured_apex_rt)` for target peptides passing FDR in this run
 - LOESS bandwidth: 0.3
 - Outlier retention: 1.0 (no outlier removal — all points are FDR-controlled)
 - Minimum points: 20 (falls back to original calibration if fewer)
 
 This produces a tighter calibration because:
+
 1. All calibration points are high-confidence FDR-controlled detections
 2. The consensus library RTs are more consistent than first-pass library RTs
 3. LOESS robustness iterations still downweight genuine outliers
@@ -74,22 +77,26 @@ This produces a tighter calibration because:
 For each peptide passing experiment-level FDR at `consensus_fdr` (default 1%):
 
 1. **Collect detections** across all files:
-   ```
+
+   ```text
    (file_name, apex_rt, coelution_sum, peak_width)
    ```
 
 2. **Map to library RT space** using each run's inverse calibration:
-   ```
+
+   ```text
    library_rt = cal.inverse_predict(apex_rt)
    ```
 
 3. **Compute weighted median** with `coelution_sum` as weights:
-   ```
+
+   ```text
    consensus_library_rt = weighted_median([(library_rt, coelution_sum), ...])
    ```
 
 4. **Compute median peak width** across all detections:
-   ```
+
+   ```text
    median_peak_width = simple_median([peak_width_1, peak_width_2, ...])
    ```
 
@@ -98,7 +105,8 @@ For each peptide passing experiment-level FDR at `consensus_fdr` (default 1%):
 The **weighted median** is robust to outlier detections — if one run picked the wrong peak and mapped to a wildly different library RT, the weighted median ignores it as long as most runs agree. The `coelution_sum` weighting ensures that high-quality detections (strong fragment co-elution) have more influence than dubious ones.
 
 Example:
-```
+
+```text
 File1: library_rt=32.1, coelution_sum=8.5  ← strong detection
 File2: library_rt=32.0, coelution_sum=7.9  ← strong detection
 File3: library_rt=38.5, coelution_sum=3.1  ← wrong peak (outlier)
@@ -127,7 +135,7 @@ Targets and decoys get independent consensus RTs. Decoy consensus RTs are comput
 
 Once a consensus library RT exists, Osprey predicts where a peptide should elute in any run:
 
-```
+```text
 expected_measured_rt = refined_calibration.predict(consensus_library_rt)
 ```
 
@@ -137,7 +145,7 @@ This is the RT used for reconciliation planning — the system asks "is the curr
 
 The reconciliation apex-proximity check uses a **global per-file tolerance** derived from the refined calibration's residuals:
 
-```
+```text
 rt_tolerance = max(0.1, 3.0 × MAD × 1.4826)
 ```
 
@@ -153,7 +161,7 @@ On a 3-replicate Astral HeLa dataset, the refined calibration MAD was ~0.09 min,
 
 The `median_peak_width` serves as the integration window for forced integration when no CWT candidate exists at the expected RT:
 
-```
+```text
 forced_start = expected_rt - median_peak_width / 2
 forced_end   = expected_rt + median_peak_width / 2
 ```

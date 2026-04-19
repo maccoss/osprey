@@ -9,7 +9,7 @@ Osprey includes code, libraries, and algorithmic ideas from the following projec
 **Algorithm:** Semi-supervised learning for peptide detection
 **Citation:** Käll L, Canterbury JD, Weston J, Noble WS, MacCoss MJ. Semi-supervised
 learning for peptide identification from shotgun proteomics datasets. *Nature Methods*
-4(11), 923-925 (2007). https://doi.org/10.1038/nmeth1113
+4(11), 923-925 (2007). <https://doi.org/10.1038/nmeth1113>
 
 Osprey implements a native Percolator-style FDR control pipeline inspired by the
 original Percolator algorithm:
@@ -28,12 +28,12 @@ independent Rust implementation of the published algorithm.
 
 ## Mokapot
 
-**Project:** https://github.com/wfondrie/mokapot
+**Project:** <https://github.com/wfondrie/mokapot>
 **Authors:** William E. Fondrie, William S. Noble
 **License:** Apache-2.0
 **Citation:** Fondrie WE, Noble WS. mokapot: Fast and Flexible Semisupervised
 Learning for Peptide Detection. *Journal of Proteome Research* 20(4), 1966-1971
-(2021). https://doi.org/10.1021/acs.jproteome.0c01010
+(2021). <https://doi.org/10.1021/acs.jproteome.0c01010>
 
 Osprey supports mokapot as an external FDR engine via PIN file output and CLI
 invocation (`crates/osprey-fdr/src/mokapot.rs`). The native Percolator
@@ -46,7 +46,7 @@ algorithm, including fold assignment strategy and training set selection.
 
 **Citation:** Granholm V, Noble WS, Käll L. A cross-validation scheme for machine
 learning algorithms in shotgun proteomics. *BMC Bioinformatics* 13(Suppl 16), S3
-(2012). https://doi.org/10.1186/1471-2105-13-S16-S3
+(2012). <https://doi.org/10.1186/1471-2105-13-S16-S3>
 
 Osprey uses the Granholm et al. score calibration method to normalize SVM scores
 across cross-validation folds (`crates/osprey-fdr/src/percolator.rs`). Each fold's
@@ -59,7 +59,7 @@ decoy score maps to -1, making scores comparable across folds.
 
 **Citation:** Käll L, Storey JD, MacCoss MJ, Noble WS. Posterior error probabilities
 and false discovery rates: two sides of the same coin. *Journal of Proteome Research*
-7(1), 40-44 (2008). https://doi.org/10.1021/pr700739d
+7(1), 40-44 (2008). <https://doi.org/10.1021/pr700739d>
 
 PEP estimation uses kernel density estimation (KDE) to model target and decoy score
 distributions, Bayes' rule to compute P(incorrect | score), and isotonic regression
@@ -72,7 +72,7 @@ distributions, Bayes' rule to compute P(incorrect | score), and isotonic regress
 **Citation:** Hsieh CJ, Chang KW, Lin CJ, Keerthi SS, Sundararajan S. A Dual
 Coordinate Descent Method for Large-scale Linear SVM. *Proceedings of the 25th
 International Conference on Machine Learning (ICML)* (2008).
-https://doi.org/10.1145/1390156.1390208
+<https://doi.org/10.1145/1390156.1390208>
 
 Osprey's linear SVM solver uses the dual coordinate descent algorithm for
 L2-regularized L2-loss support vector classification (`crates/osprey-ml/src/svm.rs`).
@@ -87,11 +87,11 @@ of the published algorithm.
 
 ## Comet
 
-**Project:** https://comet-ms.sourceforge.io/
+**Project:** <https://comet-ms.sourceforge.io/>
 **Authors:** Jimmy Eng et al.
 **Citation:** Eng JK, Jahan TA, Hoopmann MR. Comet: an open-source MS/MS sequence
 database search tool. *Proteomics* 13(1), 22-24 (2013).
-https://doi.org/10.1002/pmic.201200439
+<https://doi.org/10.1002/pmic.201200439>
 
 Osprey's XCorr implementation follows Comet's approach
 (`crates/osprey-scoring/src/lib.rs`):
@@ -110,16 +110,16 @@ of the published spectral scoring concepts.
 
 ## X!Tandem
 
-**Project:** https://www.thegpm.org/tandem/
+**Project:** <https://www.thegpm.org/tandem/>
 **Authors:** Ronald C. Beavis, Global Proteome Machine Organization
 **Citation:** Craig R, Beavis RC. TANDEM: matching proteins with tandem mass spectra.
 *Bioinformatics* 20(9), 1466-1467 (2004).
-https://doi.org/10.1093/bioinformatics/bth092
+<https://doi.org/10.1093/bioinformatics/bth092>
 
 Osprey implements the X!Tandem hyperscore for spectral matching
 (`crates/osprey-scoring/src/lib.rs`):
 
-```
+```text
 hyperscore = log(n_b!) + log(n_y!) + sum(log(matched_intensity + 1))
 ```
 
@@ -130,12 +130,12 @@ the number and intensity of matched fragment ions.
 
 ## DIA-NN
 
-**Project:** https://github.com/vdemichev/DiaNN
+**Project:** <https://github.com/vdemichev/DiaNN>
 **Authors:** Vadim Demichev et al.
 **License:** BSD 2-Clause / Creative Commons Attribution 4.0 International (CC-BY 4.0)
 **Citation:** Demichev V, Messner CB, Vernardis SI et al. DIA-NN: neural networks and
 interference correction enable deep proteome coverage in high throughput. *Nature
-Methods* 17, 41-44 (2020). https://doi.org/10.1038/s41592-019-0638-x
+Methods* 17, 41-44 (2020). <https://doi.org/10.1038/s41592-019-0638-x>
 
 Osprey's coelution search mode and related algorithms are inspired by DIA-NN's
 approach. Specifically:
@@ -166,7 +166,7 @@ of Tukey median polish to fragment XIC matrices.
 Osprey applies Tukey's iterative median decomposition to fragment XIC matrices in log
 space (`crates/osprey-scoring/src/lib.rs`):
 
-```
+```text
 ln(Observed[f,s]) = mu + alpha_f + beta_s + epsilon_fs
 ```
 
@@ -180,7 +180,7 @@ transitions, providing better peak boundaries than any single fragment XIC.
 
 **Citation:** Cleveland WS. Robust locally weighted regression and smoothing
 scatterplots. *Journal of the American Statistical Association* 74(368), 829-836
-(1979). https://doi.org/10.1080/01621459.1979.10481038
+(1979). <https://doi.org/10.1080/01621459.1979.10481038>
 
 Osprey uses LOESS (Locally Estimated Scatterplot Smoothing) for RT calibration,
 fitting local linear regressions with tricube weighting and bisquare robustness
@@ -192,12 +192,12 @@ iterations (`crates/osprey-chromatography/src/calibration/rt.rs`).
 
 **Citation:** Elias JE, Gygi SP. Target-decoy search strategy for increased
 confidence in large-scale protein identifications by mass spectrometry. *Nature
-Methods* 4(3), 207-214 (2007). https://doi.org/10.1038/nmeth1019
+Methods* 4(3), 207-214 (2007). <https://doi.org/10.1038/nmeth1019>
 
 **Conservative FDR:** Levitsky LI, Ivanov MV, Lobas AA, Gorshkov MV. Unbiased
 False Discovery Rate Estimation for Shotgun Proteomics Based on the Target-Decoy
 Approach. *Journal of Proteome Research* 16(2), 689-694 (2017).
-https://doi.org/10.1021/acs.jproteome.6b00144
+<https://doi.org/10.1021/acs.jproteome.6b00144>
 
 Osprey uses enzyme-aware sequence reversal for decoy generation and the conservative
 `(n_decoy + 1) / n_target` formula for FDR estimation
@@ -207,7 +207,7 @@ Osprey uses enzyme-aware sequence reversal for decoy generation and the conserva
 
 ## Sage
 
-**Project:** https://github.com/lazear/sage
+**Project:** <https://github.com/lazear/sage>
 **Author:** Michael Lazear
 **License:** MIT
 **Copyright:** Copyright (c) 2022 Michael Lazear
@@ -217,6 +217,7 @@ analysis, kernel density estimation, and q-value calculation. These modules
 enable data-driven scoring and FDR control for peptide identification.
 
 The following modules were adapted from Sage:
+
 - `osprey-ml/src/linear_discriminant.rs` - Linear Discriminant Analysis for target-decoy separation
 - `osprey-ml/src/matrix.rs` - Matrix operations for scatter matrix computation
 - `osprey-ml/src/gauss.rs` - Gauss-Jordan elimination for solving linear systems
@@ -230,7 +231,7 @@ Full license text is included in the source files.
 
 ## mzdata
 
-**Project:** https://github.com/mobiusklein/mzdata
+**Project:** <https://github.com/mobiusklein/mzdata>
 **Author:** Joshua Klein
 **License:** Apache-2.0
 

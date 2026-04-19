@@ -4,7 +4,7 @@ Osprey generates decoy peptides for FDR (False Discovery Rate) control using the
 
 ## Overview
 
-```
+```text
 Target peptide: PEPTIDEK
                     ↓
          Enzyme-aware reversal
@@ -24,7 +24,7 @@ In proteomics, we need to estimate the false discovery rate (FDR) of our identif
 2. **Searches targets and decoys together** with the same scoring
 3. **Uses decoy hits to estimate false positives**
 
-```
+```text
 FDR ≈ (decoy hits at threshold) / (target hits at threshold)
 ```
 
@@ -34,7 +34,7 @@ FDR ≈ (decoy hits at threshold) / (target hits at threshold)
 
 Simple reversal breaks enzyme cleavage rules:
 
-```
+```text
 Trypsin cleaves after K/R
 
 Target:  PEPTIDEK    ← ends with K (valid tryptic peptide)
@@ -45,7 +45,7 @@ Reverse: KEDIPTED    ← ends with D (NOT a valid tryptic peptide!)
 
 Preserve the C-terminal residue (for C-terminal cleaving enzymes):
 
-```
+```text
 Target:  PEPTIDEK
          ├──────┤ reverse this part
 Decoy:   EDITPEPK   ← K stays at C-terminus
@@ -80,7 +80,7 @@ def reverse_sequence(sequence, enzyme):
 
 Track where each residue moves for modification remapping:
 
-```
+```text
 Original:  P  E  P  T  I  D  E  K
 Position:  0  1  2  3  4  5  6  7
 
@@ -96,7 +96,7 @@ Position mapping: [6, 5, 4, 3, 2, 1, 0, 7]
 
 When we reverse a sequence, the fragment ion m/z values change:
 
-```
+```text
 Target PEPTIDEK:          Decoy EDITPEPK:
   b1 = P                    b1 = E
   b2 = PE                   b2 = ED
@@ -109,10 +109,11 @@ If we don't recalculate, the decoy spectrum won't match any observed peaks!
 ### The Solution: Ion Type Swapping
 
 When a sequence is reversed:
+
 - **b-ions become y-ions** at complementary positions
 - **y-ions become b-ions** at complementary positions
 
-```
+```text
 For sequence length N:
   b{i} → y{N-i}
   y{i} → b{N-i}
@@ -122,7 +123,7 @@ For sequence length N:
 
 **Target: PEPTIDEK (charge 2+, precursor m/z = 464.73)**
 
-```
+```text
 Library spectrum for PEPTIDEK:
 
   m/z        intensity   annotation
@@ -143,7 +144,7 @@ Library spectrum for PEPTIDEK:
 
 After enzyme-aware reversal (reverse positions 0-6, keep K at C-terminus):
 
-```
+```text
 Library spectrum for EDITPEPK:
 
   m/z        intensity   annotation
@@ -194,7 +195,7 @@ def calculate_fragment_mz(ion_type, ordinal, charge, sequence, mod_masses):
 
 Modifications must be remapped to new positions:
 
-```
+```text
 Target: PEPTIDEK with Oxidation at position 3 (on T)
         P  E  P  T  I  D  E  K
         0  1  2  3* 4  5  6  7
@@ -227,6 +228,7 @@ def remap_modifications(modifications, position_mapping):
 ## Precursor Mass Conservation
 
 The decoy has the **same precursor m/z** as the target because:
+
 - Same amino acid composition
 - Same modifications (just at different positions)
 - Same charge state
@@ -252,6 +254,7 @@ decoys_in_library: false # Generate decoys or use existing ones
 ## Implementation
 
 Key files:
+
 - `crates/osprey-scoring/src/lib.rs` - DecoyGenerator, Enzyme enum
 - `crates/osprey/src/pipeline.rs` - Decoy generation in pipeline
 - `crates/osprey-core/src/config.rs` - DecoyMethod enum
@@ -260,7 +263,7 @@ Key files:
 
 After searching both targets and decoys:
 
-```
+```text
 Score threshold = 0.5
 
 Targets above threshold: 1000
@@ -277,13 +280,14 @@ The decoy hits represent false positives, allowing FDR estimation without ground
 
 When generating decoys by reversal, collisions can occur:
 
-```
+```text
 Target database contains:
   PEPTIDEK  →  reverses to  →  EDITPEPK
   EDITPEPK  ←  already exists as a target!
 ```
 
 If the decoy sequence matches an existing target:
+
 - The decoy will score identically to the real target (same fragments!)
 - This causes spurious high-scoring decoy wins
 - FDR calculation becomes unreliable (inflated at high scores)
@@ -292,7 +296,7 @@ If the decoy sequence matches an existing target:
 
 Following pyXcorrDIA, Osprey uses a collision-aware approach:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────┐
 │  For each target peptide:                               │
 │                                                         │
@@ -323,7 +327,7 @@ Following pyXcorrDIA, Osprey uses a collision-aware approach:
 
 When reversal collides, cycling shifts the sequence:
 
-```
+```text
 Original:  PEPTIDEK
 Cycle 1:   EPTIDEPK  (shift by 1, keep C-term K)
 Cycle 2:   PTIDEPEK  (shift by 2, keep C-term K)
@@ -337,7 +341,7 @@ The first unique cycled sequence is used as the decoy.
 
 Osprey reports decoy generation statistics:
 
-```
+```text
 Decoy generation statistics:
   Reversed: 1,523,456 (97.3%)           ← Primary method succeeded
   Cycling fallback: 41,234 (2.6%)       ← Used cycling
@@ -345,6 +349,7 @@ Decoy generation statistics:
 ```
 
 This visibility helps detect potential issues:
+
 - **High cycling rate** → Many palindromic sequences
 - **High exclusion rate** → Small/redundant database
 - **Zero exclusions** → Normal for typical proteome databases
@@ -353,7 +358,7 @@ This visibility helps detect potential issues:
 
 Without collision detection:
 
-```
+```text
 Score ranking:        With collisions:
 1. PEPTIDEK (target)  ← True positive
 2. EDITPEPK (decoy)   ← But this IS a real peptide!
@@ -363,7 +368,7 @@ Score ranking:        With collisions:
 
 With collision detection:
 
-```
+```text
 Score ranking:        After excluding collisions:
 1. PEPTIDEK (target)  ← True positive
 2. ANOTHERR (target)  ← True positive

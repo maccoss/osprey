@@ -27,7 +27,7 @@ This design means the first-pass search and all re-scoring paths (multi-charge c
 
 When a peptide has multiple charge states at different peaks, the best SVM-scoring FDR-passing charge state defines the consensus. Other charge states are re-scored at the consensus boundaries.
 
-```
+```text
 Source:    select_post_fdr_consensus()
 Boundaries: (consensus_apex, consensus_start, consensus_end)
 ```
@@ -36,7 +36,7 @@ Boundaries: (consensus_apex, consensus_start, consensus_end)
 
 During reconciliation, if the current peak doesn't contain the expected RT but a stored CWT candidate does, the system switches to that candidate's boundaries.
 
-```
+```text
 Source:    plan_reconciliation() → ReconcileAction::UseCwtPeak
 Boundaries: (candidate_apex_rt, candidate_start_rt, candidate_end_rt)
 ```
@@ -47,12 +47,13 @@ CWT candidates are stored during the initial search (up to `n_cwt_candidates` pe
 
 When no CWT candidate contains the expected RT, boundaries are imputed from the consensus RT and median peak width:
 
-```
+```text
 Source:    plan_reconciliation() → ReconcileAction::ForcedIntegration
 Boundaries: (expected_rt, expected_rt - half_width, expected_rt + half_width)
 ```
 
 Where:
+
 - `expected_rt = refined_calibration.predict(consensus_library_rt)` — the predicted measured RT in this run
 - `half_width = median_peak_width / 2` — half the median peak width across all confident detections of this peptide
 
@@ -160,6 +161,7 @@ By using the same `run_search()` and `compute_features_at_peak()` for both first
 ### Parallel Window Processing
 
 Re-scoring benefits from `run_search()`'s parallel window processing via rayon. Each isolation window is processed independently, and entries in the same window share:
+
 - Grouped spectra
 - Pre-extracted fragment XICs
 - Per-window XCorr preprocessing (see [XCorr Scoring](04-xcorr-scoring.md#per-window-preprocessing-optimization))

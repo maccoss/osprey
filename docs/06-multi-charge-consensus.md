@@ -12,7 +12,7 @@ Cross-charge consensus **cannot** happen within the per-window parallel loop bec
 
 ### Execution Order
 
-```
+```text
 1. Parallel per-window search (run_search) → all_entries
 2. Overlapping-window dedup → deduped
 3. First-pass FDR → run-level q-values
@@ -35,6 +35,7 @@ Cross-charge consensus **cannot** happen within the per-window parallel loop bec
 ### Step 1: Group by Modified Sequence
 
 Entries are grouped by `modified_sequence`. This naturally separates:
+
 - **Different charge states** of the same peptide (same modified_sequence, different charge)
 - **Targets from decoys** (decoys have `DECOY_` prefix in modified_sequence)
 - **Different peptides** (different modified_sequence)
@@ -57,6 +58,7 @@ For each group with multiple charge states:
 Entries marked for re-scoring are collected as `boundary_overrides` — a `HashMap<u32, (f64, f64, f64)>` mapping `entry_id` to `(apex_rt, start_rt, end_rt)`. These are passed to `run_search()` along with a subset library containing only the entries to re-score.
 
 Inside `run_search()`, entries with boundary overrides:
+
 1. **Skip the pre-filter** (we're told to score here regardless of initial signal)
 2. **Skip CWT peak detection** (boundaries are already determined from the consensus leader)
 3. **Map consensus RT boundaries to XIC scan indices** via binary search
@@ -68,6 +70,7 @@ This reuses the same parallel window processing and per-window XCorr preprocessi
 ### Step 4: Merge Results
 
 The final result combines:
+
 - Entries that were kept as-is (single charge state, or already agreed with consensus)
 - Re-scored entries with features computed at consensus boundaries
 - Dropped entries are excluded (no evidence at consensus RT)
@@ -79,11 +82,13 @@ Results are re-sorted by `(entry_id, scan_number)` for deterministic output.
 ## Why "Best SVM Score Wins"
 
 The charge state with the highest SVM score among FDR-passing entries is most likely to have found the true elution peak because:
+
 - **SVM score** integrates all 21 discriminative features (coelution, spectral, mass accuracy, RT deviation, etc.) into a single score optimized by the semi-supervised training
 - A charge state at an interference peak will have a lower SVM score than one at the true peak
 - Using SVM score (available after the first-pass FDR) gives better consensus selection than raw coelution_sum
 
 Alternative strategies considered:
+
 - **Highest coelution_sum**: Good discriminator but doesn't use the full feature set; used in the pre-FDR design
 - **Highest apex intensity**: Biased by ionization efficiency and window interference
 - **Closest to expected RT**: Penalizes real peaks displaced by calibration error
@@ -101,7 +106,7 @@ Alternative strategies considered:
 
 ## Example
 
-```
+```text
 Peptide: PEPTIDEK
   Charge 2+: precursor m/z = 458.25 → DIA window [455, 465]
   Charge 3+: precursor m/z = 305.83 → DIA window [300, 310]
@@ -153,6 +158,7 @@ Result:
 See [Determinism](09-determinism.md) for comprehensive determinism documentation.
 
 The multi-charge consensus step follows the project's determinism patterns:
+
 - After HashMap-based grouping, results are sorted by `(entry_id, scan_number)` before return
 - Re-scoring goes through `run_search()`, which has its own determinism guarantees (sorted output, deterministic window processing)
 

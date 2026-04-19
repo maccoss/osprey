@@ -655,16 +655,21 @@ These tests verify that `run_search()` correctly handles the `boundary_overrides
 ## Test Design Principles
 
 ### All tests are unit tests
+
 Every test is co-located with the code it tests in `#[cfg(test)] mod tests` blocks. This keeps tests close to the implementation and avoids external test data dependencies.
 
 ### No external data required
+
 Tests use synthetically constructed inputs (spectra, library entries, feature vectors). The `example_test_data/` directory contains real mass spec files for manual validation but is not used by `cargo test`.
 
 ### Critical invariants have dedicated tests
+
 The [cross-validation grouping invariant](../CLAUDE.md#cross-validation-grouping) — target-decoy pairs, charge states, and peptide groups must never be split across folds — is tested by multiple dedicated tests in percolator.rs (`test_subsample_keeps_target_decoy_pairs`, `test_subsample_keeps_charge_states_together`, `test_fold_assignment_*`).
 
 ### Determinism is verified
+
 Several tests run operations multiple times to verify deterministic output, especially for code involving HashMaps or tied scores (`test_compete_from_indices_deterministic_with_ties`, `test_deterministic_with_seed`).
 
 ### The mokapot tests use mock files
+
 Mokapot result parsing tests write temporary TSV files with known content and verify the parser handles all known header variants. Mokapot itself (the Python tool) is not required to run the test suite.

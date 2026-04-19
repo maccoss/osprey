@@ -6,7 +6,7 @@ Osprey performs joint calibration of retention time, MS1 (precursor) m/z, and MS
 
 All three calibrations share the same calibration discovery phase: a co-elution search scored with LDA-based machine learning, followed by paired target-decoy competition at 1% FDR. The confident matches provide (library_RT, measured_RT) pairs for RT calibration and mass error measurements for m/z calibration.
 
-```
+```text
 Calibration Discovery Workflow
 ──────────────────────────────
 
@@ -48,7 +48,7 @@ Instead of drawing the sample uniformly at random (which would concentrate in th
 
 The stratification log line shows both the grid shape and the occupancy:
 
-```
+```text
 Calibration sampling: 100000 targets + 100000 decoys from 3131286 total (159×159 grid, 24490 occupied cells)
 ```
 
@@ -96,6 +96,7 @@ Hyperscore, signal-to-noise, and isotope cosine are intentionally excluded from 
 ### Target-Decoy Competition
 
 Each target competes against its paired decoy (linked by `base_id = entry_id & 0x7FFFFFFF`):
+
 - Higher discriminant score wins
 - Ties go to the decoy (conservative for FDR estimation)
 - Only winners enter the FDR walk
@@ -117,7 +118,7 @@ After the initial calibration discovery, Osprey performs an optional second pass
 
 **Pass 2** re-scores the same sampled candidates using the LOESS-calibrated RT predictions from pass 1 and the much tighter tolerance derived from the fit (e.g. 0.78 min — often 6× narrower). With the narrow window, false matches that only survived pass 1 due to the wide tolerance are eliminated. The result is a cleaner set of confident peptides: typically *more* peptides pass FDR (fewer false decoy wins contaminate the competition), the LOESS R² improves, and the residual SD drops.
 
-```
+```text
 Example from a real run:
   Pass 1: 4.8 min tolerance → 302 peptides, R²=0.9923, residual_SD=0.427 min
   Pass 2: 0.78 min tolerance → 369 peptides, R²=0.9963, residual_SD=0.292 min
@@ -127,7 +128,7 @@ Example from a real run:
 
 Refinement only triggers when the first-pass tolerance narrowed at least 2× from the initial tolerance:
 
-```
+```text
 pass1_tolerance < initial_tolerance × 0.5
 ```
 
@@ -137,7 +138,7 @@ If the initial tolerance was already tight (e.g. loaded from a cached calibratio
 
 The refined calibration replaces the original only if R² does not degrade:
 
-```
+```text
 refined_R² ≥ original_R² × 0.99
 ```
 
@@ -185,6 +186,7 @@ The classical mode typically produces calibrations with 10–20% smaller residua
 ### Prediction and Interpolation
 
 For prediction at a query library RT:
+
 - **Within range**: Binary search to find bracketing calibration points, linear interpolation between fitted values
 - **Outside range**: Linear extrapolation using the nearest non-duplicate pair
 
@@ -207,7 +209,7 @@ This means well-calibrated regions of the gradient get tighter RT windows while 
 
 After fitting, Osprey reports:
 
-```
+```text
 RT calibration: 500 peptides at 1% FDR
 RT calibration fit: R²=0.9987, residual_SD=0.32 min
 Calibrated RT tolerance: 0.96 min (3× residual SD)
@@ -223,6 +225,7 @@ Calibrated RT tolerance: 0.96 min (3× residual SD)
 ### Unit-Aware Calibration
 
 Mass calibration is unit-aware, supporting both instrument types:
+
 - **HRAM instruments** (e.g., Orbitrap, Astral): Errors measured in ppm
 - **Unit resolution instruments** (e.g., Stellar): Errors measured in Th (Thomson)
 
@@ -232,7 +235,7 @@ Both MS1 and MS2 errors use the same unit within a run.
 
 MS1 errors are collected from the monoisotopic (M+0) peak in the nearest MS1 spectrum:
 
-```
+```text
 For each confident match:
   1. Find nearest MS1 spectrum to the peak apex RT
   2. Calculate expected isotope m/z values:
@@ -248,7 +251,7 @@ If no MS1 spectra are available, the isolation window center is used as a fallba
 
 MS2 errors are collected from all matched fragments at the peak apex spectrum:
 
-```
+```text
 For each confident match:
   1. At the best apex spectrum, match library fragments to observed peaks
   2. For each match, calculate error in the configured unit (ppm or Th)
@@ -258,6 +261,7 @@ For each confident match:
 ### Error Statistics
 
 From the collected errors, Osprey calculates:
+
 - **Mean**: Systematic mass offset (used for correction)
 - **Median**: Robust estimate of systematic error
 - **SD**: Random error component (sample standard deviation, n-1 denominator)
@@ -265,7 +269,7 @@ From the collected errors, Osprey calculates:
 
 Histograms are generated with bin widths of 1.0 ppm (HRAM) or 0.01 Th (unit resolution).
 
-```
+```text
 MS1 calibration: mean=-2.50 ppm, median=-2.40 ppm, SD=0.80 ppm (n=500)
 MS2 calibration: mean=1.20 ppm, median=1.10 ppm, SD=1.00 ppm (n=3000)
 ```
@@ -283,7 +287,7 @@ After calibration, systematic m/z offset is removed from all MS2 spectra before 
 
 After correcting the systematic offset, the fragment matching tolerance is tightened:
 
-```
+```text
 calibrated_tolerance = max(3 × SD, minimum_floor)
 ```
 
@@ -306,7 +310,7 @@ During the main search, candidates are selected using the calibrated RT model:
 
 Calibration results are saved to a JSON file alongside the input mzML for reuse:
 
-```
+```text
 sample.mzML → sample.osprey_calibration.json
 ```
 
@@ -390,7 +394,7 @@ resolution_mode:
 
 If calibration fails (insufficient confident matches):
 
-```
+```text
 RT calibration failed: Insufficient calibration points: 23 < 50 absolute minimum
 Using fallback tolerance: 2.0 min
 ```

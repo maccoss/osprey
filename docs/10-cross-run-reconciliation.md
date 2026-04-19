@@ -12,7 +12,7 @@ To mitigate wrong-peak selection, CWT candidate peaks are ranked by `coelution_s
 
 **RT penalty** — Gaussian centered on the calibration-predicted RT:
 
-```
+```text
 rt_penalty = exp(-residual^2 / (2 * sigma^2))
 sigma      = max(5 * MAD * 1.4826, 0.1)   // from the per-file calibration
 residual   = |peak_apex - expected_rt|
@@ -24,7 +24,7 @@ An earlier 3-sigma version was too aggressive — it could downweight the correc
 
 **Intensity weight** — log-scaled peak height:
 
-```
+```text
 intensity_weight = log(1 + apex_intensity)
 ```
 
@@ -32,7 +32,7 @@ Peak intensity is a multiplicative factor in the score, always contributing alon
 
 Without these modifiers, a common failure mode on multi-replicate experiments is: an interferer with slightly better fragment co-elution than the correct peak gets selected in multiple replicates, corrupting the downstream consensus RT and causing reconciliation to "correct" the good replicates to the wrong position.
 
-```
+```text
 Peptide PEPTIDEK (with RT penalty + intensity tiebreaker):
   file1.mzML: coelution=8.5, rt_penalty=1.0, intensity=high → wins at apex=25.3 (correct)
   file2.mzML: coelution=7.9, rt_penalty=1.0, intensity=high → wins at apex=25.4 (correct)
@@ -49,7 +49,7 @@ Cross-run reconciliation uses the high-confidence runs to establish where PEPTID
 
 ## Algorithm Overview
 
-```
+```text
 After per-run FDR (first pass):
   1. collect_consensus_peptides() — targets at consensus_fdr experiment-level (from FdrEntry stubs)
   2. compute_consensus_rts()      — weighted median library RT across runs (from FdrEntry stubs)
@@ -66,7 +66,7 @@ After per-run FDR (first pass):
 
 Target peptides qualify for consensus RT computation if they pass `consensus_fdr` (default 1%) at **run-level peptide FDR** in at least one replicate. Their paired decoys (DECOY_ prefix) are included so target-decoy competition remains fair in the second FDR pass.
 
-```
+```text
 targets: {PEPTIDEK, ANOTHERR, ...}     ← pass peptide-level FDR
 decoys:  {DECOY_PEPTIDEK, DECOY_ANOTHERR, ...}  ← paired decoys included
 ```
@@ -90,19 +90,19 @@ First-pass protein FDR runs before compaction and reconciliation (see [07-fdr-co
 
 For each consensus peptide, its detections across all files are collected:
 
-```
+```text
 (file_name, apex_rt, coelution_sum, peak_width)
 ```
 
 Each measured `apex_rt` is mapped back to **library RT space** using the run's inverse RT calibration:
 
-```
+```text
 library_rt = RTCalibration::inverse_predict(apex_rt)
 ```
 
 The **consensus library RT** is the **weighted median** of these library RT values, with weights equal to `coelution_sum` (pairwise fragment correlation sum). Higher coelution_sum means more reliable detection → stronger weight in the consensus.
 
-```
+```text
 PeptideConsensusRT {
     modified_sequence: String,
     is_decoy: bool,
@@ -131,6 +131,7 @@ The per-file `select_post_fdr_consensus()` function that handles multi-charge al
 For each run, the LOESS RT calibration is refit using `(consensus_library_rt → measured_apex_rt)` pairs from **target** peptides detected in that run at experiment-level `consensus_fdr`.
 
 This produces a tighter calibration than the initial discovery pass because:
+
 - The calibration points are high-confidence FDR-controlled detections, not noisy initial matches
 - Outlier removal is disabled (`outlier_retention=1.0`) — the LOESS robustness iterations still downweight genuine outliers
 - The consensus library RTs are more consistent across the gradient than first-pass matches
@@ -143,7 +144,7 @@ The refined calibration is stored per-run and used in Step 4. If too few consens
 
 For each scored entry (target or decoy), the expected measured RT is predicted from the refined calibration:
 
-```
+```text
 expected_rt = refined_calibration.predict(consensus_library_rt)
 ```
 
@@ -151,15 +152,15 @@ Three actions are possible based on **apex proximity** to the expected RT:
 
 | Action | Condition | What happens |
 |--------|-----------|--------------|
-| **Keep** | `|apex_rt - expected_rt| <= rt_tolerance` | No change |
-| **UseCwtPeak** | A CWT candidate has `|cand.apex_rt - expected_rt| <= rt_tolerance` | Switch to the closest-apex candidate |
+| **Keep** | `\|apex_rt - expected_rt\| <= rt_tolerance` | No change |
+| **UseCwtPeak** | A CWT candidate has `\|cand.apex_rt - expected_rt\| <= rt_tolerance` | Switch to the closest-apex candidate |
 | **ForcedIntegration** | Neither current peak nor any CWT candidate has apex within tolerance | Integrate at `expected_rt ± median_peak_width/2` |
 
 ### RT Tolerance: Global MAD, Not Local Interpolation
 
 The `rt_tolerance` is computed **once per file** as:
 
-```
+```text
 rt_tolerance = max(0.1, 3.0 × MAD × 1.4826)
 ```
 
@@ -211,6 +212,7 @@ Reconciliation previously used a dedicated sequential re-scoring loop that proce
 - **Old reconciliation**: Each entry loaded spectra, extracted XICs, and computed features independently — no window-level parallelism, redundant XCorr preprocessing
 
 By reusing `run_search()` with `boundary_overrides`, reconciliation gets the same performance characteristics as the first pass:
+
 - **Parallel window processing** via rayon
 - **Per-window XCorr preprocessing** done once and shared across all entries in the window (see [XCorr Scoring](04-xcorr-scoring.md#per-window-preprocessing-optimization))
 - **Shared spectra grouping and indexing** across entries
@@ -224,6 +226,7 @@ Files are still processed **sequentially** (not in parallel) because each file r
 ## Step 6: Second-Pass FDR
 
 After reconciliation, FDR is recomputed on the updated entry set:
+
 - Features have been recomputed at consensus-aligned boundaries
 - The same Percolator/Mokapot/Simple FDR pipeline applies
 - This produces the **final experiment-level q-values** written to the blib output
@@ -251,7 +254,7 @@ Naively forcing an integration at every missing precursor is wrong for gas-phase
 
 Gap-fill therefore filters candidates by per-file isolation window coverage. Each file's isolation scheme (captured from its first MS2 cycle during the calibration step) is stored as a list of `[lower_mz, upper_mz]` intervals. A candidate survives the filter only if its library precursor m/z falls inside at least one of the target file's intervals:
 
-```
+```text
 precursor_mz = library[target_entry_id].precursor_mz
 in_range = any(lo <= precursor_mz < hi for (lo, hi) in file_windows)
 if not in_range:
@@ -260,7 +263,7 @@ if not in_range:
 
 Skipped candidates are counted and logged at INFO level:
 
-```
+```text
 Gap-fill: 18423 candidates skipped because precursor m/z is outside
 the file's isolation windows (GPF or disjoint m/z ranges)
 ```
@@ -304,7 +307,7 @@ n_cwt_candidates: 5
 
 ## Example
 
-```
+```text
 Peptide PEPTIDEK detected in 3 files:
   file1.mzML: apex_rt=25.3, coelution_sum=8.5, peak_width=0.9, library_rt_mapped=32.1
   file2.mzML: apex_rt=25.4, coelution_sum=7.9, peak_width=1.0, library_rt_mapped=32.0

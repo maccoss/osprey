@@ -78,6 +78,7 @@ Rust on Windows requires the MSVC C/C++ build tools. If you don't have Visual St
 Download and install [CMake](https://cmake.org/download/). During installation, select **"Add CMake to the system PATH"**.
 
 Alternatively, install via winget:
+
 ```powershell
 winget install Kitware.CMake
 ```
@@ -94,6 +95,7 @@ Extract the archive and set the environment variable so the build system can fin
 ```
 
 Alternatively, install OpenBLAS via [vcpkg](https://vcpkg.io/):
+
 ```powershell
 git clone https://github.com/microsoft/vcpkg.git
 cd vcpkg
@@ -155,6 +157,7 @@ pip install mokapot 'pandas>=2.0,<3.0' 'numpy<2.0'
 ```
 
 If the `mokapot` command is not found after installation, add the scripts directory to your PATH:
+
 - **Linux**: Add `~/.local/bin` to PATH in `~/.bashrc`
 - **Windows**: `pip install --user` places scripts in `%APPDATA%\Python\PythonXX\Scripts` — add this to your system PATH, or use `pip install` (without `--user`) in an activated virtual environment
 - **macOS**: Add `~/Library/Python/X.Y/bin` to PATH
@@ -236,7 +239,7 @@ fdr_level: Precursor    # Output filtering level: Precursor (default), Peptide, 
 
 ## Command-line Options
 
-```
+```text
 Options:
   -c, --config <CONFIG>
           Configuration file (YAML format)
@@ -396,6 +399,7 @@ Following the [pyXcorrDIA](https://github.com/maccoss/pyXcorrDIA) approach:
 ### Coelution Scoring
 
 For each candidate precursor:
+
 1. Extract fragment XICs across the chromatographic dimension
 2. Compute pairwise fragment co-elution correlations
 3. Detect candidate peaks via CWT consensus (Mexican Hat wavelet across transitions)
@@ -430,7 +434,7 @@ See [Pipeline Overview](docs/README.md) for memory architecture details and [Int
 
 ### Project Structure
 
-```
+```text
 osprey/
 ├── crates/
 │   ├── osprey-core/          # Core types and configuration

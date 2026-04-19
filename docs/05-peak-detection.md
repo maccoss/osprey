@@ -8,7 +8,7 @@ Osprey's primary peak detection method is **CWT (Continuous Wavelet Transform) c
 
 CWT consensus is complemented by **Tukey median polish**, which decomposes the fragment XIC matrix into additive components for robust scoring features and peak boundary refinement.
 
-```
+```text
 Peak Detection Pipeline
 ────────────────────────
 
@@ -34,7 +34,7 @@ The Mexican Hat wavelet is a natural matched filter for Gaussian-like chromatogr
 
 ### Algorithm: `detect_cwt_consensus_peaks()`
 
-```
+```text
 detect_cwt_consensus_peaks(xics, min_consensus_height)
 
   Step 1: Estimate scale parameter (σ) from fragment XICs
@@ -50,7 +50,7 @@ detect_cwt_consensus_peaks(xics, min_consensus_height)
 
 The CWT scale parameter (σ) controls which peak widths the wavelet is tuned to detect. Osprey estimates σ from the data:
 
-```
+```text
 estimate_cwt_scale(xics):
   For each fragment XIC with detectable signal:
     Find apex and measure FWHM via linear interpolation at half-maximum
@@ -63,11 +63,12 @@ estimate_cwt_scale(xics):
 
 The Mexican Hat (Ricker) wavelet is the negative normalized second derivative of a Gaussian:
 
-```
+```text
 ψ(t) = (2 / sqrt(3σ) π^(1/4)) × (1 - (t/σ)²) × exp(-t²/(2σ²))
 ```
 
 Properties:
+
 - **Positive center, negative tails**: Responds positively to peaks, negatively to flanking regions
 - **Zero-mean**: After discretization, a DC offset correction ensures zero response to constant signals
 - **Symmetric**: Equal sensitivity to leading and trailing edges
@@ -83,12 +84,13 @@ Direct convolution is O(N×K) per fragment, but with typical XIC lengths (30-200
 
 At each scan position, the median CWT coefficient across all fragments is computed:
 
-```
+```text
 For each scan s:
   consensus[s] = median(cwt_coeffs[f][s] for f in 0..n_fragments)
 ```
 
 The **median** (not mean) is the key to interference rejection:
+
 - If 5/6 fragments have a peak shape at scan s, the median is positive
 - If only 1/6 fragments has interference at scan s, the median suppresses it
 - A peak must be supported by the **majority** of transitions to survive
@@ -96,6 +98,7 @@ The **median** (not mean) is the key to interference rejection:
 #### Step 5: Apex Detection
 
 Local maxima in the consensus signal above `min_consensus_height` are identified:
+
 - Interior: `consensus[i] > consensus[i-1]` AND `consensus[i] > consensus[i+1]`
 - Endpoints checked as potential maxima
 - Sorted by consensus coefficient descending (strongest peaks first)
@@ -110,14 +113,14 @@ Walk outward from the apex to where the consensus signal crosses zero. For a Gau
 **Stage 2 — Extend to ±2σ (~95% coverage):**
 The zero-crossing distance gives an asymmetric estimate of σ (left_σ = apex - left_zc, right_σ = right_zc - apex). Boundaries are extended to ±2σ for ~95% Gaussian area coverage:
 
-```
+```text
 target_start = apex - 2 × left_σ
 target_end   = apex + 2 × right_σ
 ```
 
 **Valley guard:** During extension beyond the zero-crossing, the raw reference signal (sum of fragment intensities) is monitored. If the signal rises more than 5% of the apex value above a running minimum, we've entered a neighboring peak — stop at the valley minimum:
 
-```
+```text
 Extend left from zero-crossing toward target_start:
   Track running_min of raw reference signal
   If ref_signal[i] - running_min > 0.05 × apex_intensity:
@@ -129,7 +132,7 @@ Extend right: symmetric procedure
 
 The valley guard prevents the ±2σ extension from bleeding into adjacent peaks while still capturing the full width of isolated peaks.
 
-```
+```text
 Consensus CWT Signal
   |
   |           ╭──╮
@@ -175,7 +178,7 @@ pub struct XICPeakBounds {
 
 If CWT consensus finds no peaks (e.g., too few fragments, very low signal), Osprey falls back to simpler methods:
 
-```
+```text
 Priority:
   1. CWT consensus peak detection (multi-transition)
   2. Tukey median polish elution profile peak detection (detect_all_xic_peaks)
@@ -201,7 +204,7 @@ CWT consensus peak detection is used in both search phases:
 
 Used as a fallback when CWT consensus finds no peaks, and as the underlying detector in `detect_all_xic_peaks()`. Combines smoothing, adaptive apex finding, valley-based boundary detection, and asymmetric FWHM capping.
 
-```
+```text
 detect_xic_peak(xic, min_height, peak_boundary, expected_rt)
 
   Step 1: Smooth XIC with weighted moving average
@@ -215,7 +218,7 @@ detect_xic_peak(xic, min_height, peak_boundary, expected_rt)
 
 Applies a 5-point Savitzky-Golay quadratic filter: `[-3, 12, 17, 12, -3] / 35`
 
-```
+```text
 Interior (i >= 2 and i < n-2):
   smoothed[i] = (-3*v[i-2] + 12*v[i-1] + 17*v[i] + 12*v[i+1] - 3*v[i+2]) / 35
 
@@ -226,7 +229,7 @@ Clamping: negative values from the filter are clamped to zero
 
 #### Step 2: Apex Finding
 
-```
+```text
 find_apex(smoothed, min_height, expected_rt, xic):
   1. Collect all local maxima above min_height:
      - smoothed[i] >= smoothed[i-1] AND smoothed[i] >= smoothed[i+1]
@@ -249,7 +252,7 @@ Two independent boundary walks from the apex, each stopping at the earlier of:
 
 Compute separate left and right half-widths at half-maximum, then cap boundaries at `2.0 × half_width`:
 
-```
+```text
 If valley_start_rt < apex_rt - 2.0 * left_half_width:
   Tighten start_rt to apex_rt - 2.0 * left_half_width
 
@@ -261,7 +264,7 @@ Separate left/right half-widths naturally capture chromatographic tailing where 
 
 #### Step 5: Signal-to-Noise
 
-```
+```text
 compute_snr(raw_intensities, apex_idx, start_idx, end_idx):
   background_left  = 5 points immediately before peak start
   background_right = 5 points immediately after peak end
@@ -291,7 +294,7 @@ After peak detection, Osprey uses Tukey median polish to decompose the fragment 
 
 The matrix of fragment XIC intensities (6 fragments x N scans) is decomposed in log space:
 
-```
+```text
 ln(Observed[f,s]) = μ + α_f + β_s + ε_fs
 
   f = fragment index (top 6 by library intensity)
@@ -304,7 +307,7 @@ ln(Observed[f,s]) = μ + α_f + β_s + ε_fs
 
 ### Algorithm
 
-```
+```text
 Initialize: matrix[f,s] = ln(intensity_fs), NaN for zeros (missing data)
             row_effects = [0; n_fragments]
             col_effects = [0; n_scans]
@@ -339,7 +342,7 @@ Elution profile: (RT_s, exp(overall + col_effects[s]))  for each scan s
 
 Column effects (β_s) represent the **shared elution profile** across all fragments. Because the median operation suppresses interference on individual transitions, this profile is more robust than any single fragment XIC.
 
-```
+```text
 From Polish elution profile:
   1. Find FWHM via linear interpolation at half-maximum
   2. Convert to sigma: σ = FWHM / 2.355
@@ -364,7 +367,7 @@ Three features are extracted from the decomposition:
 
 Peak detection operates on **fragment ion chromatograms** (XICs) extracted directly from DIA spectra:
 
-```
+```text
 Fragment XIC Extraction
   → Extract top 6 fragment XICs within RT window (ppm tolerance)
 
@@ -401,7 +404,7 @@ Feature Extraction (within peak boundaries)
 
 The final peak boundaries written to the blib file for Skyline come from **Tukey median polish** (when successful) or fall back to the CWT detection boundaries:
 
-```
+```text
 Priority:
   1. Tukey median polish FWHM → σ = FWHM/2.355, boundaries = apex ± 1.96σ
   2. CWT consensus boundaries (zero-crossing ±2σ with valley guard)
@@ -421,6 +424,7 @@ Peak detection and peak selection are **two separate stages**. CWT consensus det
 CWT consensus returns all detected peaks sorted by **consensus CWT coefficient** descending. The consensus coefficient reflects how strongly the majority of fragment transitions simultaneously exhibit peak-like shapes at that location. This determines **which regions are candidate peaks** — it filters the chromatographic landscape down to regions where most fragments agree a peak exists.
 
 A peptide may have multiple candidate peaks due to:
+
 - **Isomers** eluting at different RTs
 - **False positive signals** from co-eluting peptides with similar spectra
 - **Peak splitting** from chromatographic artifacts
@@ -429,7 +433,7 @@ A peptide may have multiple candidate peaks due to:
 
 When there are **multiple candidate peaks**, each is scored by computing the **mean pairwise Pearson correlation** of fragment intensities within that peak's boundaries. The peak with the highest mean pairwise correlation wins:
 
-```
+```text
 For each candidate peak:
   Extract fragment intensities within [start_index, end_index]
   For each pair of fragments (i, j):
@@ -457,7 +461,7 @@ After selecting the best peak, a minimum co-elution threshold is applied. In the
 
 ### Summary
 
-```
+```text
 Fragment XICs
   → CWT consensus (Mexican Hat wavelet + pointwise median)
   → Candidate peaks (ranked by CWT coefficient)

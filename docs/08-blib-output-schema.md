@@ -5,10 +5,11 @@ Osprey outputs results in the **BiblioSpec (.blib)** format, a SQLite database s
 ## Overview
 
 The blib output contains:
+
 - **Standard BiblioSpec tables**: Compatible with Skyline and other tools
 - **Osprey extension tables**: Additional scoring and peak boundary information
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                    BiblioSpec Standard Tables                    │
 ├─────────────────────────────────────────────────────────────────┤
@@ -106,6 +107,7 @@ Main spectrum table. Each row represents a detected peptide precursor.
 | scoreType | INTEGER | Score type ID (14 = PERCOLATOR QVALUE) |
 
 **Note on sequences**: Osprey automatically:
+
 - Strips flanking characters (underscores, periods, dashes) from sequences. Input formats like `_PEPTIDE_` or `K.PEPTIDE.R` are cleaned to `PEPTIDE`.
 - Converts UniMod notation to mass notation for Skyline compatibility. `PEPTC[UniMod:4]IDE` becomes `PEPTC[+57.0215]IDE`.
 
@@ -202,10 +204,12 @@ Per-run retention times and peak boundaries for multi-file experiments. Each pre
 | bestSpectrum | INTEGER | 1 if this is the best run, 0 otherwise |
 
 **Nullable retentionTime for Skyline ID lines**: The `retentionTime` column controls whether Skyline shows an ID line (vertical marker) for the precursor in that run:
+
 - **`retentionTime` = apex RT**: The precursor passed run-level FDR (`run_qvalue <= 0.01`) in this file. Skyline shows an ID line at the apex and uses `startTime`/`endTime` for peak integration boundaries.
 - **`retentionTime` = NULL**: The precursor did NOT pass run-level FDR in this file. Skyline uses `startTime`/`endTime` for quantification boundaries **without** showing an ID line. This correctly indicates "we have boundaries for quantification, but this is not an independent identification."
 
 **Every passing precursor gets a row in every file**: Even when a precursor was not searched in a particular file (e.g., the precursor m/z falls outside the DIA isolation scheme), it still gets a RetentionTimes row with NULL `retentionTime` and boundaries from the best run. This ensures Skyline always has integration boundaries for every precursor in every replicate. The three sources of boundaries are:
+
 1. **Direct detection**: The precursor was searched and scored in this file. Boundaries come from CWT peak detection.
 2. **Reconciliation**: The precursor was searched but the first-pass picked the wrong peak or a weak peak. Boundaries come from an alternate CWT candidate or forced integration at the consensus expected RT.
 3. **Imputed from best run**: The precursor was not searched in this file (outside DIA windows). Boundaries are copied from the best-scoring run.
@@ -279,6 +283,7 @@ Analysis metadata as key-value pairs.
 | Value | TEXT | Metadata value |
 
 Common keys:
+
 - `osprey_version`: Osprey version
 - `rt_calibration_enabled`: Whether RT calibration was used
 - `run_fdr`: Run-level FDR threshold
@@ -397,9 +402,11 @@ The blib output is designed for seamless import into Skyline:
 ## Implementation
 
 The blib writer is implemented in:
+
 - `crates/osprey-io/src/output/blib.rs` - `BlibWriter` struct
 
 Key methods:
+
 - `create()` - Create new blib file with schema
 - `add_source_file()` - Add mzML source file
 - `add_spectrum()` - Add detected peptide spectrum

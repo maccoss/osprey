@@ -1,0 +1,19 @@
+config:
+  # Line length: technical docs with code examples, URLs, and tables
+  # are better left unwrapped. Editors handle long lines fine.
+  MD013: false
+
+  # Duplicate headings: natural in technical docs where multiple
+  # sections each have "Algorithm", "Configuration", "Tests", etc.
+  MD024: false
+
+  # Emphasis used as heading: acceptable when bold is used as a
+  # visual marker inside a section rather than a subsection.
+  MD036: false
+
+globs:
+  - "**/*.md"
+  - "!target/**"
+  - "!.git/**"
+  - "!.venv/**"
+  - "!node_modules/**"

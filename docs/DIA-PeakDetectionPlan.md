@@ -1,24 +1,30 @@
 # Technical Specification: Multi-Transition CWT Peak Detection for DIA Proteomics
+
 **Context:** Rust Implementation for Data Independent Acquisition (DIA)
 
 ---
 
 ## 1. Executive Summary
+
 This document outlines a strategy for detecting chromatographic peaks in noisy Data Independent Acquisition (DIA) data. The core approach utilizes a **Continuous Wavelet Transform (CWT)** to suppress noise and a **Multi-Transition Consensus** mechanism to "borrow information" across co-varying product ions. This allows for robust detection of peak boundaries (start/end times) even when individual transitions are compromised by interference.
 
 ## 2. Mathematical Theory
+
 The peak detection relies on the **Mexican Hat Wavelet** (Ricker Wavelet), which serves as a matched filter for Gaussian-like chromatographic peaks.
 
 ### 2.1 The Mother Wavelet
+
 The continuous form of the Mexican Hat wavelet is the negative normalized second derivative of a Gaussian:
 
 $$\psi(t) = \frac{2}{\sqrt{3\sigma}\pi^{1/4}} \left( 1 - \left(\frac{t}{\sigma}\right)^2 \right) e^{-\frac{t^2}{2\sigma^2}}$$
 
 Where:
+
 * $t$: Time (or index in the discrete domain).
 * $\sigma$: Scale parameter, related to the peak width.
 
 ### 2.2 Consensus CWT (The "Borrowing" Step)
+
 Standard peak pickers operate on single signals. To leverage the correlated nature of DIA transitions ($y_1, y_2, ... y_n$), we compute a **Consensus Scalogram**:
 
 $$S_{consensus}(a, b) = \text{Median}_{i=1..n} \left( CWT(y_i, a, b) \right)$$
@@ -30,24 +36,28 @@ Using the **median** (or a weighted sum) effectively filters out non-Gaussian no
 ## 3. Algorithm Lifecycle
 
 ### Phase 1: Preprocessing & Transformation
-1.  **Input:** A matrix of intensities `[n_transitions, n_timepoints]`.
-2.  **Smoothing (Optional):** Apply a Savitzky-Golay filter if data is extremely jagged, though CWT handles noise naturally.
-3.  **Wavelet Convolution:** For each transition, convolve the intensity vector with the Mexican Hat kernel at a specific scale $a$ (or a range of scales).
+
+1. **Input:** A matrix of intensities `[n_transitions, n_timepoints]`.
+2. **Smoothing (Optional):** Apply a Savitzky-Golay filter if data is extremely jagged, though CWT handles noise naturally.
+3. **Wavelet Convolution:** For each transition, convolve the intensity vector with the Mexican Hat kernel at a specific scale $a$ (or a range of scales).
 
 ### Phase 2: Peak Candidate Detection
-1.  **Consensus Aggregation:** Collapse the $n$ convolution results into a single 1D array (the consensus signal).
-2.  **Ridge Detection:** Identify local maxima (peaks) in the consensus signal.
-3.  **Thresholding:** Discard candidates with a consensus score below a noise floor (e.g., Signal-to-Noise Ratio < 3).
+
+1. **Consensus Aggregation:** Collapse the $n$ convolution results into a single 1D array (the consensus signal).
+2. **Ridge Detection:** Identify local maxima (peaks) in the consensus signal.
+3. **Thresholding:** Discard candidates with a consensus score below a noise floor (e.g., Signal-to-Noise Ratio < 3).
 
 ### Phase 3: Boundary Definition (The "Zero-Crossing" Logic)
-1.  **Apex:** The index of the maximum in the consensus signal.
-2.  **Boundaries:** Traverse left and right from the apex until the consensus signal drops below zero (or a strict percentage, e.g., 5% of max).
+
+1. **Apex:** The index of the maximum in the consensus signal.
+2. **Boundaries:** Traverse left and right from the apex until the consensus signal drops below zero (or a strict percentage, e.g., 5% of max).
     * *Note:* Using the wavelet signal for boundaries is more robust than raw intensity because the wavelet naturally decays to zero at the inflection points of the peak.
 
 ### Phase 4: Quantitation
-1.  **Integration:** Switch back to **raw intensity data**.
-2.  **Background Subtraction:** Estimate a linear baseline connecting the start and end intensity points.
-3.  **Calculation:** Use the Trapezoidal Rule to calculate the area under the curve (AUC) minus the trapezoidal background area.
+
+1. **Integration:** Switch back to **raw intensity data**.
+2. **Background Subtraction:** Estimate a linear baseline connecting the start and end intensity points.
+3. **Calculation:** Use the Trapezoidal Rule to calculate the area under the curve (AUC) minus the trapezoidal background area.
 
 ---
 
@@ -106,6 +116,7 @@ pub fn generate_mexican_hat(scale: f64, num_points: usize) -> Array1<f64> {
 ```
 
 ### 4.3 Consensus Logic & Peak Picking
+
 ```rust
 /// Main function to detect peaks and return boundaries
 pub fn detect_peak_boundaries(
@@ -152,8 +163,8 @@ pub fn detect_peak_boundaries(
 }
 ```
 
-
 ### 4.4 Quantitation (Trapezoidal + Background Subtraction)
+
 ```rust
 pub fn quantify_peak(
     data: &PrecursorData,
@@ -206,12 +217,13 @@ pub fn quantify_peak(
 }
 ```
 
-5. Advanced Considerations
-5.1 Handling Interference
+## 5. Advanced Considerations
+
+### 5.1 Handling Interference
+
 In DIA, it is common for 1 out of 6 transitions to be contaminated. The Consensus step in 4.3 uses a simple sum. Changing this to a Tukey median polished chromatograms to improve robustness:
 
 Calculate the correlation of each transition to the "median" shape.
-
 
 5.2 Scale Space Search
 A robust detector should not rely on a single scale. Wrap the logic in 4.3 in a loop over scales = [2.0, 4.0, 8.0, 16.0] (seconds). The "true" peak is the one that appears consistently across the most scales (Ridge Tracking).
