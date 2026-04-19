@@ -720,8 +720,10 @@ fn run_calibration_discovery_windowed(
         // Fit LOESS RT calibration
         // Use actual number of points or config minimum, whichever is smaller
         let effective_min_points = num_confident_peptides.min(rt_config.min_calibration_points);
-        // Match OspreySharp's IsOne convention: only the literal "1" enables.
-        let classical_robust = std::env::var("OSPREY_LOESS_CLASSICAL_ROBUST").as_deref() == Ok("1");
+        // Default to classical Cleveland (1979) robust LOESS, which refreshes
+        // residuals at each iteration. Set OSPREY_LOESS_CLASSICAL_ROBUST=0 to
+        // revert to the legacy single-refresh behavior for comparison.
+        let classical_robust = std::env::var("OSPREY_LOESS_CLASSICAL_ROBUST").as_deref() != Ok("0");
         let calibrator_config = RTCalibratorConfig {
             bandwidth: rt_config.loess_bandwidth,
             degree: 1,
@@ -6317,7 +6319,7 @@ fn run_search(
                         // beating the correct peak on coelution alone.
                         let rt_sigma = calibration
                             .and_then(|cal| cal.rt_calibration.mad)
-                            .map(|mad| (mad * 1.4826 * 3.0).max(0.1))
+                            .map(|mad| (mad * 1.4826 * 5.0).max(0.1))
                             .unwrap_or(rt_tolerance);
 
                         let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
@@ -6354,14 +6356,26 @@ fn run_search(
 
                                 // Gaussian RT penalty: peaks far from the calibration-
                                 // predicted RT are downweighted. A peak at the expected
-                                // position gets penalty=1.0; a peak 3-sigma away gets
+                                // position gets penalty=1.0; a peak 5-sigma away gets
                                 // penalty~0.01.
                                 let peak_apex_rt = ref_xic[bp.apex_index].0;
                                 let rt_residual = (peak_apex_rt - expected_rt).abs();
                                 let rt_penalty =
                                     (-rt_residual.powi(2) / (2.0 * rt_sigma.powi(2))).exp();
 
-                                (bp, coelution_score, coelution_score * rt_penalty)
+                                // Intensity tiebreaker: when two CWT candidates from
+                                // the same chromatographic peak (main peak vs shoulder)
+                                // have nearly identical coelution, the more intense peak
+                                // should win. Using log(1 + apex_intensity) keeps intensity
+                                // as a secondary factor that breaks ties without dominating.
+                                let apex_intensity = ref_xic[bp.apex_index].1;
+                                let intensity_weight = (1.0 + apex_intensity).ln();
+
+                                (
+                                    bp,
+                                    coelution_score,
+                                    coelution_score * rt_penalty * intensity_weight,
+                                )
                             })
                             .collect();
                         // Sort by RT-penalized score (third element)
