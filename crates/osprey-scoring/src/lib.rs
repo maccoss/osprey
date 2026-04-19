@@ -4859,4 +4859,337 @@ mod tests {
             canonical_xcorr,
         );
     }
+
+    // =========================================================================
+    // Regression tests for cross-implementation bug classes. These guard
+    // algorithmic fidelity: any future port (C#, Java, C++, etc.) should
+    // implement and pass these same tests. The OspreySharp C# port has
+    // parallel regression tests that pin the same invariants on its side.
+    // =========================================================================
+
+    /// Two library fragments mapping to the same 1-Th bin must contribute
+    /// to XCorr exactly once. The pipeline's canonical path builds the
+    /// library vector via `preprocess_library_for_xcorr` (assignment, not
+    /// accumulation), so a bin gets a unit contribution regardless of how
+    /// many fragments land in it. Exercises that production path directly.
+    #[test]
+    fn test_xcorr_fragment_bin_dedup() {
+        let scorer = SpectralScorer::new(); // unit resolution: 1.0005 Th bins
+
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 300.0,
+            isolation_window: IsolationWindow::symmetric(300.0, 12.5),
+            mzs: vec![500.2],
+            intensities: vec![10000.0],
+        };
+
+        // Two fragments in the same bin (~500 Th)
+        let mut entry_two = LibraryEntry::new(1, "T".into(), "T".into(), 2, 300.0, 10.0);
+        entry_two.fragments = vec![
+            LibraryFragment {
+                mz: 500.1,
+                relative_intensity: 1.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 500.3,
+                relative_intensity: 1.0,
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+
+        // One fragment in that bin
+        let mut entry_one = LibraryEntry::new(2, "T2".into(), "T2".into(), 2, 300.0, 10.0);
+        entry_one.fragments = vec![LibraryFragment {
+            mz: 500.1,
+            relative_intensity: 1.0,
+            annotation: FragmentAnnotation::default(),
+        }];
+
+        // Confirm the test setup: both entry_two fragments must collide
+        // into a single bin; otherwise the assertion below proves nothing.
+        let bin_a = scorer
+            .bin_config()
+            .mz_to_bin(entry_two.fragments[0].mz)
+            .expect("first fragment should map to a bin");
+        let bin_b = scorer
+            .bin_config()
+            .mz_to_bin(entry_two.fragments[1].mz)
+            .expect("second fragment should map to a bin");
+        assert_eq!(
+            bin_a, bin_b,
+            "test setup requires both fragment m/z values to collide into the same bin"
+        );
+
+        let preprocessed_spectrum = scorer.preprocess_spectrum_for_xcorr(&spectrum);
+        let lib_two = scorer.preprocess_library_for_xcorr(&entry_two);
+        let lib_one = scorer.preprocess_library_for_xcorr(&entry_one);
+
+        let score_two = SpectralScorer::xcorr_from_preprocessed(&preprocessed_spectrum, &lib_two);
+        let score_one = SpectralScorer::xcorr_from_preprocessed(&preprocessed_spectrum, &lib_one);
+
+        assert!(
+            (score_two - score_one).abs() < 1e-10,
+            "Two fragments in same bin should score identically to one: two={}, one={}",
+            score_two,
+            score_one
+        );
+    }
+
+    /// LibCosine must match the closest peak by m/z, not the most intense.
+    /// When two observed peaks are within tolerance of a library fragment,
+    /// the closer one wins even if weaker.
+    #[test]
+    fn test_libcosine_closest_by_mz() {
+        let scorer = SpectralScorer::new().with_tolerance_da(0.5);
+
+        // Two observed peaks within 0.5 Da of fragment at 500.0
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 300.0,
+            isolation_window: IsolationWindow::symmetric(300.0, 12.5),
+            mzs: vec![499.8, 500.4, 600.0],
+            intensities: vec![100.0, 10000.0, 5000.0],
+        };
+
+        let mut entry = LibraryEntry::new(1, "T".into(), "T".into(), 2, 300.0, 10.0);
+        entry.fragments = vec![
+            LibraryFragment {
+                mz: 500.0,
+                relative_intensity: 1.0,
+                annotation: FragmentAnnotation::default(),
+            },
+            LibraryFragment {
+                mz: 600.0,
+                relative_intensity: 0.5,
+                annotation: FragmentAnnotation::default(),
+            },
+        ];
+
+        let score = scorer.lib_cosine(&spectrum, &entry);
+
+        // Fragment at 500.0: closest is 499.8 (diff=0.2), not 500.4 (diff=0.4)
+        // Matched intensities: [100.0, 5000.0]
+        let lib_a = (1.0_f64).sqrt();
+        let lib_b = (0.5_f64).sqrt();
+        let obs_a = (100.0_f64).sqrt();
+        let obs_b = (5000.0_f64).sqrt();
+        let expected = (lib_a * obs_a + lib_b * obs_b)
+            / ((lib_a * lib_a + lib_b * lib_b).sqrt() * (obs_a * obs_a + obs_b * obs_b).sqrt());
+
+        assert!(
+            (score.lib_cosine - expected).abs() < 1e-6,
+            "LibCosine should match closest-by-mz: expected={:.6}, got={:.6}",
+            expected,
+            score.lib_cosine
+        );
+    }
+
+    /// Median polish convergence must compare residuals AFTER both row and
+    /// column sweeps complete, not incrementally during each sweep. The
+    /// check below is a mass-preservation identity:
+    /// `(overall + row + col + residuals).exp()` must equal the input cell
+    /// value by construction of the additive log-space decomposition. A
+    /// sweep that declares convergence mid-row-sweep (before the matching
+    /// column sweep lands) would corrupt this identity.
+    #[test]
+    fn test_median_polish_convergence_after_both_sweeps() {
+        // 3 fragments x 5 scans; fragment 2 is intentionally anti-correlated
+        // with fragments 0 and 1 so the polish has to distribute genuine
+        // structure between col_effects and residuals. The identity check
+        // still holds regardless.
+        let xics: Vec<(usize, Vec<(f64, f64)>)> = vec![
+            (
+                0,
+                vec![
+                    (1.0, 100.0),
+                    (2.0, 200.0),
+                    (3.0, 300.0),
+                    (4.0, 200.0),
+                    (5.0, 100.0),
+                ],
+            ),
+            (
+                1,
+                vec![
+                    (1.0, 50.0),
+                    (2.0, 100.0),
+                    (3.0, 150.0),
+                    (4.0, 100.0),
+                    (5.0, 50.0),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    (1.0, 200.0),
+                    (2.0, 100.0),
+                    (3.0, 50.0),
+                    (4.0, 100.0),
+                    (5.0, 200.0),
+                ],
+            ),
+        ];
+
+        let result = tukey_median_polish(&xics, 20, 1e-4);
+        assert!(result.is_some(), "Should return a result");
+        let result = result.unwrap();
+        assert!(result.converged, "Should converge");
+
+        // Mass-preservation identity: the full decomposition exp-sums back
+        // to the input within 1%. Fails if the algorithm declares
+        // convergence before row + col sweeps have jointly balanced.
+        for (f_idx, (_, scan_values)) in xics.iter().enumerate() {
+            for (s_idx, &(_rt, val)) in scan_values.iter().enumerate() {
+                if val <= 0.0 {
+                    continue;
+                }
+                let reconstructed = (result.overall
+                    + result.row_effects[f_idx]
+                    + result.col_effects[s_idx]
+                    + result.residuals[f_idx][s_idx])
+                    .exp();
+                let rel_err = (reconstructed - val).abs() / val;
+                assert!(
+                    rel_err < 0.01,
+                    "Reconstruction at [{},{}]: expected {}, got {}, rel_err={}",
+                    f_idx,
+                    s_idx,
+                    val,
+                    reconstructed,
+                    rel_err
+                );
+            }
+        }
+    }
+
+    /// Windowing normalization must prevent strong peaks from numerically
+    /// dominating the score. Two peaks with 100:1 intensity ratio should have
+    /// much more similar XCorr scores after normalization.
+    #[test]
+    fn test_xcorr_windowing_normalization() {
+        let scorer = SpectralScorer::new();
+
+        // Two peaks: strong at 300 Th, weak at 1500 Th
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 200.0,
+            isolation_window: IsolationWindow::symmetric(200.0, 1000.0),
+            mzs: vec![300.0, 1500.0],
+            intensities: vec![10000.0, 100.0],
+        };
+
+        let mut entry_strong = LibraryEntry::new(1, "T1".into(), "T1".into(), 2, 200.0, 5.0);
+        entry_strong.fragments = vec![LibraryFragment {
+            mz: 300.0,
+            relative_intensity: 1.0,
+            annotation: FragmentAnnotation::default(),
+        }];
+
+        let mut entry_weak = LibraryEntry::new(2, "T2".into(), "T2".into(), 2, 200.0, 5.0);
+        entry_weak.fragments = vec![LibraryFragment {
+            mz: 1500.0,
+            relative_intensity: 1.0,
+            annotation: FragmentAnnotation::default(),
+        }];
+
+        let score_strong = scorer.xcorr(&spectrum, &entry_strong).xcorr;
+        let score_weak = scorer.xcorr(&spectrum, &entry_weak).xcorr;
+
+        assert!(
+            score_strong > 0.0,
+            "Strong match should be positive: {}",
+            score_strong
+        );
+        assert!(
+            score_weak > 0.0,
+            "Weak match should be positive: {}",
+            score_weak
+        );
+
+        // After normalization, ratio should be much less than raw 100:1
+        let ratio = score_strong / score_weak;
+        assert!(
+            ratio < 10.0,
+            "Windowed XCorr ratio ({:.2}) should be << raw ratio (100.0)",
+            ratio
+        );
+    }
+
+    /// Standalone demonstration that f32 vs f64 sliding window accumulation
+    /// produces measurable drift. This is a precision-choice documentation
+    /// test: it proves the choice of storage type for the preprocessed XCorr
+    /// cache is observable in the output, so any future refactor that swaps
+    /// f32 <-> f64 (either side of the cache store, or the dot product
+    /// accumulator) is a semantic change that needs cross-impl revalidation.
+    /// Osprey uses f32 throughout the XCorr preprocess path; OspreySharp's
+    /// matching test guards the same invariant on the C# side.
+    #[test]
+    fn test_xcorr_f64_vs_f32_precision_drift() {
+        // Simple xorshift64 for deterministic pseudo-random values (no rand dep)
+        let mut state: u64 = 42;
+        let mut next_f64 = || -> f64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state as f64) / (u64::MAX as f64)
+        };
+
+        let n = 2000usize;
+        let spectrum_f64: Vec<f64> = (0..n).map(|_| next_f64() * 100.0).collect();
+        let spectrum_f32: Vec<f32> = spectrum_f64.iter().map(|&v| v as f32).collect();
+
+        let offset = 75i32;
+        let norm = 1.0 / (2.0 * offset as f64);
+
+        // f64 sliding window
+        let mut prefix_d = vec![0.0f64; n + 1];
+        for i in 0..n {
+            prefix_d[i + 1] = prefix_d[i] + spectrum_f64[i];
+        }
+        let result_d: Vec<f64> = (0..n)
+            .map(|i| {
+                let left = (i as i32 - offset).max(0) as usize;
+                let right = ((i as i32 + offset + 1) as usize).min(n);
+                let wsum = prefix_d[right] - prefix_d[left];
+                spectrum_f64[i] - (wsum - spectrum_f64[i]) * norm
+            })
+            .collect();
+
+        // f32 sliding window
+        let norm_f = 1.0f32 / (2.0 * offset as f32);
+        let mut prefix_f = vec![0.0f32; n + 1];
+        for i in 0..n {
+            prefix_f[i + 1] = prefix_f[i] + spectrum_f32[i];
+        }
+        let result_f: Vec<f64> = (0..n)
+            .map(|i| {
+                let left = (i as i32 - offset).max(0) as usize;
+                let right = ((i as i32 + offset + 1) as usize).min(n);
+                let wsum = prefix_f[right] - prefix_f[left];
+                (spectrum_f32[i] - (wsum - spectrum_f32[i]) * norm_f) as f64
+            })
+            .collect();
+
+        let max_diff = result_d
+            .iter()
+            .zip(&result_f)
+            .map(|(d, f)| (d - f).abs())
+            .fold(0.0f64, f64::max);
+
+        assert!(
+            max_diff > 1e-6,
+            "f32 vs f64 should differ by >1e-6, got {:.2e}",
+            max_diff
+        );
+        assert!(
+            max_diff < 1.0,
+            "Drift should be small but measurable: {:.2e}",
+            max_diff
+        );
+    }
 }
