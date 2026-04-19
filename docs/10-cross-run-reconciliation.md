@@ -8,23 +8,40 @@ Without reconciliation, each file's per-window search finds peaks independently 
 
 ### RT-Penalized Peak Selection
 
-To mitigate wrong-peak selection, CWT candidate peaks are ranked by `coelution_score * rt_penalty` rather than by `coelution_score` alone. The RT penalty is a Gaussian centered on the calibration-predicted RT:
+To mitigate wrong-peak selection, CWT candidate peaks are ranked by `coelution_score * rt_penalty * intensity_weight` rather than by `coelution_score` alone.
+
+**RT penalty** — Gaussian centered on the calibration-predicted RT:
 
 ```
 rt_penalty = exp(-residual^2 / (2 * sigma^2))
+sigma      = max(5 * MAD * 1.4826, 0.1)   // from the per-file calibration
+residual   = |peak_apex - expected_rt|
 ```
 
-where `residual = |peak_apex - expected_rt|` and `sigma = max(3 * MAD * 1.4826, 0.1)` from the per-file calibration. A peak at the expected position gets penalty 1.0; a peak 3-sigma away gets penalty ~0.01. This prevents interferer peaks at the wrong RT from winning on coelution alone — the coelution advantage must overcome the RT penalty, which drops exponentially with distance.
+A peak at the expected position gets penalty 1.0; a peak 1 sigma away gets ~0.61; a peak 3 sigma away gets ~0.011; a peak 5 sigma away is effectively zero. At 5-sigma width the penalty is gentle on peaks with slight RT deviations from the calibration (e.g., 0.3 min off with Stellar's MAD ~0.145 gives sigma ~1.07 and penalty ~0.96) but still strongly rejects genuine wrong-peak selections (1.0 min off gives penalty ~0.65, 2.0 min off gives ~0.17).
 
-Without this penalty, a common failure mode on multi-replicate experiments is: an interferer with slightly better fragment co-elution than the correct peak gets selected in multiple replicates, corrupting the downstream consensus RT and causing reconciliation to "correct" the good replicates to the wrong position.
+An earlier 3-sigma version was too aggressive — it could downweight the correct peak enough that a nearby shoulder won. The 5-sigma widening in v26.3.1 preserves the interferer-rejection benefit while leaving room for legitimate peptide-specific RT deviations from the LOESS prediction.
+
+**Intensity tiebreaker** — log-scaled peak height:
 
 ```
-Peptide PEPTIDEK (with RT penalty):
-  file1.mzML: coelution=8.5, rt_penalty=1.0  → score=8.5  → apex=25.3 (correct, wins)
-  file2.mzML: coelution=7.9, rt_penalty=1.0  → score=7.9  → apex=25.4 (correct, wins)
-  file3.mzML: correct peak coelution=3.1, rt_penalty=1.0  → score=3.1
-              interferer    coelution=4.2, rt_penalty=0.0  → score=0.0  → correct peak wins
+intensity_weight = log(1 + apex_intensity)
 ```
+
+When two CWT candidates from the same chromatographic peak (main peak vs shoulder) have nearly identical coelution scores and similar RT penalties, the more intense peak wins. Log scaling keeps intensity as a secondary factor that breaks ties without dominating the coelution-based ranking.
+
+Without these modifiers, a common failure mode on multi-replicate experiments is: an interferer with slightly better fragment co-elution than the correct peak gets selected in multiple replicates, corrupting the downstream consensus RT and causing reconciliation to "correct" the good replicates to the wrong position.
+
+```
+Peptide PEPTIDEK (with RT penalty + intensity tiebreaker):
+  file1.mzML: coelution=8.5, rt_penalty=1.0, intensity=high → wins at apex=25.3 (correct)
+  file2.mzML: coelution=7.9, rt_penalty=1.0, intensity=high → wins at apex=25.4 (correct)
+  file3.mzML: correct peak   coelution=3.1, rt_penalty=1.0,  intensity=medium → score dominates
+              interferer     coelution=4.2, rt_penalty=0.17, intensity=medium → score=~0.7
+              → correct peak wins despite lower coelution
+```
+
+The stored CWT candidates for reconciliation retain their **raw** `coelution_score` (not the RT-penalized version) since reconciliation has its own consensus-based RT tolerance logic via `plan_reconciliation`.
 
 Cross-run reconciliation uses the high-confidence runs to establish where PEPTIDEK actually elutes, then goes back to files where the selected peak is wrong and either finds an alternate CWT candidate at that RT or imputes the integration boundaries at the expected position.
 
