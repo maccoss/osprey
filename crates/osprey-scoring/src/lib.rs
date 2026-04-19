@@ -4866,10 +4866,11 @@ mod tests {
     // parallel regression tests that pin the same invariants on its side.
     // =========================================================================
 
-    /// Two library fragments mapping to the same 1-Th bin must contribute to
-    /// XCorr once, not twice. The pipeline's preprocessed path uses assignment
-    /// (preprocess_library_for_xcorr), so each bin contributes once. This test
-    /// validates the preprocessed path which is what the pipeline actually uses.
+    /// Two library fragments mapping to the same 1-Th bin must contribute
+    /// to XCorr exactly once. The pipeline's canonical path builds the
+    /// library vector via `preprocess_library_for_xcorr` (assignment, not
+    /// accumulation), so a bin gets a unit contribution regardless of how
+    /// many fragments land in it. Exercises that production path directly.
     #[test]
     fn test_xcorr_fragment_bin_dedup() {
         let scorer = SpectralScorer::new(); // unit resolution: 1.0005 Th bins
@@ -4906,31 +4907,27 @@ mod tests {
             annotation: FragmentAnnotation::default(),
         }];
 
-        // Use the preprocessed path (what the pipeline actually uses).
-        // preprocess_spectrum_for_xcorr + manual bin lookup deduplicates via
-        // the library preprocessing step (assignment-based, not accumulation).
-        let preprocessed = scorer.preprocess_spectrum_for_xcorr(&spectrum);
+        // Confirm the test setup: both entry_two fragments must collide
+        // into a single bin; otherwise the assertion below proves nothing.
+        let bin_a = scorer
+            .bin_config()
+            .mz_to_bin(entry_two.fragments[0].mz)
+            .expect("first fragment should map to a bin");
+        let bin_b = scorer
+            .bin_config()
+            .mz_to_bin(entry_two.fragments[1].mz)
+            .expect("second fragment should map to a bin");
+        assert_eq!(
+            bin_a, bin_b,
+            "test setup requires both fragment m/z values to collide into the same bin"
+        );
 
-        // For the preprocessed path, look up each unique bin once
-        let mut seen = std::collections::HashSet::new();
-        let score_two: f64 = entry_two
-            .fragments
-            .iter()
-            .filter_map(|f| scorer.bin_config().mz_to_bin(f.mz))
-            .filter(|bin| seen.insert(*bin))
-            .map(|bin| preprocessed[bin] as f64)
-            .sum::<f64>()
-            * 0.005;
+        let preprocessed_spectrum = scorer.preprocess_spectrum_for_xcorr(&spectrum);
+        let lib_two = scorer.preprocess_library_for_xcorr(&entry_two);
+        let lib_one = scorer.preprocess_library_for_xcorr(&entry_one);
 
-        seen.clear();
-        let score_one: f64 = entry_one
-            .fragments
-            .iter()
-            .filter_map(|f| scorer.bin_config().mz_to_bin(f.mz))
-            .filter(|bin| seen.insert(*bin))
-            .map(|bin| preprocessed[bin] as f64)
-            .sum::<f64>()
-            * 0.005;
+        let score_two = SpectralScorer::xcorr_from_preprocessed(&preprocessed_spectrum, &lib_two);
+        let score_one = SpectralScorer::xcorr_from_preprocessed(&preprocessed_spectrum, &lib_one);
 
         assert!(
             (score_two - score_one).abs() < 1e-10,
