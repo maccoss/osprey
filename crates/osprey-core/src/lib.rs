@@ -4,6 +4,7 @@
 //! error handling, and traits used throughout the Osprey analysis pipeline.
 
 pub mod config;
+pub mod diagnostics;
 pub mod error;
 pub mod isotope;
 pub mod traits;

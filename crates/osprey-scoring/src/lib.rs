@@ -41,6 +41,7 @@
 
 pub mod batch;
 pub mod calibration_ml;
+pub mod diagnostics;
 pub mod pipeline;
 
 use osprey_core::{

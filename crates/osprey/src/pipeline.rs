@@ -489,6 +489,7 @@ fn run_calibration_discovery_windowed(
                 initial_tolerance,
                 None, // First pass: use library RT directly
                 Some(&xcorr_scorer),
+                None, // Pass 1: no fitted LOESS model yet for diag dump
             )
         } else {
             run_coelution_calibration_scoring::<MS1IndexWrapper>(
@@ -500,6 +501,7 @@ fn run_calibration_discovery_windowed(
                 initial_tolerance,
                 None, // First pass: use library RT directly
                 Some(&xcorr_scorer),
+                None, // Pass 1: no fitted LOESS model yet for diag dump
             )
         };
 
@@ -725,6 +727,9 @@ fn run_calibration_discovery_windowed(
             robustness_iter: 2,
             outlier_retention: 1.0, // Use all calibration points — LDA + S/N already filtered
         };
+
+        crate::diagnostics::dump_loess_input(&library_rts_detected, &measured_rts_detected);
+
         let calibrator = RTCalibrator::with_config(calibrator_config);
         let mut rt_calibration = calibrator.fit(&library_rts_detected, &measured_rts_detected)?;
         let mut rt_stats = rt_calibration.stats();
@@ -767,6 +772,7 @@ fn run_calibration_discovery_windowed(
                     pass1_tolerance,
                     Some(&predict_fn),
                     Some(&xcorr_scorer),
+                    Some(&rt_calibration), // Pass 2: fitted LOESS model for diag dump
                 )
             } else {
                 run_coelution_calibration_scoring::<MS1IndexWrapper>(
@@ -778,6 +784,7 @@ fn run_calibration_discovery_windowed(
                     pass1_tolerance,
                     Some(&predict_fn),
                     Some(&xcorr_scorer),
+                    Some(&rt_calibration), // Pass 2: fitted LOESS model for diag dump
                 )
             };
 
@@ -2540,6 +2547,10 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 );
             }
 
+            if osprey_core::diagnostics::should_exit_after_calibration() {
+                return Ok(());
+            }
+
             // Run coelution search
             let entries = run_search(
                 &library,
@@ -2622,6 +2633,10 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         total_scored,
         config.input_files.len()
     );
+
+    if osprey_core::diagnostics::should_exit_after_scoring(total_scored) {
+        return Ok(());
+    }
 
     if per_file_entries.is_empty() || total_scored == 0 {
         log::warn!("No scored entries found. Cannot perform FDR control.");
@@ -5434,6 +5449,14 @@ fn compute_features_at_peak(
         let lib_preprocessed = ctx.scorer.preprocess_library_for_xcorr(entry);
         score.xcorr =
             SpectralScorer::xcorr_from_preprocessed(&preprocessed[win_idx], &lib_preprocessed);
+        crate::diagnostics::dump_xcorr_scan(
+            apex_spectrum,
+            entry,
+            &preprocessed[win_idx],
+            &lib_preprocessed,
+            score.xcorr,
+            ctx.scorer,
+        );
         score
     } else {
         ctx.scorer.xcorr(apex_spectrum, entry)
@@ -5601,6 +5624,17 @@ fn compute_features_at_peak(
             let res = median_polish_residual_ratio(mp);
             let min_r2 = median_polish_min_fragment_r2(mp);
             let resid_corr = median_polish_residual_correlation(mp);
+            crate::diagnostics::dump_mp_diag(
+                apex_spectrum,
+                entry,
+                mp,
+                &peak,
+                cos,
+                res,
+                min_r2,
+                resid_corr,
+                &peak_xics,
+            );
             (cos, rsq, res, min_r2, resid_corr)
         } else {
             (0.0, 0.0, 1.0, 0.0, 0.0)
@@ -5944,6 +5978,8 @@ fn run_search(
         SpectralScorer::new().with_tolerance_da(fragment_tolerance.tolerance)
     };
 
+    let search_xic_dump = crate::diagnostics::SearchXicDump::new();
+
     // Progress bar — one tick per isolation window, with descriptive label.
     let pb = ProgressBar::new(window_groups.len() as u64);
     let bar_template = format!(
@@ -6149,6 +6185,14 @@ fn run_search(
                             6,
                         );
 
+                        search_xic_dump.dump_header(
+                            entry,
+                            expected_rt,
+                            rt_tolerance,
+                            &cand_spectra,
+                            &xics,
+                        );
+
                         if xics.len() < 2 {
                             return None;
                         }
@@ -6331,6 +6375,8 @@ fn run_search(
                             .collect();
                         // Sort by RT-penalized score (third element)
                         scored_candidates.sort_by(|a, b| b.2.total_cmp(&a.2));
+
+                        search_xic_dump.dump_peaks(entry, &scored_candidates);
 
                         // Store top-N CWT candidates for inter-replicate reconciliation.
                         // Use raw coelution_score (not RT-penalized) since reconciliation
