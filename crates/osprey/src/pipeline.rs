@@ -6583,149 +6583,18 @@ impl MzRTIndex {
     }
 }
 
-/// Build an index of library entries by precursor m/z (unsorted, for tests)
+/// Build an index of library entries by precursor m/z (for tests).
 #[cfg(test)]
 fn build_mz_index(library: &[LibraryEntry]) -> MzRTIndex {
     MzRTIndex::build(library, None)
 }
 
-/// Select candidate library entries for a spectrum using RT-sorted binary search.
-///
-/// Candidate selection uses:
-/// 1. Isolation window from mzML (defines which precursors are fragmented)
-/// 2. RT tolerance — binary search on pre-sorted expected_rt within each m/z bin
-/// 3. Optional library filter (for calibration discovery phase)
-/// 4. Optional RT calibration (local tolerance refinement after binary search)
-/// 5. Optional top-N fragment pre-filter (requires at least 2 of top 6 peaks in spectrum)
-///
-/// The MzRTIndex stores entries sorted by expected_rt (calibrated if available),
-/// enabling O(log n + k) candidate selection instead of O(n) per m/z bin.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn select_candidates_with_calibration(
-    spectrum: &Spectrum,
-    library: &[LibraryEntry],
-    mz_rt_index: &MzRTIndex,
-    rt_tolerance: f64,
-    max_candidates: usize,
-    min_rt_tolerance: f64,
-    library_filter: Option<&std::collections::HashSet<usize>>,
-    calibration: Option<&RTCalibration>,
-    fragment_tolerance: Option<FragmentToleranceConfig>,
-    search_tolerance: f64,
-) -> Vec<usize> {
-    let mut candidates = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    let spectrum_rt = spectrum.retention_time;
-
-    // Get the range of bins to search based on isolation window
-    let lower_bin = spectrum.isolation_window.lower_bound().floor() as i32;
-    let upper_bin = spectrum.isolation_window.upper_bound().ceil() as i32;
-
-    // Binary search bounds for RT
-    let rt_low = spectrum_rt - search_tolerance;
-    let rt_high = spectrum_rt + search_tolerance;
-
-    // Search all bins that could contain candidates within the isolation window
-    for bin in lower_bin..=upper_bin {
-        if let Some(entries) = mz_rt_index.get(bin) {
-            // Binary search to find the start of the RT range
-            let start = entries.partition_point(|&(rt, _)| rt < rt_low);
-            // Binary search to find the end of the RT range
-            let end = entries.partition_point(|&(rt, _)| rt <= rt_high);
-
-            for &(expected_rt, idx) in &entries[start..end] {
-                // Skip if already processed (entry can appear in adjacent m/z bins)
-                if seen.contains(&idx) {
-                    continue;
-                }
-                seen.insert(idx);
-
-                // Skip if not in library filter (for calibration discovery)
-                if let Some(filter) = library_filter {
-                    if !filter.contains(&idx) {
-                        continue;
-                    }
-                }
-
-                let entry = &library[idx];
-
-                // Check if precursor falls within isolation window
-                if !spectrum.isolation_window.contains(entry.precursor_mz) {
-                    continue;
-                }
-
-                // Exact local tolerance check (binary search used conservative global bound)
-                if let Some(cal) = calibration {
-                    let factor = rt_tolerance / cal.residual_std().max(0.001);
-                    let effective_tolerance =
-                        cal.local_tolerance(entry.retention_time, factor, min_rt_tolerance);
-                    if (expected_rt - spectrum_rt).abs() > effective_tolerance {
-                        continue;
-                    }
-                }
-
-                // Apply top-N fragment pre-filter if enabled
-                if let Some(ref frag_tol) = fragment_tolerance {
-                    if !osprey_scoring::has_topn_fragment_match(
-                        &entry.fragments,
-                        &spectrum.mzs,
-                        frag_tol.tolerance,
-                        frag_tol.unit,
-                    ) {
-                        continue;
-                    }
-                }
-
-                candidates.push(idx);
-            }
-        }
-    }
-
-    // Limit to max candidates (keep those closest in RT)
-    if candidates.len() > max_candidates {
-        candidates.sort_by(|&a, &b| {
-            let rt_a = if let Some(cal) = calibration {
-                (cal.predict(library[a].retention_time) - spectrum_rt).abs()
-            } else {
-                (library[a].retention_time - spectrum_rt).abs()
-            };
-            let rt_b = if let Some(cal) = calibration {
-                (cal.predict(library[b].retention_time) - spectrum_rt).abs()
-            } else {
-                (library[b].retention_time - spectrum_rt).abs()
-            };
-            rt_a.total_cmp(&rt_b)
-        });
-        candidates.truncate(max_candidates);
-    }
-
-    candidates
-}
-
-/// Select candidate library entries for a spectrum (simple version for tests)
-#[cfg(test)]
-fn select_candidates(
-    spectrum: &Spectrum,
-    library: &[LibraryEntry],
-    library_by_mz: &MzRTIndex,
-    rt_tolerance: f64,
-    max_candidates: usize,
-) -> Vec<usize> {
-    select_candidates_with_calibration(
-        spectrum,
-        library,
-        library_by_mz,
-        rt_tolerance,
-        max_candidates,
-        0.1, // Default min_rt_tolerance for tests
-        None,
-        None,
-        None,         // No fragment pre-filter for tests
-        rt_tolerance, // search_tolerance = rt_tolerance for uncalibrated
-    )
-}
+// Production candidate selection is inlined inside `run_search()` and uses
+// the same `MzRTIndex` via `mz_rt_index.get(bin)` with a per-window RT filter.
+// The standalone `select_candidates_with_calibration` helper that used to live
+// here was only referenced by tests and has been removed along with the legacy
+// `--max-candidates` / ridge-regression CLI options; the current search doesn't
+// cap candidates per spectrum.
 
 /// Write calibration debug CSV showing LDA features and discriminant scores
 ///
@@ -6848,52 +6717,8 @@ mod tests {
     use super::*;
     use osprey_core::{FragmentAnnotation, IsolationWindow};
 
-    fn make_test_spectrum() -> Spectrum {
-        Spectrum {
-            scan_number: 1,
-            retention_time: 10.0,
-            precursor_mz: 500.0,
-            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
-            mzs: vec![300.0, 400.0, 500.0],
-            intensities: vec![100.0, 200.0, 300.0],
-        }
-    }
-
     fn make_test_entry(id: u32, mz: f64, rt: f64) -> LibraryEntry {
         LibraryEntry::new(id, "PEPTIDE".into(), "PEPTIDE".into(), 2, mz, rt)
-    }
-
-    /// Verifies candidate selection includes entries within the isolation window and RT tolerance.
-    #[test]
-    fn test_select_candidates() {
-        let spectrum = make_test_spectrum();
-        let library = vec![
-            make_test_entry(0, 500.0, 10.0), // Should match - in window and correct RT
-            make_test_entry(1, 505.0, 10.0), // In window and correct RT - should match
-            make_test_entry(2, 520.0, 10.0), // Outside isolation window
-            make_test_entry(3, 500.0, 20.0), // In window but wrong RT
-        ];
-        let mz_index = build_mz_index(&library);
-
-        // With rt_tolerance=2.0, entries 0 and 1 should match (in isolation window and RT)
-        let candidates = select_candidates(&spectrum, &library, &mz_index, 2.0, 100);
-
-        assert!(
-            candidates.contains(&0),
-            "Entry 0 should match (in window, correct RT)"
-        );
-        assert!(
-            candidates.contains(&1),
-            "Entry 1 should match (in window, correct RT)"
-        );
-        assert!(
-            !candidates.contains(&2),
-            "Entry 2 should not match (outside window)"
-        );
-        assert!(
-            !candidates.contains(&3),
-            "Entry 3 should not match (wrong RT)"
-        );
     }
 
     /// Verifies MzRTIndex bins each entry into 3 adjacent m/z bins (±1 Da).
@@ -6932,20 +6757,6 @@ mod tests {
     fn test_build_mz_index_empty() {
         let index = build_mz_index(&[]);
         assert!(index.is_empty());
-    }
-
-    /// Verifies that candidate selection respects the max_candidates limit.
-    #[test]
-    fn test_select_candidates_max_limit() {
-        let spectrum = make_test_spectrum();
-        // Create many entries that all match
-        let library: Vec<LibraryEntry> = (0..20)
-            .map(|i| make_test_entry(i, 500.0 + (i as f64 * 0.1), 10.0))
-            .collect();
-        let mz_index = build_mz_index(&library);
-
-        let candidates = select_candidates(&spectrum, &library, &mz_index, 2.0, 5);
-        assert!(candidates.len() <= 5, "Should respect max_candidates limit");
     }
 
     /// Verifies count_topn_fragment_overlap detects identical top-6 fragments.

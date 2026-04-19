@@ -138,8 +138,10 @@ struct Args {
     #[arg(long, default_value = "percolator")]
     fdr_method: String,
 
-    /// FDR filtering level: precursor, peptide (default), protein, or both.
-    /// Controls which q-value gates the blib output. 'protein' requires --protein-fdr.
+    /// FDR filtering level: precursor (default), peptide, protein, or both.
+    /// Controls which peptide identities are eligible for blib output;
+    /// precursor-level FDR is always enforced within each eligible peptide.
+    /// 'protein' requires --protein-fdr.
     #[arg(long)]
     fdr_level: Option<String>,
 
