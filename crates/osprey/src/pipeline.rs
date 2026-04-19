@@ -720,8 +720,10 @@ fn run_calibration_discovery_windowed(
         // Fit LOESS RT calibration
         // Use actual number of points or config minimum, whichever is smaller
         let effective_min_points = num_confident_peptides.min(rt_config.min_calibration_points);
-        // Match OspreySharp's IsOne convention: only the literal "1" enables.
-        let classical_robust = std::env::var("OSPREY_LOESS_CLASSICAL_ROBUST").as_deref() == Ok("1");
+        // Default to classical Cleveland (1979) robust LOESS, which refreshes
+        // residuals at each iteration. Set OSPREY_LOESS_CLASSICAL_ROBUST=0 to
+        // revert to the legacy single-refresh behavior for comparison.
+        let classical_robust = std::env::var("OSPREY_LOESS_CLASSICAL_ROBUST").as_deref() != Ok("0");
         let calibrator_config = RTCalibratorConfig {
             bandwidth: rt_config.loess_bandwidth,
             degree: 1,
