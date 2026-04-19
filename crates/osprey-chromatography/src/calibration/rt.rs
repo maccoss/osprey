@@ -26,6 +26,17 @@ pub struct RTCalibratorConfig {
     /// and the fit is repeated on the clean data (mirrors DIA-NN's map_RT approach).
     /// Set to 1.0 to disable outlier removal.
     pub outlier_retention: f64,
+    /// When false (default), residuals are captured from the initial fit and
+    /// reused across every iteration of the robustness loop, giving a single
+    /// refinement regardless of `robustness_iter`. When true, residuals are
+    /// refreshed from the current fit at the top of each iteration, which is
+    /// the classical Cleveland (1979) robust LOESS algorithm.
+    ///
+    /// Library users set this flag explicitly; the crate does not read env
+    /// vars directly. The `osprey` binary maps
+    /// `OSPREY_LOESS_CLASSICAL_ROBUST=1` to this flag, and OspreySharp honors
+    /// the same env var on the C# side for cross-impl validation.
+    pub classical_robust_iterations: bool,
 }
 
 impl Default for RTCalibratorConfig {
@@ -36,6 +47,7 @@ impl Default for RTCalibratorConfig {
             min_points: 20,
             robustness_iter: 2,
             outlier_retention: 0.8, // Keep best 80%, remove worst 20% (DIA-NN default)
+            classical_robust_iterations: false,
         }
     }
 }
@@ -116,20 +128,29 @@ impl RTCalibrator {
         // Compute initial LOESS fit
         let fitted = self.loess_fit(&x, &y, None)?;
 
-        // Compute residuals
-        let residuals: Vec<f64> = y
+        // Start with residuals from the initial fit. In default mode these
+        // are reused across every robustness iteration; in classical mode
+        // they are refreshed from the current fit at the top of each
+        // iteration (see `classical_robust_iterations`).
+        let mut abs_residuals: Vec<f64> = y
             .iter()
             .zip(fitted.iter())
-            .map(|(obs, pred)| obs - pred)
+            .map(|(obs, pred)| (obs - pred).abs())
             .collect();
 
         // Robustness iterations
         let mut weights: Vec<f64> = vec![1.0; x.len()];
         let mut final_fitted = fitted;
 
-        for _ in 0..self.config.robustness_iter {
+        for iter in 0..self.config.robustness_iter {
+            if self.config.classical_robust_iterations && iter > 0 {
+                // Refresh residuals from the current fit (classical Cleveland 1979)
+                for (i, (yv, fv)) in y.iter().zip(final_fitted.iter()).enumerate() {
+                    abs_residuals[i] = (yv - fv).abs();
+                }
+            }
+
             // Compute robust weights using bisquare function
-            let abs_residuals: Vec<f64> = residuals.iter().map(|r| r.abs()).collect();
             let median_abs_residual = median(&abs_residuals);
             let s = 6.0 * median_abs_residual; // MAD scale estimate
 
@@ -1371,6 +1392,90 @@ mod tests {
             (result - 12.5).abs() < 0.01,
             "Expected ~12.5 for duplicate fitted_values, got {}",
             result
+        );
+    }
+
+    /// In default mode the robustness loop reuses abs_residuals captured
+    /// from the initial fit, so the weights and final fit are identical
+    /// regardless of `robustness_iter`. This test pins that invariant.
+    #[test]
+    fn test_loess_default_mode_is_iteration_invariant() {
+        // Linear data with two large outliers so the robust weights are
+        // non-trivial.
+        let library_rts: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        let mut measured_rts: Vec<f64> = library_rts.iter().map(|&x| 2.0 * x + 5.0).collect();
+        measured_rts[10] += 50.0;
+        measured_rts[35] -= 50.0;
+
+        let make = |iters: usize| RTCalibratorConfig {
+            bandwidth: 0.3,
+            degree: 1,
+            min_points: 20,
+            robustness_iter: iters,
+            outlier_retention: 1.0,
+            classical_robust_iterations: false,
+        };
+
+        let cal_1 = RTCalibrator::with_config(make(1))
+            .fit(&library_rts, &measured_rts)
+            .unwrap();
+        let cal_5 = RTCalibrator::with_config(make(5))
+            .fit(&library_rts, &measured_rts)
+            .unwrap();
+
+        for &x in &[5.0, 15.0, 25.0, 35.0, 45.0] {
+            let p1 = cal_1.predict(x);
+            let p5 = cal_5.predict(x);
+            assert!(
+                (p1 - p5).abs() < 1e-12,
+                "default mode must be iteration-invariant at x={}: iter1={}, iter5={}",
+                x,
+                p1,
+                p5
+            );
+        }
+    }
+
+    /// Classical mode must actually diverge from default mode — the whole
+    /// point of the flag. Asserts that classical and default produce
+    /// measurably different fits on data where iterative reweighting can
+    /// make a difference (noise plus moderate outliers that don't fully
+    /// saturate the bisquare weight at `|r| >= 6 * MAD`).
+    #[test]
+    fn test_loess_classical_mode_diverges_from_default() {
+        let library_rts: Vec<f64> = (0..80).map(|i| i as f64).collect();
+        let mut measured_rts: Vec<f64> = library_rts
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| 2.0 * x + 5.0 + (i as f64 * 0.31415).sin())
+            .collect();
+        measured_rts[20] += 3.0;
+        measured_rts[40] -= 3.0;
+        measured_rts[60] += 3.0;
+
+        let make = |classical: bool| RTCalibratorConfig {
+            bandwidth: 0.3,
+            degree: 1,
+            min_points: 20,
+            robustness_iter: 5,
+            outlier_retention: 1.0,
+            classical_robust_iterations: classical,
+        };
+
+        let cal_default = RTCalibrator::with_config(make(false))
+            .fit(&library_rts, &measured_rts)
+            .unwrap();
+        let cal_classical = RTCalibrator::with_config(make(true))
+            .fit(&library_rts, &measured_rts)
+            .unwrap();
+
+        let any_differ = library_rts
+            .iter()
+            .any(|&x| (cal_classical.predict(x) - cal_default.predict(x)).abs() > 1e-9);
+        assert!(
+            any_differ,
+            "classical mode should produce a different fit than default on \
+             data where iterative reweighting can refine weights"
         );
     }
 }
