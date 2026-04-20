@@ -8,6 +8,17 @@ Osprey's primary peak detection method is **CWT (Continuous Wavelet Transform) c
 
 CWT consensus is complemented by **Tukey median polish**, which decomposes the fragment XIC matrix into additive components for robust scoring features and peak boundary refinement.
 
+### XIC Extraction vs Apex Acceptance
+
+Peak detection operates on fragment XICs extracted from a window around the calibration-predicted RT. Two related windows govern this:
+
+- **XIC extraction window** (`expected_rt ± xic_half_width`): which spectra feed the CWT detector. Needs to be wide enough for CWT to see the full peak shape — including the left and right tails — even when the true apex drifts within the acceptance tolerance.
+- **Apex acceptance window** (`expected_rt ± rt_tolerance`, where `rt_tolerance = 3 × MAD × 1.4826` from the per-file RT calibration): the detected apex must fall within this tighter tolerance for a candidate to be considered.
+
+These are **decoupled**: the XIC extraction window is `rt_tolerance + max(rt_tolerance, 0.1 min)` on each side (i.e., at least doubled, with a 0.1 min floor for tight-calibration runs). After CWT returns candidates, any candidate whose apex lies outside `rt_tolerance` is dropped by an explicit filter, preserving first-pass selectivity. The wider extraction window only provides boundary-determination context.
+
+**Why the decouple matters.** An earlier implementation used the same window for both extraction and acceptance. When a peak's apex drifted 2σ toward the rt_tolerance edge (well within the 3σ acceptance), the extraction window truncated the peak's tail on that side. CWT had no data to extend the boundary past the apex, and returned degenerate bounds with `start_rt == apex_rt` (or `end_rt == apex_rt`). On Stellar this happened for ~7% of target detections on the left side plus ~5.5% on the right, producing integration windows visibly misaligned with the peak shape in downstream tools (e.g., Skyline showed the ID marker at the leftmost or rightmost edge of the integration box instead of inside it). Decoupling the two windows eliminates the truncation while the post-CWT apex filter keeps selectivity unchanged.
+
 ```text
 Peak Detection Pipeline
 ────────────────────────
