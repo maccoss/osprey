@@ -43,6 +43,7 @@ pub mod batch;
 pub mod calibration_ml;
 pub mod diagnostics;
 pub mod pipeline;
+pub mod xcorr_pool;
 
 use osprey_core::{
     BinConfig, FragmentAnnotation, IonType, LibraryEntry, LibraryFragment, Modification, Result,
@@ -2279,6 +2280,20 @@ impl SpectralScorer {
     /// Divides spectrum into 10 windows and normalizes each to max=50.0
     fn apply_windowing_normalization(&self, spectrum: &[f32]) -> Vec<f32> {
         let mut result = vec![0.0f32; spectrum.len()];
+        self.apply_windowing_normalization_into(spectrum, &mut result);
+        result
+    }
+
+    /// In-place variant of [`apply_windowing_normalization`] that writes
+    /// into a caller-provided buffer. The buffer must be zero on entry
+    /// because below-threshold and empty-window positions retain their
+    /// initial value.
+    fn apply_windowing_normalization_into(&self, spectrum: &[f32], result: &mut [f32]) {
+        debug_assert_eq!(
+            spectrum.len(),
+            result.len(),
+            "windowing output must match input length"
+        );
         let num_windows = 10;
         let window_size = (spectrum.len() / num_windows) + 1;
 
@@ -2308,8 +2323,6 @@ impl SpectralScorer {
                 }
             }
         }
-
-        result
     }
 
     /// Apply sliding window subtraction for fast XCorr (Comet-style)
@@ -2319,17 +2332,31 @@ impl SpectralScorer {
     /// offset=75, matching Comet's iXcorrProcessingOffset default.
     fn apply_sliding_window(&self, spectrum: &[f32]) -> Vec<f32> {
         let n = spectrum.len();
+        let mut prefix = vec![0.0f32; n + 1];
+        let mut result = vec![0.0f32; n];
+        self.apply_sliding_window_into(spectrum, &mut prefix, &mut result);
+        result
+    }
+
+    /// In-place variant of [`apply_sliding_window`] that writes into
+    /// caller-provided prefix and result buffers. Every position of
+    /// `result` is overwritten; `prefix[0]` is assumed to be 0 on entry
+    /// and positions 1..=n are overwritten.
+    fn apply_sliding_window_into(&self, spectrum: &[f32], prefix: &mut [f32], result: &mut [f32]) {
+        let n = spectrum.len();
         let offset: usize = 75;
         // Comet uses (window_size - 1) = 2*offset = 150 as divisor
         let norm_factor = 1.0f32 / (2 * offset) as f32;
 
+        debug_assert_eq!(prefix.len(), n + 1, "prefix buffer must be n+1");
+        debug_assert_eq!(result.len(), n, "result buffer must be n");
+        debug_assert_eq!(prefix[0], 0.0, "prefix[0] must be 0 on entry");
+
         // Build prefix sum for O(n) window sums
-        let mut prefix = vec![0.0f32; n + 1];
         for i in 0..n {
             prefix[i + 1] = prefix[i] + spectrum[i];
         }
 
-        let mut result = vec![0.0f32; n];
         for i in 0..n {
             let left = i.saturating_sub(offset);
             let right = if i + offset < n { i + offset + 1 } else { n };
@@ -2340,8 +2367,6 @@ impl SpectralScorer {
             // Subtract local average from center value
             result[i] = spectrum[i] - sum_excluding_center * norm_factor;
         }
-
-        result
     }
 
     // ========================================================================
@@ -2355,19 +2380,46 @@ impl SpectralScorer {
     ///
     /// This allows precomputing once per spectrum and reusing across library entries.
     pub fn preprocess_spectrum_for_xcorr(&self, spectrum: &Spectrum) -> Vec<f32> {
+        let mut scratch = crate::xcorr_pool::XcorrScratch::new_unpooled(self.bin_config.n_bins);
+        let mut output = vec![0.0f32; self.bin_config.n_bins];
+        self.preprocess_spectrum_for_xcorr_into(spectrum, &mut scratch, &mut output);
+        output
+    }
+
+    /// In-place XCorr preprocess using a pool-rented scratch and a
+    /// caller-provided output buffer. The output buffer is fully
+    /// overwritten. The scratch's accumulator fields (`binned`,
+    /// `windowed`) are zeroed at the start of the call, so callers can
+    /// reuse a single rented scratch across many preprocess calls
+    /// without interleaving recycle/rent.
+    pub fn preprocess_spectrum_for_xcorr_into(
+        &self,
+        spectrum: &Spectrum,
+        scratch: &mut crate::xcorr_pool::XcorrScratch,
+        output: &mut [f32],
+    ) {
+        debug_assert_eq!(scratch.binned.len(), self.bin_config.n_bins);
+        debug_assert_eq!(scratch.windowed.len(), self.bin_config.n_bins);
+        debug_assert_eq!(scratch.prefix.len(), self.bin_config.n_bins + 1);
+        debug_assert_eq!(output.len(), self.bin_config.n_bins);
+
+        // binned is accumulated via += and windowed is written only at
+        // above-threshold positions, so both must start at zero. The
+        // memset cost is the same whether we zero here, in the pool, or
+        // via vec![0; n]; doing it here means callers can rent once and
+        // reuse across many spectra safely.
+        scratch.binned.fill(0.0);
+        scratch.windowed.fill(0.0);
+
         // Bin observed spectrum with sqrt transformation using Comet BIN macro
-        let mut binned = vec![0.0f32; self.bin_config.n_bins];
         for (&mz, &intensity) in spectrum.mzs.iter().zip(spectrum.intensities.iter()) {
             if let Some(bin) = self.bin_config.mz_to_bin(mz) {
-                binned[bin] += intensity.sqrt();
+                scratch.binned[bin] += intensity.sqrt();
             }
         }
 
-        // Apply windowing normalization
-        let windowed = self.apply_windowing_normalization(&binned);
-
-        // Apply flanking bin subtraction
-        self.apply_sliding_window(&windowed)
+        self.apply_windowing_normalization_into(&scratch.binned, &mut scratch.windowed);
+        self.apply_sliding_window_into(&scratch.windowed, &mut scratch.prefix, output);
     }
 
     /// Lightweight XCorr for a single spectrum — no LibCosine overhead.
@@ -2394,6 +2446,53 @@ impl SpectralScorer {
             }
         }
         xcorr_raw * 0.005
+    }
+
+    /// Compute XCorr without materializing a library preprocess vector.
+    ///
+    /// Functionally equivalent to
+    /// `xcorr_from_preprocessed(spectrum_preprocessed, &preprocess_library_for_xcorr(entry))`:
+    /// sum the preprocessed spectrum values at the unique library fragment
+    /// bins, then scale by 0.005 (Comet).
+    ///
+    /// The dense path allocates an `NBins`-sized `Vec<f32>` per call and does
+    /// a dot product over ~100K bins at HRAM. Since typical library entries
+    /// have only ~10-30 fragments, 99.97% of that dot product is
+    /// zero*something. Iterating fragments directly is O(n_frags) and
+    /// allocates only a small stack of bin indices for deduplication.
+    ///
+    /// Bit-parity with the dense path: the final scale and cast follow the
+    /// exact pattern `(sum_f32 * 0.005_f32) as f64` so both return the same
+    /// numerical value; the only difference is the summation ORDER (linear
+    /// left-to-right vs SIMD reduction), which typically differs by less
+    /// than 1e-7 on xcorr values around 1.0.
+    #[inline]
+    pub fn xcorr_sparse(&self, spectrum_preprocessed: &[f32], entry: &LibraryEntry) -> f64 {
+        // Small stack-friendly accumulator for unique fragment bins. At HRAM
+        // NBins=~100K, the dense path would alloc 400 KB per call; here we
+        // alloc one usize per fragment (~80-240 bytes per call, served by
+        // the allocator's thread-local cache).
+        let mut bins: Vec<usize> = Vec::with_capacity(entry.fragments.len());
+        for frag in &entry.fragments {
+            if let Some(bin) = self.bin_config.mz_to_bin(frag.mz) {
+                bins.push(bin);
+            }
+        }
+        bins.sort_unstable();
+        bins.dedup();
+
+        let n_bins = spectrum_preprocessed.len();
+        let sum: f32 = bins
+            .iter()
+            .filter_map(|&b| {
+                if b < n_bins {
+                    Some(spectrum_preprocessed[b])
+                } else {
+                    None
+                }
+            })
+            .sum();
+        (sum * 0.005f32) as f64
     }
 
     /// Preprocess a library entry for XCorr (Comet-style)

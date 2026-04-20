@@ -56,7 +56,9 @@ use osprey_io::{
 };
 use osprey_scoring::{
     batch::{run_coelution_calibration_scoring, sample_library_for_calibration, MS1SpectrumLookup},
-    has_topn_fragment_match, DecoyGenerator, DecoyMethod, Enzyme, SpectralScorer,
+    has_topn_fragment_match,
+    xcorr_pool::XcorrScratchPool,
+    DecoyGenerator, DecoyMethod, Enzyme, SpectralScorer,
 };
 
 /// Wrapper to implement MS1SpectrumLookup for MS1Index
@@ -5338,6 +5340,13 @@ struct FeatureComputeContext<'a> {
     /// For each spectrum in cand_spectra, its index into the window_spectra array.
     /// Used to look up pre-preprocessed XCorr data.
     cand_window_local: Option<&'a [usize]>,
+    /// When true, compute XCorr via `SpectralScorer::xcorr_sparse` (iterate
+    /// the ~30 library fragments and index into the preprocessed spectrum)
+    /// instead of materializing an `NBins`-sized library vector and doing a
+    /// dense dot product. Controlled by `OSPREY_XCORR_SPARSE=1`. Scoring is
+    /// numerically equivalent up to floating-point summation order
+    /// (~1e-7 drift on xcorr values).
+    use_sparse_xcorr: bool,
 }
 
 /// Compute all coelution features and build a `CoelutionScoredEntry` at the
@@ -5443,17 +5452,23 @@ fn compute_features_at_peak(
     {
         let mut score = ctx.scorer.lib_cosine(apex_spectrum, entry);
         let win_idx = win_indices[apex_local_idx];
-        let lib_preprocessed = ctx.scorer.preprocess_library_for_xcorr(entry);
-        score.xcorr =
-            SpectralScorer::xcorr_from_preprocessed(&preprocessed[win_idx], &lib_preprocessed);
-        crate::diagnostics::dump_xcorr_scan(
-            apex_spectrum,
-            entry,
-            &preprocessed[win_idx],
-            &lib_preprocessed,
-            score.xcorr,
-            ctx.scorer,
-        );
+        if ctx.use_sparse_xcorr {
+            score.xcorr = ctx.scorer.xcorr_sparse(&preprocessed[win_idx], entry);
+            // Skip dump_xcorr_scan: the diagnostic needs a library-preprocessed
+            // vector we didn't materialize. Diagnostics stay on the dense path.
+        } else {
+            let lib_preprocessed = ctx.scorer.preprocess_library_for_xcorr(entry);
+            score.xcorr =
+                SpectralScorer::xcorr_from_preprocessed(&preprocessed[win_idx], &lib_preprocessed);
+            crate::diagnostics::dump_xcorr_scan(
+                apex_spectrum,
+                entry,
+                &preprocessed[win_idx],
+                &lib_preprocessed,
+                score.xcorr,
+                ctx.scorer,
+            );
+        }
         score
     } else {
         ctx.scorer.xcorr(apex_spectrum, entry)
@@ -5469,8 +5484,9 @@ fn compute_features_at_peak(
     ];
     let mut sg_xcorr = 0.0;
     let mut sg_cosine = 0.0;
-    // Pre-compute library XCorr vector once for SG-weighted lookups
-    let lib_xcorr_preprocessed = if ctx.preprocessed_xcorr.is_some() {
+    // Pre-compute library XCorr vector once for SG-weighted lookups (dense
+    // path only; the sparse path iterates fragments directly each call).
+    let lib_xcorr_preprocessed = if ctx.preprocessed_xcorr.is_some() && !ctx.use_sparse_xcorr {
         Some(ctx.scorer.preprocess_library_for_xcorr(entry))
     } else {
         None
@@ -5479,15 +5495,19 @@ fn compute_features_at_peak(
         let idx = apex_local_idx as i32 + offset;
         if idx >= 0 && (idx as usize) < cand_spectra.len() {
             let spec = cand_spectra[idx as usize];
-            if let (Some(preprocessed), Some(win_indices), Some(ref lib_pre)) = (
-                ctx.preprocessed_xcorr,
-                ctx.cand_window_local,
-                &lib_xcorr_preprocessed,
-            ) {
+            if let (Some(preprocessed), Some(win_indices)) =
+                (ctx.preprocessed_xcorr, ctx.cand_window_local)
+            {
                 let win_idx = win_indices[idx as usize];
-                sg_xcorr +=
-                    SpectralScorer::xcorr_from_preprocessed(&preprocessed[win_idx], lib_pre)
-                        * weight;
+                if ctx.use_sparse_xcorr {
+                    sg_xcorr += ctx.scorer.xcorr_sparse(&preprocessed[win_idx], entry) * weight;
+                } else if let Some(ref lib_pre) = lib_xcorr_preprocessed {
+                    sg_xcorr +=
+                        SpectralScorer::xcorr_from_preprocessed(&preprocessed[win_idx], lib_pre)
+                            * weight;
+                } else {
+                    sg_xcorr += ctx.scorer.xcorr_at_scan(spec, entry) * weight;
+                }
             } else {
                 sg_xcorr += ctx.scorer.xcorr_at_scan(spec, entry) * weight;
             }
@@ -5977,6 +5997,31 @@ fn run_search(
 
     let search_xic_dump = crate::diagnostics::SearchXicDump::new();
 
+    // Shared pool for per-window XCorr preprocessing buffers. One pool per
+    // search reaches its high-water mark after the first few windows and
+    // then recycles; subsequent windows do not allocate the ~400 KB
+    // `preprocessed_xcorr` cache entries or the ~1.2 MB scratch bundles.
+    // HRAM (NBins ~100K) sees the largest win -- ~400 MB of cache + ~1.2 GB
+    // of transient scratch per window is recycled instead of freed/re-malloc'd.
+    let xcorr_pool = XcorrScratchPool::new(scorer.num_bins());
+
+    // Sparse XCorr scoring path (default). Iterate library fragments and
+    // index into the preprocessed spectrum instead of materializing an
+    // NBins-wide library vector and doing a dense dot product. At HRAM
+    // binning (NBins ~100K) this saves a 400 KB allocation and a 100K-
+    // element dot per candidate scan -- ~1 TB of transient Vec<f32> churn
+    // and ~6*10^10 zero-multiplies per single Astral file. Scoring is
+    // numerically equivalent modulo summation order (sub-ppm drift on
+    // xcorr values). Set OSPREY_XCORR_SPARSE=0 to force the dense path
+    // (kept for the xcorr_scan diagnostic dump and for parity verification).
+    let use_sparse_xcorr = std::env::var("OSPREY_XCORR_SPARSE").as_deref() != Ok("0");
+    if !use_sparse_xcorr {
+        log::info!(
+            "XCorr scoring: dense path forced (OSPREY_XCORR_SPARSE=0); \
+             sparse iteration disabled"
+        );
+    }
+
     // Progress bar — one tick per isolation window, with descriptive label.
     let pb = ProgressBar::new(window_groups.len() as u64);
     let bar_template = format!(
@@ -6028,10 +6073,23 @@ fn run_search(
                 // per-entry preprocessing (binning + windowing + sliding window subtraction).
                 // Each spectrum is preprocessed once here; per-entry scoring then uses
                 // O(n_frags) dot product lookups instead of O(n_peaks) re-preprocessing.
+                //
+                // Buffers come from the shared pool -- after the first few windows
+                // reach the high-water mark no allocation happens here.
+                let mut preprocess_scratch = xcorr_pool.rent();
                 let preprocessed_xcorr: Vec<Vec<f32>> = window_spectra
                     .iter()
-                    .map(|s| scorer.preprocess_spectrum_for_xcorr(s))
+                    .map(|s| {
+                        let mut out = xcorr_pool.rent_bins();
+                        scorer.preprocess_spectrum_for_xcorr_into(
+                            s,
+                            &mut preprocess_scratch,
+                            &mut out,
+                        );
+                        out
+                    })
                     .collect();
+                xcorr_pool.recycle(preprocess_scratch);
 
                 // Find candidate library entries for this window using MzRTIndex
                 // Collect unique library indices whose precursor_mz falls in this window
@@ -6275,6 +6333,7 @@ fn run_search(
                                 file_name,
                                 preprocessed_xcorr: Some(&preprocessed_xcorr),
                                 cand_window_local: Some(&cand_window_local),
+                                use_sparse_xcorr,
                             };
 
                             return compute_features_at_peak(&ctx, peak);
@@ -6477,6 +6536,7 @@ fn run_search(
                             file_name,
                             preprocessed_xcorr: Some(&preprocessed_xcorr),
                             cand_window_local: Some(&cand_window_local),
+                            use_sparse_xcorr,
                         };
 
                         let mut result = compute_features_at_peak(&ctx, peak);
@@ -6500,6 +6560,10 @@ fn run_search(
                         map.insert(entry.entry_id, entry);
                     }
                 }
+
+                // Return the per-spectrum preprocessed buffers to the pool so
+                // the next window's scoring can reuse them without re-allocating.
+                xcorr_pool.recycle_bins_all(preprocessed_xcorr);
 
                 pb.inc(1);
                 map
