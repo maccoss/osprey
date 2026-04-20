@@ -45,7 +45,8 @@ use osprey_chromatography::{
 use osprey_core::{
     CoelutionFeatureSet, CoelutionScoredEntry, CwtCandidate, DecoyMethod as CoreDecoyMethod,
     FdrEntry, FdrLevel, FdrMethod, FragmentToleranceConfig, LibraryEntry, LibraryFragment,
-    MS1Spectrum, OspreyConfig, OspreyError, Result, Spectrum, ToleranceUnit, XICPeakBounds,
+    MS1Spectrum, OspreyConfig, OspreyError, ParquetCompression, Result, Spectrum, ToleranceUnit,
+    XICPeakBounds,
 };
 use osprey_fdr::{
     get_pin_feature_names, percolator, pin_feature_value, MokapotRunner, NUM_PIN_FEATURES,
@@ -1301,13 +1302,23 @@ fn persist_fdr_scores(
 }
 
 /// Write per-file scored entries to parquet with optional key-value metadata.
+/// Map the public `ParquetCompression` config enum onto the parquet
+/// crate's `Compression` value. Defaults inside `Compression::ZSTD` etc.
+/// preserve the historical Osprey defaults.
+fn parquet_compression_codec(c: ParquetCompression) -> parquet::basic::Compression {
+    match c {
+        ParquetCompression::Zstd => parquet::basic::Compression::ZSTD(Default::default()),
+        ParquetCompression::Snappy => parquet::basic::Compression::SNAPPY,
+    }
+}
+
 fn write_scores_parquet_with_metadata(
     path: &std::path::Path,
     entries: &[CoelutionScoredEntry],
     metadata: Option<Vec<parquet::file::metadata::KeyValue>>,
+    compression: parquet::basic::Compression,
 ) -> Result<()> {
     use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
 
     if entries.is_empty() {
@@ -1477,8 +1488,14 @@ fn write_scores_parquet_with_metadata(
             e
         ))
     })?;
-    let mut props_builder =
-        WriterProperties::builder().set_compression(Compression::ZSTD(Default::default()));
+    let mut props_builder = WriterProperties::builder().set_compression(compression);
+    // When emitting Snappy (the cross-impl interop format), also disable
+    // dictionary encoding. Parquet.Net 3.x (used by OspreySharp embedded
+    // in Skyline) does not support RLE_DICTIONARY decoding; PLAIN is the
+    // safe fallback. Modest file-size cost for repetitive string columns.
+    if matches!(compression, parquet::basic::Compression::SNAPPY) {
+        props_builder = props_builder.set_dictionary_enabled(false);
+    }
     if metadata.is_some() {
         props_builder = props_builder.set_key_value_metadata(metadata);
     }
@@ -2268,9 +2285,12 @@ pub(crate) fn load_cwt_candidates_from_parquet(
 }
 
 /// Write coelution scored entries to Parquet report (one row per precursor per run)
-fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]) -> Result<()> {
+fn write_parquet_report(
+    path: &std::path::Path,
+    entries: &[CoelutionScoredEntry],
+    compression: parquet::basic::Compression,
+) -> Result<()> {
     use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
 
     if entries.is_empty() {
@@ -2382,7 +2402,7 @@ fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         columns.push(std::sync::Arc::new(builder.finish()));
     }
 
-    // Write parquet with ZSTD compression
+    // Write parquet with the configured compression codec.
     let file = std::fs::File::create(path).map_err(|e| {
         OspreyError::OutputError(format!(
             "Failed to create parquet file {}: {}",
@@ -2391,7 +2411,7 @@ fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         ))
     })?;
     let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
+        .set_compression(compression)
         .build();
     let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| OspreyError::OutputError(format!("Failed to create RecordBatch: {}", e)))?;
@@ -2848,9 +2868,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
                 // Save scores to parquet for future re-use (with search parameter metadata)
                 let scores_meta = build_scores_metadata(&config);
-                if let Err(e) =
-                    write_scores_parquet_with_metadata(&scores_path, &entries, Some(scores_meta))
-                {
+                let codec = parquet_compression_codec(config.parquet_compression);
+                if let Err(e) = write_scores_parquet_with_metadata(
+                    &scores_path,
+                    &entries,
+                    Some(scores_meta),
+                    codec,
+                ) {
                     log::warn!("Failed to save scores to {}: {}", scores_path.display(), e);
                 }
 
@@ -3685,10 +3709,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         }
                         // Write back to Parquet with reconciliation metadata
                         let recon_metadata = build_reconciled_metadata(&config);
+                        let codec = parquet_compression_codec(config.parquet_compression);
                         if let Err(e) = write_scores_parquet_with_metadata(
                             cache_path,
                             &full_entries,
                             Some(recon_metadata),
+                            codec,
                         ) {
                             log::warn!(
                                 "Failed to write reconciled scores for {}: {}",
@@ -4130,7 +4156,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     }
                 }
             }
-            write_parquet_report(report_path, &all_entries)?;
+            write_parquet_report(
+                report_path,
+                &all_entries,
+                parquet_compression_codec(config.parquet_compression),
+            )?;
         } else {
             // TSV report from plan entries (no full entry reload needed)
             log::info!("Writing TSV report to {}", report_path.display());

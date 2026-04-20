@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::Parser;
 use log::LevelFilter;
 use osprey::{
-    run_analysis, ConfigOverrides, FdrLevel, FdrMethod, OspreyConfig, ResolutionMode,
-    SharedPeptideMode, ToleranceUnit,
+    run_analysis, ConfigOverrides, FdrLevel, FdrMethod, OspreyConfig, ParquetCompression,
+    ResolutionMode, SharedPeptideMode, ToleranceUnit,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -181,6 +181,14 @@ struct Args {
     /// --join-only is set; ignored otherwise.
     #[arg(long, num_args = 1..)]
     input_scores: Option<Vec<PathBuf>>,
+
+    /// Compression codec for `.scores.parquet` writes. Default `zstd`
+    /// keeps the historical Osprey production behavior. `snappy` is
+    /// offered for cross-impl interop with OspreySharp (Parquet.Net 3.x
+    /// supports Snappy only). Reading is always auto-dispatched on
+    /// per-column-chunk metadata, so this flag only governs writes.
+    #[arg(long)]
+    parquet_compression: Option<String>,
 }
 
 /// Validate the HPC mode flags (`--no-join`, `--join-only`,
@@ -399,6 +407,18 @@ fn main() -> Result<()> {
     // These don't go through ConfigOverrides because they're CLI-only and
     // not commonly set in YAML (HPC orchestration is the use case).
     config.no_join = args.no_join;
+    if let Some(ref s) = args.parquet_compression {
+        config.parquet_compression = match s.to_lowercase().as_str() {
+            "zstd" => ParquetCompression::Zstd,
+            "snappy" => ParquetCompression::Snappy,
+            other => {
+                anyhow::bail!(
+                    "Unknown --parquet-compression value '{}'. Expected 'zstd' or 'snappy'.",
+                    other
+                );
+            }
+        };
+    }
     if args.join_only {
         let resolved = resolve_input_scores(args.input_scores.unwrap())?;
         log::info!(
