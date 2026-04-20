@@ -64,34 +64,40 @@ After per-run FDR (first pass):
 
 ## Step 1: Consensus Peptide Selection
 
-Target peptides qualify for consensus RT computation if they pass `consensus_fdr` (default 1%) at **run-level peptide FDR** in at least one replicate. Their paired decoys (DECOY_ prefix) are included so target-decoy competition remains fair in the second FDR pass.
+A target **detection** (not just the peptide as a whole) qualifies for consensus RT computation when ALL of the following hold:
+
+1. Its **per-entry precursor q-value** is ≤ `consensus_fdr` (default 0.01). This is a **hard gate** — protein FDR cannot rescue poor precursor evidence.
+2. EITHER its peptide-level q-value is ≤ `consensus_fdr`, OR its first-pass protein group q-value is ≤ `protein_fdr_threshold`.
+
+Paired decoys (DECOY_ prefix, any matching modified_sequence) are included regardless of their own q-values so the second FDR pass sees fair competition:
 
 ```text
-targets: {PEPTIDEK, ANOTHERR, ...}     ← pass peptide-level FDR
-decoys:  {DECOY_PEPTIDEK, DECOY_ANOTHERR, ...}  ← paired decoys included
+targets: {PEPTIDEK, ANOTHERR, ...}     ← at least one detection with prec_q ≤ fdr
+decoys:  {DECOY_PEPTIDEK, DECOY_ANOTHERR, ...}  ← all paired decoys
 ```
 
 Both sides get independent consensus RTs — decoy consensus RTs are computed from decoy detections (not from target detections) to avoid any information leakage.
 
-### Protein FDR Rescue Gate
+### Why Precursor-Level Evidence Is a Hard Gate
 
-When `--protein-fdr` is set, `compute_consensus_rts()` accepts an additional `protein_fdr_threshold` parameter. A target peptide qualifies for consensus RT computation if EITHER:
+Consensus RT is driven by each surviving entry's own `apex_rt`. If the only thing qualifying a detection is its protein group being strong (but the entry itself has a weak/wrong-peak apex), that wrong apex gets pulled into the weighted median and can shift the consensus toward an interferer.
 
-1. Its peptide-level q-value is ≤ `consensus_fdr`, OR
-2. Its first-pass protein group's q-value is ≤ `protein_fdr_threshold`
+**Regression case (Stellar, DAQVVGMTTTGAAK):** this peptide's z=3 first-pass CWT consistently picked an interferer at ~8.46 in three replicates (scores −4.1 / −3.6 / −0.26, precursor q-values 0.099 / 0.091 / 0.016). The correct z=2 peak was at ~8.67 in two replicates. Under the looser earlier gate, the three z=3 wrong-peak detections were rescued into consensus by their protein's picked-protein FDR and — with `coelution_sum` as the median weight — just barely outweighed the two correct z=2 detections (total weight 18.62 vs 17.64). The consensus collapsed to the interferer position. Reconciliation then force-integrated the two correct z=2 observations to the interferer RT, and experiment-level FDR rejected them as "wrong peak."
 
-Rule (2) lets peptides from strong proteins contribute to consensus RT computation even when their individual peptide q-values are borderline. This is particularly valuable for peptides that are weakly scored on their own but belong to a protein with many other strong peptides — the protein evidence "rescues" them into the consensus anchor set.
+The tightened gate drops all three z=3 wrong-peak detections (precursor q > 0.01) and the two z=2 correct detections alone anchor the consensus at 8.68. Reconciliation now keeps the two correct observations and the third sample is gap-filled (via gap-fill CWT) to the correct 8.66 peak. See the `test_consensus_rejects_low_precursor_q_despite_protein_rescue` regression test in [reconciliation.rs](../crates/osprey/src/reconciliation.rs).
 
-First-pass protein FDR runs before compaction and reconciliation (see [07-fdr-control.md](07-fdr-control.md#two-pass-picked-protein-fdr-savitski-2015)), so `run_protein_qvalue` is already populated by the time `compute_consensus_rts()` is called. When `--protein-fdr` is not set, rule (2) is disabled (`protein_fdr_threshold = 0.0`).
+### Protein FDR Rescue Gate (borderline peptide evidence)
+
+The protein-FDR rescue path lets peptides from strong proteins enter consensus when their *peptide*-level q-value is borderline but their own detection is decent. Specifically: a detection with `run_precursor_qvalue ≤ consensus_fdr` AND `run_peptide_qvalue > consensus_fdr` can still qualify if its first-pass protein group passes (`run_protein_qvalue ≤ protein_fdr_threshold`). This retains the original intent — boost borderline peptides from strong proteins — without allowing protein FDR to override individual detection quality. Protein FDR runs before reconciliation (see [07-fdr-control.md](07-fdr-control.md)), so `run_protein_qvalue` is already populated. When `--protein-fdr` is disabled (threshold 0.0), the rescue branch is off.
 
 ---
 
 ## Step 2: Consensus Library RT
 
-For each consensus peptide, its detections across all files are collected:
+For each consensus peptide, its qualifying detections across all files are collected:
 
 ```text
-(file_name, apex_rt, coelution_sum, peak_width)
+(file_name, apex_rt, score, peak_width, coelution_sum)
 ```
 
 Each measured `apex_rt` is mapped back to **library RT space** using the run's inverse RT calibration:
@@ -100,19 +106,36 @@ Each measured `apex_rt` is mapped back to **library RT space** using the run's i
 library_rt = RTCalibration::inverse_predict(apex_rt)
 ```
 
-The **consensus library RT** is the **weighted median** of these library RT values, with weights equal to `coelution_sum` (pairwise fragment correlation sum). Higher coelution_sum means more reliable detection → stronger weight in the consensus.
+The **consensus library RT** is the **weighted median** of these library RT values, with weights derived from the SVM discriminant score:
+
+```text
+weight = max(1e-6, 1 / (1 + exp(-score)))     // sigmoid(score), floor prevents zero
+```
+
+The SVM score is our strongest per-detection quality signal — it's what FDR itself ranks on. Mapping it through `sigmoid` produces a smoothly monotonic weight in `(0, 1)`: a detection with positive score (target-like) dominates the weighted median; a detection with negative score (noise/interferer-like) contributes near-zero weight and cannot poison the median.
+
+Per-peptide peak widths are aggregated the same way (weighted median with sigmoid-score weights), so the `median_peak_width` used for gap-fill / forced integration reflects high-quality detections' peak shapes and not noisy wide fallbacks.
+
+An additional `coelution_sum > 0` sanity filter rejects anti-correlated "noise integration" detections (e.g., forced integrations at an empty RT window where fragments happen to anti-correlate). They never reach the weighted median.
 
 ```text
 PeptideConsensusRT {
     modified_sequence: String,
     is_decoy: bool,
-    consensus_library_rt: f64,   // weighted median in library RT space
-    median_peak_width: f64,       // median peak width across detections (minutes)
+    consensus_library_rt: f64,    // weighted median in library RT space
+    median_peak_width: f64,        // weighted median peak width across detections (minutes)
     n_runs_detected: usize,
+    apex_library_rt_mad: Option<f64>,  // per-peptide MAD in library RT space (≥ 3 detections)
 }
 ```
 
 Working in library RT space is important: it decouples the consensus from run-specific RT drift. The consensus library RT can then be mapped into any run's measured RT space using that run's calibration.
+
+### Why SVM Score, Not `coelution_sum`
+
+`coelution_sum` (sum of pairwise fragment Pearson correlations at the selected peak) is a single feature. It captures whether *the chosen apex has co-eluting fragments*, but says nothing about whether *this apex is the correct peak for this peptide*. A strong interferer with 5-6 coincidentally co-eluting fragments can have `coelution_sum > 5` at a completely wrong RT. The SVM is trained on all 21 PIN features (coelution, mass accuracy, xcorr, peak shape, RT deviation, median polish, etc.) explicitly to separate correct detections from wrong-peak targets — so it is by construction a better weight.
+
+**Regression case (Stellar, DAQVVGMTTTGAAK):** under coelution_sum weighting, three z=3 wrong-peak detections had weights 5.48 / 7.11 / 6.03 (total 18.62), barely outweighing the two correct z=2 detections with weights 10.25 and 7.39 (total 17.64). Under sigmoid-score weighting (given the z=3 scores of −4.1 / −3.6 / −0.26 and z=2 scores of +0.32 / +1.61), the wrong side totals ~0.46 and the correct side totals ~1.41 — a 3x margin. See the `test_consensus_weighting_downweights_negative_score_detections` regression test.
 
 ### Multi-Charge Reconciliation Is Inherently Cross-Run
 
@@ -156,19 +179,31 @@ Three actions are possible based on **apex proximity** to the expected RT:
 | **UseCwtPeak** | A CWT candidate has `\|cand.apex_rt - expected_rt\| <= rt_tolerance` | Switch to the closest-apex candidate |
 | **ForcedIntegration** | Neither current peak nor any CWT candidate has apex within tolerance | Integrate at `expected_rt ± median_peak_width/2` |
 
-### RT Tolerance: Global MAD, Not Local Interpolation
+### RT Tolerance: Global Within-Peptide MAD
 
-The `rt_tolerance` is computed **once per file** as:
+The `rt_tolerance` used by `plan_reconciliation` is now driven by the **within-peptide** RT reproducibility of the experiment, not the cross-peptide calibration residuals:
 
 ```text
-rt_tolerance = max(0.1, 3.0 × MAD × 1.4826)
+global_within_peptide_mad = median over all target peptides (with n_runs_detected ≥ 3) of:
+    median_i( | library_rt_i − consensus_library_rt | )
+
+rt_tolerance = max(0.1, 3.0 × global_within_peptide_mad × 1.4826)
+rt_tolerance = rt_tolerance.min(file_calibration_ceiling)  // safety ceiling
 ```
 
-where `MAD` is the median absolute residual from the refined calibration's training points (thousands of consensus peptides across the gradient). This is a global measure of how tightly the calibration fits, and it is robust to individual outliers because it uses the median, not per-point residuals.
+Each peptide's own `apex_library_rt_mad` is the median absolute deviation of its library-space apex RTs across replicates. For a well-aligned peptide detected 3+ times, this MAD reflects only the LC/instrument reproducibility floor (drift between replicates), not any cross-peptide calibration residual. The **global** tolerance is the median across all peptides' MADs — a robust experiment-wide estimate that individual noisy peptides can barely move. Applied uniformly to every peptide.
 
-**Why not per-point local tolerance?** An earlier version used `local_tolerance(query_rt)` which interpolated the absolute residual from the nearest training points at the query RT. This created a self-fulfilling prophecy: a peptide with a wrong apex RT contributed a huge residual to the calibration training set, which inflated the local tolerance at that RT, which then allowed the wrong-RT detection to pass the apex proximity check. Using a global MAD eliminates this feedback loop — one bad peptide's residual barely moves the median.
+**Why global, not per-peptide.** Individual per-peptide MADs from 3-5 replicates are very noisy estimators; the median across thousands of peptides is much more stable. After LOESS alignment, within-peptide scatter is approximately peptide-independent — it reflects the instrument/LC floor, not anything unique to the peptide — so the global median is an appropriate summary. Per-peptide MADs are still computed and stored on `PeptideConsensusRT` (and included in trace output for diagnostic use) but not used as the primary tolerance.
 
-A minimum floor of 0.1 min prevents being too strict when the calibration is exceptionally tight (e.g., very short gradients with highly reproducible LC).
+**Why not cross-peptide calibration MAD.** The per-file LOESS fit's MAD conflates two very different things: (1) genuine LC drift between replicates (what we care about for reconciliation tolerance), and (2) peptide-to-peptide deviation from the LOESS model at each RT (which has nothing to do with whether a single peptide's apex drifted between runs). On a well-aligned experiment the calibration MAD is typically 3-5x larger than the within-peptide MAD. Using it as the tolerance makes reconciliation blind to wrong-peak selections that are within 0.2-0.3 min of the correct peak, because those residuals fall within the calibration's cross-peptide noise envelope.
+
+**Concrete example.** On a Stellar 3-replicate HeLa experiment the cross-peptide calibration MAD was ~0.07 min, giving a tolerance of ~0.31 min. The global within-peptide MAD was **0.0207 min**, giving a tolerance of ~0.1 min (after the floor). The previous tolerance of 0.31 min Kept the DAQVVGMTTTGAAK wrong-peak detections 0.21 min off-consensus; the new tolerance of 0.1 min correctly flags them for re-scoring.
+
+**The per-file calibration MAD is retained as a safety ceiling.** If a pathological global MAD is somehow tighter than scan resolution (e.g., degenerate dataset with all apexes rounded to the same scan), the calibration-MAD-based ceiling guards against a sub-threshold tolerance that would force every peak to get re-scored.
+
+A minimum floor of 0.1 min prevents being too strict when the global MAD is exceptionally tight. (This floor is intentionally coarse for now — it exceeds the raw global MAD × 3-sigma on well-aligned experiments, so in practice the floor is often the binding constraint. Tightening it is a future refinement if warranted by specific datasets.)
+
+**No per-point local tolerance.** An earlier version used `local_tolerance(query_rt)` which interpolated the absolute residual from the nearest training points at the query RT. That created a self-fulfilling prophecy: a peptide with a wrong apex RT contributed a huge residual to the calibration training set, which inflated the local tolerance at that RT, which then allowed the wrong-RT detection to pass the apex proximity check. Using a single global number eliminates this feedback loop.
 
 ### Apex Proximity vs Boundary Containment
 
@@ -371,6 +406,11 @@ If file3 had no CWT candidate with its apex within tolerance (e.g., the peptide 
 | `test_gap_fill_identifies_missing_precursors` | Precursor in file1 but not file2 → file2 gets a gap-fill target |
 | `test_gap_fill_filters_precursors_outside_isolation_windows` | GPF disjoint ranges: precursor visible in file1 is NOT gap-filled in file2 when its m/z is outside file2's isolation windows |
 | `test_gap_fill_allows_precursors_inside_isolation_windows` | Overlapping replicate-style ranges: same precursor IS gap-filled in file2 when m/z falls inside the shared window |
+| `test_consensus_rejects_low_precursor_q_despite_protein_rescue` | Three z=3 wrong-peak detections (precursor q > 0.01) rescued by protein FDR no longer enter consensus; two correct z=2 detections alone anchor the consensus on the correct peak |
+| `test_consensus_weighting_downweights_negative_score_detections` | Two detections with identical precursor q but scores −4 vs +1.5 — weighted median collapses to the high-score detection (sigmoid-score weight, not coelution_sum weight) |
+| `test_plan_reconciliation_global_mad_is_median_across_peptides` | Five peptides with MADs 0.01-0.50 yield median=0.05 and tolerance=0.222 min; an outlier peptide (MAD 0.50) does not inflate the global tolerance |
+| `test_plan_reconciliation_uses_global_within_peptide_mad_tighter_than_calibration` | Peptide MAD (0.02) much tighter than file calibration MAD (0.1) — tolerance driven by global MAD, not calibration ceiling |
+| `test_plan_reconciliation_tolerance_matches_expected_mad_formula` | Global MAD of 0.1 produces tolerance 3 × 0.1 × 1.4826 ≈ 0.445 min; entry 0.4 min off passes, entry 0.5 min off is re-scored |
 
 ---
 

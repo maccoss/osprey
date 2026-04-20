@@ -23,7 +23,8 @@ Osprey is an open-source tool for peptide detection and quantification in data-i
 - **Skyline integration**: Outputs BiblioSpec (.blib) format for seamless quantification in Skyline
 - **FDR control**: Built-in Percolator-style semi-supervised SVM with two-level FDR (run + experiment) at precursor and peptide levels
 - **Protein FDR**: Native protein parsimony with true picked-protein FDR (Savitski 2015), shared peptide handling (All/Razor/Unique), and two-pass architecture (first-pass protein q-values gate compaction and reconciliation consensus; second-pass q-values are authoritative)
-- **Cross-run reconciliation**: Consensus RT alignment across replicates with peak boundary imputation for missing detections
+- **Cross-run reconciliation**: Consensus RT alignment across replicates with peak boundary imputation for missing detections; tolerance derived from within-peptide RT reproducibility (typically 3-5x tighter than cross-peptide calibration MAD)
+- **Peptide trace diagnostics**: `OSPREY_TRACE_PEPTIDE=<sequence>` emits a detailed per-peptide log at every pipeline stage (CWT candidates, consensus, reconciliation, gap-fill, FDR) for investigating integration quality on specific peptides. See [docs/17-peptide-trace.md](docs/17-peptide-trace.md).
 - **Flexible input**: Supports DIA-NN TSV, EncyclopeDIA elib, and BiblioSpec blib libraries
 - **Scalable**: Disk-backed memory architecture with automatic cache invalidation; tested on 240-file experiments
 - **Configurable**: YAML configuration files with CLI argument overrides for reproducible analyses
@@ -191,6 +192,10 @@ osprey -i *.mzML -l library.tsv -o results.blib --protein-fdr 0.05 --shared-pept
 
 # Filter blib output to only peptides from protein groups passing protein FDR:
 osprey -i *.mzML -l library.tsv -o results.blib --fdr-level protein
+
+# Trace a specific peptide's journey through the pipeline (zero overhead when unset)
+OSPREY_TRACE_PEPTIDE=PEPTIDEK osprey -i *.mzML -l library.tsv -o results.blib --verbose 2>&1 | tee trace.log
+grep '\[trace\]' trace.log
 ```
 
 ### Using configuration files
@@ -419,11 +424,12 @@ For each candidate precursor:
 
 For multi-file experiments, Osprey reconciles peak integration boundaries across replicates after the initial FDR pass:
 
-1. Collect peptides passing FDR across all files
-2. Compute consensus library RTs using weighted median of per-run detections
+1. Collect peptides passing run-level precursor FDR across all files (per-entry precursor q-value is a hard precondition; protein FDR can upgrade borderline peptide-level evidence but cannot override poor precursor evidence)
+2. Compute consensus library RTs using weighted median of per-run detections, weighted by `sigmoid(SVM score)` so wrong-peak detections with negative scores are downweighted
 3. Refit per-run LOESS calibration using consensus peptides
-4. For each entry in each run: keep the existing peak, switch to an alternate CWT candidate at the consensus RT, or perform forced integration
-5. Re-score reconciled entries and compute final experiment-level q-values
+4. Derive `rt_tolerance` from the global median of per-peptide library-RT MADs (within-peptide reproducibility floor, typically 3-5x tighter than cross-peptide calibration MAD)
+5. For each entry in each run: keep the existing peak, switch to an alternate CWT candidate at the consensus RT, or perform forced integration
+6. Re-score reconciled entries and compute final experiment-level q-values
 
 This ensures consistent quantification across replicates by aligning peak boundaries to the same chromatographic feature. See [Cross-Run Reconciliation](docs/10-cross-run-reconciliation.md) for algorithm details.
 

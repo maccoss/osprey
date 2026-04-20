@@ -596,7 +596,12 @@ A peptide survives compaction if EITHER its peptide-level q-value is ≤ `reconc
 
 **Reconciliation consensus** (uses first-pass protein q-values):
 
-`compute_consensus_rts()` includes a peptide in the consensus RT computation if it passes peptide-level FDR directly OR if its first-pass protein group passes protein-level FDR. Peptides from strong proteins can anchor the consensus even if their individual peptide q-values are borderline.
+`compute_consensus_rts()` includes a target *detection* in consensus RT computation if it passes BOTH of:
+
+1. **Hard precursor gate**: `run_precursor_qvalue ≤ consensus_fdr`. The consensus RT is driven by each surviving entry's own `apex_rt`, so per-entry evidence of being a correct detection is required. Protein FDR cannot override this.
+2. **Peptide OR protein rescue**: `run_peptide_qvalue ≤ consensus_fdr` directly, OR the first-pass protein group passes (`run_protein_qvalue ≤ protein_fdr_threshold`).
+
+The rescue path lets peptides from strong proteins contribute when their *peptide*-level aggregate evidence is borderline but their own individual detection is decent. An earlier looser gate allowed protein FDR to rescue detections regardless of precursor-level evidence, which caused wrong-peak detections from strong proteins to poison the charge-agnostic consensus. See [docs/10-cross-run-reconciliation.md](10-cross-run-reconciliation.md#step-1-consensus-peptide-selection) for the regression case and the `test_consensus_rejects_low_precursor_q_despite_protein_rescue` test.
 
 **Second-pass protein FDR** (runs after second-pass peptide FDR — AUTHORITATIVE):
 
