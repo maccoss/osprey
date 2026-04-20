@@ -93,6 +93,40 @@ pub struct OspreyConfig {
     // Performance
     /// Number of threads to use
     pub n_threads: usize,
+
+    // HPC scoring split (--no-join / --join-only)
+    /// When true, run Stages 1-4 only and exit. Each input mzML produces a
+    /// `{stem}.scores.parquet`; no FDR is run and no blib is written. Set by
+    /// the `--no-join` CLI flag. Mutually exclusive with `input_scores`.
+    #[serde(default)]
+    pub no_join: bool,
+    /// When set, skip Stages 1-4 entirely and load these per-file scoring
+    /// caches as the starting point for Stage 5+. Set by `--join-only`
+    /// + `--input-scores`. When this is `Some`, `input_files` is ignored.
+    #[serde(default)]
+    pub input_scores: Option<Vec<PathBuf>>,
+    /// Compression codec for `.scores.parquet` writes. Default `Zstd` keeps
+    /// production behavior identical to the historical Osprey default.
+    /// `Snappy` is offered as a cross-impl interop affordance: OspreySharp
+    /// (which uses Parquet.Net 3.x with Snappy only) can read Snappy
+    /// parquets the Rust binary writes, and vice versa. Reading is always
+    /// auto-dispatched on per-column-chunk metadata, so this only affects
+    /// writes.
+    #[serde(default)]
+    pub parquet_compression: ParquetCompression,
+}
+
+/// Compression codec for `.scores.parquet` writes. Reading auto-dispatches
+/// based on per-column-chunk metadata; this enum only governs the codec
+/// used by the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ParquetCompression {
+    /// Zstandard. Smaller files, comparable read speed; default.
+    #[default]
+    Zstd,
+    /// Google Snappy. Looser compression but cross-compatible with the
+    /// `Parquet.Net 3.x` library used by OspreySharp embedded in Skyline.
+    Snappy,
 }
 
 impl Default for OspreyConfig {
@@ -119,6 +153,9 @@ impl Default for OspreyConfig {
             fdr_level: FdrLevel::default(),
             reconciliation_compaction_fdr: default_compaction_fdr(),
             n_threads: num_cpus(),
+            no_join: false,
+            input_scores: None,
+            parquet_compression: ParquetCompression::default(),
         }
     }
 }
@@ -415,6 +452,8 @@ n_threads: 0  # 0 = auto-detect
 
     /// Compute a fast identity hash for the library file (path + size + mtime).
     /// Uses filesystem metadata only — no content hashing.
+    /// `mtime` is serialized as Unix seconds (integer) so the C# port can
+    /// produce a bit-identical hash for cross-impl `--join-only` validation.
     pub fn library_identity_hash(&self) -> String {
         let lib_path = self.library_source.path();
         let mut hasher = Sha256::new();
@@ -422,7 +461,9 @@ n_threads: 0  # 0 = auto-detect
         if let Ok(meta) = std::fs::metadata(lib_path) {
             hasher.update(format!("size:{}\n", meta.len()).as_bytes());
             if let Ok(mtime) = meta.modified() {
-                hasher.update(format!("mtime:{:?}\n", mtime).as_bytes());
+                if let Ok(secs) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    hasher.update(format!("mtime:{}\n", secs.as_secs()).as_bytes());
+                }
             }
         }
         format!("{:x}", hasher.finalize())
