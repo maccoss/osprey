@@ -328,6 +328,33 @@ Options:
       --no-prefilter
           Disable the coelution signal pre-filter
 
+      --no-join
+          HPC scoring split: run Stages 1-4 (per-file scoring) and exit
+          before FDR / reconciliation / blib output. Per-file
+          `<stem>.scores.parquet` is written next to each input mzML.
+          Mutually exclusive with --join-only; cannot be combined with
+          --input-scores.
+
+      --join-only
+          HPC scoring split: skip Stages 1-4 and run FDR, reconciliation,
+          and blib output starting from existing `.scores.parquet` caches
+          provided via --input-scores. Requires --library and --output.
+          Validates parquet footer hashes against the current config and
+          aborts before any work if they don't match. Mutually exclusive
+          with --no-join; cannot be combined with --input.
+
+      --input-scores <PATH...>
+          One or more `.scores.parquet` files, or a single directory
+          scanned non-recursively for `*.scores.parquet`. Required with
+          --join-only; ignored otherwise.
+
+      --parquet-compression <CODEC>
+          Compression codec for `.scores.parquet` writes: zstd (default,
+          smaller files) or snappy. Reading auto-dispatches on per-column-
+          chunk metadata. Use `snappy` for cross-implementation
+          compatibility with OspreySharp (Parquet.Net 3.x supports Snappy
+          only, not zstd).
+
       --threads <N>
           Number of threads (default: all available)
 
@@ -343,6 +370,25 @@ Options:
   -V, --version
           Print version
 ```
+
+### HPC scoring split (`--no-join` / `--join-only`)
+
+For large experiments, Osprey can split scoring (per-file, embarrassingly parallel) from joining (one process that runs FDR, reconciliation, and writes the blib):
+
+```bash
+# Score each file independently on a compute node; writes <stem>.scores.parquet next to each mzML
+osprey --no-join -i file_001.mzML -l library.tsv --resolution hram
+osprey --no-join -i file_002.mzML -l library.tsv --resolution hram
+# ... fan out across N nodes ...
+
+# Once all per-file parquets are written, run the join step on the head node
+osprey --join-only --input-scores /path/to/parquet/dir \
+       -l library.tsv -o results.blib --resolution hram
+```
+
+`--input-scores` accepts either a directory (scanned non-recursively for `*.scores.parquet`) or an explicit list of files. The join step validates each parquet's footer hashes (search parameters + library identity + binary version) before doing any work; mismatch aborts with a clear, file-named error.
+
+For cross-implementation interop with OspreySharp, add `--parquet-compression snappy` on the scoring step so the resulting parquets can be read by either the Rust or the C# join.
 
 ## Output
 
