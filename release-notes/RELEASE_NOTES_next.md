@@ -20,7 +20,11 @@ Working draft for the next release. Append entries here as features and fixes la
 
 ## Performance
 
-<!-- none yet -->
+- **Sparse XCorr scoring path for HRAM data** (thanks to Brendan MacLean, [PR #12](https://github.com/maccoss/osprey/pull/12)). At HRAM binning (`NBins` ~100K), the original dense XCorr computed a 100K-element dot product per candidate against a preprocessed library vector whose result depended on only ~30 non-zero fragment bins — 99.97% of the multiplies were zero×something, and each candidate allocated a 400 KB library vector. New `xcorr_sparse` iterates the library fragments, deduplicates bin indices, and indexes directly into the preprocessed spectrum (sort+dedup over ~30 bins instead of a 100K dot). Numerically equivalent modulo summation order (~1e-7 drift on xcorr values around 1.0). Default on; `OSPREY_XCORR_SPARSE=0` forces the dense path (still used by the `xcorr_scan` diagnostic dump and for parity verification). Validated: 21/21 PIN features match OspreySharp at 1e-6 on Stellar and Astral.
+
+- **Pooled XCorr preprocessing scratch** (thanks to Brendan MacLean, [PR #12](https://github.com/maccoss/osprey/pull/12)). Added `XcorrScratchPool` in `crates/osprey-scoring/src/xcorr_pool.rs` to recycle the three `NBins`-sized scratch buffers (binned, windowed, sliding-window prefix) and the per-spectrum preprocessed-XCorr output buffers across windows. Under HRAM, each window was allocating ~1.2 GB of transient `Vec<f32>` scratch and ~400 MB of cache that was immediately dropped and re-allocated by the next window. After the first few windows reach the high-water mark the pool recycles and the hot path no longer allocates. Mirrors the C# `XcorrScratchPool` in OspreySharp.
+
+- **~10x speedup on HRAM main-search Stage 4** (sparse XCorr + pooled scratch, combined). On a single-file Astral benchmark with 3 iterations the median Stage 4 time dropped from 516s to 49s, and main-search is now 2.7x faster than OspreySharp on the same stage.
 
 ## Breaking Changes
 
