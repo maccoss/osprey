@@ -29,6 +29,12 @@ pub struct PeptideConsensusRT {
     pub median_peak_width: f64,
     /// Number of runs where this peptide was detected
     pub n_runs_detected: usize,
+    /// MAD of this peptide's apex RTs across runs, in library RT space (minutes).
+    /// `None` when fewer than 3 detections contribute (insufficient to estimate).
+    /// Captures within-peptide RT reproducibility, typically 3-5x tighter than
+    /// the cross-peptide calibration MAD. Used by `plan_reconciliation` as a
+    /// peptide-specific RT tolerance.
+    pub apex_library_rt_mad: Option<f64>,
 }
 
 /// Compute consensus library RTs for peptides detected across runs.
@@ -54,14 +60,30 @@ pub fn compute_consensus_rts(
     consensus_fdr: f64,
     protein_fdr_threshold: f64,
 ) -> Vec<PeptideConsensusRT> {
-    // A peptide qualifies for consensus RT computation if EITHER:
-    //   (a) it passes peptide-level FDR at consensus_fdr, OR
-    //   (b) its first-pass protein group passes protein-level FDR
+    // A target detection qualifies for consensus RT computation if:
+    //   (1) Its per-entry precursor q-value is within consensus_fdr — this is
+    //       a HARD gate. The detection's RT is only trustworthy if the
+    //       detection itself has decent direct evidence. Protein-level FDR
+    //       cannot rescue poor precursor-level evidence, because the
+    //       consensus RT is driven by each entry's own apex_rt.
+    //   (2) AND either the peptide-level q-value also passes, OR the first-
+    //       pass protein group passes (the borderline-peptide rescue).
+    //
+    // The earlier looser gate allowed protein FDR to rescue entries with
+    // poor precursor-level evidence. That was observed to poison the
+    // consensus when a strong protein had a wrong-peak detection in some
+    // charge state: the low-quality wrong-peak apex got pulled into the
+    // weighted median and shifted the consensus to the interferer. The
+    // tighter gate rejects such entries and lets the remaining good
+    // detections anchor the consensus.
     let qualifies = |entry: &FdrEntry| -> bool {
         if entry.is_decoy {
             return false;
         }
-        entry.effective_run_qvalue(FdrLevel::Both) <= consensus_fdr
+        if entry.run_precursor_qvalue > consensus_fdr {
+            return false;
+        }
+        entry.run_peptide_qvalue <= consensus_fdr
             || (protein_fdr_threshold > 0.0 && entry.run_protein_qvalue <= protein_fdr_threshold)
     };
 
@@ -86,9 +108,12 @@ pub fn compute_consensus_rts(
     );
 
     // 2. Collect detections for targets and their paired decoys
-    //    Group by (modified_sequence, is_decoy)
-    //    Each detection: (file_name, apex_rt, coelution_sum, peak_width)
-    type DetectionVec = Vec<(String, f64, f64, f64)>;
+    //    Group by (modified_sequence, is_decoy).
+    //    Each detection: (file_name, apex_rt, score, peak_width, coelution_sum).
+    //    `score` is the SVM discriminant (signed) — used for the consensus
+    //    weight via `sigmoid(score)`. `coelution_sum` is retained only as a
+    //    sanity filter (> 0.0 → fragments correlate positively).
+    type DetectionVec = Vec<(String, f64, f64, f64, f64)>;
     let mut detections: HashMap<(String, bool), DetectionVec> = HashMap::new();
 
     // Identify decoy modified_sequences paired to target peptides
@@ -137,8 +162,9 @@ pub fn compute_consensus_rts(
                     .push((
                         file_name.clone(),
                         entry.apex_rt,
-                        entry.coelution_sum,
+                        entry.score,
                         peak_width,
+                        entry.coelution_sum,
                     ));
             }
         }
@@ -156,15 +182,24 @@ pub fn compute_consensus_rts(
         let mut library_rt_weights: Vec<(f64, f64)> = Vec::new();
         let mut peak_width_weights: Vec<(f64, f64)> = Vec::new();
 
-        for (file_name, apex_rt, coelution_sum, peak_width) in dets {
+        for (file_name, apex_rt, score, peak_width, coelution_sum) in dets {
             if let Some(cal) = per_file_calibrations.get(file_name) {
                 let library_rt = cal.inverse_predict(*apex_rt);
+                // Sanity filter: require at least minimally positive fragment
+                // co-elution. This rejects anti-correlated noise integrations
+                // (e.g., forced integrations at empty RT regions).
                 if library_rt.is_finite() && *coelution_sum > 0.0 {
-                    library_rt_weights.push((library_rt, *coelution_sum));
-                    // Weight peak widths by coelution_sum so high-quality detections
-                    // dominate — avoids noisy detections with wide fallback peaks
-                    // inflating the median_peak_width used for forced integration
-                    peak_width_weights.push((*peak_width, *coelution_sum));
+                    // Weight by sigmoid(SVM score) — the SVM discriminant is
+                    // our strongest quality signal, and sigmoid maps it to
+                    // (0, 1) monotonically. A wrong-peak detection with
+                    // negative score gets near-zero weight and cannot poison
+                    // the weighted median; a strong detection with positive
+                    // score dominates. Floor at 1e-6 so every detection keeps
+                    // a non-zero weight (avoids degenerate zero-total-weight
+                    // edge cases when all scores are very negative).
+                    let weight = (1.0 / (1.0 + (-*score).exp())).max(1e-6);
+                    library_rt_weights.push((library_rt, weight));
+                    peak_width_weights.push((*peak_width, weight));
                 }
             }
         }
@@ -177,12 +212,69 @@ pub fn compute_consensus_rts(
         let median_peak_width = weighted_median(&peak_width_weights);
         let n_runs_detected = library_rt_weights.len();
 
+        // Within-peptide RT MAD in library space. Requires >= 3 detections
+        // for a stable estimate (with only 2 points, MAD is just half the
+        // range and not robust). Captures how tightly this peptide reproduces
+        // across runs — typically much tighter than the cross-peptide
+        // calibration MAD, so this gives a better RT tolerance downstream.
+        let apex_library_rt_mad = if n_runs_detected >= 3 {
+            let mut abs_devs: Vec<f64> = library_rt_weights
+                .iter()
+                .map(|(lib_rt, _)| (lib_rt - consensus_library_rt).abs())
+                .collect();
+            abs_devs.sort_by(|a, b| a.total_cmp(b));
+            let mid = abs_devs.len() / 2;
+            let mad = if abs_devs.len() % 2 == 0 {
+                0.5 * (abs_devs[mid - 1] + abs_devs[mid])
+            } else {
+                abs_devs[mid]
+            };
+            Some(mad)
+        } else {
+            None
+        };
+
+        if crate::trace::is_traced(modified_sequence) {
+            let kind = if *is_decoy { "DECOY" } else { "TARGET" };
+            log::info!(
+                "[trace] consensus {} {} — detections ({} runs contributing):",
+                modified_sequence,
+                kind,
+                n_runs_detected,
+            );
+            for (file_name, apex_rt, score, peak_width, coelution_sum) in dets {
+                let lib_rt_str = per_file_calibrations
+                    .get(file_name)
+                    .map(|cal| format!("lib_rt={:.4}", cal.inverse_predict(*apex_rt)))
+                    .unwrap_or_else(|| "lib_rt=<no-cal>".into());
+                let weight = (1.0 / (1.0 + (-*score).exp())).max(1e-6);
+                log::info!(
+                    "[trace]   file={} apex_rt={:.4} {} score={:.3} weight={:.4} coelution_sum={:.3} peak_width={:.3}",
+                    file_name,
+                    apex_rt,
+                    lib_rt_str,
+                    score,
+                    weight,
+                    coelution_sum,
+                    peak_width,
+                );
+            }
+            log::info!(
+                "[trace] consensus {} {} → consensus_library_rt={:.4}, median_peak_width={:.3}",
+                modified_sequence,
+                kind,
+                consensus_library_rt,
+                median_peak_width,
+            );
+        }
+
         consensus.push(PeptideConsensusRT {
             modified_sequence: modified_sequence.clone(),
             is_decoy: *is_decoy,
             consensus_library_rt,
             median_peak_width,
             n_runs_detected,
+            apex_library_rt_mad,
         });
     }
 
@@ -374,6 +466,53 @@ pub fn plan_reconciliation(
         .map(|c| ((c.modified_sequence.as_str(), c.is_decoy), c))
         .collect();
 
+    // Global within-peptide RT MAD (library RT space) — median of per-peptide
+    // apex MADs across all target peptides that have >= 3 detections.
+    //
+    // After cross-run RT alignment (LOESS refit on consensus peptides), the
+    // *within-peptide* variance is what matters for reconciliation tolerance.
+    // We expect it to be roughly peptide-independent: once aligned, the scatter
+    // of a well-behaved peptide's apex RT across replicates reflects the
+    // chromatographic reproducibility of the instrument, not anything unique
+    // to that peptide. The median across peptides is a far more stable
+    // estimator than any single peptide's MAD (which is very noisy with only
+    // 3-5 replicates).
+    //
+    // This replaces the earlier cross-peptide calibration MAD, which conflated
+    // LOESS fit residuals (peptide-to-peptide variation) with true run-to-run
+    // RT reproducibility. Typical global within-peptide MAD is 3-5x tighter
+    // than calibration MAD, giving a correspondingly tighter rt_tolerance.
+    //
+    // If no peptides have >= 3 detections (e.g., 2-replicate experiment), fall
+    // back to a conservative 0.05 min.
+    let global_within_peptide_mad_lib = {
+        let mut peptide_mads: Vec<f64> = consensus
+            .iter()
+            .filter(|c| !c.is_decoy)
+            .filter_map(|c| c.apex_library_rt_mad)
+            .collect();
+        if peptide_mads.is_empty() {
+            log::warn!(
+                "Reconciliation: no peptides have >= 3 detections; using 0.05 min fallback MAD"
+            );
+            0.05
+        } else {
+            peptide_mads.sort_by(|a, b| a.total_cmp(b));
+            let mid = peptide_mads.len() / 2;
+            let med = if peptide_mads.len() % 2 == 0 {
+                0.5 * (peptide_mads[mid - 1] + peptide_mads[mid])
+            } else {
+                peptide_mads[mid]
+            };
+            log::info!(
+                "Reconciliation: global within-peptide RT MAD = {:.4} min ({} peptides with >= 3 detections contributed)",
+                med,
+                peptide_mads.len()
+            );
+            med
+        }
+    };
+
     // Build set of precursors (base_sequence, charge) that passed run-level FDR in any replicate.
     // Only these precursors (and their paired decoys) will be reconciled.
     // "base_sequence" strips the DECOY_ prefix so targets and decoys share the same key.
@@ -410,30 +549,28 @@ pub fn plan_reconciliation(
                 None => return Vec::new(),
             };
 
-            // Compute a global RT tolerance for this file from the refined
-            // calibration's residuals, with two safeguards against wrong-peak
-            // contamination:
+            // Compute a per-file safety ceiling for RT tolerance from the
+            // refined calibration's residuals. This is a cross-peptide measure
+            // and is usually LOOSER than any individual peptide's within-peptide
+            // reproducibility — we use it only as an upper bound so that a
+            // peptide with pathologically low apparent MAD (e.g., n=3 with all
+            // detections at exactly the same RT) cannot produce a sub-floor
+            // tolerance that rejects every tiny drift.
             //
-            // 1. **Sigma-clipped MAD**: the raw MAD (P50 of absolute residuals)
-            //    is inflated when wrong-peak detections feed their bad apex_rt
-            //    into the refit calibration. We compute an initial 3-sigma clip
-            //    threshold from the raw MAD, discard outlier residuals above it,
-            //    then recompute MAD from the survivors. This gives a tolerance
-            //    based on the well-calibrated majority, not the contaminated tail.
+            // The per-entry tolerance itself is derived from within-peptide MAD
+            // (see the inner loop below).
             //
-            // 2. **Original-calibration cap**: the reconciliation tolerance must
-            //    never exceed the first-pass calibration tolerance. Each
-            //    successive calibration pass (initial -> first-pass -> refined
-            //    consensus) should only tighten the tolerance. If the refined
-            //    tolerance is wider than the original, the refit is contaminated
-            //    and should not be trusted for tolerance purposes.
-            let rt_tolerance = {
+            // Sigma-clipped MAD: the raw MAD is inflated when wrong-peak
+            // detections feed their bad apex_rt into the refit calibration. We
+            // clip at 3-sigma from the raw MAD and recompute MAD from the
+            // survivors. Capped at the original (first-pass) calibration
+            // tolerance so each successive calibration pass can only tighten.
+            let file_cal_tolerance_ceiling = {
                 let raw_mad = cal.stats().mad;
                 let clip_threshold = raw_mad * 1.4826 * 3.0;
                 let clipped_mad = sigma_clipped_mad(cal.abs_residuals(), clip_threshold);
                 let refined_tolerance = (clipped_mad * 1.4826 * 3.0).max(0.1);
 
-                // Cap at original calibration tolerance (monotonicity invariant)
                 let original_cal_for_cap = per_file_original_cal.get(file_name);
                 let cap = original_cal_for_cap
                     .map(|oc| (oc.stats().mad * 1.4826 * 3.0).max(0.1))
@@ -441,7 +578,7 @@ pub fn plan_reconciliation(
 
                 let final_tol = refined_tolerance.min(cap);
                 log::debug!(
-                    "Reconciliation RT tolerance for {}: {:.3} min (raw_MAD={:.3}, clipped_MAD={:.3}, original_cap={:.3})",
+                    "Reconciliation RT tolerance ceiling for {}: {:.3} min (raw_MAD={:.3}, clipped_MAD={:.3}, original_cap={:.3})",
                     file_name,
                     final_tol,
                     raw_mad,
@@ -478,13 +615,84 @@ pub fn plan_reconciliation(
                     .get(entry.parquet_index as usize)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
+
+                // RT tolerance from the global within-peptide MAD (library RT
+                // space, treated as approximately equal to measured space given
+                // local calibration slope ~ 1). We use the *global* median
+                // rather than this peptide's individual MAD because:
+                //
+                //   (a) After alignment, within-peptide scatter is roughly
+                //       peptide-independent — it reflects instrument/LC
+                //       reproducibility, not anything unique to the peptide.
+                //   (b) An individual peptide's MAD from 3-5 replicates is a
+                //       very noisy estimator; the cross-peptide median is far
+                //       more stable.
+                //
+                // The 3 × 1.4826 factor converts MAD to a ~3-sigma tolerance.
+                // Floor of 0.1 min accommodates scan-resolution rounding.
+                // Ceiling is the file's cross-peptide calibration tolerance as
+                // a safety net against pathological MAD estimates.
+                let peptide_tolerance = (global_within_peptide_mad_lib * 1.4826 * 3.0)
+                    .max(0.1)
+                    .min(file_cal_tolerance_ceiling);
+
                 let action = determine_reconcile_action(
                     entry.apex_rt,
                     cwt,
                     expected_rt,
-                    rt_tolerance,
+                    peptide_tolerance,
                     consensus_entry.median_peak_width / 2.0,
                 );
+
+                if crate::trace::is_traced(&entry.modified_sequence) {
+                    let kind = if entry.is_decoy { "DECOY" } else { "TARGET" };
+                    let action_str = match &action {
+                        ReconcileAction::Keep => "Keep".to_string(),
+                        ReconcileAction::UseCwtPeak {
+                            candidate_idx,
+                            apex_rt,
+                            ..
+                        } => format!("UseCwtPeak(idx={}, apex={:.4})", candidate_idx, apex_rt),
+                        ReconcileAction::ForcedIntegration {
+                            expected_rt,
+                            half_width,
+                        } => format!(
+                            "ForcedIntegration(center={:.4}, half_width={:.3})",
+                            expected_rt, half_width
+                        ),
+                    };
+                    let own_mad = consensus_entry
+                        .apex_library_rt_mad
+                        .map(|m| format!("{:.4}", m))
+                        .unwrap_or_else(|| "n/a".into());
+                    log::info!(
+                        "[trace] plan {} z={} {} file={} current_apex={:.4} expected_rt={:.4} residual={:+.3} tolerance={:.3} (global_MAD={:.4}, this_peptide_MAD={} from n={}, ceiling={:.3}) n_cwt={} → {}",
+                        entry.modified_sequence,
+                        entry.charge,
+                        kind,
+                        file_name,
+                        entry.apex_rt,
+                        expected_rt,
+                        entry.apex_rt - expected_rt,
+                        peptide_tolerance,
+                        global_within_peptide_mad_lib,
+                        own_mad,
+                        consensus_entry.n_runs_detected,
+                        file_cal_tolerance_ceiling,
+                        cwt.len(),
+                        action_str,
+                    );
+                    for (i, c) in cwt.iter().enumerate() {
+                        log::info!(
+                            "[trace]   cwt[{}]: apex={:.4} (res={:+.3}) coelution={:.4} area={:.1}",
+                            i,
+                            c.apex_rt,
+                            c.apex_rt - expected_rt,
+                            c.coelution_score,
+                            c.area,
+                        );
+                    }
+                }
 
                 if entry.is_decoy {
                     match &action {
@@ -692,6 +900,17 @@ pub fn identify_gap_fill_targets(
                 // Map consensus library RT to expected measured RT in this file
                 let expected_rt = cal.predict(consensus_entry.consensus_library_rt);
                 let half_width = consensus_entry.median_peak_width / 2.0;
+
+                if crate::trace::is_traced(mod_seq) {
+                    log::info!(
+                        "[trace] gap-fill: {} z={} file={} expected_rt={:.4} half_width={:.3} (missing from this file, passed in another)",
+                        mod_seq,
+                        charge,
+                        file_name,
+                        expected_rt,
+                        half_width,
+                    );
+                }
 
                 targets.push(GapFillTarget {
                     target_entry_id: target_id,
@@ -914,6 +1133,43 @@ mod tests {
         }
     }
 
+    // ---- Helper: detailed FdrEntry builder for consensus-gating / weighting tests ----
+    #[allow(clippy::too_many_arguments)]
+    fn make_consensus_entry(
+        entry_id: u32,
+        modified_sequence: &str,
+        charge: u8,
+        is_decoy: bool,
+        apex_rt: f64,
+        peak_width: f64,
+        coelution_sum: f64,
+        score: f64,
+        run_precursor_qvalue: f64,
+        run_peptide_qvalue: f64,
+        run_protein_qvalue: f64,
+    ) -> FdrEntry {
+        FdrEntry {
+            entry_id,
+            parquet_index: 0,
+            is_decoy,
+            charge,
+            scan_number: 1,
+            apex_rt,
+            start_rt: apex_rt - peak_width / 2.0,
+            end_rt: apex_rt + peak_width / 2.0,
+            coelution_sum,
+            score,
+            run_precursor_qvalue,
+            run_peptide_qvalue,
+            run_protein_qvalue,
+            experiment_precursor_qvalue: run_precursor_qvalue,
+            experiment_peptide_qvalue: run_peptide_qvalue,
+            experiment_protein_qvalue: run_protein_qvalue,
+            pep: 1.0,
+            modified_sequence: Arc::from(modified_sequence),
+        }
+    }
+
     // ---- weighted_median / simple_median tests ----
 
     #[test]
@@ -946,6 +1202,127 @@ mod tests {
     #[test]
     fn test_weighted_median_empty() {
         assert!((weighted_median(&[]) - 0.0).abs() < 1e-10);
+    }
+
+    // ---- compute_consensus_rts regression tests ----
+
+    #[test]
+    fn test_consensus_rejects_low_precursor_q_despite_protein_rescue() {
+        // Regression: on Stellar, DAQVVGMTTTGAAK had three z=3 wrong-peak
+        // detections with precursor_q = 0.099/0.091/0.016 that got rescued
+        // into consensus via protein FDR because protein_q was low. Their
+        // wrong-peak apex (8.46) out-weighted two correct z=2 detections
+        // (8.67), pulling the consensus to the interferer. The tightened
+        // qualification gate now rejects entries with precursor_q above
+        // consensus_fdr regardless of protein rescue, so only the two good
+        // z=2 detections anchor the consensus.
+        let cal = make_identity_calibration();
+        let cals: HashMap<String, RTCalibration> = ["file_20", "file_21", "file_22"]
+            .iter()
+            .map(|f| (f.to_string(), cal.clone()))
+            .collect();
+
+        let per_file_entries: Vec<(String, Vec<FdrEntry>)> = vec![
+            (
+                "file_20".to_string(),
+                vec![
+                    // z=3 wrong peak at 8.46, protein rescues (was poisoning)
+                    make_consensus_entry(
+                        1, "PEPTIDEK", 3, false, 8.46, 0.12, 5.48, -4.1, 0.099, 0.126, 0.005,
+                    ),
+                ],
+            ),
+            (
+                "file_21".to_string(),
+                vec![
+                    // z=2 correct peak at 8.67 with strong precursor evidence
+                    make_consensus_entry(
+                        2, "PEPTIDEK", 2, false, 8.67, 0.24, 10.25, 0.32, 0.009, 0.010, 0.005,
+                    ),
+                    // z=3 wrong peak, rescued by protein, should now be rejected
+                    make_consensus_entry(
+                        3, "PEPTIDEK", 3, false, 8.44, 0.12, 7.11, -3.6, 0.091, 0.099, 0.005,
+                    ),
+                ],
+            ),
+            (
+                "file_22".to_string(),
+                vec![
+                    // z=2 correct peak at 8.69
+                    make_consensus_entry(
+                        4, "PEPTIDEK", 2, false, 8.69, 0.18, 7.39, 1.61, 0.002, 0.002, 0.005,
+                    ),
+                    // z=3 wrong peak, rescued by protein, should now be rejected
+                    make_consensus_entry(
+                        5, "PEPTIDEK", 3, false, 8.46, 0.15, 6.03, -0.26, 0.016, 0.016, 0.005,
+                    ),
+                ],
+            ),
+        ];
+
+        // With protein_fdr_threshold=0.01, the OLD gate would have rescued all
+        // three z=3 entries. The NEW gate requires precursor_q <= consensus_fdr
+        // (0.01) as a hard precondition, so they are rejected.
+        let consensus = compute_consensus_rts(&per_file_entries, &cals, 0.01, 0.01);
+
+        let peptide = consensus
+            .iter()
+            .find(|c| c.modified_sequence == "PEPTIDEK" && !c.is_decoy)
+            .expect("PEPTIDEK should be in consensus (2 z=2 detections qualify)");
+
+        assert_eq!(
+            peptide.n_runs_detected, 2,
+            "Only the two z=2 detections should anchor consensus; the three z=3 wrong-peak detections should be rejected by the precursor-q gate"
+        );
+        assert!(
+            (peptide.consensus_library_rt - 8.68).abs() < 0.05,
+            "Consensus should be on the correct peak at ~8.68, got {:.4}",
+            peptide.consensus_library_rt
+        );
+    }
+
+    #[test]
+    fn test_consensus_weighting_downweights_negative_score_detections() {
+        // Even if a low-quality wrong-peak detection somehow slips through the
+        // qualification gate (e.g., its precursor-q is borderline but passing),
+        // the sigmoid(score) weighting should crush its influence on the
+        // weighted median. Here two detections have identical precursor-q but
+        // one has score -4.0 (sigmoid ~ 0.018) and the other +1.5 (sigmoid ~
+        // 0.818), a ~45x weight ratio.
+        let cal = make_identity_calibration();
+        let cals: HashMap<String, RTCalibration> = ["file_A", "file_B"]
+            .iter()
+            .map(|f| (f.to_string(), cal.clone()))
+            .collect();
+
+        let per_file_entries: Vec<(String, Vec<FdrEntry>)> = vec![
+            (
+                "file_A".to_string(),
+                vec![make_consensus_entry(
+                    1, "PEPTIDEK", 2, false, 8.40, 0.10, 3.0, -4.0, 0.005, 0.005, 1.0,
+                )],
+            ),
+            (
+                "file_B".to_string(),
+                vec![make_consensus_entry(
+                    2, "PEPTIDEK", 2, false, 8.70, 0.10, 3.0, 1.5, 0.005, 0.005, 1.0,
+                )],
+            ),
+        ];
+
+        let consensus = compute_consensus_rts(&per_file_entries, &cals, 0.01, 0.0);
+        let peptide = consensus
+            .iter()
+            .find(|c| c.modified_sequence == "PEPTIDEK" && !c.is_decoy)
+            .expect("PEPTIDEK should be in consensus");
+
+        // The high-score detection's weighted contribution should dominate, so
+        // the weighted median collapses onto 8.70 (not 8.40 and not the midpoint).
+        assert!(
+            (peptide.consensus_library_rt - 8.70).abs() < 1e-6,
+            "Consensus should track the high-score detection at 8.70, got {:.4}",
+            peptide.consensus_library_rt
+        );
     }
 
     // ---- determine_reconcile_action tests ----
@@ -1347,6 +1724,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 1.0,
             n_runs_detected: 2,
+            apex_library_rt_mad: None,
         }];
 
         // Entry already at correct RT
@@ -1393,6 +1771,7 @@ mod tests {
             consensus_library_rt: 20.0, // consensus at RT 20
             median_peak_width: 2.0,
             n_runs_detected: 2,
+            apex_library_rt_mad: None,
         }];
 
         // Entry at wrong RT (10.0 instead of 20.0), no CWT candidates
@@ -1452,6 +1831,7 @@ mod tests {
             consensus_library_rt: 20.0,
             median_peak_width: 2.0,
             n_runs_detected: 2,
+            apex_library_rt_mad: None,
         }];
 
         // Entry at wrong RT, but CWT candidate at correct RT
@@ -1512,6 +1892,7 @@ mod tests {
             consensus_library_rt: 20.0,
             median_peak_width: 2.0,
             n_runs_detected: 2,
+            apex_library_rt_mad: None,
         }];
 
         // Entry with experiment_qvalue > 0.01 (doesn't pass)
@@ -1604,6 +1985,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 0.2,
             n_runs_detected: 3,
+            apex_library_rt_mad: None,
         }];
 
         // Entry with apex 0.5 min off from consensus (should FAIL the tight tolerance).
@@ -1658,6 +2040,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 0.2,
             n_runs_detected: 3,
+            apex_library_rt_mad: None,
         }];
 
         // Entry with apex 0.05 min off (within the 0.1 min minimum floor).
@@ -1692,20 +2075,19 @@ mod tests {
 
     #[test]
     fn test_plan_reconciliation_tolerance_matches_expected_mad_formula() {
-        // Calibration with MAD = 0.1 min -> tolerance = 3 × 0.1 × 1.4826 ≈ 0.445 min
+        // Peptide MAD of 0.1 min -> tolerance = 3 × 0.1 × 1.4826 ≈ 0.445 min.
         // An entry 0.5 min off should fail; an entry 0.4 min off should pass.
-        let cal = make_calibration_with_residuals(vec![0.1_f64; 30]);
-        let mad = cal.stats().mad;
-        assert!((mad - 0.1).abs() < 1e-6, "MAD should be 0.1");
-
-        let expected_tolerance = 3.0 * 0.1 * 1.4826; // ≈ 0.44478
-        assert!(expected_tolerance > 0.4 && expected_tolerance < 0.5);
-
+        // The file calibration MAD is set wide enough that it does NOT clip
+        // the peptide-derived tolerance (it acts only as a ceiling).
+        let cal = make_calibration_with_residuals(vec![0.2_f64; 30]);
         let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
             .into_iter()
             .collect();
         let original_cal: HashMap<String, RTCalibration> =
             vec![("file1".to_string(), cal)].into_iter().collect();
+
+        let expected_tolerance = 3.0 * 0.1 * 1.4826; // ≈ 0.445
+        assert!(expected_tolerance > 0.4 && expected_tolerance < 0.5);
 
         let consensus = vec![PeptideConsensusRT {
             modified_sequence: "PEPTIDEK".to_string(),
@@ -1713,6 +2095,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 0.2,
             n_runs_detected: 3,
+            apex_library_rt_mad: Some(0.1),
         }];
 
         // Entry 1: 0.4 min off → within tolerance (0.445) → Keep
@@ -1742,12 +2125,132 @@ mod tests {
         // Entry 0 (0.4 min off): should Keep → not in actions
         assert!(
             !actions.contains_key(&("file1".to_string(), 0)),
-            "Entry 0.4 min off should Keep (within tolerance 0.445)"
+            "Entry 0.4 min off should Keep (peptide-MAD tolerance 0.445)"
         );
         // Entry 1 (0.5 min off): should be re-scored
         assert!(
             actions.contains_key(&("file1".to_string(), 1)),
-            "Entry 0.5 min off should be flagged (exceeds tolerance 0.445)"
+            "Entry 0.5 min off should be flagged (exceeds peptide-MAD tolerance 0.445)"
+        );
+    }
+
+    #[test]
+    fn test_plan_reconciliation_uses_global_within_peptide_mad_tighter_than_calibration() {
+        // Single consensus peptide with within-peptide MAD = 0.02 min → global
+        // median MAD = 0.02 → tolerance = 3 × 0.02 × 1.4826 = 0.089 floored to 0.1.
+        // File cal MAD = 0.1 → ceiling = 0.445. Global-MAD tolerance (0.1 after floor)
+        // wins because it's below the ceiling. An entry 0.15 min off — which the
+        // old cross-peptide calibration formula (0.445) would Keep — is now re-scored.
+        let cal = make_calibration_with_residuals(vec![0.1_f64; 30]);
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        let consensus = vec![PeptideConsensusRT {
+            modified_sequence: "PEPTIDEK".to_string(),
+            is_decoy: false,
+            consensus_library_rt: 15.0,
+            median_peak_width: 0.2,
+            n_runs_detected: 3,
+            apex_library_rt_mad: Some(0.02),
+        }];
+
+        // Entry 0.15 min off from expected: |0.15| > 0.1 → re-score
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![make_fdr_entry(
+                1, "PEPTIDEK", 2, false, 15.15, 15.05, 15.25, 8.0, 0.005,
+            )],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> = vec![(
+            "file1".to_string(),
+            vec![vec![CwtCandidate {
+                apex_rt: 15.02,
+                start_rt: 14.92,
+                end_rt: 15.12,
+                area: 1000.0,
+                snr: 5.0,
+                coelution_score: 0.9,
+            }]],
+        )]
+        .into_iter()
+        .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        assert!(
+            actions.contains_key(&("file1".to_string(), 0)),
+            "Entry 0.15 min off should be flagged when peptide MAD is 0.02 (tolerance ~0.1 after floor), even though file cal MAD would allow 0.445"
+        );
+    }
+
+    #[test]
+    fn test_plan_reconciliation_global_mad_is_median_across_peptides() {
+        // Five peptides with MADs 0.01, 0.03, 0.05, 0.20, 0.50 → median = 0.05.
+        // Tolerance = max(0.1, 3 × 0.05 × 1.4826 = 0.222) = 0.222 min.
+        // An outlier peptide (MAD 0.50) does not drag the tolerance up.
+        // An entry 0.3 min off for ANY peptide should be re-scored.
+        let cal = make_calibration_with_residuals(vec![0.2_f64; 30]);
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        let consensus: Vec<PeptideConsensusRT> = ["PEP1", "PEP2", "PEP3", "PEP4", "PEP5"]
+            .iter()
+            .zip([0.01, 0.03, 0.05, 0.20, 0.50])
+            .map(|(seq, mad)| PeptideConsensusRT {
+                modified_sequence: seq.to_string(),
+                is_decoy: false,
+                consensus_library_rt: 15.0,
+                median_peak_width: 0.2,
+                n_runs_detected: 3,
+                apex_library_rt_mad: Some(mad),
+            })
+            .collect();
+
+        // For PEP3 (MAD 0.05, the median), an entry 0.3 min off should exceed
+        // the global tolerance (0.222). An entry 0.15 min off should Keep.
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![
+                make_fdr_entry(1, "PEP3", 2, false, 15.3, 15.2, 15.4, 8.0, 0.005),
+                make_fdr_entry(2, "PEP3", 3, false, 15.15, 15.05, 15.25, 8.0, 0.005),
+            ],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![], vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        assert!(
+            actions.contains_key(&("file1".to_string(), 0)),
+            "Entry 0.3 min off should be flagged (exceeds global-MAD tolerance 0.222)"
+        );
+        assert!(
+            !actions.contains_key(&("file1".to_string(), 1)),
+            "Entry 0.15 min off should Keep (within global-MAD tolerance 0.222)"
         );
     }
 
@@ -1790,6 +2293,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 0.2,
             n_runs_detected: 3,
+            apex_library_rt_mad: None,
         }];
 
         // This entry simulates the bad peptide itself: apex at 16.2 when consensus expects 15.0.
@@ -1854,6 +2358,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 0.2,
             n_runs_detected: 3,
+            apex_library_rt_mad: None,
         }];
 
         // Entry at 15.5 — 0.5 min from expected. With the uncapped refined
@@ -1907,6 +2412,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 0.5,
             n_runs_detected: 3,
+            apex_library_rt_mad: None,
         }];
 
         // Peak at 16.0 — 1.0 min from expected (15.0). Clearly wrong.
@@ -1957,6 +2463,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 0.5,
             n_runs_detected: 3,
+            apex_library_rt_mad: None,
         }];
 
         // Peak at 15.05 — 0.05 min from expected. Should be kept.
@@ -2007,6 +2514,7 @@ mod tests {
                 consensus_library_rt: 15.0,
                 median_peak_width: 1.0,
                 n_runs_detected: 2,
+                apex_library_rt_mad: None,
             },
             PeptideConsensusRT {
                 modified_sequence: "DECOY_PEPTIDEK".to_string(),
@@ -2014,6 +2522,7 @@ mod tests {
                 consensus_library_rt: 15.0,
                 median_peak_width: 1.0,
                 n_runs_detected: 2,
+                apex_library_rt_mad: None,
             },
         ];
 
@@ -2105,6 +2614,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 1.0,
             n_runs_detected: 2,
+            apex_library_rt_mad: None,
         }];
 
         // Both files have PEPTIDEK
@@ -2162,6 +2672,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 1.0,
             n_runs_detected: 1,
+            apex_library_rt_mad: None,
         }];
 
         // file1 has PEPTIDEK but it FAILS experiment-level FDR
@@ -2214,6 +2725,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 1.0,
             n_runs_detected: 2,
+            apex_library_rt_mad: None,
         }];
 
         let per_file_entries = vec![
@@ -2265,6 +2777,7 @@ mod tests {
                 consensus_library_rt: 15.0,
                 median_peak_width: 1.0,
                 n_runs_detected: 2,
+                apex_library_rt_mad: None,
             },
             PeptideConsensusRT {
                 modified_sequence: "ANOTHERPEP".to_string(),
@@ -2272,6 +2785,7 @@ mod tests {
                 consensus_library_rt: 25.0,
                 median_peak_width: 1.5,
                 n_runs_detected: 2,
+                apex_library_rt_mad: None,
             },
         ];
 
@@ -2357,6 +2871,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 1.0,
             n_runs_detected: 2,
+            apex_library_rt_mad: None,
         }];
 
         let per_file_entries = vec![
@@ -2407,6 +2922,7 @@ mod tests {
             consensus_library_rt: 15.0,
             median_peak_width: 1.0,
             n_runs_detected: 1,
+            apex_library_rt_mad: None,
         }];
 
         let per_file_entries = vec![(
@@ -2460,6 +2976,7 @@ mod tests {
                 consensus_library_rt: 15.0,
                 median_peak_width: 1.0,
                 n_runs_detected: 1,
+                apex_library_rt_mad: None,
             },
             PeptideConsensusRT {
                 modified_sequence: "DECOY_PEPTIDEK".to_string(),
@@ -2467,6 +2984,7 @@ mod tests {
                 consensus_library_rt: 15.0,
                 median_peak_width: 1.0,
                 n_runs_detected: 1,
+                apex_library_rt_mad: None,
             },
         ];
 
@@ -2547,6 +3065,7 @@ mod tests {
                 consensus_library_rt: 15.0,
                 median_peak_width: 1.0,
                 n_runs_detected: 1,
+                apex_library_rt_mad: None,
             },
             PeptideConsensusRT {
                 modified_sequence: "DECOY_PEPTIDEK".to_string(),
@@ -2554,6 +3073,7 @@ mod tests {
                 consensus_library_rt: 15.0,
                 median_peak_width: 1.0,
                 n_runs_detected: 1,
+                apex_library_rt_mad: None,
             },
         ];
 

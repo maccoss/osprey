@@ -52,6 +52,9 @@ pub mod diagnostics;
 // Cross-run peak reconciliation
 pub mod reconciliation;
 
+// Runtime peptide trace (env-var gated)
+pub mod trace;
+
 // Pipeline
 mod pipeline;
 pub use pipeline::run_analysis;

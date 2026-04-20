@@ -2708,6 +2708,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             }
         }
 
+        crate::trace::log_fdr_qvalues(&per_file_entries, "first-pass");
+
         // Persist first-pass SVM scores to sidecar files
         log::debug!("Persisting 1st-pass FDR scores...");
         persist_fdr_scores(
@@ -3465,6 +3467,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     }
                 }
             }
+
+            crate::trace::log_fdr_qvalues(&per_file_entries, "second-pass");
         }
     }
 
@@ -6368,6 +6372,39 @@ fn run_search(
                             .collect();
                         // Sort by RT-penalized score (third element)
                         scored_candidates.sort_by(|a, b| b.2.total_cmp(&a.2));
+
+                        if crate::trace::is_traced(&entry.modified_sequence) {
+                            log::info!(
+                                "[trace] {} z={} {} {} expected_rt={:.4} rt_sigma={:.4} — CWT candidates (sorted by penalized score):",
+                                entry.modified_sequence,
+                                entry.charge,
+                                if entry.is_decoy { "DECOY" } else { "TARGET" },
+                                file_name,
+                                expected_rt,
+                                rt_sigma,
+                            );
+                            for (rank, (bp, raw_score, penalized)) in
+                                scored_candidates.iter().enumerate()
+                            {
+                                let apex_rt = ref_xic[bp.apex_index].0;
+                                let apex_intensity = ref_xic[bp.apex_index].1;
+                                let rt_residual = (apex_rt - expected_rt).abs();
+                                let rt_penalty =
+                                    (-rt_residual.powi(2) / (2.0 * rt_sigma.powi(2))).exp();
+                                let intensity_weight = (1.0 + apex_intensity).ln();
+                                log::info!(
+                                    "[trace]   rank {}: apex={:.4} (rt_res={:+.3}) coelution={:.4} rt_penalty={:.3} intensity={:.1} int_weight={:.2} penalized={:.4}",
+                                    rank,
+                                    apex_rt,
+                                    apex_rt - expected_rt,
+                                    raw_score,
+                                    rt_penalty,
+                                    apex_intensity,
+                                    intensity_weight,
+                                    penalized,
+                                );
+                            }
+                        }
 
                         search_xic_dump.dump_peaks(entry, &scored_candidates);
 
