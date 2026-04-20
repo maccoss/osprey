@@ -45,7 +45,8 @@ use osprey_chromatography::{
 use osprey_core::{
     CoelutionFeatureSet, CoelutionScoredEntry, CwtCandidate, DecoyMethod as CoreDecoyMethod,
     FdrEntry, FdrLevel, FdrMethod, FragmentToleranceConfig, LibraryEntry, LibraryFragment,
-    MS1Spectrum, OspreyConfig, OspreyError, Result, Spectrum, ToleranceUnit, XICPeakBounds,
+    MS1Spectrum, OspreyConfig, OspreyError, ParquetCompression, Result, Spectrum, ToleranceUnit,
+    XICPeakBounds,
 };
 use osprey_fdr::{
     get_pin_feature_names, percolator, pin_feature_value, MokapotRunner, NUM_PIN_FEATURES,
@@ -165,6 +166,157 @@ fn validate_scores_cache(path: &std::path::Path, config: &OspreyConfig) -> Cache
     }
 
     CacheValidity::ValidFirstPass
+}
+
+/// Parse a `MAJOR.MINOR.PATCH` version string. Returns `None` if the
+/// string isn't in the expected shape. Used by `check_parquet_metadata`
+/// to compare versions; patch differences warn, minor/major differences
+/// abort.
+fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.splitn(3, '.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts.next()?.parse::<u32>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Pure helper that checks one parquet's footer metadata against the
+/// expected hashes. Separated from the IO so it's unit-testable without
+/// constructing real parquet files. Returns `Ok(warning_message)` on
+/// success (warning may be empty) or `Err(message)` naming the file
+/// + offending field.
+fn check_parquet_metadata(
+    file_label: &str,
+    cached_version: Option<&str>,
+    cached_search: Option<&str>,
+    cached_library: Option<&str>,
+    expected_search: &str,
+    expected_library: &str,
+    current_version: &str,
+) -> std::result::Result<Option<String>, String> {
+    // Version: warn on patch drift, abort on minor/major drift.
+    let cached_v = cached_version
+        .ok_or_else(|| format!("{}: parquet has no `osprey.version` metadata", file_label))?;
+    let warning = match (parse_version(cached_v), parse_version(current_version)) {
+        (Some((cm, cmn, cp)), Some((rm, rmn, rp))) => {
+            if cm != rm || cmn != rmn {
+                return Err(format!(
+                    "{}: osprey version mismatch: parquet was scored with {} but current binary is {} (incompatible major/minor)",
+                    file_label, cached_v, current_version
+                ));
+            }
+            if cp != rp {
+                Some(format!(
+                    "{}: osprey patch-version drift (parquet={}, current={}); proceeding",
+                    file_label, cached_v, current_version
+                ))
+            } else {
+                None
+            }
+        }
+        _ => Some(format!(
+            "{}: could not parse osprey version (parquet={:?}, current={:?}); proceeding",
+            file_label, cached_v, current_version
+        )),
+    };
+
+    let cached_s = cached_search.ok_or_else(|| {
+        format!(
+            "{}: parquet has no `osprey.search_hash` metadata",
+            file_label
+        )
+    })?;
+    if cached_s != expected_search {
+        return Err(format!(
+            "{}: search_hash mismatch: parquet was scored with search_hash={} but current config hashes to {}",
+            file_label, cached_s, expected_search
+        ));
+    }
+
+    let cached_l = cached_library.ok_or_else(|| {
+        format!(
+            "{}: parquet has no `osprey.library_hash` metadata",
+            file_label
+        )
+    })?;
+    if cached_l != expected_library {
+        return Err(format!(
+            "{}: library_hash mismatch: parquet was scored with library_hash={} but --library hashes to {}",
+            file_label, cached_l, expected_library
+        ));
+    }
+
+    Ok(warning)
+}
+
+/// Open each `.scores.parquet` in `paths` and assert its footer metadata
+/// matches `config`'s search and library hashes. Aborts on the first
+/// per-file failure (with a message naming the file + field). Used at
+/// the start of `--join-only` mode so the operator gets a clear error
+/// if they accidentally point the merge node at parquets from a
+/// different search or library.
+fn validate_scores_parquet_group(
+    paths: &[std::path::PathBuf],
+    config: &OspreyConfig,
+) -> Result<()> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let expected_search = config.search_parameter_hash();
+    let expected_library = config.library_identity_hash();
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    for path in paths {
+        let label = path.display().to_string();
+        let file = std::fs::File::open(path).map_err(|e| {
+            OspreyError::ConfigError(format!("{}: cannot open parquet: {}", label, e))
+        })?;
+        let reader = SerializedFileReader::new(file).map_err(|e| {
+            OspreyError::ConfigError(format!("{}: cannot read parquet metadata: {}", label, e))
+        })?;
+        let kv = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .ok_or_else(|| {
+                OspreyError::ConfigError(format!(
+                    "{}: parquet has no key-value metadata (pre-hash cache)",
+                    label
+                ))
+            })?
+            .clone();
+
+        let get = |key: &str| -> Option<String> {
+            kv.iter()
+                .find(|kv| kv.key == key)
+                .and_then(|kv| kv.value.clone())
+        };
+
+        let cached_v = get(META_OSPREY_VERSION);
+        let cached_s = get(META_SEARCH_HASH);
+        let cached_l = get(META_LIBRARY_HASH);
+
+        match check_parquet_metadata(
+            &label,
+            cached_v.as_deref(),
+            cached_s.as_deref(),
+            cached_l.as_deref(),
+            &expected_search,
+            &expected_library,
+            current_version,
+        ) {
+            Ok(Some(warn)) => log::warn!("{}", warn),
+            Ok(None) => {}
+            Err(msg) => return Err(OspreyError::ConfigError(msg)),
+        }
+    }
+
+    log::info!(
+        "--join-only: validated {} parquet(s) against current config (search_hash={}..., library_hash={}...)",
+        paths.len(),
+        &expected_search[..8],
+        &expected_library[..8]
+    );
+    Ok(())
 }
 
 /// Build Parquet key-value metadata for a first-pass scores cache.
@@ -1039,6 +1191,22 @@ fn scores_path_for_input(input_path: &std::path::Path) -> std::path::PathBuf {
     parent.join(format!("{}.scores.parquet", stem))
 }
 
+/// Inverse of `scores_path_for_input`: given `/data/sample1.scores.parquet`,
+/// produce a synthetic input path `/data/sample1.mzML` whose `file_stem()`
+/// matches what the worker used. This lets `--join-only` reuse the existing
+/// path-derivation helpers (FDR sidecars, calibration JSON) without
+/// duplicating them. The synthetic path is never opened — only its components
+/// are inspected.
+fn synthetic_input_from_parquet(parquet_path: &std::path::Path) -> std::path::PathBuf {
+    let stem = parquet_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim_end_matches(".scores"))
+        .unwrap_or("unknown");
+    let parent = parquet_path.parent().unwrap_or(std::path::Path::new("."));
+    parent.join(format!("{}.mzML", stem))
+}
+
 /// Path for per-file first-pass FDR score sidecar.
 fn fdr_scores_path_pass1(input_path: &std::path::Path) -> std::path::PathBuf {
     let stem = input_path
@@ -1136,13 +1304,23 @@ fn persist_fdr_scores(
 }
 
 /// Write per-file scored entries to parquet with optional key-value metadata.
+/// Map the public `ParquetCompression` config enum onto the parquet
+/// crate's `Compression` value. Defaults inside `Compression::ZSTD` etc.
+/// preserve the historical Osprey defaults.
+fn parquet_compression_codec(c: ParquetCompression) -> parquet::basic::Compression {
+    match c {
+        ParquetCompression::Zstd => parquet::basic::Compression::ZSTD(Default::default()),
+        ParquetCompression::Snappy => parquet::basic::Compression::SNAPPY,
+    }
+}
+
 fn write_scores_parquet_with_metadata(
     path: &std::path::Path,
     entries: &[CoelutionScoredEntry],
     metadata: Option<Vec<parquet::file::metadata::KeyValue>>,
+    compression: parquet::basic::Compression,
 ) -> Result<()> {
     use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
 
     if entries.is_empty() {
@@ -1312,8 +1490,14 @@ fn write_scores_parquet_with_metadata(
             e
         ))
     })?;
-    let mut props_builder =
-        WriterProperties::builder().set_compression(Compression::ZSTD(Default::default()));
+    let mut props_builder = WriterProperties::builder().set_compression(compression);
+    // When emitting Snappy (the cross-impl interop format), also disable
+    // dictionary encoding. Parquet.Net 3.x (used by OspreySharp embedded
+    // in Skyline) does not support RLE_DICTIONARY decoding; PLAIN is the
+    // safe fallback. Modest file-size cost for repetitive string columns.
+    if matches!(compression, parquet::basic::Compression::SNAPPY) {
+        props_builder = props_builder.set_dictionary_enabled(false);
+    }
     if metadata.is_some() {
         props_builder = props_builder.set_key_value_metadata(metadata);
     }
@@ -2103,9 +2287,12 @@ pub(crate) fn load_cwt_candidates_from_parquet(
 }
 
 /// Write coelution scored entries to Parquet report (one row per precursor per run)
-fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]) -> Result<()> {
+fn write_parquet_report(
+    path: &std::path::Path,
+    entries: &[CoelutionScoredEntry],
+    compression: parquet::basic::Compression,
+) -> Result<()> {
     use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
 
     if entries.is_empty() {
@@ -2217,7 +2404,7 @@ fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         columns.push(std::sync::Arc::new(builder.finish()));
     }
 
-    // Write parquet with ZSTD compression
+    // Write parquet with the configured compression codec.
     let file = std::fs::File::create(path).map_err(|e| {
         OspreyError::OutputError(format!(
             "Failed to create parquet file {}: {}",
@@ -2226,7 +2413,7 @@ fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]
         ))
     })?;
     let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
+        .set_compression(compression)
         .build();
     let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| OspreyError::OutputError(format!("Failed to create RecordBatch: {}", e)))?;
@@ -2258,9 +2445,17 @@ fn write_parquet_report(path: &std::path::Path, entries: &[CoelutionScoredEntry]
 /// Calibrates retention time per file, searches for peptide candidates, performs
 /// FDR control, and writes results to blib format for Skyline integration.
 pub fn run_analysis(config: OspreyConfig) -> Result<()> {
-    // Validate config
-    if config.input_files.is_empty() {
+    // Validate config: --join-only feeds per-file state from --input-scores
+    // parquets and ignores --input-files; default + --no-join modes both
+    // require mzML inputs.
+    let join_only = config.input_scores.is_some();
+    if !join_only && config.input_files.is_empty() {
         return Err(OspreyError::ConfigError("No input files specified".into()));
+    }
+    if join_only && config.input_scores.as_ref().unwrap().is_empty() {
+        return Err(OspreyError::ConfigError(
+            "--join-only: --input-scores list is empty".into(),
+        ));
     }
 
     // Load library
@@ -2326,322 +2521,425 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // Track whether all files loaded SVM scores from sidecars (enables skipping Percolator)
     let mut all_scores_loaded = true;
 
-    for (file_idx, input_file) in config.input_files.iter().enumerate() {
-        log::info!("");
+    if join_only {
+        // --join-only: load per-file FdrEntry stubs directly from each
+        // .scores.parquet listed via --input-scores. Skips Stages 1-4.
+        // Side data (RT calibration, FDR sidecars) is loaded best-effort
+        // when the worker preserved sibling files next to each parquet.
+        let parquets = config.input_scores.as_ref().unwrap();
+        // Guard: hash check against current --library and search params.
+        // Aborts with a clear, file-named error if the operator points
+        // the merge node at parquets from a different scoring run.
+        validate_scores_parquet_group(parquets, &config)?;
         log::info!(
-            "File #{}/{}: {}",
-            file_idx + 1,
-            config.input_files.len(),
-            input_file
+            "--join-only: loading {} per-file score parquet(s)",
+            parquets.len()
+        );
+        for (file_idx, parquet_path) in parquets.iter().enumerate() {
+            let synthetic = synthetic_input_from_parquet(parquet_path);
+            let file_name = synthetic
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
-        );
+                .to_string();
+            log::info!(
+                "File #{}/{}: {} (from {})",
+                file_idx + 1,
+                parquets.len(),
+                file_name,
+                parquet_path.display()
+            );
 
-        let file_name = input_file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
+            let mut stubs = match load_fdr_stubs_from_parquet(parquet_path, &mut seq_interner) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(OspreyError::ConfigError(format!(
+                        "--join-only: failed to load {}: {}",
+                        parquet_path.display(),
+                        e
+                    )));
+                }
+            };
 
-        // Check for cached scores parquet (skip search if already scored)
-        let scores_path = scores_path_for_input(input_file);
-        let scores_file_valid =
-            scores_path.exists() && scores_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
-        let cached_stubs = if scores_file_valid {
-            match load_fdr_stubs_from_parquet(&scores_path, &mut seq_interner) {
-                Ok(mut stubs) => {
-                    // Try loading SVM scores from sidecar (prefer 2nd-pass, fall back to 1st-pass)
-                    let pass2 = fdr_scores_path_pass2(input_file);
-                    let pass1 = fdr_scores_path_pass1(input_file);
-                    if load_fdr_scores_sidecar(&pass2, &mut stubs) {
-                        log::debug!(
-                            "Loaded {} cached scores + 2nd-pass SVM scores from {}",
-                            stubs.len(),
-                            scores_path.display()
-                        );
-                    } else if load_fdr_scores_sidecar(&pass1, &mut stubs) {
-                        log::debug!(
-                            "Loaded {} cached scores + 1st-pass SVM scores from {}",
-                            stubs.len(),
-                            scores_path.display()
-                        );
-                    } else {
-                        all_scores_loaded = false;
-                        log::debug!(
-                            "Loaded {} cached scores from {} (no SVM scores sidecar)",
-                            stubs.len(),
-                            scores_path.display()
-                        );
+            // FDR sidecars (best-effort)
+            let pass2 = fdr_scores_path_pass2(&synthetic);
+            let pass1 = fdr_scores_path_pass1(&synthetic);
+            if !load_fdr_scores_sidecar(&pass2, &mut stubs)
+                && !load_fdr_scores_sidecar(&pass1, &mut stubs)
+            {
+                all_scores_loaded = false;
+            }
+
+            // Calibration JSON (best-effort, used by inter-replicate reconciliation)
+            if let Some(input_dir) = synthetic.parent() {
+                let cal_path = calibration_path_for_input(&synthetic, input_dir);
+                if cal_path.exists() {
+                    if let Ok(cal_params) = load_calibration(&cal_path) {
+                        if let Some(ref mp) = cal_params.rt_calibration.model_params {
+                            if let Ok(rt_cal) = RTCalibration::from_model_params(
+                                mp,
+                                cal_params.rt_calibration.residual_sd,
+                            ) {
+                                per_file_calibrations.insert(file_name.clone(), rt_cal);
+                            }
+                        }
                     }
-                    // Load cached calibration for inter-replicate reconciliation
-                    if let Some(input_dir) = input_file.parent() {
-                        let cal_path = calibration_path_for_input(input_file, input_dir);
-                        if cal_path.exists() {
-                            if let Ok(cal_params) = load_calibration(&cal_path) {
-                                if let Some(ref model_params) =
-                                    cal_params.rt_calibration.model_params
-                                {
-                                    if let Ok(rt_cal) = RTCalibration::from_model_params(
-                                        model_params,
-                                        cal_params.rt_calibration.residual_sd,
-                                    ) {
-                                        per_file_calibrations.insert(file_name.clone(), rt_cal);
+                }
+            }
+
+            log::info!(
+                "  Loaded {} FDR stubs (svm_scores: {})",
+                stubs.len(),
+                if all_scores_loaded { "yes" } else { "missing" }
+            );
+
+            per_file_entries.push((file_name.clone(), stubs));
+            per_file_cache_paths.insert(file_name, parquet_path.clone());
+        }
+    } else {
+        for (file_idx, input_file) in config.input_files.iter().enumerate() {
+            log::info!("");
+            log::info!(
+                "File #{}/{}: {}",
+                file_idx + 1,
+                config.input_files.len(),
+                input_file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+            );
+
+            let file_name = input_file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            // Check for cached scores parquet (skip search if already scored)
+            let scores_path = scores_path_for_input(input_file);
+            let scores_file_valid = scores_path.exists()
+                && scores_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+            let cached_stubs = if scores_file_valid {
+                match load_fdr_stubs_from_parquet(&scores_path, &mut seq_interner) {
+                    Ok(mut stubs) => {
+                        // Try loading SVM scores from sidecar (prefer 2nd-pass, fall back to 1st-pass)
+                        let pass2 = fdr_scores_path_pass2(input_file);
+                        let pass1 = fdr_scores_path_pass1(input_file);
+                        if load_fdr_scores_sidecar(&pass2, &mut stubs) {
+                            log::debug!(
+                                "Loaded {} cached scores + 2nd-pass SVM scores from {}",
+                                stubs.len(),
+                                scores_path.display()
+                            );
+                        } else if load_fdr_scores_sidecar(&pass1, &mut stubs) {
+                            log::debug!(
+                                "Loaded {} cached scores + 1st-pass SVM scores from {}",
+                                stubs.len(),
+                                scores_path.display()
+                            );
+                        } else {
+                            all_scores_loaded = false;
+                            log::debug!(
+                                "Loaded {} cached scores from {} (no SVM scores sidecar)",
+                                stubs.len(),
+                                scores_path.display()
+                            );
+                        }
+                        // Load cached calibration for inter-replicate reconciliation
+                        if let Some(input_dir) = input_file.parent() {
+                            let cal_path = calibration_path_for_input(input_file, input_dir);
+                            if cal_path.exists() {
+                                if let Ok(cal_params) = load_calibration(&cal_path) {
+                                    if let Some(ref model_params) =
+                                        cal_params.rt_calibration.model_params
+                                    {
+                                        if let Ok(rt_cal) = RTCalibration::from_model_params(
+                                            model_params,
+                                            cal_params.rt_calibration.residual_sd,
+                                        ) {
+                                            per_file_calibrations.insert(file_name.clone(), rt_cal);
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    // For PIN writing: if needed and PIN doesn't exist yet,
-                    // fall back to full parquet load for this file
-                    if write_pin {
-                        let pin_path_check = mokapot_dir.join(format!("{}.pin", file_name));
-                        if pin_path_check.exists() {
-                            pin_files.insert(file_name.clone(), pin_path_check);
-                        } else {
-                            // Need full entries for PIN writing
-                            if let Ok(full_entries) = load_scores_parquet(&scores_path) {
-                                let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
-                                    compete_target_decoy_pairs(full_entries)
-                                } else {
-                                    full_entries
-                                };
-                                if let Ok(pin_path) =
-                                    mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)
-                                {
-                                    pin_files.insert(file_name.clone(), pin_path);
+                        // For PIN writing: if needed and PIN doesn't exist yet,
+                        // fall back to full parquet load for this file
+                        if write_pin {
+                            let pin_path_check = mokapot_dir.join(format!("{}.pin", file_name));
+                            if pin_path_check.exists() {
+                                pin_files.insert(file_name.clone(), pin_path_check);
+                            } else {
+                                // Need full entries for PIN writing
+                                if let Ok(full_entries) = load_scores_parquet(&scores_path) {
+                                    let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
+                                        compete_target_decoy_pairs(full_entries)
+                                    } else {
+                                        full_entries
+                                    };
+                                    if let Ok(pin_path) = mokapot.write_pin_file(
+                                        &file_name,
+                                        &pin_entries,
+                                        &mokapot_dir,
+                                    ) {
+                                        pin_files.insert(file_name.clone(), pin_path);
+                                    }
                                 }
                             }
                         }
+                        Some(stubs)
                     }
-                    Some(stubs)
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to load cached scores from {}: {}. Re-scoring.",
-                        scores_path.display(),
-                        e
-                    );
-                    all_scores_loaded = false;
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // If we got cached stubs, skip loading spectra and scoring
-        let fdr_entries = if let Some(stubs) = cached_stubs {
-            stubs
-        } else {
-            all_scores_loaded = false;
-            // Load spectra
-            let (spectra, ms1_index) = load_all_spectra(input_file)?;
-            if spectra.is_empty() {
-                log::warn!("No spectra found in {}", input_file.display());
-                continue;
-            }
-
-            // Save binary spectra cache for fast reload during re-scoring
-            let cache_path = spectra_cache_path(input_file);
-            if let Err(e) = save_spectra_cache(&cache_path, &spectra, &ms1_index) {
-                log::warn!("Failed to save spectra cache: {}", e);
-            }
-
-            // Run calibration (reuse the windowed calibration discovery)
-            let (rt_cal, cal_params): (Option<RTCalibration>, Option<CalibrationParams>) = if config
-                .rt_calibration
-                .enabled
-            {
-                // Try to load cached calibration
-                let cached = input_file.parent().and_then(|input_dir| {
-                    let cal_path = calibration_path_for_input(input_file, input_dir);
-                    if !cal_path.exists() {
-                        return None;
-                    }
-                    let cal_params = load_calibration(&cal_path).ok()?;
-                    if !cal_params.rt_calibration.has_model_data() || !cal_params.is_calibrated() {
-                        return None;
-                    }
-                    let model_params = cal_params.rt_calibration.model_params.as_ref()?;
-                    let rt_cal = RTCalibration::from_model_params(
-                        model_params,
-                        cal_params.rt_calibration.residual_sd,
-                    )
-                    .ok()?;
-                    log::debug!("Reusing cached calibration from {}", cal_path.display());
-                    cal_params.log_summary();
-                    Some((rt_cal, cal_params))
-                });
-
-                if let Some((rt_cal, cal_params)) = cached {
-                    (Some(rt_cal), Some(cal_params))
-                } else {
-                    // Run calibration discovery
-                    match run_calibration_discovery_windowed(
-                        &library, &spectra, &ms1_index, &config,
-                    ) {
-                        Ok((rt_cal, cal_params)) => {
-                            cal_params.log_summary();
-                            if let Some(input_dir) = input_file.parent() {
-                                let cal_path = calibration_path_for_input(input_file, input_dir);
-                                if let Err(e) = save_calibration(&cal_params, &cal_path) {
-                                    log::warn!("Failed to save calibration: {}", e);
-                                }
-                            }
-                            (Some(rt_cal), Some(cal_params))
-                        }
-                        Err(e) => {
-                            log::warn!("Calibration failed: {}. Using fallback tolerance.", e);
-                            (None, None)
-                        }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to load cached scores from {}: {}. Re-scoring.",
+                            scores_path.display(),
+                            e
+                        );
+                        all_scores_loaded = false;
+                        None
                     }
                 }
             } else {
-                (None, None)
+                None
             };
 
-            // Retain RT calibration for inter-replicate reconciliation
-            if let Some(ref cal) = rt_cal {
-                per_file_calibrations.insert(file_name.clone(), cal.clone());
-            }
-
-            // Retain isolation window coverage for gap-fill m/z filtering
-            if let Some(ref cp) = cal_params {
-                if let Some(ref scheme) = cp.metadata.isolation_scheme {
-                    let intervals: Vec<(f64, f64)> = scheme
-                        .windows
-                        .iter()
-                        .map(|&(center, width)| {
-                            let half = width / 2.0;
-                            (center - half, center + half)
-                        })
-                        .collect();
-                    per_file_isolation_mz.insert(file_name.clone(), intervals);
+            // If we got cached stubs, skip loading spectra and scoring
+            let fdr_entries = if let Some(stubs) = cached_stubs {
+                stubs
+            } else {
+                all_scores_loaded = false;
+                // Load spectra
+                let (spectra, ms1_index) = load_all_spectra(input_file)?;
+                if spectra.is_empty() {
+                    log::warn!("No spectra found in {}", input_file.display());
+                    continue;
                 }
-            }
 
-            // Log one-line calibration summary for terminal
-            if let Some(ref cp) = cal_params {
-                let n_pep = cp.metadata.num_confident_peptides;
-                let rt_tol = cp.rt_calibration.mad.unwrap_or(0.0) * 1.4826 * 3.0;
-                let ms1_str = if cp.ms1_calibration.calibrated {
-                    format!(
-                        ", MS1 shift {:+.2} {} (tol {:.2})",
-                        cp.ms1_calibration.mean,
-                        cp.ms1_calibration.unit,
-                        3.0 * cp.ms1_calibration.sd,
-                    )
-                } else {
-                    String::new()
-                };
-                let ms2_str = if cp.ms2_calibration.calibrated {
-                    format!(
-                        ", MS2 shift {:+.4} {} (tol {:.4})",
-                        cp.ms2_calibration.mean,
-                        cp.ms2_calibration.unit,
-                        3.0 * cp.ms2_calibration.sd,
-                    )
-                } else {
-                    String::new()
-                };
+                // Save binary spectra cache for fast reload during re-scoring
+                let cache_path = spectra_cache_path(input_file);
+                if let Err(e) = save_spectra_cache(&cache_path, &spectra, &ms1_index) {
+                    log::warn!("Failed to save spectra cache: {}", e);
+                }
+
+                // Run calibration (reuse the windowed calibration discovery)
+                let (rt_cal, cal_params): (Option<RTCalibration>, Option<CalibrationParams>) =
+                    if config.rt_calibration.enabled {
+                        // Try to load cached calibration
+                        let cached = input_file.parent().and_then(|input_dir| {
+                            let cal_path = calibration_path_for_input(input_file, input_dir);
+                            if !cal_path.exists() {
+                                return None;
+                            }
+                            let cal_params = load_calibration(&cal_path).ok()?;
+                            if !cal_params.rt_calibration.has_model_data()
+                                || !cal_params.is_calibrated()
+                            {
+                                return None;
+                            }
+                            let model_params = cal_params.rt_calibration.model_params.as_ref()?;
+                            let rt_cal = RTCalibration::from_model_params(
+                                model_params,
+                                cal_params.rt_calibration.residual_sd,
+                            )
+                            .ok()?;
+                            log::debug!("Reusing cached calibration from {}", cal_path.display());
+                            cal_params.log_summary();
+                            Some((rt_cal, cal_params))
+                        });
+
+                        if let Some((rt_cal, cal_params)) = cached {
+                            (Some(rt_cal), Some(cal_params))
+                        } else {
+                            // Run calibration discovery
+                            match run_calibration_discovery_windowed(
+                                &library, &spectra, &ms1_index, &config,
+                            ) {
+                                Ok((rt_cal, cal_params)) => {
+                                    cal_params.log_summary();
+                                    if let Some(input_dir) = input_file.parent() {
+                                        let cal_path =
+                                            calibration_path_for_input(input_file, input_dir);
+                                        if let Err(e) = save_calibration(&cal_params, &cal_path) {
+                                            log::warn!("Failed to save calibration: {}", e);
+                                        }
+                                    }
+                                    (Some(rt_cal), Some(cal_params))
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Calibration failed: {}. Using fallback tolerance.",
+                                        e
+                                    );
+                                    (None, None)
+                                }
+                            }
+                        }
+                    } else {
+                        (None, None)
+                    };
+
+                // Retain RT calibration for inter-replicate reconciliation
+                if let Some(ref cal) = rt_cal {
+                    per_file_calibrations.insert(file_name.clone(), cal.clone());
+                }
+
+                // Retain isolation window coverage for gap-fill m/z filtering
+                if let Some(ref cp) = cal_params {
+                    if let Some(ref scheme) = cp.metadata.isolation_scheme {
+                        let intervals: Vec<(f64, f64)> = scheme
+                            .windows
+                            .iter()
+                            .map(|&(center, width)| {
+                                let half = width / 2.0;
+                                (center - half, center + half)
+                            })
+                            .collect();
+                        per_file_isolation_mz.insert(file_name.clone(), intervals);
+                    }
+                }
+
+                // Log one-line calibration summary for terminal
+                if let Some(ref cp) = cal_params {
+                    let n_pep = cp.metadata.num_confident_peptides;
+                    let rt_tol = cp.rt_calibration.mad.unwrap_or(0.0) * 1.4826 * 3.0;
+                    let ms1_str = if cp.ms1_calibration.calibrated {
+                        format!(
+                            ", MS1 shift {:+.2} {} (tol {:.2})",
+                            cp.ms1_calibration.mean,
+                            cp.ms1_calibration.unit,
+                            3.0 * cp.ms1_calibration.sd,
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let ms2_str = if cp.ms2_calibration.calibrated {
+                        format!(
+                            ", MS2 shift {:+.4} {} (tol {:.4})",
+                            cp.ms2_calibration.mean,
+                            cp.ms2_calibration.unit,
+                            3.0 * cp.ms2_calibration.sd,
+                        )
+                    } else {
+                        String::new()
+                    };
+                    log::info!(
+                        "Calibration: {} peptides, RT {:.2} min{}{}",
+                        n_pep,
+                        rt_tol,
+                        ms1_str,
+                        ms2_str
+                    );
+                }
+
+                if osprey_core::diagnostics::should_exit_after_calibration() {
+                    return Ok(());
+                }
+
+                // Run coelution search
+                let entries = run_search(
+                    &library,
+                    &spectra,
+                    &ms1_index,
+                    cal_params.as_ref(),
+                    rt_cal.as_ref(),
+                    &config,
+                    &file_name,
+                    None,
+                    "Scoring",
+                )?;
+
                 log::info!(
-                    "Calibration: {} peptides, RT {:.2} min{}{}",
-                    n_pep,
-                    rt_tol,
-                    ms1_str,
-                    ms2_str
+                    "Scored {} entries ({} targets, {} decoys) for {}",
+                    entries.len(),
+                    entries.iter().filter(|e| !e.is_decoy).count(),
+                    entries.iter().filter(|e| e.is_decoy).count(),
+                    file_name
                 );
-            }
 
-            if osprey_core::diagnostics::should_exit_after_calibration() {
-                return Ok(());
-            }
+                // Remove double-counted entries (different precursors sharing fragment ions)
+                let entries = deduplicate_double_counting(
+                    entries,
+                    &library,
+                    &spectra,
+                    cal_params.as_ref(),
+                    &config,
+                );
 
-            // Run coelution search
-            let entries = run_search(
-                &library,
-                &spectra,
-                &ms1_index,
-                cal_params.as_ref(),
-                rt_cal.as_ref(),
-                &config,
-                &file_name,
-                None,
-                "Scoring",
-            )?;
+                // Deduplicate: keep best target and best decoy per base_id.
+                let entries = deduplicate_pairs(entries);
 
-            log::info!(
-                "Scored {} entries ({} targets, {} decoys) for {}",
-                entries.len(),
-                entries.iter().filter(|e| !e.is_decoy).count(),
-                entries.iter().filter(|e| e.is_decoy).count(),
-                file_name
-            );
+                // Save scores to parquet for future re-use (with search parameter metadata)
+                let scores_meta = build_scores_metadata(&config);
+                let codec = parquet_compression_codec(config.parquet_compression);
+                if let Err(e) = write_scores_parquet_with_metadata(
+                    &scores_path,
+                    &entries,
+                    Some(scores_meta),
+                    codec,
+                ) {
+                    log::warn!("Failed to save scores to {}: {}", scores_path.display(), e);
+                }
 
-            // Remove double-counted entries (different precursors sharing fragment ions)
-            let entries = deduplicate_double_counting(
-                entries,
-                &library,
-                &spectra,
-                cal_params.as_ref(),
-                &config,
-            );
+                // Write coelution PIN file (if mokapot or --write-pin)
+                if write_pin {
+                    let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
+                        compete_target_decoy_pairs(entries.clone())
+                    } else {
+                        entries.clone()
+                    };
+                    let pin_path =
+                        mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
+                    pin_files.insert(file_name.clone(), pin_path);
+                }
 
-            // Deduplicate: keep best target and best decoy per base_id.
-            let entries = deduplicate_pairs(entries);
+                // Convert to lightweight FdrEntry stubs (intern modified_sequences).
+                // CRITICAL: set parquet_index to the entry's row in the Parquet file
+                // (which matches its position in the Vec at this point, before compaction).
+                // Without this, all stubs have parquet_index=0 and Percolator scores
+                // every entry against the same feature row.
+                let mut fdr_stubs: Vec<FdrEntry> = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let mut stub = e.to_fdr_entry();
+                        stub.parquet_index = i as u32;
+                        stub
+                    })
+                    .collect();
+                for stub in &mut fdr_stubs {
+                    stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
+                }
+                fdr_stubs
+            };
 
-            // Save scores to parquet for future re-use (with search parameter metadata)
-            let scores_meta = build_scores_metadata(&config);
-            if let Err(e) =
-                write_scores_parquet_with_metadata(&scores_path, &entries, Some(scores_meta))
-            {
-                log::warn!("Failed to save scores to {}: {}", scores_path.display(), e);
-            }
+            per_file_cache_paths.insert(file_name.clone(), scores_path);
+            per_file_entries.push((file_name, fdr_entries));
+        }
+    } // end of `else` for `if join_only`
 
-            // Write coelution PIN file (if mokapot or --write-pin)
-            if write_pin {
-                let pin_entries = if config.fdr_method == FdrMethod::Mokapot {
-                    compete_target_decoy_pairs(entries.clone())
-                } else {
-                    entries.clone()
-                };
-                let pin_path = mokapot.write_pin_file(&file_name, &pin_entries, &mokapot_dir)?;
-                pin_files.insert(file_name.clone(), pin_path);
-            }
-
-            // Convert to lightweight FdrEntry stubs (intern modified_sequences).
-            // CRITICAL: set parquet_index to the entry's row in the Parquet file
-            // (which matches its position in the Vec at this point, before compaction).
-            // Without this, all stubs have parquet_index=0 and Percolator scores
-            // every entry against the same feature row.
-            let mut fdr_stubs: Vec<FdrEntry> = entries
-                .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let mut stub = e.to_fdr_entry();
-                    stub.parquet_index = i as u32;
-                    stub
-                })
-                .collect();
-            for stub in &mut fdr_stubs {
-                stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
-            }
-            fdr_stubs
-        };
-
-        per_file_cache_paths.insert(file_name.clone(), scores_path);
-        per_file_entries.push((file_name, fdr_entries));
-    }
-
+    let n_files = if join_only {
+        config.input_scores.as_ref().map(|v| v.len()).unwrap_or(0)
+    } else {
+        config.input_files.len()
+    };
     let total_scored: usize = per_file_entries.iter().map(|(_, s)| s.len()).sum();
     log::debug!(
         "Coelution analysis complete. {} total scored entries across {} files",
         total_scored,
-        config.input_files.len()
+        n_files
     );
 
-    if osprey_core::diagnostics::should_exit_after_scoring(total_scored) {
+    // --no-join: stop here. Per-file `.scores.parquet` files are now on
+    // disk; a separate `--join-only` invocation (typically on a merge node)
+    // will pick them up and run Stage 5+.
+    if config.no_join {
+        log::info!(
+            "--no-join: Stage 1-4 complete. {} entries scored across {} file(s). \
+             Per-file `.scores.parquet` written next to each input mzML. \
+             Skipping FDR and blib output.",
+            total_scored,
+            n_files
+        );
         return Ok(());
     }
 
@@ -3413,10 +3711,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         }
                         // Write back to Parquet with reconciliation metadata
                         let recon_metadata = build_reconciled_metadata(&config);
+                        let codec = parquet_compression_codec(config.parquet_compression);
                         if let Err(e) = write_scores_parquet_with_metadata(
                             cache_path,
                             &full_entries,
                             Some(recon_metadata),
+                            codec,
                         ) {
                             log::warn!(
                                 "Failed to write reconciled scores for {}: {}",
@@ -3858,7 +4158,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     }
                 }
             }
-            write_parquet_report(report_path, &all_entries)?;
+            write_parquet_report(
+                report_path,
+                &all_entries,
+                parquet_compression_codec(config.parquet_compression),
+            )?;
         } else {
             // TSV report from plan entries (no full entry reload needed)
             log::info!("Writing TSV report to {}", report_path.display());
@@ -8724,5 +9028,112 @@ mod tests {
             SpectralScorer::new().num_bins(),
             "calibration XCorr on unit-resolution data should stay unit bins"
         );
+    }
+
+    // -- Phase 3 (HPC scoring split) parquet group validation -----------
+    // Tests for the pure helpers behind validate_scores_parquet_group.
+    // The IO wrapper (which actually opens parquets) is exercised by the
+    // Stellar round-trip smoke tests, not unit tests, since constructing
+    // real parquets in-memory is too heavy for a unit test.
+
+    const VALID_SEARCH: &str = "search-hash-aaa";
+    const VALID_LIB: &str = "lib-hash-bbb";
+    const CURRENT_VERSION: &str = "26.3.0";
+
+    fn check_md(
+        cached_v: Option<&str>,
+        cached_s: Option<&str>,
+        cached_l: Option<&str>,
+    ) -> std::result::Result<Option<String>, String> {
+        check_parquet_metadata(
+            "test.scores.parquet",
+            cached_v,
+            cached_s,
+            cached_l,
+            VALID_SEARCH,
+            VALID_LIB,
+            CURRENT_VERSION,
+        )
+    }
+
+    #[test]
+    fn parse_version_round_trip() {
+        assert_eq!(parse_version("26.3.0"), Some((26, 3, 0)));
+        assert_eq!(parse_version("0.0.1"), Some((0, 0, 1)));
+        assert_eq!(parse_version("100.200.300"), Some((100, 200, 300)));
+    }
+
+    #[test]
+    fn parse_version_rejects_bad_input() {
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("26.3"), None);
+        assert_eq!(parse_version("v26.3.0"), None);
+        assert_eq!(parse_version("26.3.x"), None);
+    }
+
+    #[test]
+    fn metadata_happy_path_no_warning() {
+        let res = check_md(Some("26.3.0"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap();
+        assert!(res.is_none(), "no warning expected, got {:?}", res);
+    }
+
+    #[test]
+    fn metadata_patch_drift_warns_but_succeeds() {
+        let res = check_md(Some("26.3.5"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap();
+        let warn = res.expect("expected a warning");
+        assert!(warn.contains("patch-version drift"), "got: {}", warn);
+    }
+
+    #[test]
+    fn metadata_minor_version_drift_aborts() {
+        let err = check_md(Some("26.4.0"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("major/minor"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_major_version_drift_aborts() {
+        let err = check_md(Some("27.0.0"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("major/minor"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_missing_version_aborts() {
+        let err = check_md(None, Some(VALID_SEARCH), Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("osprey.version"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_missing_search_hash_aborts() {
+        let err = check_md(Some("26.3.0"), None, Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("osprey.search_hash"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_missing_library_hash_aborts() {
+        let err = check_md(Some("26.3.0"), Some(VALID_SEARCH), None).unwrap_err();
+        assert!(err.contains("osprey.library_hash"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_search_hash_mismatch_names_field_and_file() {
+        let err = check_md(Some("26.3.0"), Some("wrong-hash"), Some(VALID_LIB)).unwrap_err();
+        assert!(err.contains("search_hash mismatch"), "got: {}", err);
+        assert!(err.contains("test.scores.parquet"), "got: {}", err);
+        assert!(err.contains("wrong-hash"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_library_hash_mismatch_names_field_and_file() {
+        let err = check_md(Some("26.3.0"), Some(VALID_SEARCH), Some("wrong-lib")).unwrap_err();
+        assert!(err.contains("library_hash mismatch"), "got: {}", err);
+        assert!(err.contains("test.scores.parquet"), "got: {}", err);
+        assert!(err.contains("wrong-lib"), "got: {}", err);
+    }
+
+    #[test]
+    fn metadata_unparseable_version_warns_but_proceeds() {
+        let res = check_md(Some("garbage"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap();
+        let warn = res.expect("expected a warning");
+        assert!(warn.contains("could not parse"), "got: {}", warn);
     }
 }
