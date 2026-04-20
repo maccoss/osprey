@@ -6454,7 +6454,15 @@ fn run_search(
 
                         // Filter spectra within RT range.
                         // For boundary overrides: use the given boundaries + margin for SNR context.
-                        // For normal search: use expected_rt ± rt_tolerance.
+                        // For normal search: extract over a window wider than the apex-
+                        // acceptance rt_tolerance so CWT has context on both sides of any
+                        // in-tolerance apex to determine full peak boundaries. Without the
+                        // extra buffer, a peak whose apex drifts close to one edge of
+                        // rt_tolerance has its tail on that side truncated and CWT returns
+                        // degenerate boundaries with start_rt == apex_rt (or end_rt ==
+                        // apex_rt). The apex itself is still required to be within
+                        // rt_tolerance of expected_rt (enforced in the candidate-scoring
+                        // loop below) — the wider extraction only provides context.
                         let rt_spec_triples: Vec<(usize, usize, &Spectrum)> =
                             if let Some((_, target_start, target_end)) = has_override {
                                 let peak_width = (target_end - target_start).max(0.1);
@@ -6472,11 +6480,18 @@ fn run_search(
                                     })
                                     .collect()
                             } else {
+                                // Buffer beyond rt_tolerance so CWT can extend peak
+                                // boundaries symmetrically even when the apex drifts to
+                                // the edge of the acceptance window. At least 0.1 min
+                                // on each side, or an extra rt_tolerance (whichever is
+                                // larger) — so tight-calibration runs get enough scan
+                                // context and wide-calibration runs scale proportionally.
+                                let xic_half_width = rt_tolerance + rt_tolerance.max(0.1);
                                 window_pairs
                                     .iter()
                                     .enumerate()
                                     .filter(|(_, (_, spec))| {
-                                        (spec.retention_time - expected_rt).abs() <= rt_tolerance
+                                        (spec.retention_time - expected_rt).abs() <= xic_half_width
                                     })
                                     .map(|(win_idx, (global_idx, spec))| {
                                         (win_idx, *global_idx, *spec)
@@ -6680,7 +6695,21 @@ fn run_search(
                         let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
                         let mut scored_candidates: Vec<(&XICPeakBounds, f64, f64)> = candidates
                             .iter()
-                            .map(|bp| {
+                            .filter_map(|bp| {
+                                // Apex-acceptance filter: the XIC extraction window is
+                                // wider than rt_tolerance so CWT can extend peak boundaries
+                                // past the acceptance edge, but the detected apex itself
+                                // must still fall within rt_tolerance of expected_rt. This
+                                // preserves first-pass selectivity — we are not accepting
+                                // apexes that the old (narrower-window) logic would have
+                                // rejected, only allowing their already-accepted boundaries
+                                // to extend properly.
+                                let peak_apex_rt = ref_xic[bp.apex_index].0;
+                                let rt_residual = (peak_apex_rt - expected_rt).abs();
+                                if has_override.is_none() && rt_residual > rt_tolerance {
+                                    return None;
+                                }
+
                                 let si = bp.start_index;
                                 let ei = bp.end_index;
                                 let peak_len = ei - si + 1;
@@ -6713,8 +6742,6 @@ fn run_search(
                                 // predicted RT are downweighted. A peak at the expected
                                 // position gets penalty=1.0; a peak 5-sigma away gets
                                 // penalty~0.01.
-                                let peak_apex_rt = ref_xic[bp.apex_index].0;
-                                let rt_residual = (peak_apex_rt - expected_rt).abs();
                                 let rt_penalty =
                                     (-rt_residual.powi(2) / (2.0 * rt_sigma.powi(2))).exp();
 
@@ -6726,15 +6753,22 @@ fn run_search(
                                 let apex_intensity = ref_xic[bp.apex_index].1;
                                 let intensity_weight = (1.0 + apex_intensity).ln();
 
-                                (
+                                Some((
                                     bp,
                                     coelution_score,
                                     coelution_score * rt_penalty * intensity_weight,
-                                )
+                                ))
                             })
                             .collect();
                         // Sort by RT-penalized score (third element)
                         scored_candidates.sort_by(|a, b| b.2.total_cmp(&a.2));
+
+                        // If the apex-acceptance filter rejected every CWT candidate
+                        // (all detected apexes were outside rt_tolerance of expected_rt),
+                        // there is no in-tolerance peak for this entry.
+                        if scored_candidates.is_empty() {
+                            return None;
+                        }
 
                         if crate::trace::is_traced(&entry.modified_sequence) {
                             log::info!(
@@ -8570,6 +8604,113 @@ mod tests {
                 width
             );
         }
+    }
+
+    #[test]
+    fn test_run_search_xic_window_extends_beyond_rt_tolerance() {
+        // Regression: when a peak's apex falls near the rt_tolerance edge,
+        // the XIC extraction window must extend beyond rt_tolerance so the
+        // CWT peak detector can capture the full peak shape. Before the
+        // fix the XIC window was clipped at expected_rt ± rt_tolerance,
+        // which truncated the peak's left/right tail on whichever side
+        // the apex was drifting toward and produced degenerate boundaries
+        // with start_rt == apex_rt (or end_rt == apex_rt).
+        //
+        // Setup: library retention_time=10.0, fallback rt_tolerance=0.3,
+        // Gaussian peak centered at 9.75 (0.25 min off, well inside the
+        // ±0.3 acceptance). With the old narrow XIC window of ±0.3 min
+        // the first scan included was right at the apex (9.75), leaving
+        // no data to the left. With the new wider XIC window of ±0.6 min
+        // (rt_tolerance + max(rt_tolerance, 0.1)), CWT sees scans back
+        // to 9.4 and can extend the left boundary properly.
+        let spectra = make_gaussian_spectra(200, 5.0, 15.0, 9.75, 0.2, 500.0, 12.5);
+        let entry = make_lib_entry_with_fragments(0, 500.0, 10.0);
+        let library = vec![entry];
+        let ms1_index = MS1Index::new(vec![]);
+
+        let mut config = make_test_config();
+        config.rt_calibration.fallback_rt_tolerance = 0.3;
+        config.rt_calibration.min_rt_tolerance = 0.1;
+
+        let results = run_search(
+            &library,
+            &spectra,
+            &ms1_index,
+            None,
+            None,
+            &config,
+            "test.mzML",
+            None,
+            "Test",
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1, "Expected one detection");
+        let r = &results[0];
+        let apex = r.peak_bounds.apex_rt;
+        let start = r.peak_bounds.start_rt;
+        let end = r.peak_bounds.end_rt;
+
+        assert!(
+            (apex - 9.75).abs() < 0.3,
+            "apex {:.3} should be within rt_tolerance of expected_rt=10.0 (and close to Gaussian center 9.75)",
+            apex
+        );
+        assert!(
+            start < apex,
+            "Peak should have a left tail (start_rt={:.4} < apex_rt={:.4}); \
+             before the fix this would have been equal because the XIC \
+             extraction window was truncated at expected_rt - rt_tolerance",
+            start,
+            apex
+        );
+        assert!(
+            end > apex,
+            "Peak should have a right tail (end_rt={:.4} > apex_rt={:.4})",
+            end,
+            apex
+        );
+    }
+
+    #[test]
+    fn test_run_search_rejects_apex_outside_rt_tolerance() {
+        // Complement to the window-extension test: widening the XIC window
+        // must NOT relax apex selectivity. A peak whose apex falls outside
+        // rt_tolerance (but now inside the wider extraction window) must
+        // still be rejected by the explicit apex-acceptance filter in the
+        // candidate-scoring loop.
+        //
+        // Library retention_time=10.0, rt_tolerance=0.3, Gaussian peak at
+        // 9.5 — that's 0.5 min from expected_rt, outside rt_tolerance but
+        // inside the widened XIC window of ±0.6 min.
+        let spectra = make_gaussian_spectra(200, 5.0, 15.0, 9.5, 0.2, 500.0, 12.5);
+        let entry = make_lib_entry_with_fragments(0, 500.0, 10.0);
+        let library = vec![entry];
+        let ms1_index = MS1Index::new(vec![]);
+
+        let mut config = make_test_config();
+        config.rt_calibration.fallback_rt_tolerance = 0.3;
+        config.rt_calibration.min_rt_tolerance = 0.1;
+
+        let results = run_search(
+            &library,
+            &spectra,
+            &ms1_index,
+            None,
+            None,
+            &config,
+            "test.mzML",
+            None,
+            "Test",
+        )
+        .unwrap();
+
+        assert!(
+            results.is_empty(),
+            "Apex 0.5 min from expected_rt (outside rt_tolerance=0.3) should be \
+             rejected by the apex-acceptance filter, got {} results",
+            results.len()
+        );
     }
 
     // Regression guard for the calibration XCorr bin spec in
