@@ -71,18 +71,8 @@ pub fn should_exit_after_calibration() -> bool {
     }
 }
 
-/// If `OSPREY_EXIT_AFTER_SCORING=1` is set, log a benchmark message
-/// (including the `total_scored` count) and return true so the caller
-/// can short-circuit the pipeline after Stage 4. Used to time and diff
-/// Stages 1–4 in isolation.
-pub fn should_exit_after_scoring(total_scored: usize) -> bool {
-    if std::env::var("OSPREY_EXIT_AFTER_SCORING").is_ok() {
-        log::info!(
-            "[BENCH] OSPREY_EXIT_AFTER_SCORING set - exiting after Stage 4 ({} entries)",
-            total_scored
-        );
-        true
-    } else {
-        false
-    }
-}
+// Note: the `OSPREY_EXIT_AFTER_SCORING` env-var gate that used to live
+// here was retired in favor of the `--no-join` CLI flag. See the HPC
+// scoring split work in `crates/osprey/src/pipeline.rs::run_analysis`.
+// `OSPREY_EXIT_AFTER_CALIBRATION` (Stage 3) stays because it has no
+// production CLI analog -- its purpose is purely diagnostic.

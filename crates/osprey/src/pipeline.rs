@@ -2905,9 +2905,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
     // --no-join: stop here. Per-file `.scores.parquet` files are now on
     // disk; a separate `--join-only` invocation (typically on a merge node)
-    // will pick them up and run Stage 5+. The `should_exit_after_scoring`
-    // env-var path is retained alongside for legacy bench scripts and
-    // will be removed in Phase 5.
+    // will pick them up and run Stage 5+.
     if config.no_join {
         log::info!(
             "--no-join: Stage 1-4 complete. {} entries scored across {} file(s). \
@@ -2916,9 +2914,6 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             total_scored,
             n_files
         );
-        return Ok(());
-    }
-    if osprey_core::diagnostics::should_exit_after_scoring(total_scored) {
         return Ok(());
     }
 
