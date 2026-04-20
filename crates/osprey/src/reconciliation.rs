@@ -513,14 +513,32 @@ pub fn plan_reconciliation(
         }
     };
 
-    // Build set of precursors (base_sequence, charge) that passed run-level FDR in any replicate.
-    // Only these precursors (and their paired decoys) will be reconciled.
-    // "base_sequence" strips the DECOY_ prefix so targets and decoys share the same key.
+    // Build set of precursors (base_sequence, charge) that will appear in
+    // the blib output. Every such precursor needs reconciliation in ALL
+    // files so its per-file boundaries agree with the consensus. We use the
+    // MINIMUM of (run_precursor, run_peptide, experiment_precursor,
+    // experiment_peptide) q-values — most permissive — because the blib
+    // admits a precursor if ANY of those levels passes at the configured
+    // FDR gate. Using the strict max (e.g., `FdrLevel::Both`) would leave
+    // out precursors that clear peptide-level FDR but just barely fail
+    // precursor-level; those precursors still ship in the blib and must be
+    // reconciled so sibling charges don't end up at inconsistent RTs within
+    // the same run. Decoys are included through the paired-decoy logic
+    // below, not this gate. "base_sequence" strips the DECOY_ prefix so
+    // targets and decoys share the same key.
     let mut passing_precursors: std::collections::HashSet<(&str, u8)> =
         std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.effective_run_qvalue(FdrLevel::Both) <= experiment_fdr {
+            if entry.is_decoy {
+                continue;
+            }
+            let best_q = entry
+                .run_precursor_qvalue
+                .min(entry.run_peptide_qvalue)
+                .min(entry.experiment_precursor_qvalue)
+                .min(entry.experiment_peptide_qvalue);
+            if best_q <= experiment_fdr {
                 passing_precursors.insert((&entry.modified_sequence, entry.charge));
             }
         }
@@ -809,13 +827,24 @@ pub fn identify_gap_fill_targets(
     lib_precursor_mz: &HashMap<u32, f64>,
     per_file_isolation_mz: &HashMap<String, Vec<(f64, f64)>>,
 ) -> HashMap<String, Vec<GapFillTarget>> {
-    // 1. Build passing precursors: (modified_sequence, charge) for targets passing run-level
-    //    FDR in at least one replicate. This ensures gap-fill covers all precursors that
-    //    will be eligible for the second-pass experiment-level FDR.
+    // 1. Build passing precursors: (modified_sequence, charge) for targets
+    //    that will end up in the blib output. See the matching rationale in
+    //    `plan_reconciliation` — we use the minimum of (run, experiment) ×
+    //    (precursor, peptide) q-values so a peptide that clears peptide-
+    //    level FDR (even with middling precursor-level q) still gets its
+    //    missing charge states gap-filled to the correct consensus RT.
     let mut passing_precursors: HashSet<(Arc<str>, u8)> = HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if !entry.is_decoy && entry.effective_run_qvalue(FdrLevel::Both) <= experiment_fdr {
+            if entry.is_decoy {
+                continue;
+            }
+            let best_q = entry
+                .run_precursor_qvalue
+                .min(entry.run_peptide_qvalue)
+                .min(entry.experiment_precursor_qvalue)
+                .min(entry.experiment_peptide_qvalue);
+            if best_q <= experiment_fdr {
                 passing_precursors.insert((entry.modified_sequence.clone(), entry.charge));
             }
         }
@@ -1928,6 +1957,65 @@ mod tests {
         assert!(
             actions.is_empty(),
             "Non-passing precursors should not be reconciled"
+        );
+    }
+
+    #[test]
+    fn test_plan_reconciliation_reconciles_blib_eligible_precursors() {
+        // Regression (Stellar TPTLQPTPEVHNGLR z=2): a precursor whose run-
+        // level precursor and peptide q-values and experiment-level precursor
+        // q-value all exceed 0.01, but whose experiment-level PEPTIDE q-value
+        // is 0.0008 (well below 0.01), still ends up in the blib — every
+        // observation gets admitted via peptide-level experiment FDR.
+        // Reconciliation must cover these precursors in every file so their
+        // per-file apexes align with the consensus; otherwise a wrong-peak
+        // first-pass detection in one file stays at that wrong RT and
+        // breaks the same-boundaries-across-charges invariant.
+        let cal = make_identity_calibration();
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        let consensus = vec![PeptideConsensusRT {
+            modified_sequence: "PEPTIDEK".to_string(),
+            is_decoy: false,
+            consensus_library_rt: 10.0,
+            median_peak_width: 0.2,
+            n_runs_detected: 3,
+            apex_library_rt_mad: Some(0.02),
+        }];
+
+        // Entry mirrors sample 21 z=2 for TPTLQPTPEVHNGLR: poor run and
+        // experiment precursor q-values, but strong experiment-peptide q
+        // driven by other observations of the same peptide in other files.
+        let mut entry = make_consensus_entry(
+            1, "PEPTIDEK", 2, false, 11.0, 0.2, 5.0, -2.0, 0.12, 0.13, 1.0,
+        );
+        entry.experiment_precursor_qvalue = 0.04;
+        entry.experiment_peptide_qvalue = 0.0008;
+
+        let per_file_entries = vec![("file1".to_string(), vec![entry])];
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        assert!(
+            !actions.is_empty(),
+            "Precursor passing only at experiment-peptide level must still \
+             be reconciled; blib admits it via peptide-level FDR, so \
+             reconciliation must keep its boundaries consistent across files."
         );
     }
 
