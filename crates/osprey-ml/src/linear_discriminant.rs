@@ -42,6 +42,25 @@ impl LinearDiscriminantAnalysis {
     pub fn fit(features: &Matrix, decoy: &[bool]) -> Option<LinearDiscriminantAnalysis> {
         assert_eq!(features.rows, decoy.len());
 
+        // Both classes (target and decoy) must be present for LDA to compute
+        // a well-defined scatter_between. With only one class, the per-class
+        // loop below accumulates a degenerate class_means row, class_data for
+        // the absent class is a 0-row matrix, its covariance is NaN (division
+        // by rows = 0), and the Gauss solve silently returns None. Reject
+        // the degenerate input explicitly so the failure mode is visible in
+        // the log instead of masquerading as a numerical failure downstream.
+        let has_decoy = decoy.iter().any(|&d| d);
+        let has_target = decoy.iter().any(|&d| !d);
+        if !has_decoy || !has_target {
+            log::warn!(
+                "LDA fit requires both classes (has_decoy={}, has_target={}, n_samples={})",
+                has_decoy,
+                has_target,
+                decoy.len()
+            );
+            return None;
+        }
+
         // Calculate class means, and overall mean
         let x_bar = features.mean();
         let mut scatter_within = Matrix::zeros(features.cols, features.cols);
@@ -181,5 +200,24 @@ mod test {
             scores,
             expected
         );
+    }
+
+    #[test]
+    fn single_class_returns_none() {
+        // 3x2 feature matrix; degenerate label sets (all one class) should
+        // cause fit() to return None cleanly instead of propagating NaN
+        // scatter_within into Gauss::solve.
+        #[rustfmt::skip]
+        let feats = Matrix::new(
+            [
+                1.0, 2.0,
+                3.0, 4.0,
+                5.0, 6.0,
+            ],
+            3,
+            2,
+        );
+        assert!(LinearDiscriminantAnalysis::fit(&feats, &[false, false, false]).is_none());
+        assert!(LinearDiscriminantAnalysis::fit(&feats, &[true, true, true]).is_none());
     }
 }
