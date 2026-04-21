@@ -194,8 +194,7 @@ mod tests {
         let right = Matrix::new([1.0, 6.0], 2, 1);
         // Use solve_inner with eps=0 for an exact answer; the outer `solve`
         // adds a 1e-8 diagonal perturbation that prevents bit-exact matches.
-        let solution =
-            Gauss::solve_inner(left, right, 0.0).expect("solve_inner should succeed");
+        let solution = Gauss::solve_inner(left, right, 0.0).expect("solve_inner should succeed");
         assert_eq!(solution.shape(), (2, 1));
         let scores = [solution[(0, 0)], solution[(1, 0)]];
         assert!(all_close(&scores, &[0.75, 2.0], 1e-12), "got {:?}", scores);
