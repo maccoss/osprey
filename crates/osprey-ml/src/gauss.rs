@@ -68,16 +68,17 @@ impl Gauss {
 
     // Is `left` an identity matrix, or else contains rows of all zeros?
     fn left_solved(&self) -> bool {
+        const TOL: f64 = 1E-8;
         let n = self.left.cols;
         for i in 0..n {
             for j in 0..n {
                 let x = self.left[(i, j)];
                 if i == j {
-                    if x != 1.0 && x != 0.0 {
+                    if (x - 1.0).abs() > TOL && x.abs() > TOL {
                         log::debug!("Finding solution to linear system failed: left side of matrix [{},{}] = {}", i, j, x);
                         return false;
                     }
-                } else if x > 1E-8 {
+                } else if x.abs() > TOL {
                     log::debug!("Finding solution to linear system failed: left side of matrix [{},{}] = {}", i, j, x);
                     return false;
                 }
@@ -87,20 +88,25 @@ impl Gauss {
     }
 
     fn echelon(&mut self) {
+        const EPS: f64 = 1E-12;
         let (m, n) = self.left.shape();
         let mut h = 0;
         let mut k = 0;
 
         while h < m && k < n {
-            // find the row with the largest value in the current pivot column (k)
-            let mut max = (0, f64::MIN);
+            // Partial pivoting: pick the row with the largest-magnitude value
+            // in the current pivot column. Using the signed value skips
+            // large-magnitude negatives in favor of small positives, which
+            // hurts numerical stability.
+            let mut max = (h, 0.0f64);
             for i in h..m {
-                if self.left[(i, k)] >= max.1 {
-                    max = (i, self.left[(i, k)])
+                let abs_val = self.left[(i, k)].abs();
+                if abs_val > max.1 {
+                    max = (i, abs_val);
                 }
             }
             let i = max.0;
-            if self.left[(i, k)] == 0.0 {
+            if max.1 < EPS {
                 k += 1;
                 continue;
             }
@@ -165,5 +171,46 @@ impl Gauss {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_close(a: &[f64], b: &[f64], eps: f64) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < eps)
+    }
+
+    /// Regression test for abs-value pivot selection.
+    ///
+    /// Column 0 contains a large-magnitude negative (-4) and a zero. Signed-
+    /// max pivoting picks the zero (because 0 > -4), skips the column, and
+    /// produces a permuted-identity result that `left_solved` rejects through
+    /// every eps in the ladder. Abs-max pivoting picks -4 and solves exactly.
+    #[test]
+    fn gauss_negative_pivot() {
+        let left = Matrix::new([-4.0, 2.0, 0.0, 3.0], 2, 2);
+        let right = Matrix::new([1.0, 6.0], 2, 1);
+        // Use solve_inner with eps=0 for an exact answer; the outer `solve`
+        // adds a 1e-8 diagonal perturbation that prevents bit-exact matches.
+        let solution =
+            Gauss::solve_inner(left, right, 0.0).expect("solve_inner should succeed");
+        assert_eq!(solution.shape(), (2, 1));
+        let scores = [solution[(0, 0)], solution[(1, 0)]];
+        assert!(all_close(&scores, &[0.75, 2.0], 1e-12), "got {:?}", scores);
+    }
+
+    /// Regression test for rank-deficient input.
+    ///
+    /// `left` has rank 1 (row 2 = 2 * row 1). With `eps = 0` (no diagonal
+    /// perturbation), `solve_inner` must return `None` because echelon
+    /// produces a zero row on `left`, and the surviving non-zero off-diagonal
+    /// entry fails the `left_solved` tolerance check.
+    #[test]
+    fn gauss_near_singular_returns_none() {
+        let left = Matrix::new([1.0, 2.0, 2.0, 4.0], 2, 2);
+        let right = Matrix::new([1.0, 2.0], 2, 1);
+        assert!(Gauss::solve_inner(left, right, 0.0).is_none());
     }
 }
