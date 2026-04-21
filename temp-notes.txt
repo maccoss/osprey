@@ -1,9 +1,8 @@
-cargo run --release -- -i *.mzML -l SkylineAI_spectral_library.tsv -o astral-ospreyoutput.blib --resolution hram --report report.parquet
+ #Astral
+ osprey -i *.mzML -l SkylineAI_spectral_library.tsv -o ospreyoutput.blib --resolution hram --protein-fdr 0.01
 
-
-cargo run --release -- -i *.mzML -l ../hela-filtered-SkylineAI_spectral_library.tsv -o stellar-ospreyoutput.blib 
-
-
+#Stellar
+osprey -i *.mzML -l hela-filtered-SkylineAI_spectral_library.tsv -o stellar-ospreyoutput.blib --resolution unit
 
 python3 visualize_pin_features.py ../example_test_data/stellar/calibrated-GPF-data/mokapot/Ste-2024-12-02_HeLa_20msIIT_GPFDIA_400-500_14-mars.pin --output report-stellar.html
 
