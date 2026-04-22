@@ -170,7 +170,7 @@ impl Kde {
     /// reduction tree is non-deterministic: scheduling differences lead to
     /// different tree shapes, and floating-point `+` is non-associative,
     /// so parallel reduction produces pep values that differ by ~1 ULP
-    /// across runs. Stage 5 calls this once per of ~1000 bins over ~241k
+    /// across runs. Stage 5 calls this once for each of ~1000 bins over ~241k
     /// samples (~sub-second total), so the perf cost of serial reduction
     /// is negligible compared to the Percolator SVM pass that precedes it.
     fn pdf(&self, x: f64) -> f64 {
@@ -374,5 +374,54 @@ mod tests {
         let estimator = PepEstimator::fit_default(&scores, &is_decoy);
         // With no decoys, PEP should be 1.0 (can't estimate)
         assert!((estimator.posterior_error(5.0) - 1.0).abs() < 1e-10);
+    }
+
+    /// Regression for Copilot PR #16 review: `PepEstimator::fit_default`
+    /// must produce bit-identical bins for the same input presented in
+    /// different orders. This locks in the serial-KDE-sum change made in
+    /// the sibling commit — if anyone re-introduces `par_iter().sum()`
+    /// or lets HashMap iteration order leak into the fit path, this
+    /// test flips immediately.
+    #[test]
+    fn fit_default_is_order_invariant() {
+        // A deterministically-shaped set of scores/decoys. ~200 points is
+        // enough that a parallel reduction would visibly drift.
+        let n = 200;
+        let mut scores: Vec<f64> = Vec::with_capacity(n);
+        let mut is_decoy: Vec<bool> = Vec::with_capacity(n);
+        for i in 0..n {
+            // Targets get higher scores than decoys, with some overlap.
+            let t = (i as f64) * 0.037 + 1.5;
+            let d = (i as f64) * 0.037 + 0.5;
+            scores.push(t);
+            is_decoy.push(false);
+            scores.push(d);
+            is_decoy.push(true);
+        }
+
+        let a = PepEstimator::fit_default(&scores, &is_decoy);
+
+        // Permute the inputs together (same pairing of score <-> decoy
+        // flag preserved). Use a stride-based permutation for a
+        // deterministic non-trivial reorder.
+        let m = scores.len();
+        let mut perm: Vec<usize> = (0..m).collect();
+        // Inverse order (simplest non-identity permutation) plus an
+        // odd/even split to make the reorder substantive.
+        perm.sort_by_key(|&i| (i % 7, std::cmp::Reverse(i)));
+        let permuted_scores: Vec<f64> = perm.iter().map(|&i| scores[i]).collect();
+        let permuted_decoys: Vec<bool> = perm.iter().map(|&i| is_decoy[i]).collect();
+
+        let b = PepEstimator::fit_default(&permuted_scores, &permuted_decoys);
+
+        // Bits on bins should match exactly. If any parallel reduction
+        // sneaks back in, bin values would drift at ~1 ULP per entry.
+        assert_eq!(
+            a.bins, b.bins,
+            "PepEstimator::fit_default is order-dependent -- \
+             KDE summation or q-value fit is no longer deterministic"
+        );
+        assert_eq!(a.min_score, b.min_score);
+        assert_eq!(a.score_step, b.score_step);
     }
 }

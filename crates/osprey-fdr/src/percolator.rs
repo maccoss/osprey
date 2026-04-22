@@ -2715,4 +2715,82 @@ mod tests {
         );
         assert_eq!(selected, vec![0, 1, 2, 3]);
     }
+
+    /// Helper for the order-invariance test below.
+    fn stub(entry_id: u32, is_decoy: bool, score: f64, peptide: &str, charge: u8) -> FdrEntry {
+        FdrEntry {
+            entry_id,
+            parquet_index: entry_id,
+            is_decoy,
+            charge,
+            scan_number: 0,
+            apex_rt: 0.0,
+            start_rt: 0.0,
+            end_rt: 0.0,
+            coelution_sum: 0.0,
+            score,
+            run_precursor_qvalue: 1.0,
+            run_peptide_qvalue: 1.0,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: 1.0,
+            experiment_peptide_qvalue: 1.0,
+            experiment_protein_qvalue: 1.0,
+            pep: 1.0,
+            modified_sequence: std::sync::Arc::from(peptide),
+        }
+    }
+
+    /// Regression for Copilot PR #16 review: `compute_fdr_from_stubs`
+    /// must produce the same per-entry PEPs regardless of the input Vec
+    /// order. Building the `targets`/`decoys` HashMaps and then
+    /// iterating for PEP fitting used to leak HashMap iteration order
+    /// (randomized per process in Rust) into the fit inputs. The fix
+    /// sorts the union of base_ids before building `winner_scores`, so
+    /// the fit sees inputs in a stable order independent of insertion
+    /// order or process hash seed.
+    #[test]
+    fn compute_fdr_from_stubs_is_order_invariant() {
+        // A minimum-sized but non-trivial dataset: 6 target-decoy pairs
+        // plus one unpaired decoy, in a single "file".
+        let mut forward: Vec<(String, Vec<FdrEntry>)> = vec![(
+            "file1".to_string(),
+            vec![
+                stub(1, false, 2.5, "AAAAAK", 2),
+                stub(2, false, 1.8, "BBBBBR", 2),
+                stub(3, false, 0.4, "CCCCCK", 2),
+                stub(4, false, -0.5, "DDDDDR", 2),
+                stub(5, false, -1.2, "EEEEEK", 2),
+                stub(6, false, -2.1, "FFFFFR", 2),
+                stub(1 | 0x8000_0000, true, 0.2, "KAAAAA", 2),
+                stub(2 | 0x8000_0000, true, -0.8, "RBBBBB", 2),
+                stub(3 | 0x8000_0000, true, -1.1, "KCCCCC", 2),
+                stub(4 | 0x8000_0000, true, -1.5, "RDDDDD", 2),
+                stub(5 | 0x8000_0000, true, -2.0, "KEEEEE", 2),
+                stub(6 | 0x8000_0000, true, -2.3, "RFFFFF", 2),
+                stub(7 | 0x8000_0000, true, -0.3, "KGGGGG", 2), // unpaired decoy
+            ],
+        )];
+        let mut reversed: Vec<(String, Vec<FdrEntry>)> = forward.clone();
+        reversed[0].1.reverse();
+
+        compute_fdr_from_stubs(&mut forward, 0.01, None);
+        compute_fdr_from_stubs(&mut reversed, 0.01, None);
+
+        // Key each result by entry_id so we can compare regardless of
+        // the input Vec order.
+        let forward_map: std::collections::HashMap<u32, f64> =
+            forward[0].1.iter().map(|e| (e.entry_id, e.pep)).collect();
+        let reversed_map: std::collections::HashMap<u32, f64> =
+            reversed[0].1.iter().map(|e| (e.entry_id, e.pep)).collect();
+
+        assert_eq!(forward_map.len(), reversed_map.len());
+        for (eid, fwd_pep) in &forward_map {
+            let rev_pep = reversed_map.get(eid).copied().unwrap_or(f64::NAN);
+            assert_eq!(
+                *fwd_pep, rev_pep,
+                "PEP for entry {} differs across input orderings: {} vs {}",
+                eid, fwd_pep, rev_pep
+            );
+        }
+    }
 }
