@@ -11,7 +11,6 @@
 //! - The qvality algorithm as implemented in triqler/mokapot
 
 use super::*;
-use rayon::prelude::*;
 
 /// Posterior error probability estimator using KDE + isotonic regression
 ///
@@ -165,17 +164,21 @@ impl Kde {
         }
     }
 
-    /// Evaluate PDF at a point
+    /// Evaluate PDF at a point.
+    ///
+    /// Summation is serial (not `par_iter`) because Rayon's work-stealing
+    /// reduction tree is non-deterministic: scheduling differences lead to
+    /// different tree shapes, and floating-point `+` is non-associative,
+    /// so parallel reduction produces pep values that differ by ~1 ULP
+    /// across runs. Stage 5 calls this once per of ~1000 bins over ~241k
+    /// samples (~sub-second total), so the perf cost of serial reduction
+    /// is negligible compared to the Percolator SVM pass that precedes it.
     fn pdf(&self, x: f64) -> f64 {
         let h = self.bandwidth;
         let sum: f64 = self
             .sample
-            .par_iter()
-            .fold(
-                || 0.0,
-                |acc, &xi| acc + (-0.5 * ((x - xi) / h).powi(2)).exp(),
-            )
-            .sum();
+            .iter()
+            .fold(0.0, |acc, &xi| acc + (-0.5 * ((x - xi) / h).powi(2)).exp());
         sum / self.constant
     }
 }
