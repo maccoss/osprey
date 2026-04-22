@@ -762,6 +762,51 @@ mod tests {
         );
     }
 
+    /// Regression for Copilot PR #17 review: when multiple C values tie
+    /// on `count_passing_targets_svm`, the first candidate in `c_values`
+    /// must win. Previous implementation used `Iterator::max_by_key`
+    /// which per stdlib docs returns the LAST tied element; the fix
+    /// replaced it with a manual scan using strict `>`.
+    #[test]
+    fn test_grid_search_c_first_tie_wins() {
+        // Perfectly-separable data: every C value converges to a model
+        // that classifies all targets correctly, so `count_passing`
+        // ties across the entire grid.
+        #[rustfmt::skip]
+        let features = Matrix::new(vec![
+            5.0, 5.0,  // target 1
+            4.5, 5.5,  // target 2
+            5.5, 4.5,  // target 3
+            1.0, 1.0,  // decoy 1
+            0.5, 1.5,  // decoy 2
+            1.5, 0.5,  // decoy 3
+        ], 6, 2);
+
+        let labels = vec![false, false, false, true, true, true];
+        let entry_ids = vec![1, 2, 3, 1 | 0x80000000, 2 | 0x80000000, 3 | 0x80000000];
+        let fold_assignments = vec![0, 1, 2, 0, 1, 2];
+        // All values are "large enough" for this separable problem,
+        // guaranteeing the passing count ties.
+        let c_values = vec![0.1, 1.0, 10.0, 100.0];
+
+        let best_c = grid_search_c(
+            &features,
+            &labels,
+            &entry_ids,
+            &c_values,
+            &fold_assignments,
+            3,
+            42,
+            0.50, // Loose threshold so every fold contributes max passing
+        );
+
+        assert_eq!(
+            best_c, c_values[0],
+            "first-C tiebreaker broken: expected {} but got {}",
+            c_values[0], best_c
+        );
+    }
+
     #[test]
     fn test_count_passing_targets() {
         // 3 targets beat their decoys, 1 decoy beats its target
