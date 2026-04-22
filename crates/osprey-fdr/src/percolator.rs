@@ -1536,11 +1536,7 @@ fn dump_stage5_subsample(
         )
         .ok();
     }
-    log::info!(
-        "Wrote Stage 5 subsample dump: {} ({} rows)",
-        path,
-        n
-    );
+    log::info!("Wrote Stage 5 subsample dump: {} ({} rows)", path, n);
 
     exit_if_only("OSPREY_SUBSAMPLE_ONLY", "Stage 5 subsample dump");
 }
@@ -1584,15 +1580,7 @@ fn dump_stage5_svm_weights(
                 .unwrap_or("unknown");
             writeln!(f, "{}\t{}\t{}\t{}\t{}", fold, wi, name, w, iters).ok();
         }
-        writeln!(
-            f,
-            "{}\t{}\tbias\t{}\t{}",
-            fold,
-            weights.len(),
-            bias,
-            iters
-        )
-        .ok();
+        writeln!(f, "{}\t{}\tbias\t{}\t{}", fold, weights.len(), bias, iters).ok();
     }
 
     log::info!(
@@ -1617,10 +1605,7 @@ fn dump_stage5_svm_weights(
 ///
 /// Gated by `OSPREY_DUMP_STANDARDIZER=1`. When
 /// `OSPREY_STANDARDIZER_ONLY=1` is also set, exits after writing.
-fn dump_stage5_standardizer(
-    standardizer: &FeatureStandardizer,
-    feature_names: Option<&[String]>,
-) {
+fn dump_stage5_standardizer(standardizer: &FeatureStandardizer, feature_names: Option<&[String]>) {
     if !is_dump_enabled("OSPREY_DUMP_STANDARDIZER") {
         return;
     }
