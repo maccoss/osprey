@@ -67,22 +67,72 @@ impl Gauss {
     }
 
     // Is `left` an identity matrix, or else contains rows of all zeros?
+    //
+    // Any non-finite entry (NaN or +/-inf) causes an immediate fail —
+    // the TOL-based comparisons below would silently treat NaN as
+    // "in tolerance" (every comparison with NaN is false).
+    //
+    // A left-side row of all zeros is only acceptable if the corresponding
+    // right-side row is also all zeros. Otherwise we have an inconsistent
+    // row of the form `[0 ... 0 | b]` with `b != 0`, which means no
+    // solution exists.
     fn left_solved(&self) -> bool {
         const TOL: f64 = 1E-8;
         let n = self.left.cols;
+        let right_cols = self.right.cols;
         for i in 0..n {
+            let mut is_all_zero = true;
+            let mut is_identity = true;
             for j in 0..n {
                 let x = self.left[(i, j)];
-                if i == j {
-                    if (x - 1.0).abs() > TOL && x.abs() > TOL {
-                        log::debug!("Finding solution to linear system failed: left side of matrix [{},{}] = {}", i, j, x);
-                        return false;
-                    }
-                } else if x.abs() > TOL {
-                    log::debug!("Finding solution to linear system failed: left side of matrix [{},{}] = {}", i, j, x);
+                if !x.is_finite() {
+                    log::debug!(
+                        "Finding solution to linear system failed: left[{},{}] = {} (not finite)",
+                        i,
+                        j,
+                        x
+                    );
                     return false;
                 }
+                if x.abs() > TOL {
+                    is_all_zero = false;
+                }
+                if i == j {
+                    if (x - 1.0).abs() > TOL {
+                        is_identity = false;
+                    }
+                } else if x.abs() > TOL {
+                    is_identity = false;
+                }
             }
+            if is_identity {
+                continue;
+            }
+            if is_all_zero {
+                // Verify the right row is also ~0 so the system is
+                // consistent. Any non-zero (or non-finite) on the right
+                // means no solution exists for that row.
+                for rj in 0..right_cols {
+                    let r = self.right[(i, rj)];
+                    if !r.is_finite() || r.abs() > TOL {
+                        log::debug!(
+                            "Finding solution to linear system failed: row {} has zeros on left but right[{},{}] = {} (inconsistent)",
+                            i,
+                            i,
+                            rj,
+                            r
+                        );
+                        return false;
+                    }
+                }
+                continue;
+            }
+            // Neither identity nor all-zero -> not solved.
+            log::debug!(
+                "Finding solution to linear system failed: row {} is neither identity nor all-zero",
+                i
+            );
+            return false;
         }
         true
     }
@@ -211,5 +261,47 @@ mod tests {
         let left = Matrix::new([1.0, 2.0, 2.0, 4.0], 2, 2);
         let right = Matrix::new([1.0, 2.0], 2, 1);
         assert!(Gauss::solve_inner(left, right, 0.0).is_none());
+    }
+
+    /// Regression for Copilot PR #15 review: `left_solved` must reject
+    /// NaN entries. TOL-based comparisons silently treat NaN as in
+    /// tolerance (every comparison with NaN is false), which could
+    /// otherwise cause `solve_inner` to return `Some` wrapping an
+    /// invalid matrix.
+    #[test]
+    fn gauss_left_solved_rejects_nan() {
+        // Identity-ish matrix but with a NaN entry sneaks in.
+        let left = Matrix::new([1.0, f64::NAN, 0.0, 1.0], 2, 2);
+        let right = Matrix::new([1.0, 1.0], 2, 1);
+        let g = Gauss { left, right };
+        assert!(!g.left_solved());
+    }
+
+    /// Regression for Copilot PR #15 review: a row of all zeros on the
+    /// left must force the corresponding right-side row to also be ~0;
+    /// otherwise the system is inconsistent (a row of the form
+    /// `[0 ... 0 | b]` with `b != 0` has no solution) and
+    /// `left_solved` must return false.
+    #[test]
+    fn gauss_left_solved_rejects_inconsistent_zero_row() {
+        // Row 0 is fine (identity); row 1 is all zeros on the left but
+        // has a non-zero value on the right -> inconsistent.
+        let left = Matrix::new([1.0, 0.0, 0.0, 0.0], 2, 2);
+        let right = Matrix::new([1.0, 5.0], 2, 1);
+        let g = Gauss { left, right };
+        assert!(!g.left_solved());
+    }
+
+    /// The companion positive case: a row of all zeros on the left with
+    /// the corresponding right-side row also ~0 is a free-variable row
+    /// and `left_solved` accepts it (systems with free variables still
+    /// have solutions, just not unique ones — this matches upstream's
+    /// existing comment about "contains rows of all zeros").
+    #[test]
+    fn gauss_left_solved_accepts_consistent_zero_row() {
+        let left = Matrix::new([1.0, 0.0, 0.0, 0.0], 2, 2);
+        let right = Matrix::new([1.0, 0.0], 2, 1);
+        let g = Gauss { left, right };
+        assert!(g.left_solved());
     }
 }
