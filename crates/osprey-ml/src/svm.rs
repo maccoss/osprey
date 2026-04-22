@@ -780,17 +780,16 @@ mod tests {
         let n_pass = count_passing_targets_svm(&scores, &labels, &entry_ids, 0.10);
 
         // Pairs: (1: 0.9 vs 0.3 → target), (2: 0.8 vs 0.2 → target), (3: 0.7 vs 0.1 → target)
-        // Unpaired decoy 4 with score 0.85
-        // Winners sorted: target(0.9), decoy_4(0.85), target(0.8), target(0.7)
-        // Walk: 1T/0D=0%, 1T/1D=100%, 2T/1D=50%, 3T/1D=33% → none pass 10%
-        // Actually with +1: FDR = (0+1)/1=100%, (1+1)/1=200%, (1+1)/2=100%, (1+1)/3=66%
-        // Hmm, the +1 makes it harder. For 3 targets with 0 decoys among pairs:
-        // Wait, unpaired decoy enters the winners list too.
-        // Let me recalculate...
-        // Winners: (0.9, target_1), (0.85, decoy_4), (0.8, target_2), (0.7, target_3)
-        // Walk: 1T,0D → FDR=(0+1)/1=100%; 1T,1D → FDR=(1+1)/1=200%; 2T,1D → (1+1)/2=100%; 3T,1D → (1+1)/3=66%
-        // None pass 10% FDR
-        assert_eq!(n_pass, 0);
+        // Unpaired decoy 4 with score 0.85.
+        // Winners sorted desc by score: target(0.9), decoy_4(0.85), target(0.8), target(0.7)
+        // Non-conservative q-values (n_decoy/n_target) with backward monotonization:
+        //   rank 0: target → n_t=1 n_d=0 → q=0
+        //   rank 1: decoy  → n_t=1 n_d=1 → q=1.00
+        //   rank 2: target → n_t=2 n_d=1 → q=0.50
+        //   rank 3: target → n_t=3 n_d=1 → q=0.333
+        // Monotonize from the right: q_min=0.333, so q=[0, 0.333, 0.333, 0.333]
+        // At threshold 0.10, only rank 0 target has q <= 0.10 → 1 passes.
+        assert_eq!(n_pass, 1);
     }
 
     #[test]
