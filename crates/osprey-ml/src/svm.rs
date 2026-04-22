@@ -256,11 +256,22 @@ pub fn grid_search_c(
         })
         .collect();
 
-    // Find best C (highest passing targets, first C as tiebreaker)
-    let (best_c, best_passing) = results
-        .into_iter()
-        .max_by_key(|&(_, count)| count)
-        .unwrap_or((c_values[0], 0));
+    // Find best C (highest passing targets, first C as tiebreaker).
+    // Iterator::max_by_key returns the LAST element on a tie (per stdlib
+    // docs), so we scan manually with a strict `>` to get first-tied,
+    // matching the comment above and OspreySharp's GridSearchC. This is
+    // a parity fix: a tie between e.g. C=1 and C=10 previously yielded
+    // C=10 in Rust but C=1 in C#, and the former's higher-complexity
+    // model drove per-fold SVM weight drift between the two
+    // implementations on Stellar single-file.
+    let mut best_c = c_values[0];
+    let mut best_passing = 0usize;
+    for (c, count) in results {
+        if count > best_passing {
+            best_passing = count;
+            best_c = c;
+        }
+    }
 
     log::debug!("  Best C={:.4} ({} passing targets)", best_c, best_passing);
     best_c
