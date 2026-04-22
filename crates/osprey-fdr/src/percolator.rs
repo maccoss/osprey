@@ -192,6 +192,13 @@ pub fn run_percolator(
     let (standardizer, std_features) = FeatureStandardizer::fit_transform(&features);
     log::debug!("  Features standardized to zero mean, unit variance");
 
+    // Stage 5 standardizer dump. Gated by OSPREY_DUMP_STANDARDIZER=1;
+    // exits via OSPREY_STANDARDIZER_ONLY=1. Per-feature mean and std
+    // computed on all entries before subsampling and SVM training.
+    // Divergence here means feature values arrive differently on the
+    // two sides, cascading through every downstream computation.
+    dump_stage5_standardizer(&standardizer, config.feature_names.as_deref());
+
     // 3. Subsample by peptide groups if needed (before fold splitting, per PMC5059416)
     //    Keeps target-decoy pairs and charge states together.
     //    The subsampled set is used for fold assignment + SVM training.
@@ -1595,6 +1602,53 @@ fn dump_stage5_svm_weights(
     );
 
     exit_if_only("OSPREY_SVM_WEIGHTS_ONLY", "Stage 5 SVM weights dump");
+}
+
+/// Cross-impl bisection dump of the feature standardizer state, taken
+/// right after `FeatureStandardizer::fit_transform` returns and before
+/// subsampling / fold assignment. Writes `rust_stage5_standardizer.tsv`
+/// with one row per feature: `feature_idx, feature_name, mean, std`.
+///
+/// If this file differs between Rust and C#, the drift is in how the
+/// feature matrix is built (Parquet load, fallback values) or in the
+/// summation order / sample-vs-population std formula. Everything
+/// downstream -- initial feature pick, SVM weights, q-values -- would
+/// cascade from it.
+///
+/// Gated by `OSPREY_DUMP_STANDARDIZER=1`. When
+/// `OSPREY_STANDARDIZER_ONLY=1` is also set, exits after writing.
+fn dump_stage5_standardizer(
+    standardizer: &FeatureStandardizer,
+    feature_names: Option<&[String]>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_STANDARDIZER") {
+        return;
+    }
+
+    let path = "rust_stage5_standardizer.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(f, "feature_idx\tfeature_name\tmean\tstd").ok();
+    let means = standardizer.means();
+    let stds = standardizer.stds();
+    for (i, (&mean, &std)) in means.iter().zip(stds.iter()).enumerate() {
+        let name = feature_names
+            .and_then(|names| names.get(i))
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        writeln!(f, "{}\t{}\t{}\t{}", i, name, mean, std).ok();
+    }
+
+    log::info!(
+        "Wrote Stage 5 standardizer dump: {} ({} features)",
+        path,
+        means.len()
+    );
+
+    exit_if_only("OSPREY_STANDARDIZER_ONLY", "Stage 5 standardizer dump");
 }
 
 /// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.
