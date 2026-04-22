@@ -326,7 +326,7 @@ pub fn run_percolator(
             .progress_chars("#>-"),
     );
     // Train all folds in parallel — each fold is independent
-    let fold_results: Vec<(usize, LinearSvm, usize)> = (0..config.n_folds)
+    let fold_results: Vec<(usize, LinearSvm, usize, Vec<TrainIterSnapshot>)> = (0..config.n_folds)
         .into_par_iter()
         .map(|fold| {
             let train_indices: Vec<usize> = (0..sub_n)
@@ -344,7 +344,7 @@ pub fn run_percolator(
                 test_indices.len()
             );
 
-            let (best_model, n_iterations) = train_fold(
+            let (best_model, n_iterations, iter_trace) = train_fold(
                 &sub_features,
                 &sub_labels,
                 &sub_entry_ids,
@@ -355,7 +355,7 @@ pub fn run_percolator(
                 Some(&pb),
             );
 
-            (fold, best_model, n_iterations)
+            (fold, best_model, n_iterations, iter_trace)
         })
         .collect();
 
@@ -368,7 +368,7 @@ pub fn run_percolator(
             let in_subset: HashSet<usize> = indices.iter().copied().collect();
 
             // For subset entries: score with the held-out fold model (standard CV)
-            for (fold, best_model, _) in &fold_results {
+            for (fold, best_model, _, _) in &fold_results {
                 let test_sub_indices: Vec<usize> = (0..sub_n)
                     .filter(|&i| fold_assignments[i] == *fold)
                     .collect();
@@ -386,7 +386,7 @@ pub fn run_percolator(
                 (0..n).filter(|i| !in_subset.contains(i)).collect();
             if !non_subset_indices.is_empty() {
                 let non_sub_features = extract_rows(&std_features, &non_subset_indices);
-                let models: Vec<&LinearSvm> = fold_results.iter().map(|(_, m, _)| m).collect();
+                let models: Vec<&LinearSvm> = fold_results.iter().map(|(_, m, _, _)| m).collect();
                 let n_models = models.len() as f64;
                 // Batch score all non-subset entries per model, then average
                 let mut avg_scores = vec![0.0f64; non_subset_indices.len()];
@@ -403,7 +403,7 @@ pub fn run_percolator(
         }
         None => {
             // No subsampling: score test fold directly (standard CV)
-            for (fold, best_model, _) in &fold_results {
+            for (fold, best_model, _, _) in &fold_results {
                 let test_indices: Vec<usize> =
                     (0..n).filter(|&i| fold_assignments[i] == *fold).collect();
                 let test_features = extract_rows(&std_features, &test_indices);
@@ -416,7 +416,7 @@ pub fn run_percolator(
     }
 
     let mut fold_biases: Vec<f64> = Vec::new();
-    for (fold, best_model, n_iterations) in &fold_results {
+    for (fold, best_model, n_iterations, _) in &fold_results {
         fold_weights.push(best_model.weights().to_vec());
         fold_biases.push(best_model.bias());
         iterations_per_fold.push(*n_iterations);
@@ -444,6 +444,17 @@ pub fn run_percolator(
         &iterations_per_fold,
         config.feature_names.as_deref(),
     );
+
+    // Stage 5 per-iteration train trace dump. Gated by
+    // OSPREY_DUMP_TRAIN_TRACE=1; exits via OSPREY_TRAIN_TRACE_ONLY=1.
+    // Captures best_c, n_selected_targets, n_passing per (fold,
+    // iteration) to localize whether SVM drift sits in grid-search C
+    // selection or in the positive-training-set choice.
+    let per_fold_traces: Vec<&[TrainIterSnapshot]> = fold_results
+        .iter()
+        .map(|(_, _, _, trace)| trace.as_slice())
+        .collect();
+    dump_stage5_train_trace(&per_fold_traces);
 
     // 6b. Calibrate scores between folds (Granholm et al. 2012)
     // For subsampled runs, calibrate using subset fold assignments;
@@ -618,6 +629,19 @@ pub fn run_percolator(
 
 /// Train SVM iteratively for one CV fold
 #[allow(clippy::too_many_arguments)]
+/// Per-iteration training trace entry emitted by `train_fold` for the
+/// Stage 5 `OSPREY_DUMP_TRAIN_TRACE` diagnostic. `best_c` is the C
+/// selected by grid search on this iteration; `n_selected_targets` is
+/// the size of the positive training set; `n_passing` is the number of
+/// targets below the train-FDR threshold after re-scoring with the
+/// newly-fit model.
+#[derive(Debug, Clone)]
+pub struct TrainIterSnapshot {
+    pub best_c: f64,
+    pub n_selected_targets: usize,
+    pub n_passing: usize,
+}
+
 fn train_fold(
     std_features: &Matrix,
     labels: &[bool],
@@ -627,7 +651,7 @@ fn train_fold(
     initial_scores: &[f64],
     config: &PercolatorConfig,
     progress: Option<&indicatif::ProgressBar>,
-) -> (LinearSvm, usize) {
+) -> (LinearSvm, usize, Vec<TrainIterSnapshot>) {
     let n_features = std_features.cols;
     let mut current_scores = initial_scores.to_vec();
 
@@ -648,6 +672,7 @@ fn train_fold(
     );
     let mut best_passing = 0usize;
     let mut iterations_completed = 0usize;
+    let mut iter_trace: Vec<TrainIterSnapshot> = Vec::with_capacity(config.max_iterations);
     log::debug!(
         "    Initial feature baseline on training set: {} pass {:.0}% FDR",
         initial_passing,
@@ -742,6 +767,12 @@ fn train_fold(
             config.train_fdr * 100.0
         );
 
+        iter_trace.push(TrainIterSnapshot {
+            best_c,
+            n_selected_targets: selected_target_indices.len(),
+            n_passing,
+        });
+
         if n_passing > best_passing {
             best_model = model;
             best_passing = n_passing;
@@ -784,7 +815,7 @@ fn train_fold(
         best_passing
     );
 
-    (best_model, final_iteration)
+    (best_model, final_iteration, iter_trace)
 }
 
 /// Select high-confidence targets for positive training set
@@ -1536,11 +1567,7 @@ fn dump_stage5_subsample(
         )
         .ok();
     }
-    log::info!(
-        "Wrote Stage 5 subsample dump: {} ({} rows)",
-        path,
-        n
-    );
+    log::info!("Wrote Stage 5 subsample dump: {} ({} rows)", path, n);
 
     exit_if_only("OSPREY_SUBSAMPLE_ONLY", "Stage 5 subsample dump");
 }
@@ -1584,15 +1611,7 @@ fn dump_stage5_svm_weights(
                 .unwrap_or("unknown");
             writeln!(f, "{}\t{}\t{}\t{}\t{}", fold, wi, name, w, iters).ok();
         }
-        writeln!(
-            f,
-            "{}\t{}\tbias\t{}\t{}",
-            fold,
-            weights.len(),
-            bias,
-            iters
-        )
-        .ok();
+        writeln!(f, "{}\t{}\tbias\t{}\t{}", fold, weights.len(), bias, iters).ok();
     }
 
     log::info!(
@@ -1617,10 +1636,7 @@ fn dump_stage5_svm_weights(
 ///
 /// Gated by `OSPREY_DUMP_STANDARDIZER=1`. When
 /// `OSPREY_STANDARDIZER_ONLY=1` is also set, exits after writing.
-fn dump_stage5_standardizer(
-    standardizer: &FeatureStandardizer,
-    feature_names: Option<&[String]>,
-) {
+fn dump_stage5_standardizer(standardizer: &FeatureStandardizer, feature_names: Option<&[String]>) {
     if !is_dump_enabled("OSPREY_DUMP_STANDARDIZER") {
         return;
     }
@@ -1649,6 +1665,63 @@ fn dump_stage5_standardizer(
     );
 
     exit_if_only("OSPREY_STANDARDIZER_ONLY", "Stage 5 standardizer dump");
+}
+
+/// Cross-impl bisection dump of the per-(fold, iteration) training
+/// trace: `best_c` (the C selected by grid search this iteration),
+/// `n_selected_targets` (size of the positive-training set), and
+/// `n_passing` (targets below train-FDR after the re-fit). Written
+/// to `rust_stage5_train_trace.tsv` after all folds finish.
+///
+/// Columns: `fold, iteration, best_c, n_selected_targets, n_passing`.
+/// Up to `n_folds * max_iterations` rows (30 for default config).
+/// Iterations that early-stop are simply absent — the row count per
+/// fold equals the fold's `iterations_completed`.
+///
+/// Divergence on `best_c` alone says the inner grid search differs.
+/// Divergence on `n_selected_targets` says `select_positive_training_set`
+/// differs. Divergence on `n_passing` alone (with same inputs) says
+/// the SVM coordinate-descent fit itself is drifting.
+///
+/// Gated by `OSPREY_DUMP_TRAIN_TRACE=1`. When `OSPREY_TRAIN_TRACE_ONLY=1`
+/// is also set, exits after writing.
+fn dump_stage5_train_trace(per_fold_traces: &[&[TrainIterSnapshot]]) {
+    if !is_dump_enabled("OSPREY_DUMP_TRAIN_TRACE") {
+        return;
+    }
+
+    let path = "rust_stage5_train_trace.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(f, "fold\titeration\tbest_c\tn_selected_targets\tn_passing").ok();
+    let mut total_rows = 0usize;
+    for (fold, trace) in per_fold_traces.iter().enumerate() {
+        for (i, snap) in trace.iter().enumerate() {
+            writeln!(
+                f,
+                "{}\t{}\t{}\t{}\t{}",
+                fold,
+                i + 1,
+                snap.best_c,
+                snap.n_selected_targets,
+                snap.n_passing
+            )
+            .ok();
+            total_rows += 1;
+        }
+    }
+
+    log::info!(
+        "Wrote Stage 5 train trace dump: {} ({} rows across {} folds)",
+        path,
+        total_rows,
+        per_fold_traces.len()
+    );
+
+    exit_if_only("OSPREY_TRAIN_TRACE_ONLY", "Stage 5 train trace dump");
 }
 
 /// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.
