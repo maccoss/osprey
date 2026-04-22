@@ -12,12 +12,14 @@
 //! and peptides (unique modified sequences), not PSMs.
 
 use osprey_core::config::FdrLevel;
+use osprey_core::diagnostics::{exit_if_only, is_dump_enabled};
 use osprey_core::types::FdrEntry;
 use osprey_ml::matrix::Matrix;
 use osprey_ml::pep::PepEstimator;
 use osprey_ml::svm::{self, FeatureStandardizer, LinearSvm};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 
 /// Configuration for the Percolator runner
 #[derive(Debug, Clone)]
@@ -246,6 +248,14 @@ pub fn run_percolator(
         &sub_entry_ids,
         config.n_folds,
     );
+
+    // Stage 5 sub-stage diagnostic dump. Gated by OSPREY_DUMP_SUBSAMPLE=1;
+    // exits via OSPREY_SUBSAMPLE_ONLY=1. Captures the subsample membership
+    // and fold assignment per entry, so the cross-impl compare can see
+    // whether the two tools pick the same 300K subset and assign the same
+    // fold IDs. Both algorithms are identical in source — drift here
+    // indicates input-array ordering differs between Rust and C#.
+    dump_stage5_subsample(entries, train_subset.as_deref(), &fold_assignments);
 
     // 5. Find best initial feature (on subsampled set)
     let (best_feat_idx, best_feat_passing) =
@@ -1427,6 +1437,92 @@ fn create_stratified_folds_by_peptide(
     }
 
     fold_assignments
+}
+
+/// Cross-impl bisection dump of the subsample + fold-assignment state,
+/// taken right after `create_stratified_folds_by_peptide` and before
+/// SVM training. Writes `rust_stage5_subsample.tsv` with one row per
+/// entry in the best-per-precursor array (n ~= 462k on Stellar single
+/// file).
+///
+/// Columns: `entry_id, native_position, charge, modified_sequence,
+/// is_decoy, base_id, in_subsample, fold_id`. `native_position` is the
+/// entry's index in the input `entries` slice — divergence on this
+/// column between Rust and C# means the two tools populate the array
+/// in different orders, which would cascade through every downstream
+/// `usize` index. `in_subsample` is false for entries filtered out by
+/// `subsample_by_peptide_group`; `fold_id` is `-1` for those rows.
+///
+/// Gated by `OSPREY_DUMP_SUBSAMPLE=1`. When `OSPREY_SUBSAMPLE_ONLY=1`
+/// is also set, exits the process after writing. Rows sorted by
+/// `entry_id` for stable human inspection; the compare script
+/// hash-joins on `entry_id`, sort-order-agnostic.
+fn dump_stage5_subsample(
+    entries: &[PercolatorEntry],
+    train_subset: Option<&[usize]>,
+    fold_assignments: &[usize],
+) {
+    if !is_dump_enabled("OSPREY_DUMP_SUBSAMPLE") {
+        return;
+    }
+
+    let n = entries.len();
+    let mut in_sub = vec![false; n];
+    let mut fold_for = vec![-1i32; n];
+    match train_subset {
+        Some(indices) => {
+            for (sub_pos, &native_pos) in indices.iter().enumerate() {
+                in_sub[native_pos] = true;
+                fold_for[native_pos] = fold_assignments[sub_pos] as i32;
+            }
+        }
+        None => {
+            for (i, &f) in fold_assignments.iter().enumerate() {
+                in_sub[i] = true;
+                fold_for[i] = f as i32;
+            }
+        }
+    }
+
+    let path = "rust_stage5_subsample.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "entry_id\tnative_position\tcharge\tmodified_sequence\tis_decoy\tbase_id\tin_subsample\tfold_id"
+    )
+    .ok();
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| entries[i].entry_id);
+
+    for i in order {
+        let e = &entries[i];
+        let base_id = e.entry_id & 0x7FFF_FFFF;
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            e.entry_id,
+            i,
+            e.charge,
+            e.peptide,
+            if e.is_decoy { "true" } else { "false" },
+            base_id,
+            if in_sub[i] { "true" } else { "false" },
+            fold_for[i],
+        )
+        .ok();
+    }
+    log::info!(
+        "Wrote Stage 5 subsample dump: {} ({} rows)",
+        path,
+        n
+    );
+
+    exit_if_only("OSPREY_SUBSAMPLE_ONLY", "Stage 5 subsample dump");
 }
 
 /// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.
