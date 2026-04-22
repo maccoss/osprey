@@ -12,7 +12,7 @@
 //! and peptides (unique modified sequences), not PSMs.
 
 use osprey_core::config::FdrLevel;
-use osprey_core::diagnostics::{exit_if_only, is_dump_enabled};
+use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::types::FdrEntry;
 use osprey_ml::matrix::Matrix;
 use osprey_ml::pep::PepEstimator;
@@ -1578,9 +1578,26 @@ fn dump_stage5_svm_weights(
                 .and_then(|names| names.get(wi))
                 .map(|s| s.as_str())
                 .unwrap_or("unknown");
-            writeln!(f, "{}\t{}\t{}\t{}\t{}", fold, wi, name, w, iters).ok();
+            writeln!(
+                f,
+                "{}\t{}\t{}\t{}\t{}",
+                fold,
+                wi,
+                name,
+                format_f64_roundtrip(w),
+                iters
+            )
+            .ok();
         }
-        writeln!(f, "{}\t{}\tbias\t{}\t{}", fold, weights.len(), bias, iters).ok();
+        writeln!(
+            f,
+            "{}\t{}\tbias\t{}\t{}",
+            fold,
+            weights.len(),
+            format_f64_roundtrip(*bias),
+            iters
+        )
+        .ok();
     }
 
     log::info!(
@@ -1624,7 +1641,15 @@ fn dump_stage5_standardizer(standardizer: &FeatureStandardizer, feature_names: O
             .and_then(|names| names.get(i))
             .map(|s| s.as_str())
             .unwrap_or("unknown");
-        writeln!(f, "{}\t{}\t{}\t{}", i, name, mean, std).ok();
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}",
+            i,
+            name,
+            format_f64_roundtrip(mean),
+            format_f64_roundtrip(std)
+        )
+        .ok();
     }
 
     log::info!(

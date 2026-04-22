@@ -9,7 +9,7 @@
 //! See `osprey-core::diagnostics` for shared primitives and the env-var
 //! gating convention.
 
-use osprey_core::diagnostics::{exit_if_only, is_dump_enabled};
+use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::{LibraryEntry, Spectrum, XICPeakBounds};
 use osprey_scoring::{SpectralScorer, TukeyMedianPolishResult};
 use std::io::Write;
@@ -418,24 +418,6 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
     exit_if_only("OSPREY_PERCOLATOR_ONLY", "Stage 5 Percolator dump");
 }
 
-/// f64 formatter for diagnostic dumps. Rust's default `{}` uses ryu,
-/// which emits the shortest decimal that roundtrips exactly — ideal for
-/// bit-level cross-impl comparison of double-precision values. NaN and
-/// +/-inf are given stable textual forms so diff tools don't choke.
-fn format_f64_roundtrip(v: f64) -> String {
-    if v.is_nan() {
-        "NaN".to_string()
-    } else if v.is_infinite() {
-        if v > 0.0 {
-            "inf".to_string()
-        } else {
-            "-inf".to_string()
-        }
-    } else {
-        format!("{}", v)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,21 +448,26 @@ mod tests {
     }
 
     #[test]
-    fn format_f64_roundtrip_handles_special_values() {
-        assert_eq!(format_f64_roundtrip(f64::NAN), "NaN");
-        assert_eq!(format_f64_roundtrip(f64::INFINITY), "inf");
-        assert_eq!(format_f64_roundtrip(f64::NEG_INFINITY), "-inf");
-        assert_eq!(format_f64_roundtrip(0.0), "0");
-        assert_eq!(format_f64_roundtrip(1.5), "1.5");
-    }
-
-    #[test]
     fn dump_is_noop_without_env_var() {
-        // Ensure the env var is not set for this test.
+        // Hermetic: chdir into a fresh temp dir so a stale
+        // rust_stage5_percolator.tsv from a previous run (or another
+        // test) can't produce a spurious pass. The Rust-standard
+        // tempfile crate is a dev-dep of this workspace.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tmp.path()).expect("chdir");
+
         std::env::remove_var("OSPREY_DUMP_PERCOLATOR");
         let entries = vec![("f1".to_string(), vec![make_entry(0, 1.0, false)])];
         dump_stage5_percolator(&entries);
-        // If the function honors the gate, no file is written.
-        assert!(!std::path::Path::new("rust_stage5_percolator.tsv").exists());
+        let written = std::path::Path::new("rust_stage5_percolator.tsv").exists();
+
+        // Restore cwd before asserting so a failure doesn't strand the
+        // process in the temp dir for other tests.
+        std::env::set_current_dir(prev_cwd).expect("restore cwd");
+        assert!(
+            !written,
+            "dump wrote a file even though the gate was not set"
+        );
     }
 }
