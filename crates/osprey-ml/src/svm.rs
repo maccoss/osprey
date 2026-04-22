@@ -335,27 +335,53 @@ fn count_passing_targets_svm(
     // Sort by score descending, then base_id ascending for deterministic tiebreaking
     winners.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2.cmp(&b.2)));
 
-    // Walk and compute FDR = (n_decoy + 1) / n_target
+    // Compute non-conservative q-values (FDR = n_decoy / n_target) with a
+    // backward monotonicity pass, then count target-winners at ranks where
+    // q-value <= threshold. Matches both:
+    //   - osprey-fdr::percolator::compute_qvalues, which
+    //     select_positive_training_set uses on the same iteration path;
+    //   - OspreySharp::PercolatorFdr::ComputeQvalues, which CountPassing
+    //     uses for its equivalent grid-search accounting.
+    //
+    // Previous inline conservative formula `(n_decoy+1)/n_target` was
+    // internally inconsistent within Rust (the sibling
+    // select_positive_training_set already used non-conservative) and
+    // made the grid search pick different `best_c` from OspreySharp on
+    // ~0.04 % of boundary cases, cascading into full Stage 5 divergence.
+    // Non-conservative is correct for this hyperparameter-tuning use
+    // case; the conservative formula is retained for final reported
+    // q-values in the percolator pipeline.
+    let n = winners.len();
+    let mut q_values = vec![1.0f64; n];
     let mut n_target = 0usize;
     let mut n_decoy = 0usize;
-    let mut max_passing = 0usize;
-
-    for &(_, is_decoy, _) in &winners {
+    for (i, &(_, is_decoy, _)) in winners.iter().enumerate() {
         if is_decoy {
             n_decoy += 1;
         } else {
             n_target += 1;
         }
-
-        if n_target > 0 {
-            let fdr = (n_decoy + 1) as f64 / n_target as f64;
-            if fdr <= fdr_threshold {
-                max_passing = n_target;
-            }
+        q_values[i] = if n_target > 0 {
+            n_decoy as f64 / n_target as f64
+        } else {
+            1.0
+        };
+    }
+    let mut q_min = 1.0f64;
+    for q in q_values.iter_mut().rev() {
+        if *q < q_min {
+            q_min = *q;
         }
+        *q = q_min;
     }
 
-    max_passing
+    let mut count = 0usize;
+    for (i, &(_, is_decoy, _)) in winners.iter().enumerate() {
+        if !is_decoy && q_values[i] <= fdr_threshold {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Extract specific rows from a matrix into a new matrix
