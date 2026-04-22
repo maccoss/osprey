@@ -354,3 +354,133 @@ impl SearchXicDump {
         .ok();
     }
 }
+
+/// Dump per-precursor Stage 5 (Percolator FDR) state to
+/// `rust_stage5_percolator.tsv` so cross-impl parity can be checked at
+/// end-of-first-pass-FDR, before compaction or first-pass protein FDR.
+///
+/// Gated by `OSPREY_DUMP_PERCOLATOR=1`. When `OSPREY_PERCOLATOR_ONLY=1`
+/// is also set, exits the process after writing. Columns:
+/// `file_name, entry_id, charge, modified_sequence, is_decoy, score, pep,
+/// run_precursor_q, run_peptide_q, experiment_precursor_q,
+/// experiment_peptide_q`. Rows sorted by `(file_name, entry_id)` for
+/// stable human inspection; `Compare-Percolator.ps1` hash-joins on the
+/// composite key and is sort-order-agnostic.
+pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrEntry>)]) {
+    if !is_dump_enabled("OSPREY_DUMP_PERCOLATOR") {
+        return;
+    }
+
+    let path = "rust_stage5_percolator.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "file_name\tentry_id\tcharge\tmodified_sequence\tis_decoy\tscore\tpep\trun_precursor_q\trun_peptide_q\texperiment_precursor_q\texperiment_peptide_q"
+    )
+    .ok();
+
+    let mut rows: Vec<(&str, &osprey_core::FdrEntry)> = per_file_entries
+        .iter()
+        .flat_map(|(file_name, entries)| entries.iter().map(move |e| (file_name.as_str(), e)))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.entry_id.cmp(&b.1.entry_id)));
+
+    let mut n_written = 0usize;
+    for (file_name, e) in &rows {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            file_name,
+            e.entry_id,
+            e.charge,
+            e.modified_sequence,
+            if e.is_decoy { "true" } else { "false" },
+            format_f64_roundtrip(e.score),
+            format_f64_roundtrip(e.pep),
+            format_f64_roundtrip(e.run_precursor_qvalue),
+            format_f64_roundtrip(e.run_peptide_qvalue),
+            format_f64_roundtrip(e.experiment_precursor_qvalue),
+            format_f64_roundtrip(e.experiment_peptide_qvalue),
+        )
+        .ok();
+        n_written += 1;
+    }
+    log::info!(
+        "Wrote Stage 5 Percolator dump: {} ({} rows)",
+        path,
+        n_written
+    );
+
+    exit_if_only("OSPREY_PERCOLATOR_ONLY", "Stage 5 Percolator dump");
+}
+
+/// f64 formatter for diagnostic dumps. Rust's default `{}` uses ryu,
+/// which emits the shortest decimal that roundtrips exactly — ideal for
+/// bit-level cross-impl comparison of double-precision values. NaN and
+/// +/-inf are given stable textual forms so diff tools don't choke.
+fn format_f64_roundtrip(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        }
+    } else {
+        format!("{}", v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use osprey_core::FdrEntry;
+    use std::sync::Arc;
+
+    fn make_entry(id: u32, score: f64, is_decoy: bool) -> FdrEntry {
+        FdrEntry {
+            entry_id: id,
+            parquet_index: id,
+            is_decoy,
+            charge: 2,
+            scan_number: 0,
+            apex_rt: 0.0,
+            start_rt: 0.0,
+            end_rt: 0.0,
+            coelution_sum: 0.0,
+            score,
+            run_precursor_qvalue: 0.1,
+            run_peptide_qvalue: 0.1,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: 0.1,
+            experiment_peptide_qvalue: 0.1,
+            experiment_protein_qvalue: 1.0,
+            pep: 0.5,
+            modified_sequence: Arc::from("PEPTIDE"),
+        }
+    }
+
+    #[test]
+    fn format_f64_roundtrip_handles_special_values() {
+        assert_eq!(format_f64_roundtrip(f64::NAN), "NaN");
+        assert_eq!(format_f64_roundtrip(f64::INFINITY), "inf");
+        assert_eq!(format_f64_roundtrip(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_f64_roundtrip(0.0), "0");
+        assert_eq!(format_f64_roundtrip(1.5), "1.5");
+    }
+
+    #[test]
+    fn dump_is_noop_without_env_var() {
+        // Ensure the env var is not set for this test.
+        std::env::remove_var("OSPREY_DUMP_PERCOLATOR");
+        let entries = vec![("f1".to_string(), vec![make_entry(0, 1.0, false)])];
+        dump_stage5_percolator(&entries);
+        // If the function honors the gate, no file is written.
+        assert!(!std::path::Path::new("rust_stage5_percolator.tsv").exists());
+    }
+}
