@@ -456,6 +456,14 @@ pub fn run_percolator(
         .collect();
     dump_stage5_train_trace(&per_fold_traces);
 
+    // Stage 5 grid-search detail dump. Gated by OSPREY_DUMP_GRID_SEARCH=1;
+    // exits via OSPREY_GRID_SEARCH_ONLY=1. One row per (fold, iteration,
+    // c_value) recording that C's inner-CV count_passing and whether it
+    // was selected. If Rust and C# report the same per-C counts on the
+    // same iteration, divergence is tie-break only; if they differ,
+    // LinearSvm::fit itself is drifting between implementations.
+    dump_stage5_grid_search(&per_fold_traces, &config.c_values);
+
     // 6b. Calibrate scores between folds (Granholm et al. 2012)
     // For subsampled runs, calibrate using subset fold assignments;
     // non-subset entries already have averaged scores (no fold-specific bias).
@@ -640,6 +648,13 @@ pub struct TrainIterSnapshot {
     pub best_c: f64,
     pub n_selected_targets: usize,
     pub n_passing: usize,
+    /// Per-C count_passing from the inner grid-search CV, aligned to
+    /// `PercolatorConfig::c_values`. Lets the grid-search diagnostic
+    /// dump reveal whether Rust and C# pick the same best_c for the
+    /// same reason (per-C counts match, tie at different rank) or
+    /// whether they disagree on per-C counts given identical training
+    /// data (which would imply numerical drift inside `LinearSvm::fit`).
+    pub per_c_counts: Vec<usize>,
 }
 
 fn train_fold(
@@ -727,7 +742,7 @@ fn train_fold(
             config.n_folds,
         );
 
-        let best_c = svm::grid_search_c(
+        let (best_c, per_c_counts) = svm::grid_search_c(
             &svm_features,
             &svm_labels,
             &svm_entry_ids,
@@ -771,6 +786,7 @@ fn train_fold(
             best_c,
             n_selected_targets: selected_target_indices.len(),
             n_passing,
+            per_c_counts,
         });
 
         if n_passing > best_passing {
@@ -1722,6 +1738,69 @@ fn dump_stage5_train_trace(per_fold_traces: &[&[TrainIterSnapshot]]) {
     );
 
     exit_if_only("OSPREY_TRAIN_TRACE_ONLY", "Stage 5 train trace dump");
+}
+
+/// Cross-impl bisection dump of the per-(fold, iteration, C) inner
+/// grid-search counts, written to `rust_stage5_grid_search.tsv`.
+/// One row per (fold, iteration, c_idx) — typically 3 folds x ~10
+/// iterations x 6 C values = ~180 rows.
+///
+/// Columns: `fold, iteration, c_idx, c_value, count_passing,
+/// is_selected`. `is_selected` is `true` for the C value chosen as
+/// `best_c` for that iteration; all other rows are `false`. If the
+/// Rust and C# files agree on `count_passing` per (fold, iteration,
+/// c_value), any remaining `best_c` disagreement is pure tie-break
+/// semantics. If they disagree on `count_passing` given identical
+/// training data, `LinearSvm::fit` or the test-set rescoring is
+/// drifting numerically.
+///
+/// Gated by `OSPREY_DUMP_GRID_SEARCH=1`. When
+/// `OSPREY_GRID_SEARCH_ONLY=1` is also set, exits after writing.
+fn dump_stage5_grid_search(per_fold_traces: &[&[TrainIterSnapshot]], c_values: &[f64]) {
+    if !is_dump_enabled("OSPREY_DUMP_GRID_SEARCH") {
+        return;
+    }
+
+    let path = "rust_stage5_grid_search.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "fold\titeration\tc_idx\tc_value\tcount_passing\tis_selected"
+    )
+    .ok();
+    let mut total_rows = 0usize;
+    for (fold, trace) in per_fold_traces.iter().enumerate() {
+        for (iter_idx, snap) in trace.iter().enumerate() {
+            for (c_idx, &count) in snap.per_c_counts.iter().enumerate() {
+                let c_val = c_values.get(c_idx).copied().unwrap_or(f64::NAN);
+                let selected = c_val == snap.best_c;
+                writeln!(
+                    f,
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    fold,
+                    iter_idx + 1,
+                    c_idx,
+                    c_val,
+                    count,
+                    if selected { "true" } else { "false" }
+                )
+                .ok();
+                total_rows += 1;
+            }
+        }
+    }
+
+    log::info!(
+        "Wrote Stage 5 grid-search dump: {} ({} rows)",
+        path,
+        total_rows
+    );
+
+    exit_if_only("OSPREY_GRID_SEARCH_ONLY", "Stage 5 grid-search dump");
 }
 
 /// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.

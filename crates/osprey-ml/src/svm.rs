@@ -203,7 +203,7 @@ pub fn grid_search_c(
     n_folds: usize,
     seed: u64,
     fdr_threshold: f64,
-) -> f64 {
+) -> (f64, Vec<usize>) {
     // Evaluate each C value in parallel
     let results: Vec<(f64, usize)> = c_values
         .par_iter()
@@ -264,6 +264,7 @@ pub fn grid_search_c(
     // C=10 in Rust but C=1 in C#, and the former's higher-complexity
     // model drove per-fold SVM weight drift between the two
     // implementations on Stellar single-file.
+    let per_c_counts: Vec<usize> = results.iter().map(|&(_, count)| count).collect();
     let mut best_c = c_values[0];
     let mut best_passing = 0usize;
     for (c, count) in results {
@@ -274,7 +275,7 @@ pub fn grid_search_c(
     }
 
     log::debug!("  Best C={:.4} ({} passing targets)", best_c, best_passing);
-    best_c
+    (best_c, per_c_counts)
 }
 
 /// Count targets passing FDR threshold using paired target-decoy competition
@@ -729,7 +730,7 @@ mod tests {
         let fold_assignments = vec![0, 1, 2, 0, 1, 2];
         let c_values = vec![0.01, 0.1, 1.0, 10.0];
 
-        let best_c = grid_search_c(
+        let (best_c, _per_c_counts) = grid_search_c(
             &features,
             &labels,
             &entry_ids,
