@@ -425,6 +425,19 @@ pub fn run_percolator(
         );
     }
 
+    // Stage 5 SVM-internals dump. Gated by OSPREY_DUMP_SVM_WEIGHTS=1;
+    // exits via OSPREY_SVM_WEIGHTS_ONLY=1. Captures the 21 per-feature
+    // weights plus bias per fold, and the iteration count per fold,
+    // right after SVM training and before Granholm calibration. If these
+    // match across tools but the end-of-Stage-5 dump still diverges,
+    // drift is in calibration; if they differ, drift is in SVM training.
+    dump_stage5_svm_weights(
+        &fold_weights,
+        &fold_biases,
+        &iterations_per_fold,
+        config.feature_names.as_deref(),
+    );
+
     // 6b. Calibrate scores between folds (Granholm et al. 2012)
     // For subsampled runs, calibrate using subset fold assignments;
     // non-subset entries already have averaged scores (no fold-specific bias).
@@ -1523,6 +1536,65 @@ fn dump_stage5_subsample(
     );
 
     exit_if_only("OSPREY_SUBSAMPLE_ONLY", "Stage 5 subsample dump");
+}
+
+/// Cross-impl bisection dump of per-fold SVM weights, taken right after
+/// training converges and before Granholm cross-fold calibration. Writes
+/// `rust_stage5_svm_weights.tsv` with one row per (fold, weight) pair:
+/// 21 feature weights + 1 bias per fold, so 66 rows total for the default
+/// 3-fold / 21-feature configuration.
+///
+/// Columns: `fold, weight_idx, feature_name, value, fold_iterations`.
+/// The `fold_iterations` column repeats a per-fold scalar (0..max_iter);
+/// drift there alone means convergence differs across tools. Sorted by
+/// `(fold, weight_idx)` for stable inspection; compare script hash-joins.
+///
+/// Gated by `OSPREY_DUMP_SVM_WEIGHTS=1`. When `OSPREY_SVM_WEIGHTS_ONLY=1`
+/// is also set, exits after writing.
+fn dump_stage5_svm_weights(
+    fold_weights: &[Vec<f64>],
+    fold_biases: &[f64],
+    iterations_per_fold: &[usize],
+    feature_names: Option<&[String]>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_SVM_WEIGHTS") {
+        return;
+    }
+
+    let path = "rust_stage5_svm_weights.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(f, "fold\tweight_idx\tfeature_name\tvalue\tfold_iterations").ok();
+    for (fold, (weights, bias)) in fold_weights.iter().zip(fold_biases.iter()).enumerate() {
+        let iters = iterations_per_fold.get(fold).copied().unwrap_or(0);
+        for (wi, &w) in weights.iter().enumerate() {
+            let name = feature_names
+                .and_then(|names| names.get(wi))
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            writeln!(f, "{}\t{}\t{}\t{}\t{}", fold, wi, name, w, iters).ok();
+        }
+        writeln!(
+            f,
+            "{}\t{}\tbias\t{}\t{}",
+            fold,
+            weights.len(),
+            bias,
+            iters
+        )
+        .ok();
+    }
+
+    log::info!(
+        "Wrote Stage 5 SVM weights dump: {} ({} folds)",
+        path,
+        fold_weights.len()
+    );
+
+    exit_if_only("OSPREY_SVM_WEIGHTS_ONLY", "Stage 5 SVM weights dump");
 }
 
 /// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.
