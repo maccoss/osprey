@@ -1680,33 +1680,50 @@ pub fn compute_fdr_from_stubs(
         }
     }
 
-    // Compete target-decoy pairs for PEP fitting
-    let mut winner_scores: Vec<f64> = Vec::with_capacity(targets.len());
-    let mut winner_is_decoy: Vec<bool> = Vec::with_capacity(targets.len());
-    let mut winner_locations: Vec<(usize, usize)> = Vec::with_capacity(targets.len());
+    // Compete target-decoy pairs for PEP fitting.
+    //
+    // Iterate in base_id-sorted order so winner_scores / winner_is_decoy
+    // are deterministic regardless of HashMap hash randomization.
+    // PepEstimator::fit_default's internal float accumulations are not
+    // associative, so HashMap iteration order would otherwise produce
+    // per-entry pep values that differ by ~1 ULP run-to-run. Keeping
+    // this stable is a prerequisite for Stage-5 cross-impl parity.
+    let mut union_base_ids: Vec<u32> = targets.keys().copied().collect();
+    for &b in decoys.keys() {
+        if !targets.contains_key(&b) {
+            union_base_ids.push(b);
+        }
+    }
+    union_base_ids.sort_unstable();
 
-    for (&base_id, &(t_score, t_fi, t_li)) in &targets {
-        if let Some(&(d_score, d_fi, d_li)) = decoys.get(&base_id) {
-            if t_score > d_score {
+    let mut winner_scores: Vec<f64> = Vec::with_capacity(union_base_ids.len());
+    let mut winner_is_decoy: Vec<bool> = Vec::with_capacity(union_base_ids.len());
+    let mut winner_locations: Vec<(usize, usize)> = Vec::with_capacity(union_base_ids.len());
+
+    for base_id in &union_base_ids {
+        match (targets.get(base_id), decoys.get(base_id)) {
+            (Some(&(t_score, t_fi, t_li)), Some(&(d_score, d_fi, d_li))) => {
+                if t_score > d_score {
+                    winner_scores.push(t_score);
+                    winner_is_decoy.push(false);
+                    winner_locations.push((t_fi, t_li));
+                } else {
+                    winner_scores.push(d_score);
+                    winner_is_decoy.push(true);
+                    winner_locations.push((d_fi, d_li));
+                }
+            }
+            (Some(&(t_score, t_fi, t_li)), None) => {
                 winner_scores.push(t_score);
                 winner_is_decoy.push(false);
                 winner_locations.push((t_fi, t_li));
-            } else {
+            }
+            (None, Some(&(d_score, d_fi, d_li))) => {
                 winner_scores.push(d_score);
                 winner_is_decoy.push(true);
                 winner_locations.push((d_fi, d_li));
             }
-        } else {
-            winner_scores.push(t_score);
-            winner_is_decoy.push(false);
-            winner_locations.push((t_fi, t_li));
-        }
-    }
-    for (&base_id, &(d_score, d_fi, d_li)) in &decoys {
-        if !targets.contains_key(&base_id) {
-            winner_scores.push(d_score);
-            winner_is_decoy.push(true);
-            winner_locations.push((d_fi, d_li));
+            (None, None) => unreachable!("base_id in union is in neither map"),
         }
     }
 
