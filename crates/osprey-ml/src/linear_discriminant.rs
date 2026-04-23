@@ -49,13 +49,27 @@ impl LinearDiscriminantAnalysis {
         // by rows = 0), and the Gauss solve silently returns None. Reject
         // the degenerate input explicitly so the failure mode is visible in
         // the log instead of masquerading as a numerical failure downstream.
-        let has_decoy = decoy.iter().any(|&d| d);
-        let has_target = decoy.iter().any(|&d| !d);
-        if !has_decoy || !has_target {
+        //
+        // Single-pass class counts: reused both for the guard (so we can
+        // name the missing class in the log) and to skip a redundant
+        // `.filter().count()` in the per-class loop below.
+        let mut n_decoy = 0usize;
+        let mut n_target = 0usize;
+        for &d in decoy {
+            if d {
+                n_decoy += 1;
+            } else {
+                n_target += 1;
+            }
+        }
+        if n_decoy == 0 || n_target == 0 {
+            let missing = if n_decoy == 0 { "decoy" } else { "target" };
             log::warn!(
-                "LDA fit requires both classes (has_decoy={}, has_target={}, n_samples={})",
-                has_decoy,
-                has_target,
+                "LDA fit requires both classes: no {} samples present \
+                 (n_decoy={}, n_target={}, n_total={})",
+                missing,
+                n_decoy,
+                n_target,
                 decoy.len()
             );
             return None;
@@ -69,7 +83,7 @@ impl LinearDiscriminantAnalysis {
         let mut class_means = Vec::new();
 
         for class in [true, false] {
-            let count = decoy.iter().filter(|&label| *label == class).count();
+            let count = if class { n_decoy } else { n_target };
 
             let class_data = (0..features.rows)
                 .zip(decoy)
