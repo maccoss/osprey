@@ -1680,33 +1680,50 @@ pub fn compute_fdr_from_stubs(
         }
     }
 
-    // Compete target-decoy pairs for PEP fitting
-    let mut winner_scores: Vec<f64> = Vec::with_capacity(targets.len());
-    let mut winner_is_decoy: Vec<bool> = Vec::with_capacity(targets.len());
-    let mut winner_locations: Vec<(usize, usize)> = Vec::with_capacity(targets.len());
+    // Compete target-decoy pairs for PEP fitting.
+    //
+    // Iterate in base_id-sorted order so winner_scores / winner_is_decoy
+    // are deterministic regardless of HashMap hash randomization.
+    // PepEstimator::fit_default's internal float accumulations are not
+    // associative, so HashMap iteration order would otherwise produce
+    // per-entry pep values that differ by ~1 ULP run-to-run. Keeping
+    // this stable is a prerequisite for Stage-5 cross-impl parity.
+    let mut union_base_ids: Vec<u32> = targets.keys().copied().collect();
+    for &b in decoys.keys() {
+        if !targets.contains_key(&b) {
+            union_base_ids.push(b);
+        }
+    }
+    union_base_ids.sort_unstable();
 
-    for (&base_id, &(t_score, t_fi, t_li)) in &targets {
-        if let Some(&(d_score, d_fi, d_li)) = decoys.get(&base_id) {
-            if t_score > d_score {
+    let mut winner_scores: Vec<f64> = Vec::with_capacity(union_base_ids.len());
+    let mut winner_is_decoy: Vec<bool> = Vec::with_capacity(union_base_ids.len());
+    let mut winner_locations: Vec<(usize, usize)> = Vec::with_capacity(union_base_ids.len());
+
+    for base_id in &union_base_ids {
+        match (targets.get(base_id), decoys.get(base_id)) {
+            (Some(&(t_score, t_fi, t_li)), Some(&(d_score, d_fi, d_li))) => {
+                if t_score > d_score {
+                    winner_scores.push(t_score);
+                    winner_is_decoy.push(false);
+                    winner_locations.push((t_fi, t_li));
+                } else {
+                    winner_scores.push(d_score);
+                    winner_is_decoy.push(true);
+                    winner_locations.push((d_fi, d_li));
+                }
+            }
+            (Some(&(t_score, t_fi, t_li)), None) => {
                 winner_scores.push(t_score);
                 winner_is_decoy.push(false);
                 winner_locations.push((t_fi, t_li));
-            } else {
+            }
+            (None, Some(&(d_score, d_fi, d_li))) => {
                 winner_scores.push(d_score);
                 winner_is_decoy.push(true);
                 winner_locations.push((d_fi, d_li));
             }
-        } else {
-            winner_scores.push(t_score);
-            winner_is_decoy.push(false);
-            winner_locations.push((t_fi, t_li));
-        }
-    }
-    for (&base_id, &(d_score, d_fi, d_li)) in &decoys {
-        if !targets.contains_key(&base_id) {
-            winner_scores.push(d_score);
-            winner_is_decoy.push(true);
-            winner_locations.push((d_fi, d_li));
+            (None, None) => unreachable!("base_id in union is in neither map"),
         }
     }
 
@@ -2697,5 +2714,83 @@ mod tests {
             "Should return all entries when under limit"
         );
         assert_eq!(selected, vec![0, 1, 2, 3]);
+    }
+
+    /// Helper for the order-invariance test below.
+    fn stub(entry_id: u32, is_decoy: bool, score: f64, peptide: &str, charge: u8) -> FdrEntry {
+        FdrEntry {
+            entry_id,
+            parquet_index: entry_id,
+            is_decoy,
+            charge,
+            scan_number: 0,
+            apex_rt: 0.0,
+            start_rt: 0.0,
+            end_rt: 0.0,
+            coelution_sum: 0.0,
+            score,
+            run_precursor_qvalue: 1.0,
+            run_peptide_qvalue: 1.0,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: 1.0,
+            experiment_peptide_qvalue: 1.0,
+            experiment_protein_qvalue: 1.0,
+            pep: 1.0,
+            modified_sequence: std::sync::Arc::from(peptide),
+        }
+    }
+
+    /// Regression for Copilot PR #16 review: `compute_fdr_from_stubs`
+    /// must produce the same per-entry PEPs regardless of the input Vec
+    /// order. Building the `targets`/`decoys` HashMaps and then
+    /// iterating for PEP fitting used to leak HashMap iteration order
+    /// (randomized per process in Rust) into the fit inputs. The fix
+    /// sorts the union of base_ids before building `winner_scores`, so
+    /// the fit sees inputs in a stable order independent of insertion
+    /// order or process hash seed.
+    #[test]
+    fn compute_fdr_from_stubs_is_order_invariant() {
+        // A minimum-sized but non-trivial dataset: 6 target-decoy pairs
+        // plus one unpaired decoy, in a single "file".
+        let mut forward: Vec<(String, Vec<FdrEntry>)> = vec![(
+            "file1".to_string(),
+            vec![
+                stub(1, false, 2.5, "AAAAAK", 2),
+                stub(2, false, 1.8, "BBBBBR", 2),
+                stub(3, false, 0.4, "CCCCCK", 2),
+                stub(4, false, -0.5, "DDDDDR", 2),
+                stub(5, false, -1.2, "EEEEEK", 2),
+                stub(6, false, -2.1, "FFFFFR", 2),
+                stub(1 | 0x8000_0000, true, 0.2, "KAAAAA", 2),
+                stub(2 | 0x8000_0000, true, -0.8, "RBBBBB", 2),
+                stub(3 | 0x8000_0000, true, -1.1, "KCCCCC", 2),
+                stub(4 | 0x8000_0000, true, -1.5, "RDDDDD", 2),
+                stub(5 | 0x8000_0000, true, -2.0, "KEEEEE", 2),
+                stub(6 | 0x8000_0000, true, -2.3, "RFFFFF", 2),
+                stub(7 | 0x8000_0000, true, -0.3, "KGGGGG", 2), // unpaired decoy
+            ],
+        )];
+        let mut reversed: Vec<(String, Vec<FdrEntry>)> = forward.clone();
+        reversed[0].1.reverse();
+
+        compute_fdr_from_stubs(&mut forward, 0.01, None);
+        compute_fdr_from_stubs(&mut reversed, 0.01, None);
+
+        // Key each result by entry_id so we can compare regardless of
+        // the input Vec order.
+        let forward_map: std::collections::HashMap<u32, f64> =
+            forward[0].1.iter().map(|e| (e.entry_id, e.pep)).collect();
+        let reversed_map: std::collections::HashMap<u32, f64> =
+            reversed[0].1.iter().map(|e| (e.entry_id, e.pep)).collect();
+
+        assert_eq!(forward_map.len(), reversed_map.len());
+        for (eid, fwd_pep) in &forward_map {
+            let rev_pep = reversed_map.get(eid).copied().unwrap_or(f64::NAN);
+            assert_eq!(
+                *fwd_pep, rev_pep,
+                "PEP for entry {} differs across input orderings: {} vs {}",
+                eid, fwd_pep, rev_pep
+            );
+        }
     }
 }
