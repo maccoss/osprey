@@ -86,24 +86,6 @@ pub fn format_f64_roundtrip(v: f64) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_f64_roundtrip_handles_special_values() {
-        assert_eq!(format_f64_roundtrip(f64::NAN), "NaN");
-        assert_eq!(format_f64_roundtrip(f64::INFINITY), "inf");
-        assert_eq!(format_f64_roundtrip(f64::NEG_INFINITY), "-inf");
-        assert_eq!(format_f64_roundtrip(0.0), "0");
-        // Cross-impl parity: -0.0 must not stringify as "-0", since .NET
-        // Framework's G17 renders it as "0".
-        assert_eq!(format_f64_roundtrip(-0.0), "0");
-        assert_eq!(format_f64_roundtrip(1.5), "1.5");
-        assert_eq!(format_f64_roundtrip(-1.5), "-1.5");
-    }
-}
-
 /// If `OSPREY_EXIT_AFTER_CALIBRATION=1` is set, log a benchmark message
 /// and return true so the caller can short-circuit the pipeline after
 /// Stage 3. Used to time and diff calibration in isolation.
@@ -123,3 +105,21 @@ pub fn should_exit_after_calibration() -> bool {
 // scoring split work in `crates/osprey/src/pipeline.rs::run_analysis`.
 // `OSPREY_EXIT_AFTER_CALIBRATION` (Stage 3) stays because it has no
 // production CLI analog -- its purpose is purely diagnostic.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_f64_roundtrip_handles_special_values() {
+        assert_eq!(format_f64_roundtrip(f64::NAN), "NaN");
+        assert_eq!(format_f64_roundtrip(f64::INFINITY), "inf");
+        assert_eq!(format_f64_roundtrip(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_f64_roundtrip(0.0), "0");
+        // Cross-impl parity: -0.0 must not stringify as "-0", since .NET
+        // Framework's G17 renders it as "0".
+        assert_eq!(format_f64_roundtrip(-0.0), "0");
+        assert_eq!(format_f64_roundtrip(1.5), "1.5");
+        assert_eq!(format_f64_roundtrip(-1.5), "-1.5");
+    }
+}
