@@ -9,7 +9,7 @@
 //! See `osprey-core::diagnostics` for shared primitives and the env-var
 //! gating convention.
 
-use osprey_core::diagnostics::{exit_if_only, is_dump_enabled};
+use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::{LibraryEntry, Spectrum, XICPeakBounds};
 use osprey_scoring::{SpectralScorer, TukeyMedianPolishResult};
 use std::io::Write;
@@ -352,5 +352,122 @@ impl SearchXicDump {
             best_bp.start_index, best_bp.apex_index, best_bp.end_index
         )
         .ok();
+    }
+}
+
+/// Dump per-precursor Stage 5 (Percolator FDR) state to
+/// `rust_stage5_percolator.tsv` so cross-impl parity can be checked at
+/// end-of-first-pass-FDR, before compaction or first-pass protein FDR.
+///
+/// Gated by `OSPREY_DUMP_PERCOLATOR=1`. When `OSPREY_PERCOLATOR_ONLY=1`
+/// is also set, exits the process after writing. Columns:
+/// `file_name, entry_id, charge, modified_sequence, is_decoy, score, pep,
+/// run_precursor_q, run_peptide_q, experiment_precursor_q,
+/// experiment_peptide_q`. Rows sorted by `(file_name, entry_id)` for
+/// stable human inspection; `Compare-Percolator.ps1` hash-joins on the
+/// composite key and is sort-order-agnostic.
+pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrEntry>)]) {
+    if !is_dump_enabled("OSPREY_DUMP_PERCOLATOR") {
+        return;
+    }
+
+    let path = "rust_stage5_percolator.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "file_name\tentry_id\tcharge\tmodified_sequence\tis_decoy\tscore\tpep\trun_precursor_q\trun_peptide_q\texperiment_precursor_q\texperiment_peptide_q"
+    )
+    .ok();
+
+    let mut rows: Vec<(&str, &osprey_core::FdrEntry)> = per_file_entries
+        .iter()
+        .flat_map(|(file_name, entries)| entries.iter().map(move |e| (file_name.as_str(), e)))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.entry_id.cmp(&b.1.entry_id)));
+
+    let mut n_written = 0usize;
+    for (file_name, e) in &rows {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            file_name,
+            e.entry_id,
+            e.charge,
+            e.modified_sequence,
+            if e.is_decoy { "true" } else { "false" },
+            format_f64_roundtrip(e.score),
+            format_f64_roundtrip(e.pep),
+            format_f64_roundtrip(e.run_precursor_qvalue),
+            format_f64_roundtrip(e.run_peptide_qvalue),
+            format_f64_roundtrip(e.experiment_precursor_qvalue),
+            format_f64_roundtrip(e.experiment_peptide_qvalue),
+        )
+        .ok();
+        n_written += 1;
+    }
+    log::info!(
+        "Wrote Stage 5 Percolator dump: {} ({} rows)",
+        path,
+        n_written
+    );
+
+    exit_if_only("OSPREY_PERCOLATOR_ONLY", "Stage 5 Percolator dump");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use osprey_core::FdrEntry;
+    use std::sync::Arc;
+
+    fn make_entry(id: u32, score: f64, is_decoy: bool) -> FdrEntry {
+        FdrEntry {
+            entry_id: id,
+            parquet_index: id,
+            is_decoy,
+            charge: 2,
+            scan_number: 0,
+            apex_rt: 0.0,
+            start_rt: 0.0,
+            end_rt: 0.0,
+            coelution_sum: 0.0,
+            score,
+            run_precursor_qvalue: 0.1,
+            run_peptide_qvalue: 0.1,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: 0.1,
+            experiment_peptide_qvalue: 0.1,
+            experiment_protein_qvalue: 1.0,
+            pep: 0.5,
+            modified_sequence: Arc::from("PEPTIDE"),
+        }
+    }
+
+    #[test]
+    fn dump_is_noop_without_env_var() {
+        // Hermetic: chdir into a fresh temp dir so a stale
+        // rust_stage5_percolator.tsv from a previous run (or another
+        // test) can't produce a spurious pass. The Rust-standard
+        // tempfile crate is a dev-dep of this workspace.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tmp.path()).expect("chdir");
+
+        std::env::remove_var("OSPREY_DUMP_PERCOLATOR");
+        let entries = vec![("f1".to_string(), vec![make_entry(0, 1.0, false)])];
+        dump_stage5_percolator(&entries);
+        let written = std::path::Path::new("rust_stage5_percolator.tsv").exists();
+
+        // Restore cwd before asserting so a failure doesn't strand the
+        // process in the temp dir for other tests.
+        std::env::set_current_dir(prev_cwd).expect("restore cwd");
+        assert!(
+            !written,
+            "dump wrote a file even though the gate was not set"
+        );
     }
 }

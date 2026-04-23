@@ -402,6 +402,18 @@ pub struct FeatureStandardizer {
 }
 
 impl FeatureStandardizer {
+    /// Per-feature means used for standardization.
+    pub fn means(&self) -> &[f64] {
+        &self.means
+    }
+
+    /// Per-feature standard deviations used for standardization.
+    /// Values below 1e-12 are replaced by 1.0 during fit to guard
+    /// against zero-variance features.
+    pub fn stds(&self) -> &[f64] {
+        &self.stds
+    }
+
     /// Compute mean and std for each feature column
     pub fn fit(features: &Matrix) -> Self {
         let n = features.rows as f64;
