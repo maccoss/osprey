@@ -42,6 +42,39 @@ impl LinearDiscriminantAnalysis {
     pub fn fit(features: &Matrix, decoy: &[bool]) -> Option<LinearDiscriminantAnalysis> {
         assert_eq!(features.rows, decoy.len());
 
+        // Both classes (target and decoy) must be present for LDA to compute
+        // a well-defined scatter_between. With only one class, the per-class
+        // loop below accumulates a degenerate class_means row, class_data for
+        // the absent class is a 0-row matrix, its covariance is NaN (division
+        // by rows = 0), and the Gauss solve silently returns None. Reject
+        // the degenerate input explicitly so the failure mode is visible in
+        // the log instead of masquerading as a numerical failure downstream.
+        //
+        // Single-pass class counts: reused both for the guard (so we can
+        // name the missing class in the log) and to skip a redundant
+        // `.filter().count()` in the per-class loop below.
+        let mut n_decoy = 0usize;
+        let mut n_target = 0usize;
+        for &d in decoy {
+            if d {
+                n_decoy += 1;
+            } else {
+                n_target += 1;
+            }
+        }
+        if n_decoy == 0 || n_target == 0 {
+            let missing = if n_decoy == 0 { "decoy" } else { "target" };
+            log::warn!(
+                "LDA fit requires both classes: no {} samples present \
+                 (n_decoy={}, n_target={}, n_total={})",
+                missing,
+                n_decoy,
+                n_target,
+                decoy.len()
+            );
+            return None;
+        }
+
         // Calculate class means, and overall mean
         let x_bar = features.mean();
         let mut scatter_within = Matrix::zeros(features.cols, features.cols);
@@ -50,7 +83,7 @@ impl LinearDiscriminantAnalysis {
         let mut class_means = Vec::new();
 
         for class in [true, false] {
-            let count = decoy.iter().filter(|&label| *label == class).count();
+            let count = if class { n_decoy } else { n_target };
 
             let class_data = (0..features.rows)
                 .zip(decoy)
@@ -181,5 +214,24 @@ mod test {
             scores,
             expected
         );
+    }
+
+    #[test]
+    fn single_class_returns_none() {
+        // 3x2 feature matrix; degenerate label sets (all one class) should
+        // cause fit() to return None cleanly instead of propagating NaN
+        // scatter_within into Gauss::solve.
+        #[rustfmt::skip]
+        let feats = Matrix::new(
+            [
+                1.0, 2.0,
+                3.0, 4.0,
+                5.0, 6.0,
+            ],
+            3,
+            2,
+        );
+        assert!(LinearDiscriminantAnalysis::fit(&feats, &[false, false, false]).is_none());
+        assert!(LinearDiscriminantAnalysis::fit(&feats, &[true, true, true]).is_none());
     }
 }
