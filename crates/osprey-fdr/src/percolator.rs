@@ -12,12 +12,14 @@
 //! and peptides (unique modified sequences), not PSMs.
 
 use osprey_core::config::FdrLevel;
+use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::types::FdrEntry;
 use osprey_ml::matrix::Matrix;
 use osprey_ml::pep::PepEstimator;
 use osprey_ml::svm::{self, FeatureStandardizer, LinearSvm};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 
 /// Configuration for the Percolator runner
 #[derive(Debug, Clone)]
@@ -190,6 +192,13 @@ pub fn run_percolator(
     let (standardizer, std_features) = FeatureStandardizer::fit_transform(&features);
     log::debug!("  Features standardized to zero mean, unit variance");
 
+    // Stage 5 standardizer dump. Gated by OSPREY_DUMP_STANDARDIZER=1;
+    // exits via OSPREY_STANDARDIZER_ONLY=1. Per-feature mean and std
+    // computed on all entries before subsampling and SVM training.
+    // Divergence here means feature values arrive differently on the
+    // two sides, cascading through every downstream computation.
+    dump_stage5_standardizer(&standardizer, config.feature_names.as_deref());
+
     // 3. Subsample by peptide groups if needed (before fold splitting, per PMC5059416)
     //    Keeps target-decoy pairs and charge states together.
     //    The subsampled set is used for fold assignment + SVM training.
@@ -246,6 +255,14 @@ pub fn run_percolator(
         &sub_entry_ids,
         config.n_folds,
     );
+
+    // Stage 5 sub-stage diagnostic dump. Gated by OSPREY_DUMP_SUBSAMPLE=1;
+    // exits via OSPREY_SUBSAMPLE_ONLY=1. Captures the subsample membership
+    // and fold assignment per entry, so the cross-impl compare can see
+    // whether the two tools pick the same 300K subset and assign the same
+    // fold IDs. Both algorithms are identical in source — drift here
+    // indicates input-array ordering differs between Rust and C#.
+    dump_stage5_subsample(entries, train_subset.as_deref(), &fold_assignments);
 
     // 5. Find best initial feature (on subsampled set)
     let (best_feat_idx, best_feat_passing) =
@@ -414,6 +431,19 @@ pub fn run_percolator(
                 .join(", ")
         );
     }
+
+    // Stage 5 SVM-internals dump. Gated by OSPREY_DUMP_SVM_WEIGHTS=1;
+    // exits via OSPREY_SVM_WEIGHTS_ONLY=1. Captures the 21 per-feature
+    // weights plus bias per fold, and the iteration count per fold,
+    // right after SVM training and before Granholm calibration. If these
+    // match across tools but the end-of-Stage-5 dump still diverges,
+    // drift is in calibration; if they differ, drift is in SVM training.
+    dump_stage5_svm_weights(
+        &fold_weights,
+        &fold_biases,
+        &iterations_per_fold,
+        config.feature_names.as_deref(),
+    );
 
     // 6b. Calibrate scores between folds (Granholm et al. 2012)
     // For subsampled runs, calibrate using subset fold assignments;
@@ -1429,6 +1459,208 @@ fn create_stratified_folds_by_peptide(
     fold_assignments
 }
 
+/// Cross-impl bisection dump of the subsample + fold-assignment state,
+/// taken right after `create_stratified_folds_by_peptide` and before
+/// SVM training. Writes `rust_stage5_subsample.tsv` with one row per
+/// entry in the best-per-precursor array (n ~= 462k on Stellar single
+/// file).
+///
+/// Columns: `entry_id, native_position, charge, modified_sequence,
+/// is_decoy, base_id, in_subsample, fold_id`. `native_position` is the
+/// entry's index in the input `entries` slice — divergence on this
+/// column between Rust and C# means the two tools populate the array
+/// in different orders, which would cascade through every downstream
+/// `usize` index. `in_subsample` is false for entries filtered out by
+/// `subsample_by_peptide_group`; `fold_id` is `-1` for those rows.
+///
+/// Gated by `OSPREY_DUMP_SUBSAMPLE=1`. When `OSPREY_SUBSAMPLE_ONLY=1`
+/// is also set, exits the process after writing. Rows sorted by
+/// `entry_id` for stable human inspection; the compare script
+/// hash-joins on `entry_id`, sort-order-agnostic.
+fn dump_stage5_subsample(
+    entries: &[PercolatorEntry],
+    train_subset: Option<&[usize]>,
+    fold_assignments: &[usize],
+) {
+    if !is_dump_enabled("OSPREY_DUMP_SUBSAMPLE") {
+        return;
+    }
+
+    let n = entries.len();
+    let mut in_sub = vec![false; n];
+    let mut fold_for = vec![-1i32; n];
+    match train_subset {
+        Some(indices) => {
+            for (sub_pos, &native_pos) in indices.iter().enumerate() {
+                in_sub[native_pos] = true;
+                fold_for[native_pos] = fold_assignments[sub_pos] as i32;
+            }
+        }
+        None => {
+            for (i, &f) in fold_assignments.iter().enumerate() {
+                in_sub[i] = true;
+                fold_for[i] = f as i32;
+            }
+        }
+    }
+
+    let path = "rust_stage5_subsample.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "entry_id\tnative_position\tcharge\tmodified_sequence\tis_decoy\tbase_id\tin_subsample\tfold_id"
+    )
+    .ok();
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| entries[i].entry_id);
+
+    for i in order {
+        let e = &entries[i];
+        let base_id = e.entry_id & 0x7FFF_FFFF;
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            e.entry_id,
+            i,
+            e.charge,
+            e.peptide,
+            if e.is_decoy { "true" } else { "false" },
+            base_id,
+            if in_sub[i] { "true" } else { "false" },
+            fold_for[i],
+        )
+        .ok();
+    }
+    log::info!("Wrote Stage 5 subsample dump: {} ({} rows)", path, n);
+
+    exit_if_only("OSPREY_SUBSAMPLE_ONLY", "Stage 5 subsample dump");
+}
+
+/// Cross-impl bisection dump of per-fold SVM weights, taken right after
+/// training converges and before Granholm cross-fold calibration. Writes
+/// `rust_stage5_svm_weights.tsv` with one row per (fold, weight) pair:
+/// 21 feature weights + 1 bias per fold, so 66 rows total for the default
+/// 3-fold / 21-feature configuration.
+///
+/// Columns: `fold, weight_idx, feature_name, value, fold_iterations`.
+/// The `fold_iterations` column repeats a per-fold scalar (0..max_iter);
+/// drift there alone means convergence differs across tools. Sorted by
+/// `(fold, weight_idx)` for stable inspection; compare script hash-joins.
+///
+/// Gated by `OSPREY_DUMP_SVM_WEIGHTS=1`. When `OSPREY_SVM_WEIGHTS_ONLY=1`
+/// is also set, exits after writing.
+fn dump_stage5_svm_weights(
+    fold_weights: &[Vec<f64>],
+    fold_biases: &[f64],
+    iterations_per_fold: &[usize],
+    feature_names: Option<&[String]>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_SVM_WEIGHTS") {
+        return;
+    }
+
+    let path = "rust_stage5_svm_weights.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(f, "fold\tweight_idx\tfeature_name\tvalue\tfold_iterations").ok();
+    for (fold, (weights, bias)) in fold_weights.iter().zip(fold_biases.iter()).enumerate() {
+        let iters = iterations_per_fold.get(fold).copied().unwrap_or(0);
+        for (wi, &w) in weights.iter().enumerate() {
+            let name = feature_names
+                .and_then(|names| names.get(wi))
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            writeln!(
+                f,
+                "{}\t{}\t{}\t{}\t{}",
+                fold,
+                wi,
+                name,
+                format_f64_roundtrip(w),
+                iters
+            )
+            .ok();
+        }
+        writeln!(
+            f,
+            "{}\t{}\tbias\t{}\t{}",
+            fold,
+            weights.len(),
+            format_f64_roundtrip(*bias),
+            iters
+        )
+        .ok();
+    }
+
+    log::info!(
+        "Wrote Stage 5 SVM weights dump: {} ({} folds)",
+        path,
+        fold_weights.len()
+    );
+
+    exit_if_only("OSPREY_SVM_WEIGHTS_ONLY", "Stage 5 SVM weights dump");
+}
+
+/// Cross-impl bisection dump of the feature standardizer state, taken
+/// right after `FeatureStandardizer::fit_transform` returns and before
+/// subsampling / fold assignment. Writes `rust_stage5_standardizer.tsv`
+/// with one row per feature: `feature_idx, feature_name, mean, std`.
+///
+/// If this file differs between Rust and C#, the drift is in how the
+/// feature matrix is built (Parquet load, fallback values) or in the
+/// summation order / sample-vs-population std formula. Everything
+/// downstream -- initial feature pick, SVM weights, q-values -- would
+/// cascade from it.
+///
+/// Gated by `OSPREY_DUMP_STANDARDIZER=1`. When
+/// `OSPREY_STANDARDIZER_ONLY=1` is also set, exits after writing.
+fn dump_stage5_standardizer(standardizer: &FeatureStandardizer, feature_names: Option<&[String]>) {
+    if !is_dump_enabled("OSPREY_DUMP_STANDARDIZER") {
+        return;
+    }
+
+    let path = "rust_stage5_standardizer.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(f, "feature_idx\tfeature_name\tmean\tstd").ok();
+    let means = standardizer.means();
+    let stds = standardizer.stds();
+    for (i, (&mean, &std)) in means.iter().zip(stds.iter()).enumerate() {
+        let name = feature_names
+            .and_then(|names| names.get(i))
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}",
+            i,
+            name,
+            format_f64_roundtrip(mean),
+            format_f64_roundtrip(std)
+        )
+        .ok();
+    }
+
+    log::info!(
+        "Wrote Stage 5 standardizer dump: {} ({} features)",
+        path,
+        means.len()
+    );
+
+    exit_if_only("OSPREY_STANDARDIZER_ONLY", "Stage 5 standardizer dump");
+}
+
 /// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.
 ///
 /// Groups entries by target peptide (via base_id), then randomly selects groups until
@@ -1680,33 +1912,50 @@ pub fn compute_fdr_from_stubs(
         }
     }
 
-    // Compete target-decoy pairs for PEP fitting
-    let mut winner_scores: Vec<f64> = Vec::with_capacity(targets.len());
-    let mut winner_is_decoy: Vec<bool> = Vec::with_capacity(targets.len());
-    let mut winner_locations: Vec<(usize, usize)> = Vec::with_capacity(targets.len());
+    // Compete target-decoy pairs for PEP fitting.
+    //
+    // Iterate in base_id-sorted order so winner_scores / winner_is_decoy
+    // are deterministic regardless of HashMap hash randomization.
+    // PepEstimator::fit_default's internal float accumulations are not
+    // associative, so HashMap iteration order would otherwise produce
+    // per-entry pep values that differ by ~1 ULP run-to-run. Keeping
+    // this stable is a prerequisite for Stage-5 cross-impl parity.
+    let mut union_base_ids: Vec<u32> = targets.keys().copied().collect();
+    for &b in decoys.keys() {
+        if !targets.contains_key(&b) {
+            union_base_ids.push(b);
+        }
+    }
+    union_base_ids.sort_unstable();
 
-    for (&base_id, &(t_score, t_fi, t_li)) in &targets {
-        if let Some(&(d_score, d_fi, d_li)) = decoys.get(&base_id) {
-            if t_score > d_score {
+    let mut winner_scores: Vec<f64> = Vec::with_capacity(union_base_ids.len());
+    let mut winner_is_decoy: Vec<bool> = Vec::with_capacity(union_base_ids.len());
+    let mut winner_locations: Vec<(usize, usize)> = Vec::with_capacity(union_base_ids.len());
+
+    for base_id in &union_base_ids {
+        match (targets.get(base_id), decoys.get(base_id)) {
+            (Some(&(t_score, t_fi, t_li)), Some(&(d_score, d_fi, d_li))) => {
+                if t_score > d_score {
+                    winner_scores.push(t_score);
+                    winner_is_decoy.push(false);
+                    winner_locations.push((t_fi, t_li));
+                } else {
+                    winner_scores.push(d_score);
+                    winner_is_decoy.push(true);
+                    winner_locations.push((d_fi, d_li));
+                }
+            }
+            (Some(&(t_score, t_fi, t_li)), None) => {
                 winner_scores.push(t_score);
                 winner_is_decoy.push(false);
                 winner_locations.push((t_fi, t_li));
-            } else {
+            }
+            (None, Some(&(d_score, d_fi, d_li))) => {
                 winner_scores.push(d_score);
                 winner_is_decoy.push(true);
                 winner_locations.push((d_fi, d_li));
             }
-        } else {
-            winner_scores.push(t_score);
-            winner_is_decoy.push(false);
-            winner_locations.push((t_fi, t_li));
-        }
-    }
-    for (&base_id, &(d_score, d_fi, d_li)) in &decoys {
-        if !targets.contains_key(&base_id) {
-            winner_scores.push(d_score);
-            winner_is_decoy.push(true);
-            winner_locations.push((d_fi, d_li));
+            (None, None) => unreachable!("base_id in union is in neither map"),
         }
     }
 
@@ -2697,5 +2946,83 @@ mod tests {
             "Should return all entries when under limit"
         );
         assert_eq!(selected, vec![0, 1, 2, 3]);
+    }
+
+    /// Helper for the order-invariance test below.
+    fn stub(entry_id: u32, is_decoy: bool, score: f64, peptide: &str, charge: u8) -> FdrEntry {
+        FdrEntry {
+            entry_id,
+            parquet_index: entry_id,
+            is_decoy,
+            charge,
+            scan_number: 0,
+            apex_rt: 0.0,
+            start_rt: 0.0,
+            end_rt: 0.0,
+            coelution_sum: 0.0,
+            score,
+            run_precursor_qvalue: 1.0,
+            run_peptide_qvalue: 1.0,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: 1.0,
+            experiment_peptide_qvalue: 1.0,
+            experiment_protein_qvalue: 1.0,
+            pep: 1.0,
+            modified_sequence: std::sync::Arc::from(peptide),
+        }
+    }
+
+    /// Regression for Copilot PR #16 review: `compute_fdr_from_stubs`
+    /// must produce the same per-entry PEPs regardless of the input Vec
+    /// order. Building the `targets`/`decoys` HashMaps and then
+    /// iterating for PEP fitting used to leak HashMap iteration order
+    /// (randomized per process in Rust) into the fit inputs. The fix
+    /// sorts the union of base_ids before building `winner_scores`, so
+    /// the fit sees inputs in a stable order independent of insertion
+    /// order or process hash seed.
+    #[test]
+    fn compute_fdr_from_stubs_is_order_invariant() {
+        // A minimum-sized but non-trivial dataset: 6 target-decoy pairs
+        // plus one unpaired decoy, in a single "file".
+        let mut forward: Vec<(String, Vec<FdrEntry>)> = vec![(
+            "file1".to_string(),
+            vec![
+                stub(1, false, 2.5, "AAAAAK", 2),
+                stub(2, false, 1.8, "BBBBBR", 2),
+                stub(3, false, 0.4, "CCCCCK", 2),
+                stub(4, false, -0.5, "DDDDDR", 2),
+                stub(5, false, -1.2, "EEEEEK", 2),
+                stub(6, false, -2.1, "FFFFFR", 2),
+                stub(1 | 0x8000_0000, true, 0.2, "KAAAAA", 2),
+                stub(2 | 0x8000_0000, true, -0.8, "RBBBBB", 2),
+                stub(3 | 0x8000_0000, true, -1.1, "KCCCCC", 2),
+                stub(4 | 0x8000_0000, true, -1.5, "RDDDDD", 2),
+                stub(5 | 0x8000_0000, true, -2.0, "KEEEEE", 2),
+                stub(6 | 0x8000_0000, true, -2.3, "RFFFFF", 2),
+                stub(7 | 0x8000_0000, true, -0.3, "KGGGGG", 2), // unpaired decoy
+            ],
+        )];
+        let mut reversed: Vec<(String, Vec<FdrEntry>)> = forward.clone();
+        reversed[0].1.reverse();
+
+        compute_fdr_from_stubs(&mut forward, 0.01, None);
+        compute_fdr_from_stubs(&mut reversed, 0.01, None);
+
+        // Key each result by entry_id so we can compare regardless of
+        // the input Vec order.
+        let forward_map: std::collections::HashMap<u32, f64> =
+            forward[0].1.iter().map(|e| (e.entry_id, e.pep)).collect();
+        let reversed_map: std::collections::HashMap<u32, f64> =
+            reversed[0].1.iter().map(|e| (e.entry_id, e.pep)).collect();
+
+        assert_eq!(forward_map.len(), reversed_map.len());
+        for (eid, fwd_pep) in &forward_map {
+            let rev_pep = reversed_map.get(eid).copied().unwrap_or(f64::NAN);
+            assert_eq!(
+                *fwd_pep, rev_pep,
+                "PEP for entry {} differs across input orderings: {} vs {}",
+                eid, fwd_pep, rev_pep
+            );
+        }
     }
 }

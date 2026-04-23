@@ -3020,6 +3020,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         );
     }
 
+    // Stage 5 diagnostic dump. Gated by OSPREY_DUMP_PERCOLATOR=1; exits the
+    // process when OSPREY_PERCOLATOR_ONLY=1 is also set. Writes all 4 q-values
+    // plus the SVM score and PEP for every FdrEntry, before compaction drops
+    // any rows, so the cross-impl diff sees both targets and decoys.
+    crate::diagnostics::dump_stage5_percolator(&per_file_entries);
+
     // First-pass protein FDR (picked-protein, Savitski 2015).
     //
     // Runs on the full pre-compaction peptide pool so target and decoy proteins

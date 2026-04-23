@@ -11,7 +11,6 @@
 //! - The qvality algorithm as implemented in triqler/mokapot
 
 use super::*;
-use rayon::prelude::*;
 
 /// Posterior error probability estimator using KDE + isotonic regression
 ///
@@ -165,17 +164,21 @@ impl Kde {
         }
     }
 
-    /// Evaluate PDF at a point
+    /// Evaluate PDF at a point.
+    ///
+    /// Summation is serial (not `par_iter`) because Rayon's work-stealing
+    /// reduction tree is non-deterministic: scheduling differences lead to
+    /// different tree shapes, and floating-point `+` is non-associative,
+    /// so parallel reduction produces pep values that differ by ~1 ULP
+    /// across runs. Stage 5 calls this once for each of ~1000 bins over ~241k
+    /// samples (~sub-second total), so the perf cost of serial reduction
+    /// is negligible compared to the Percolator SVM pass that precedes it.
     fn pdf(&self, x: f64) -> f64 {
         let h = self.bandwidth;
         let sum: f64 = self
             .sample
-            .par_iter()
-            .fold(
-                || 0.0,
-                |acc, &xi| acc + (-0.5 * ((x - xi) / h).powi(2)).exp(),
-            )
-            .sum();
+            .iter()
+            .fold(0.0, |acc, &xi| acc + (-0.5 * ((x - xi) / h).powi(2)).exp());
         sum / self.constant
     }
 }
@@ -371,5 +374,46 @@ mod tests {
         let estimator = PepEstimator::fit_default(&scores, &is_decoy);
         // With no decoys, PEP should be 1.0 (can't estimate)
         assert!((estimator.posterior_error(5.0) - 1.0).abs() < 1e-10);
+    }
+
+    /// Regression for Copilot PR #16 review: `PepEstimator::fit_default`
+    /// must produce bit-identical bins across consecutive calls with
+    /// the same input. This is the exact invariant the serial-KDE-sum
+    /// fix provides: `par_iter().sum()` would yield different
+    /// reduction-tree shapes across calls depending on Rayon's
+    /// work-stealing state, drifting bins at ~1 ULP per accumulated
+    /// term. Serial `iter().fold()` is fully deterministic on a fixed
+    /// input, so two calls must give identical output.
+    ///
+    /// This test intentionally does NOT permute the input: serial
+    /// summation is still order-dependent at the last ULP for floating
+    /// point, so a permutation-invariance test would be too strict. The
+    /// fix guarantees same-input reproducibility, not multiset
+    /// invariance — same-input reproducibility is what the downstream
+    /// pipeline relies on for cross-run PEP stability.
+    #[test]
+    fn fit_default_is_deterministic() {
+        let n = 200;
+        let mut scores: Vec<f64> = Vec::with_capacity(n);
+        let mut is_decoy: Vec<bool> = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = (i as f64) * 0.037 + 1.5;
+            let d = (i as f64) * 0.037 + 0.5;
+            scores.push(t);
+            is_decoy.push(false);
+            scores.push(d);
+            is_decoy.push(true);
+        }
+
+        let a = PepEstimator::fit_default(&scores, &is_decoy);
+        let b = PepEstimator::fit_default(&scores, &is_decoy);
+
+        assert_eq!(
+            a.bins, b.bins,
+            "PepEstimator::fit_default is non-deterministic -- \
+             KDE summation likely has a parallel reduction again"
+        );
+        assert_eq!(a.min_score, b.min_score);
+        assert_eq!(a.score_step, b.score_step);
     }
 }

@@ -256,11 +256,22 @@ pub fn grid_search_c(
         })
         .collect();
 
-    // Find best C (highest passing targets, first C as tiebreaker)
-    let (best_c, best_passing) = results
-        .into_iter()
-        .max_by_key(|&(_, count)| count)
-        .unwrap_or((c_values[0], 0));
+    // Find best C (highest passing targets, first C as tiebreaker).
+    // Iterator::max_by_key returns the LAST element on a tie (per stdlib
+    // docs), so we scan manually with a strict `>` to get first-tied,
+    // matching the comment above and OspreySharp's GridSearchC. This is
+    // a parity fix: a tie between e.g. C=1 and C=10 previously yielded
+    // C=10 in Rust but C=1 in C#, and the former's higher-complexity
+    // model drove per-fold SVM weight drift between the two
+    // implementations on Stellar single-file.
+    let mut best_c = c_values[0];
+    let mut best_passing = 0usize;
+    for (c, count) in results {
+        if count > best_passing {
+            best_passing = count;
+            best_c = c;
+        }
+    }
 
     log::debug!("  Best C={:.4} ({} passing targets)", best_c, best_passing);
     best_c
@@ -323,27 +334,53 @@ fn count_passing_targets_svm(
     // Sort by score descending, then base_id ascending for deterministic tiebreaking
     winners.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2.cmp(&b.2)));
 
-    // Walk and compute FDR = (n_decoy + 1) / n_target
+    // Compute non-conservative q-values (FDR = n_decoy / n_target) with a
+    // backward monotonicity pass, then count target-winners at ranks where
+    // q-value <= threshold. Matches both:
+    //   - osprey-fdr::percolator::compute_qvalues, which
+    //     select_positive_training_set uses on the same iteration path;
+    //   - OspreySharp::PercolatorFdr::ComputeQvalues, which CountPassing
+    //     uses for its equivalent grid-search accounting.
+    //
+    // Previous inline conservative formula `(n_decoy+1)/n_target` was
+    // internally inconsistent within Rust (the sibling
+    // select_positive_training_set already used non-conservative) and
+    // made the grid search pick different `best_c` from OspreySharp on
+    // ~0.04 % of boundary cases, cascading into full Stage 5 divergence.
+    // Non-conservative is correct for this hyperparameter-tuning use
+    // case; the conservative formula is retained for final reported
+    // q-values in the percolator pipeline.
+    let n = winners.len();
+    let mut q_values = vec![1.0f64; n];
     let mut n_target = 0usize;
     let mut n_decoy = 0usize;
-    let mut max_passing = 0usize;
-
-    for &(_, is_decoy, _) in &winners {
+    for (i, &(_, is_decoy, _)) in winners.iter().enumerate() {
         if is_decoy {
             n_decoy += 1;
         } else {
             n_target += 1;
         }
-
-        if n_target > 0 {
-            let fdr = (n_decoy + 1) as f64 / n_target as f64;
-            if fdr <= fdr_threshold {
-                max_passing = n_target;
-            }
+        q_values[i] = if n_target > 0 {
+            n_decoy as f64 / n_target as f64
+        } else {
+            1.0
+        };
+    }
+    let mut q_min = 1.0f64;
+    for q in q_values.iter_mut().rev() {
+        if *q < q_min {
+            q_min = *q;
         }
+        *q = q_min;
     }
 
-    max_passing
+    let mut count = 0usize;
+    for (i, &(_, is_decoy, _)) in winners.iter().enumerate() {
+        if !is_decoy && q_values[i] <= fdr_threshold {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Extract specific rows from a matrix into a new matrix
@@ -365,6 +402,18 @@ pub struct FeatureStandardizer {
 }
 
 impl FeatureStandardizer {
+    /// Per-feature means used for standardization.
+    pub fn means(&self) -> &[f64] {
+        &self.means
+    }
+
+    /// Per-feature standard deviations used for standardization.
+    /// Values below 1e-12 are replaced by 1.0 during fit to guard
+    /// against zero-variance features.
+    pub fn stds(&self) -> &[f64] {
+        &self.stds
+    }
+
     /// Compute mean and std for each feature column
     pub fn fit(features: &Matrix) -> Self {
         let n = features.rows as f64;
@@ -725,6 +774,51 @@ mod tests {
         );
     }
 
+    /// Regression for Copilot PR #17 review: when multiple C values tie
+    /// on `count_passing_targets_svm`, the first candidate in `c_values`
+    /// must win. Previous implementation used `Iterator::max_by_key`
+    /// which per stdlib docs returns the LAST tied element; the fix
+    /// replaced it with a manual scan using strict `>`.
+    #[test]
+    fn test_grid_search_c_first_tie_wins() {
+        // Perfectly-separable data: every C value converges to a model
+        // that classifies all targets correctly, so `count_passing`
+        // ties across the entire grid.
+        #[rustfmt::skip]
+        let features = Matrix::new(vec![
+            5.0, 5.0,  // target 1
+            4.5, 5.5,  // target 2
+            5.5, 4.5,  // target 3
+            1.0, 1.0,  // decoy 1
+            0.5, 1.5,  // decoy 2
+            1.5, 0.5,  // decoy 3
+        ], 6, 2);
+
+        let labels = vec![false, false, false, true, true, true];
+        let entry_ids = vec![1, 2, 3, 1 | 0x80000000, 2 | 0x80000000, 3 | 0x80000000];
+        let fold_assignments = vec![0, 1, 2, 0, 1, 2];
+        // All values are "large enough" for this separable problem,
+        // guaranteeing the passing count ties.
+        let c_values = vec![0.1, 1.0, 10.0, 100.0];
+
+        let best_c = grid_search_c(
+            &features,
+            &labels,
+            &entry_ids,
+            &c_values,
+            &fold_assignments,
+            3,
+            42,
+            0.50, // Loose threshold so every fold contributes max passing
+        );
+
+        assert_eq!(
+            best_c, c_values[0],
+            "first-C tiebreaker broken: expected {} but got {}",
+            c_values[0], best_c
+        );
+    }
+
     #[test]
     fn test_count_passing_targets() {
         // 3 targets beat their decoys, 1 decoy beats its target
@@ -743,17 +837,16 @@ mod tests {
         let n_pass = count_passing_targets_svm(&scores, &labels, &entry_ids, 0.10);
 
         // Pairs: (1: 0.9 vs 0.3 → target), (2: 0.8 vs 0.2 → target), (3: 0.7 vs 0.1 → target)
-        // Unpaired decoy 4 with score 0.85
-        // Winners sorted: target(0.9), decoy_4(0.85), target(0.8), target(0.7)
-        // Walk: 1T/0D=0%, 1T/1D=100%, 2T/1D=50%, 3T/1D=33% → none pass 10%
-        // Actually with +1: FDR = (0+1)/1=100%, (1+1)/1=200%, (1+1)/2=100%, (1+1)/3=66%
-        // Hmm, the +1 makes it harder. For 3 targets with 0 decoys among pairs:
-        // Wait, unpaired decoy enters the winners list too.
-        // Let me recalculate...
-        // Winners: (0.9, target_1), (0.85, decoy_4), (0.8, target_2), (0.7, target_3)
-        // Walk: 1T,0D → FDR=(0+1)/1=100%; 1T,1D → FDR=(1+1)/1=200%; 2T,1D → (1+1)/2=100%; 3T,1D → (1+1)/3=66%
-        // None pass 10% FDR
-        assert_eq!(n_pass, 0);
+        // Unpaired decoy 4 with score 0.85.
+        // Winners sorted desc by score: target(0.9), decoy_4(0.85), target(0.8), target(0.7)
+        // Non-conservative q-values (n_decoy/n_target) with backward monotonization:
+        //   rank 0: target → n_t=1 n_d=0 → q=0
+        //   rank 1: decoy  → n_t=1 n_d=1 → q=1.00
+        //   rank 2: target → n_t=2 n_d=1 → q=0.50
+        //   rank 3: target → n_t=3 n_d=1 → q=0.333
+        // Monotonize from the right: q_min=0.333, so q=[0, 0.333, 0.333, 0.333]
+        // At threshold 0.10, only rank 0 target has q <= 0.10 → 1 passes.
+        assert_eq!(n_pass, 1);
     }
 
     #[test]

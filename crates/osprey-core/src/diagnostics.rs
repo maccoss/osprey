@@ -57,6 +57,35 @@ pub fn format_f10(x: f64) -> String {
     format!("{:.10}", x)
 }
 
+/// Roundtrip-stable `f64` formatter for cross-impl diagnostic dumps.
+///
+/// Rust's default `{}` uses ryu (shortest decimal that roundtrips
+/// exactly), which is ideal for bit-level comparison of double-precision
+/// values. This helper adds three safeguards so the text output stays
+/// comparable across runtimes:
+///
+/// - `NaN`, `+inf`, `-inf` get stable textual forms (`NaN`, `inf`,
+///   `-inf`) so diff tools don't choke on locale-dependent spellings.
+/// - `-0.0` is normalized to `0` so it won't produce a false-positive
+///   diff against runtimes (including OspreySharp's G17 on .NET
+///   Framework) that stringify `-0.0` identically to `0.0`.
+pub fn format_f64_roundtrip(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        }
+    } else if v == 0.0 {
+        // Covers both +0.0 and -0.0 without producing "-0" for the latter.
+        "0".to_string()
+    } else {
+        format!("{}", v)
+    }
+}
+
 /// If `OSPREY_EXIT_AFTER_CALIBRATION=1` is set, log a benchmark message
 /// and return true so the caller can short-circuit the pipeline after
 /// Stage 3. Used to time and diff calibration in isolation.
@@ -76,3 +105,21 @@ pub fn should_exit_after_calibration() -> bool {
 // scoring split work in `crates/osprey/src/pipeline.rs::run_analysis`.
 // `OSPREY_EXIT_AFTER_CALIBRATION` (Stage 3) stays because it has no
 // production CLI analog -- its purpose is purely diagnostic.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_f64_roundtrip_handles_special_values() {
+        assert_eq!(format_f64_roundtrip(f64::NAN), "NaN");
+        assert_eq!(format_f64_roundtrip(f64::INFINITY), "inf");
+        assert_eq!(format_f64_roundtrip(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_f64_roundtrip(0.0), "0");
+        // Cross-impl parity: -0.0 must not stringify as "-0", since .NET
+        // Framework's G17 renders it as "0".
+        assert_eq!(format_f64_roundtrip(-0.0), "0");
+        assert_eq!(format_f64_roundtrip(1.5), "1.5");
+        assert_eq!(format_f64_roundtrip(-1.5), "-1.5");
+    }
+}
