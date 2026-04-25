@@ -2950,7 +2950,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
     // Check if we can skip Percolator + reconciliation entirely:
     // All files must be ValidReconciled (or single-file) AND have SVM scores loaded.
-    let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
+    let reconciliation_enabled = config.reconciliation.enabled && per_file_entries.len() > 1;
     let all_already_reconciled = reconciliation_enabled
         && per_file_cache_paths.values().all(|path| {
             matches!(
@@ -3192,7 +3192,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // Check if all files are already reconciled (parquet metadata says so).
         // If yes, skip BOTH multi-charge consensus AND inter-replicate reconciliation
         // since the previous reconciled run already applied both.
-        let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
+        let reconciliation_enabled = config.reconciliation.enabled && per_file_entries.len() > 1;
         let all_already_reconciled = reconciliation_enabled
             && per_file_cache_paths.values().all(|path| {
                 match validate_scores_cache(path, &config) {
@@ -3233,6 +3233,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             );
         }
 
+        // Stage 6 cross-impl bisection dump for multi-charge rescore targets.
+        // Gated by OSPREY_DUMP_MULTICHARGE=1; exits when
+        // OSPREY_MULTICHARGE_ONLY=1 is also set.
+        crate::diagnostics::dump_stage6_multicharge(&per_file_consensus_targets);
+
         // 2. Inter-replicate reconciliation: compute per-file rescore targets
         //    Uses first-pass FDR results to build consensus RTs across runs,
         //    then plans which entries need re-scoring at reconciled boundaries.
@@ -3259,6 +3264,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 config.protein_fdr,
             );
 
+            // Stage 6 cross-impl bisection dump for the consensus set.
+            // Gated by OSPREY_DUMP_CONSENSUS=1; exits when
+            // OSPREY_CONSENSUS_ONLY=1 is also set.
+            crate::diagnostics::dump_stage6_consensus(&consensus);
+
             if !consensus.is_empty() {
                 refined_calibrations = per_file_entries
                     .par_iter()
@@ -3271,6 +3281,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         .map(|cal| (file_name.clone(), cal))
                     })
                     .collect();
+
+                // Stage 6 cross-impl bisection dump for refined-calibration
+                // statistics. Gated by OSPREY_DUMP_REFIT=1; exits when
+                // OSPREY_REFIT_ONLY=1 is also set.
+                crate::diagnostics::dump_stage6_refit(&refined_calibrations);
 
                 // Plan reconciliation with batched CWT loading.
                 // Each file's CWT data is ~240 MB. Batch size is the minimum of:

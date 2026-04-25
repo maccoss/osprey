@@ -12,6 +12,7 @@
 use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::{LibraryEntry, Spectrum, XICPeakBounds};
 use osprey_scoring::{SpectralScorer, TukeyMedianPolishResult};
+use std::collections::HashMap;
 use std::io::Write;
 
 /// Dump the (lib_rt, measured_rt) pairs fed to LOESS to
@@ -416,6 +417,168 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
     );
 
     exit_if_only("OSPREY_PERCOLATOR_ONLY", "Stage 5 Percolator dump");
+}
+
+/// Dump the per-peptide consensus RT planning state to
+/// `rust_stage6_consensus.tsv` for cross-impl parity at the start of
+/// Stage 6, before any per-file rescoring. Mirrors
+/// OspreySharp.FDR.Reconciliation.ConsensusRts.Compute.
+///
+/// Gated by `OSPREY_DUMP_CONSENSUS=1`. When `OSPREY_CONSENSUS_ONLY=1`
+/// is also set, exits the process after writing. Columns:
+/// `is_decoy, modified_sequence, consensus_library_rt,
+/// median_peak_width, n_runs_detected, apex_library_rt_mad`.
+/// Rows are emitted in the order produced by `compute_consensus_rts`,
+/// which sorts by `(is_decoy, modified_sequence)` for deterministic
+/// output. `apex_library_rt_mad` is empty when fewer than 3 detections
+/// contributed.
+pub fn dump_stage6_consensus(consensus: &[crate::reconciliation::PeptideConsensusRT]) {
+    if !is_dump_enabled("OSPREY_DUMP_CONSENSUS") {
+        return;
+    }
+
+    let path = "rust_stage6_consensus.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "is_decoy\tmodified_sequence\tconsensus_library_rt\tmedian_peak_width\tn_runs_detected\tapex_library_rt_mad"
+    )
+    .ok();
+
+    for c in consensus {
+        let mad_str = c
+            .apex_library_rt_mad
+            .map(format_f64_roundtrip)
+            .unwrap_or_default();
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            if c.is_decoy { "true" } else { "false" },
+            c.modified_sequence,
+            format_f64_roundtrip(c.consensus_library_rt),
+            format_f64_roundtrip(c.median_peak_width),
+            c.n_runs_detected,
+            mad_str,
+        )
+        .ok();
+    }
+    log::info!(
+        "Wrote Stage 6 consensus dump: {} ({} rows)",
+        path,
+        consensus.len()
+    );
+
+    exit_if_only("OSPREY_CONSENSUS_ONLY", "Stage 6 consensus dump");
+}
+
+/// Dump the per-file multi-charge consensus rescore targets to
+/// `rust_stage6_multicharge.tsv` for cross-impl parity. Mirrors
+/// `OspreySharp.FDR.Reconciliation.MultiChargeConsensus.SelectRescoreTargets`.
+///
+/// Gated by `OSPREY_DUMP_MULTICHARGE=1`. When
+/// `OSPREY_MULTICHARGE_ONLY=1` is also set, exits the process after
+/// writing. Columns: `file_name, entry_idx, consensus_apex,
+/// consensus_start, consensus_end`. Rows sorted by
+/// `(file_name, entry_idx)` for stable diff.
+pub fn dump_stage6_multicharge(
+    per_file_consensus_targets: &HashMap<String, Vec<(usize, f64, f64, f64)>>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_MULTICHARGE") {
+        return;
+    }
+
+    let path = "rust_stage6_multicharge.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "file_name\tentry_idx\tconsensus_apex\tconsensus_start\tconsensus_end"
+    )
+    .ok();
+
+    let mut rows: Vec<(&str, usize, f64, f64, f64)> = per_file_consensus_targets
+        .iter()
+        .flat_map(|(file_name, targets)| {
+            targets
+                .iter()
+                .map(move |&(idx, apex, start, end)| (file_name.as_str(), idx, apex, start, end))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+
+    for (file_name, idx, apex, start, end) in &rows {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}",
+            file_name,
+            idx,
+            format_f64_roundtrip(*apex),
+            format_f64_roundtrip(*start),
+            format_f64_roundtrip(*end),
+        )
+        .ok();
+    }
+    log::info!(
+        "Wrote Stage 6 multi-charge dump: {} ({} rows)",
+        path,
+        rows.len()
+    );
+
+    exit_if_only("OSPREY_MULTICHARGE_ONLY", "Stage 6 multi-charge dump");
+}
+
+/// Dump the per-file refined-calibration statistics produced by
+/// `refit_calibration_with_consensus` to `rust_stage6_refit.tsv`.
+/// Mirrors `OspreySharp.FDR.Reconciliation.CalibrationRefit.Refit`.
+///
+/// Gated by `OSPREY_DUMP_REFIT=1`. When `OSPREY_REFIT_ONLY=1` is also
+/// set, exits the process after writing. Columns: `file_name, n_points,
+/// r_squared, residual_sd, mad`. Rows are emitted only for files where
+/// the refit produced a calibration (insufficient-points failures are
+/// absent), sorted by `file_name` for stable diff.
+pub fn dump_stage6_refit(
+    refined_calibrations: &HashMap<String, osprey_chromatography::RTCalibration>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_REFIT") {
+        return;
+    }
+
+    let path = "rust_stage6_refit.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(f, "file_name\tn_points\tr_squared\tresidual_sd\tmad").ok();
+
+    let mut rows: Vec<(&str, _)> = refined_calibrations
+        .iter()
+        .map(|(name, cal)| (name.as_str(), cal.stats()))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (file_name, stats) in &rows {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}",
+            file_name,
+            stats.n_points,
+            format_f64_roundtrip(stats.r_squared),
+            format_f64_roundtrip(stats.residual_std),
+            format_f64_roundtrip(stats.mad),
+        )
+        .ok();
+    }
+    log::info!("Wrote Stage 6 refit dump: {} ({} rows)", path, rows.len());
+
+    exit_if_only("OSPREY_REFIT_ONLY", "Stage 6 refit dump");
 }
 
 #[cfg(test)]
