@@ -3236,7 +3236,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // Stage 6 cross-impl bisection dump for multi-charge rescore targets.
         // Gated by OSPREY_DUMP_MULTICHARGE=1; exits when
         // OSPREY_MULTICHARGE_ONLY=1 is also set.
-        crate::diagnostics::dump_stage6_multicharge(&per_file_consensus_targets);
+        crate::diagnostics::dump_stage6_multicharge(&per_file_entries, &per_file_consensus_targets);
 
         // 2. Inter-replicate reconciliation: compute per-file rescore targets
         //    Uses first-pass FDR results to build consensus RTs across runs,

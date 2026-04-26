@@ -481,10 +481,15 @@ pub fn dump_stage6_consensus(consensus: &[crate::reconciliation::PeptideConsensu
 ///
 /// Gated by `OSPREY_DUMP_MULTICHARGE=1`. When
 /// `OSPREY_MULTICHARGE_ONLY=1` is also set, exits the process after
-/// writing. Columns: `file_name, entry_idx, consensus_apex,
+/// writing. Columns: `file_name, entry_id, consensus_apex,
 /// consensus_start, consensus_end`. Rows sorted by
-/// `(file_name, entry_idx)` for stable diff.
+/// `(file_name, entry_id)` for stable diff. The dump uses the stable
+/// library entry id (as written to the parquet `entry_id` column)
+/// instead of the per-file Vec position, so cross-impl comparison is
+/// invariant to whether the implementation has compacted the
+/// per-file FdrEntry list before computing multi-charge consensus.
 pub fn dump_stage6_multicharge(
+    per_file_entries: &[(String, Vec<osprey_core::FdrEntry>)],
     per_file_consensus_targets: &HashMap<String, Vec<(usize, f64, f64, f64)>>,
 ) {
     if !is_dump_enabled("OSPREY_DUMP_MULTICHARGE") {
@@ -499,26 +504,37 @@ pub fn dump_stage6_multicharge(
 
     writeln!(
         f,
-        "file_name\tentry_idx\tconsensus_apex\tconsensus_start\tconsensus_end"
+        "file_name\tentry_id\tconsensus_apex\tconsensus_start\tconsensus_end"
     )
     .ok();
 
-    let mut rows: Vec<(&str, usize, f64, f64, f64)> = per_file_consensus_targets
+    // Resolve idx -> entry_id via the matching per_file_entries list so the
+    // dump key is the stable library entry id rather than the (compaction-
+    // dependent) Vec position.
+    let entries_by_file: HashMap<&str, &Vec<osprey_core::FdrEntry>> = per_file_entries
+        .iter()
+        .map(|(name, entries)| (name.as_str(), entries))
+        .collect();
+
+    let mut rows: Vec<(&str, u32, f64, f64, f64)> = per_file_consensus_targets
         .iter()
         .flat_map(|(file_name, targets)| {
-            targets
-                .iter()
-                .map(move |&(idx, apex, start, end)| (file_name.as_str(), idx, apex, start, end))
+            let entries = entries_by_file.get(file_name.as_str()).copied();
+            targets.iter().filter_map(move |&(idx, apex, start, end)| {
+                entries
+                    .and_then(|e| e.get(idx))
+                    .map(|entry| (file_name.as_str(), entry.entry_id, apex, start, end))
+            })
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
 
-    for (file_name, idx, apex, start, end) in &rows {
+    for (file_name, entry_id, apex, start, end) in &rows {
         writeln!(
             f,
             "{}\t{}\t{}\t{}\t{}",
             file_name,
-            idx,
+            entry_id,
             format_f64_roundtrip(*apex),
             format_f64_roundtrip(*start),
             format_f64_roundtrip(*end),
