@@ -2576,6 +2576,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 if cal_path.exists() {
                     if let Ok(cal_params) = load_calibration(&cal_path) {
                         if let Some(ref mp) = cal_params.rt_calibration.model_params {
+                            // Cross-impl JSON-decode parity check: dump the
+                            // raw library_rts and fitted_values arrays as
+                            // loaded from the calibration JSON. Gated by
+                            // OSPREY_DUMP_CALIBRATION=1.
+                            crate::diagnostics::dump_stage6_calibration(
+                                &file_name,
+                                &mp.library_rts,
+                                &mp.fitted_rts,
+                            );
                             if let Ok(rt_cal) = RTCalibration::from_model_params(
                                 mp,
                                 cal_params.rt_calibration.residual_sd,
@@ -2596,6 +2605,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             per_file_entries.push((file_name.clone(), stubs));
             per_file_cache_paths.insert(file_name, parquet_path.clone());
         }
+        // Cross-impl JSON-decode parity short-circuit: after every parquet's
+        // calibration JSON has been loaded and dumped, exit if
+        // OSPREY_CALIBRATION_ONLY is set. Pairs with OSPREY_DUMP_CALIBRATION.
+        osprey_core::diagnostics::exit_if_only(
+            "OSPREY_CALIBRATION_ONLY",
+            "Stage 6 calibration dump",
+        );
     } else {
         for (file_idx, input_file) in config.input_files.iter().enumerate() {
             log::info!("");

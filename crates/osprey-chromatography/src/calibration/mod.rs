@@ -295,16 +295,47 @@ pub struct RTCalibrationParams {
 ///
 /// Stores the library RTs and fitted measured RTs which allows
 /// the calibration curve to be reconstructed via interpolation.
+///
+/// The three numeric arrays use a custom deserializer that captures
+/// the raw JSON token via `RawValue` and re-parses through
+/// `f64::from_str`. This is required because `serde_json`'s default
+/// number parser is **not** correctly rounded for full-precision f64
+/// values — for some inputs it returns the f64 1 ULP higher than the
+/// closest representable value, breaking byte-parity with C# / .NET
+/// `double.Parse` (which is correctly rounded). The decimal literal
+/// `1.9140296182650374` for example parses to `0x3FFE9FDD85606113`
+/// under `f64::from_str` and `double.Parse` but to `0x3FFE9FDD85606114`
+/// (= `1.9140296182650376`, 1 ULP higher) under serde_json's default
+/// parser. Routing through `f64::from_str` aligns Rust with the
+/// .NET BCL parser for cross-impl `--join-only` parity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RTModelParams {
     /// Library retention times (sorted, used as x-values for interpolation)
+    #[serde(deserialize_with = "deserialize_f64_array_via_str")]
     pub library_rts: Vec<f64>,
     /// Fitted measured retention times (corresponding to library_rts)
+    #[serde(deserialize_with = "deserialize_f64_array_via_str")]
     pub fitted_rts: Vec<f64>,
     /// Absolute residuals at each calibration point (for local RT tolerance)
     /// This field is optional for backwards compatibility with older calibration files
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_f64_array_via_str")]
     pub abs_residuals: Vec<f64>,
+}
+
+/// Deserialize a JSON array of numbers as `Vec<f64>` using
+/// `f64::from_str` on each element's raw token text. This bypasses
+/// `serde_json`'s default number parser, which is not correctly
+/// rounded for full-precision f64 inputs. See the doc-comment on
+/// `RTModelParams` for why this matters.
+fn deserialize_f64_array_via_str<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Deserialize, Error};
+    let raws: Vec<Box<serde_json::value::RawValue>> = Vec::deserialize(deserializer)?;
+    raws.iter()
+        .map(|raw| raw.get().trim().parse::<f64>().map_err(Error::custom))
+        .collect()
 }
 
 impl RTCalibrationParams {

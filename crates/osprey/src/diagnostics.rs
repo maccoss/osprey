@@ -550,6 +550,124 @@ pub fn dump_stage6_multicharge(
     exit_if_only("OSPREY_MULTICHARGE_ONLY", "Stage 6 multi-charge dump");
 }
 
+/// Append the loaded calibration arrays (library_rts + fitted_values)
+/// for one file to `rust_stage6_calibration.tsv` for cross-impl
+/// JSON-decode parity check. Each call writes one row per
+/// `(library_rts[i], fitted_values[i])` pair, prefixed with the file
+/// name. The header is written on the first call (file does not yet
+/// exist) and subsequent calls append.
+///
+/// Diffing this dump against `cs_stage6_calibration.tsv` localizes
+/// whether cross-impl divergence in `inverse_predict` enters at the
+/// JSON `f64` parser (decimal-to-binary) or inside the LOESS
+/// interpolation arithmetic.
+///
+/// Gated by `OSPREY_DUMP_CALIBRATION=1`. The companion
+/// `OSPREY_CALIBRATION_ONLY=1` env-var is checked after the
+/// `--join-only` calibration-load loop completes — when all files
+/// have appended their rows — and exits the process cleanly.
+pub fn dump_stage6_calibration(file_name: &str, library_rts: &[f64], fitted_values: &[f64]) {
+    if !is_dump_enabled("OSPREY_DUMP_CALIBRATION") {
+        return;
+    }
+
+    let path = "rust_stage6_calibration.tsv";
+    let header_needed = !std::path::Path::new(path).exists();
+
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        log::warn!("Could not open {}", path);
+        return;
+    };
+
+    if header_needed {
+        writeln!(f, "file_name\tidx\tlibrary_rt\tfitted_value").ok();
+    }
+
+    let n = library_rts.len().min(fitted_values.len());
+    for i in 0..n {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}",
+            file_name,
+            i,
+            format_f64_roundtrip(library_rts[i]),
+            format_f64_roundtrip(fitted_values[i]),
+        )
+        .ok();
+    }
+    log::info!(
+        "Appended {} calibration rows for {} to {}",
+        n,
+        file_name,
+        path
+    );
+}
+
+/// Dump per-detection (apex_rt, library_rt) pairs going into
+/// `compute_consensus_rts` to `rust_stage6_inv_predict.tsv` for
+/// cross-impl ULP bisection. apex_rt is the FdrEntry value loaded
+/// from Parquet; library_rt is `inverse_predict(apex_rt)` against the
+/// per-file refined RT calibration. weight is the sigmoid-of-SVM-score
+/// Stage 6 contribution weight.
+///
+/// Diffing this dump against `cs_stage6_inv_predict.tsv` localizes
+/// whether cross-impl divergence in `consensus_library_rt` enters at
+/// Parquet f64 decode (apex_rt diverges) or LOESS interpolation
+/// (only library_rt diverges).
+///
+/// Each record is `(file_name, modified_sequence, is_decoy, apex_rt,
+/// library_rt, weight)`.
+///
+/// Gated by `OSPREY_DUMP_INV_PREDICT=1`. When `OSPREY_INV_PREDICT_ONLY=1`
+/// is also set, exits the process after writing.
+pub type InvPredictRecord = (String, String, bool, f64, f64, f64);
+
+pub fn dump_stage6_inv_predict(records: &[InvPredictRecord]) {
+    if !is_dump_enabled("OSPREY_DUMP_INV_PREDICT") {
+        return;
+    }
+
+    let path = "rust_stage6_inv_predict.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "file_name\tis_decoy\tmodified_sequence\tapex_rt\tlibrary_rt\tweight"
+    )
+    .ok();
+
+    let mut sorted: Vec<&(String, String, bool, f64, f64, f64)> = records.iter().collect();
+    sorted.sort_by(|a, b| a.2.cmp(&b.2).then(a.1.cmp(&b.1)).then(a.0.cmp(&b.0)));
+
+    for (file_name, modseq, is_decoy, apex_rt, library_rt, weight) in &sorted {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            file_name,
+            if *is_decoy { "true" } else { "false" },
+            modseq,
+            format_f64_roundtrip(*apex_rt),
+            format_f64_roundtrip(*library_rt),
+            format_f64_roundtrip(*weight),
+        )
+        .ok();
+    }
+    log::info!(
+        "Wrote Stage 6 inverse-predict dump: {} ({} rows)",
+        path,
+        sorted.len()
+    );
+
+    exit_if_only("OSPREY_INV_PREDICT_ONLY", "Stage 6 inverse-predict dump");
+}
+
 /// Dump the per-file refined-calibration statistics produced by
 /// `refit_calibration_with_consensus` to `rust_stage6_refit.tsv`.
 /// Mirrors `OspreySharp.FDR.Reconciliation.CalibrationRefit.Refit`.
