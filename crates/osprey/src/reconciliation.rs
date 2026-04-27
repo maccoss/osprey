@@ -346,9 +346,18 @@ pub fn refit_calibration_with_consensus(
 
     // Disable outlier removal (retention=1.0) — these are FDR-controlled detections,
     // not noisy initial matches. Robustness iterations still downweight any bad points.
-    let calibrator = RTCalibrator::new()
-        .with_bandwidth(0.3)
-        .with_outlier_retention(1.0);
+    //
+    // classical_robust_iterations must mirror the value used at Stage 4 on
+    // both Rust and C# sides; otherwise the refit fitted_values diverge
+    // cross-impl. Stage 4 reads OSPREY_LOESS_CLASSICAL_ROBUST (default = on,
+    // see pipeline.rs); read it the same way here.
+    let classical_robust = std::env::var("OSPREY_LOESS_CLASSICAL_ROBUST").as_deref() != Ok("0");
+    let calibrator = RTCalibrator::with_config(osprey_chromatography::RTCalibratorConfig {
+        bandwidth: 0.3,
+        outlier_retention: 1.0,
+        classical_robust_iterations: classical_robust,
+        ..osprey_chromatography::RTCalibratorConfig::default()
+    });
     match calibrator.fit(&library_rts, &measured_rts) {
         Ok(cal) => {
             let stats = cal.stats();
