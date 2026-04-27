@@ -3077,6 +3077,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         let protein_fdr_result =
             protein::compute_protein_fdr(&parsimony, &peptide_scores, config.run_fdr);
 
+        // Cross-impl bisection dump (gated by OSPREY_DUMP_PROTEIN_FDR).
+        crate::diagnostics::dump_stage6_protein_fdr(
+            &peptide_scores,
+            &protein_fdr_result.peptide_qvalues,
+        );
+
         // Write first-pass protein q-values into FdrEntry.run_protein_qvalue.
         // Do not set experiment_protein_qvalue yet — second-pass will overwrite it.
         protein::propagate_protein_qvalues(
@@ -3301,6 +3307,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 // Stage 6 cross-impl bisection dump for refined-calibration
                 // statistics. Gated by OSPREY_DUMP_REFIT=1; exits when
                 // OSPREY_REFIT_ONLY=1 is also set.
+                crate::diagnostics::dump_stage6_loess_fit(&refined_calibrations);
                 crate::diagnostics::dump_stage6_refit(&refined_calibrations);
 
                 // Plan reconciliation with batched CWT loading.
