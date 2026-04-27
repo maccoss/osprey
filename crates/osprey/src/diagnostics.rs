@@ -11,9 +11,11 @@
 
 use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::{LibraryEntry, Spectrum, XICPeakBounds};
+use osprey_fdr::protein::PeptideScore;
 use osprey_scoring::{SpectralScorer, TukeyMedianPolishResult};
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 
 /// Dump the (lib_rt, measured_rt) pairs fed to LOESS to
 /// `rust_loess_input.txt`, sorted by lib_rt ascending at `{:.17}`
@@ -644,7 +646,17 @@ pub fn dump_stage6_inv_predict(records: &[InvPredictRecord]) {
     .ok();
 
     let mut sorted: Vec<&(String, String, bool, f64, f64, f64)> = records.iter().collect();
-    sorted.sort_by(|a, b| a.2.cmp(&b.2).then(a.1.cmp(&b.1)).then(a.0.cmp(&b.0)));
+    // Tuple is (file_name, modseq, is_decoy, apex_rt, library_rt, weight).
+    // Sort by (is_decoy, modseq, file_name) and tiebreak on (apex_rt, library_rt)
+    // because a peptide with multiple charge-state detections in one file
+    // produces multiple rows that tie on the (is_decoy, modseq, file_name) key.
+    sorted.sort_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then(a.1.cmp(&b.1))
+            .then(a.0.cmp(&b.0))
+            .then(a.3.total_cmp(&b.3))
+            .then(a.4.total_cmp(&b.4))
+    });
 
     for (file_name, modseq, is_decoy, apex_rt, library_rt, weight) in &sorted {
         writeln!(
@@ -666,6 +678,140 @@ pub fn dump_stage6_inv_predict(records: &[InvPredictRecord]) {
     );
 
     exit_if_only("OSPREY_INV_PREDICT_ONLY", "Stage 6 inverse-predict dump");
+}
+
+/// Dump the per-peptide first-pass protein FDR state to
+/// `rust_stage6_protein_fdr.tsv`. Mirrors
+/// `OspreyDiagnostics.WriteStage6ProteinFdrDump`.
+///
+/// One row per peptide that appears in `best_scores` (the union of
+/// target + decoy modified_sequences seen across all per-file
+/// FdrEntry stubs at the moment first-pass protein FDR runs).
+/// Columns: `is_decoy, modified_sequence, best_qvalue, score,
+/// protein_qvalue`. `best_qvalue` is the input gate (peptide-level
+/// run q-value, min across files). `score` is the input ranking
+/// (max SVM discriminant across files). `protein_qvalue` is the
+/// propagated output -- the value `propagate_protein_qvalues` will
+/// write to `FdrEntry.run_protein_qvalue` (1.0 if the peptide is
+/// not in `protein_fdr.peptide_qvalues`, matching the
+/// `propagate_protein_qvalues` default). Rows sorted by
+/// `(is_decoy, modified_sequence)` for stable diff.
+///
+/// Gated by `OSPREY_DUMP_PROTEIN_FDR=1`. When `OSPREY_PROTEIN_FDR_ONLY=1`
+/// is also set, exits the process after writing.
+pub fn dump_stage6_protein_fdr(
+    best_scores: &HashMap<Arc<str>, PeptideScore>,
+    peptide_qvalues: &HashMap<String, f64>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_PROTEIN_FDR") {
+        return;
+    }
+
+    let path = "rust_stage6_protein_fdr.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "is_decoy\tmodified_sequence\tbest_qvalue\tscore\tprotein_qvalue"
+    )
+    .ok();
+
+    let mut rows: Vec<(&Arc<str>, &PeptideScore)> = best_scores.iter().collect();
+    rows.sort_by(|a, b| {
+        a.1.is_decoy
+            .cmp(&b.1.is_decoy)
+            .then_with(|| a.0.as_ref().cmp(b.0.as_ref()))
+    });
+
+    for (modseq, ps) in &rows {
+        let q = peptide_qvalues.get(modseq.as_ref()).copied().unwrap_or(1.0);
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}",
+            if ps.is_decoy { "true" } else { "false" },
+            modseq,
+            format_f64_roundtrip(ps.best_qvalue),
+            format_f64_roundtrip(ps.score),
+            format_f64_roundtrip(q),
+        )
+        .ok();
+    }
+    log::info!(
+        "Wrote Stage 6 first-pass protein FDR dump: {} ({} rows)",
+        path,
+        rows.len()
+    );
+
+    exit_if_only("OSPREY_PROTEIN_FDR_ONLY", "Stage 6 protein FDR dump");
+}
+
+/// Dump the per-point LOESS fit state of every refit RTCalibration to
+/// `rust_stage6_loess_fit.tsv`. Mirrors
+/// `OspreyDiagnostics.WriteStage6LoessFitDump`.
+///
+/// One row per `(file_name, idx)` into the refit's `library_rts` +
+/// `fitted_values` + `abs_residuals` arrays. Rows sorted by
+/// `(file_name, idx)` for stable diff. The refit dump captures scalar
+/// stats (R²/SD/MAD); this dump captures the LOESS curve itself so a
+/// stats-vs-smoother bisection is possible: if `(library_rt,
+/// fitted_value, abs_residual)` match cross-impl, the divergence is
+/// in the stats computation. If `fitted_value` diverges, the LOESS
+/// smoother arithmetic itself differs.
+///
+/// Gated by `OSPREY_DUMP_LOESS_FIT=1`. When `OSPREY_LOESS_FIT_ONLY=1`
+/// is also set, exits the process after writing.
+pub fn dump_stage6_loess_fit(
+    refined_calibrations: &HashMap<String, osprey_chromatography::RTCalibration>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_LOESS_FIT") {
+        return;
+    }
+
+    let path = "rust_stage6_loess_fit.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(f, "file_name\tidx\tlibrary_rt\tfitted_value\tabs_residual").ok();
+
+    let mut file_names: Vec<&String> = refined_calibrations.keys().collect();
+    file_names.sort();
+
+    let mut total_rows = 0usize;
+    for file_name in &file_names {
+        let cal = &refined_calibrations[file_name.as_str()];
+        let params = cal.export_model_params();
+        let n = params
+            .library_rts
+            .len()
+            .min(params.fitted_rts.len())
+            .min(params.abs_residuals.len());
+        for i in 0..n {
+            writeln!(
+                f,
+                "{}\t{}\t{}\t{}\t{}",
+                file_name,
+                i,
+                format_f64_roundtrip(params.library_rts[i]),
+                format_f64_roundtrip(params.fitted_rts[i]),
+                format_f64_roundtrip(params.abs_residuals[i]),
+            )
+            .ok();
+        }
+        total_rows += n;
+    }
+    log::info!(
+        "Wrote Stage 6 LOESS fit dump: {} ({} rows across {} files)",
+        path,
+        total_rows,
+        file_names.len()
+    );
+
+    exit_if_only("OSPREY_LOESS_FIT_ONLY", "Stage 6 LOESS fit dump");
 }
 
 /// Dump the per-file refined-calibration statistics produced by
