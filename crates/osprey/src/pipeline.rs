@@ -2950,7 +2950,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
     // Check if we can skip Percolator + reconciliation entirely:
     // All files must be ValidReconciled (or single-file) AND have SVM scores loaded.
-    let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
+    let reconciliation_enabled = config.reconciliation.enabled && per_file_entries.len() > 1;
     let all_already_reconciled = reconciliation_enabled
         && per_file_cache_paths.values().all(|path| {
             matches!(
@@ -3192,7 +3192,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // Check if all files are already reconciled (parquet metadata says so).
         // If yes, skip BOTH multi-charge consensus AND inter-replicate reconciliation
         // since the previous reconciled run already applied both.
-        let reconciliation_enabled = config.reconciliation.enabled && config.input_files.len() > 1;
+        let reconciliation_enabled = config.reconciliation.enabled && per_file_entries.len() > 1;
         let all_already_reconciled = reconciliation_enabled
             && per_file_cache_paths.values().all(|path| {
                 match validate_scores_cache(path, &config) {
