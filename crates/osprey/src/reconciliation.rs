@@ -173,6 +173,19 @@ pub fn compute_consensus_rts(
     // 3. Compute consensus RT for each peptide
     let mut consensus: Vec<PeptideConsensusRT> = Vec::new();
 
+    // Cross-impl ULP-bisection dump: capture the per-detection inputs
+    // and outputs of inverse_predict so consensus_library_rt divergence
+    // can be localized to either the loaded apex_rt (Parquet decode) or
+    // the LOESS inverse-interpolation step. Off unless
+    // OSPREY_DUMP_INV_PREDICT is set.
+    type InvPredictRecord = (String, String, bool, f64, f64, f64);
+    let mut inv_predict_records: Option<Vec<InvPredictRecord>> =
+        if std::env::var("OSPREY_DUMP_INV_PREDICT").is_ok() {
+            Some(Vec::new())
+        } else {
+            None
+        };
+
     for ((modified_sequence, is_decoy), dets) in &detections {
         if dets.is_empty() {
             continue;
@@ -200,6 +213,17 @@ pub fn compute_consensus_rts(
                     let weight = (1.0 / (1.0 + (-*score).exp())).max(1e-6);
                     library_rt_weights.push((library_rt, weight));
                     peak_width_weights.push((*peak_width, weight));
+
+                    if let Some(records) = inv_predict_records.as_mut() {
+                        records.push((
+                            file_name.clone(),
+                            modified_sequence.to_string(),
+                            *is_decoy,
+                            *apex_rt,
+                            library_rt,
+                            weight,
+                        ));
+                    }
                 }
             }
         }
@@ -284,6 +308,13 @@ pub fn compute_consensus_rts(
             .cmp(&b.is_decoy)
             .then(a.modified_sequence.cmp(&b.modified_sequence))
     });
+
+    // Cross-impl bisection dump for inverse_predict (apex_rt -> library_rt).
+    // Gated by OSPREY_DUMP_INV_PREDICT=1; exits when
+    // OSPREY_INV_PREDICT_ONLY=1 is also set.
+    if let Some(records) = inv_predict_records.as_ref() {
+        crate::diagnostics::dump_stage6_inv_predict(records);
+    }
 
     let n_targets = consensus.iter().filter(|c| !c.is_decoy).count();
     let n_decoys = consensus.iter().filter(|c| c.is_decoy).count();

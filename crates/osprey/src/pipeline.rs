@@ -2576,6 +2576,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 if cal_path.exists() {
                     if let Ok(cal_params) = load_calibration(&cal_path) {
                         if let Some(ref mp) = cal_params.rt_calibration.model_params {
+                            // Cross-impl JSON-decode parity check: dump the
+                            // raw library_rts and fitted_values arrays as
+                            // loaded from the calibration JSON. Gated by
+                            // OSPREY_DUMP_CALIBRATION=1.
+                            crate::diagnostics::dump_stage6_calibration(
+                                &file_name,
+                                &mp.library_rts,
+                                &mp.fitted_rts,
+                            );
                             if let Ok(rt_cal) = RTCalibration::from_model_params(
                                 mp,
                                 cal_params.rt_calibration.residual_sd,
@@ -2596,6 +2605,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             per_file_entries.push((file_name.clone(), stubs));
             per_file_cache_paths.insert(file_name, parquet_path.clone());
         }
+        // Cross-impl JSON-decode parity short-circuit: after every parquet's
+        // calibration JSON has been loaded and dumped, exit if
+        // OSPREY_CALIBRATION_ONLY is set. Pairs with OSPREY_DUMP_CALIBRATION.
+        osprey_core::diagnostics::exit_if_only(
+            "OSPREY_CALIBRATION_ONLY",
+            "Stage 6 calibration dump",
+        );
     } else {
         for (file_idx, input_file) in config.input_files.iter().enumerate() {
             log::info!("");
@@ -3061,6 +3077,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         let protein_fdr_result =
             protein::compute_protein_fdr(&parsimony, &peptide_scores, config.run_fdr);
 
+        // Cross-impl bisection dump (gated by OSPREY_DUMP_PROTEIN_FDR).
+        crate::diagnostics::dump_stage6_protein_fdr(
+            &peptide_scores,
+            &protein_fdr_result.peptide_qvalues,
+        );
+
         // Write first-pass protein q-values into FdrEntry.run_protein_qvalue.
         // Do not set experiment_protein_qvalue yet — second-pass will overwrite it.
         protein::propagate_protein_qvalues(
@@ -3233,6 +3255,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             );
         }
 
+        // Stage 6 cross-impl bisection dump for multi-charge rescore targets.
+        // Gated by OSPREY_DUMP_MULTICHARGE=1; exits when
+        // OSPREY_MULTICHARGE_ONLY=1 is also set.
+        crate::diagnostics::dump_stage6_multicharge(&per_file_entries, &per_file_consensus_targets);
+
         // 2. Inter-replicate reconciliation: compute per-file rescore targets
         //    Uses first-pass FDR results to build consensus RTs across runs,
         //    then plans which entries need re-scoring at reconciled boundaries.
@@ -3259,6 +3286,11 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 config.protein_fdr,
             );
 
+            // Stage 6 cross-impl bisection dump for the consensus set.
+            // Gated by OSPREY_DUMP_CONSENSUS=1; exits when
+            // OSPREY_CONSENSUS_ONLY=1 is also set.
+            crate::diagnostics::dump_stage6_consensus(&consensus);
+
             if !consensus.is_empty() {
                 refined_calibrations = per_file_entries
                     .par_iter()
@@ -3271,6 +3303,12 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         .map(|cal| (file_name.clone(), cal))
                     })
                     .collect();
+
+                // Stage 6 cross-impl bisection dump for refined-calibration
+                // statistics. Gated by OSPREY_DUMP_REFIT=1; exits when
+                // OSPREY_REFIT_ONLY=1 is also set.
+                crate::diagnostics::dump_stage6_loess_fit(&refined_calibrations);
+                crate::diagnostics::dump_stage6_refit(&refined_calibrations);
 
                 // Plan reconciliation with batched CWT loading.
                 // Each file's CWT data is ~240 MB. Batch size is the minimum of:
