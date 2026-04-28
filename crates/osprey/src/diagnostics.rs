@@ -11,8 +11,11 @@
 
 use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::{LibraryEntry, Spectrum, XICPeakBounds};
+use osprey_fdr::protein::PeptideScore;
 use osprey_scoring::{SpectralScorer, TukeyMedianPolishResult};
+use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 
 /// Dump the (lib_rt, measured_rt) pairs fed to LOESS to
 /// `rust_loess_input.txt`, sorted by lib_rt ascending at `{:.17}`
@@ -416,6 +419,446 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
     );
 
     exit_if_only("OSPREY_PERCOLATOR_ONLY", "Stage 5 Percolator dump");
+}
+
+/// Dump the per-peptide consensus RT planning state to
+/// `rust_stage6_consensus.tsv` for cross-impl parity at the start of
+/// Stage 6, before any per-file rescoring. Mirrors
+/// OspreySharp.FDR.Reconciliation.ConsensusRts.Compute.
+///
+/// Gated by `OSPREY_DUMP_CONSENSUS=1`. When `OSPREY_CONSENSUS_ONLY=1`
+/// is also set, exits the process after writing. Columns:
+/// `is_decoy, modified_sequence, consensus_library_rt,
+/// median_peak_width, n_runs_detected, apex_library_rt_mad`.
+/// Rows are emitted in the order produced by `compute_consensus_rts`,
+/// which sorts by `(is_decoy, modified_sequence)` for deterministic
+/// output. `apex_library_rt_mad` is empty when fewer than 3 detections
+/// contributed.
+pub fn dump_stage6_consensus(consensus: &[crate::reconciliation::PeptideConsensusRT]) {
+    if !is_dump_enabled("OSPREY_DUMP_CONSENSUS") {
+        return;
+    }
+
+    let path = "rust_stage6_consensus.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "is_decoy\tmodified_sequence\tconsensus_library_rt\tmedian_peak_width\tn_runs_detected\tapex_library_rt_mad"
+    )
+    .ok();
+
+    for c in consensus {
+        let mad_str = c
+            .apex_library_rt_mad
+            .map(format_f64_roundtrip)
+            .unwrap_or_default();
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            if c.is_decoy { "true" } else { "false" },
+            c.modified_sequence,
+            format_f64_roundtrip(c.consensus_library_rt),
+            format_f64_roundtrip(c.median_peak_width),
+            c.n_runs_detected,
+            mad_str,
+        )
+        .ok();
+    }
+    log::info!(
+        "Wrote Stage 6 consensus dump: {} ({} rows)",
+        path,
+        consensus.len()
+    );
+
+    exit_if_only("OSPREY_CONSENSUS_ONLY", "Stage 6 consensus dump");
+}
+
+/// Dump the per-file multi-charge consensus rescore targets to
+/// `rust_stage6_multicharge.tsv` for cross-impl parity. Mirrors
+/// `OspreySharp.FDR.Reconciliation.MultiChargeConsensus.SelectRescoreTargets`.
+///
+/// Gated by `OSPREY_DUMP_MULTICHARGE=1`. When
+/// `OSPREY_MULTICHARGE_ONLY=1` is also set, exits the process after
+/// writing. Columns: `file_name, entry_id, consensus_apex,
+/// consensus_start, consensus_end`. Rows sorted by
+/// `(file_name, entry_id)` for stable diff. The dump uses the stable
+/// library entry id (as written to the parquet `entry_id` column)
+/// instead of the per-file Vec position, so cross-impl comparison is
+/// invariant to whether the implementation has compacted the
+/// per-file FdrEntry list before computing multi-charge consensus.
+pub fn dump_stage6_multicharge(
+    per_file_entries: &[(String, Vec<osprey_core::FdrEntry>)],
+    per_file_consensus_targets: &HashMap<String, Vec<(usize, f64, f64, f64)>>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_MULTICHARGE") {
+        return;
+    }
+
+    let path = "rust_stage6_multicharge.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "file_name\tentry_id\tconsensus_apex\tconsensus_start\tconsensus_end"
+    )
+    .ok();
+
+    // Resolve idx -> entry_id via the matching per_file_entries list so the
+    // dump key is the stable library entry id rather than the (compaction-
+    // dependent) Vec position.
+    let entries_by_file: HashMap<&str, &Vec<osprey_core::FdrEntry>> = per_file_entries
+        .iter()
+        .map(|(name, entries)| (name.as_str(), entries))
+        .collect();
+
+    let mut rows: Vec<(&str, u32, f64, f64, f64)> = per_file_consensus_targets
+        .iter()
+        .flat_map(|(file_name, targets)| {
+            let entries = entries_by_file.get(file_name.as_str()).copied();
+            targets.iter().filter_map(move |&(idx, apex, start, end)| {
+                entries
+                    .and_then(|e| e.get(idx))
+                    .map(|entry| (file_name.as_str(), entry.entry_id, apex, start, end))
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+
+    for (file_name, entry_id, apex, start, end) in &rows {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}",
+            file_name,
+            entry_id,
+            format_f64_roundtrip(*apex),
+            format_f64_roundtrip(*start),
+            format_f64_roundtrip(*end),
+        )
+        .ok();
+    }
+    log::info!(
+        "Wrote Stage 6 multi-charge dump: {} ({} rows)",
+        path,
+        rows.len()
+    );
+
+    exit_if_only("OSPREY_MULTICHARGE_ONLY", "Stage 6 multi-charge dump");
+}
+
+/// Append the loaded calibration arrays (library_rts + fitted_values)
+/// for one file to `rust_stage6_calibration.tsv` for cross-impl
+/// JSON-decode parity check. Each call writes one row per
+/// `(library_rts[i], fitted_values[i])` pair, prefixed with the file
+/// name. The header is written on the first call (file does not yet
+/// exist) and subsequent calls append.
+///
+/// Diffing this dump against `cs_stage6_calibration.tsv` localizes
+/// whether cross-impl divergence in `inverse_predict` enters at the
+/// JSON `f64` parser (decimal-to-binary) or inside the LOESS
+/// interpolation arithmetic.
+///
+/// Gated by `OSPREY_DUMP_CALIBRATION=1`. The companion
+/// `OSPREY_CALIBRATION_ONLY=1` env-var is checked after the
+/// `--join-only` calibration-load loop completes — when all files
+/// have appended their rows — and exits the process cleanly.
+pub fn dump_stage6_calibration(file_name: &str, library_rts: &[f64], fitted_values: &[f64]) {
+    if !is_dump_enabled("OSPREY_DUMP_CALIBRATION") {
+        return;
+    }
+
+    let path = "rust_stage6_calibration.tsv";
+    let header_needed = !std::path::Path::new(path).exists();
+
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        log::warn!("Could not open {}", path);
+        return;
+    };
+
+    if header_needed {
+        writeln!(f, "file_name\tidx\tlibrary_rt\tfitted_value").ok();
+    }
+
+    let n = library_rts.len().min(fitted_values.len());
+    for i in 0..n {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}",
+            file_name,
+            i,
+            format_f64_roundtrip(library_rts[i]),
+            format_f64_roundtrip(fitted_values[i]),
+        )
+        .ok();
+    }
+    log::info!(
+        "Appended {} calibration rows for {} to {}",
+        n,
+        file_name,
+        path
+    );
+}
+
+/// Dump per-detection (apex_rt, library_rt) pairs going into
+/// `compute_consensus_rts` to `rust_stage6_inv_predict.tsv` for
+/// cross-impl ULP bisection. apex_rt is the FdrEntry value loaded
+/// from Parquet; library_rt is `inverse_predict(apex_rt)` against the
+/// per-file refined RT calibration. weight is the sigmoid-of-SVM-score
+/// Stage 6 contribution weight.
+///
+/// Diffing this dump against `cs_stage6_inv_predict.tsv` localizes
+/// whether cross-impl divergence in `consensus_library_rt` enters at
+/// Parquet f64 decode (apex_rt diverges) or LOESS interpolation
+/// (only library_rt diverges).
+///
+/// Each record is `(file_name, modified_sequence, is_decoy, apex_rt,
+/// library_rt, weight)`.
+///
+/// Gated by `OSPREY_DUMP_INV_PREDICT=1`. When `OSPREY_INV_PREDICT_ONLY=1`
+/// is also set, exits the process after writing.
+pub type InvPredictRecord = (String, String, bool, f64, f64, f64);
+
+pub fn dump_stage6_inv_predict(records: &[InvPredictRecord]) {
+    if !is_dump_enabled("OSPREY_DUMP_INV_PREDICT") {
+        return;
+    }
+
+    let path = "rust_stage6_inv_predict.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "file_name\tis_decoy\tmodified_sequence\tapex_rt\tlibrary_rt\tweight"
+    )
+    .ok();
+
+    let mut sorted: Vec<&(String, String, bool, f64, f64, f64)> = records.iter().collect();
+    // Tuple is (file_name, modseq, is_decoy, apex_rt, library_rt, weight).
+    // Sort by (is_decoy, modseq, file_name) and tiebreak on (apex_rt, library_rt)
+    // because a peptide with multiple charge-state detections in one file
+    // produces multiple rows that tie on the (is_decoy, modseq, file_name) key.
+    sorted.sort_by(|a, b| {
+        a.2.cmp(&b.2)
+            .then(a.1.cmp(&b.1))
+            .then(a.0.cmp(&b.0))
+            .then(a.3.total_cmp(&b.3))
+            .then(a.4.total_cmp(&b.4))
+    });
+
+    for (file_name, modseq, is_decoy, apex_rt, library_rt, weight) in &sorted {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            file_name,
+            if *is_decoy { "true" } else { "false" },
+            modseq,
+            format_f64_roundtrip(*apex_rt),
+            format_f64_roundtrip(*library_rt),
+            format_f64_roundtrip(*weight),
+        )
+        .ok();
+    }
+    log::info!(
+        "Wrote Stage 6 inverse-predict dump: {} ({} rows)",
+        path,
+        sorted.len()
+    );
+
+    exit_if_only("OSPREY_INV_PREDICT_ONLY", "Stage 6 inverse-predict dump");
+}
+
+/// Dump the per-peptide first-pass protein FDR state to
+/// `rust_stage6_protein_fdr.tsv`. Mirrors
+/// `OspreyDiagnostics.WriteStage6ProteinFdrDump`.
+///
+/// One row per peptide that appears in `best_scores` (the union of
+/// target + decoy modified_sequences seen across all per-file
+/// FdrEntry stubs at the moment first-pass protein FDR runs).
+/// Columns: `is_decoy, modified_sequence, best_qvalue, score,
+/// protein_qvalue`. `best_qvalue` is the input gate (peptide-level
+/// run q-value, min across files). `score` is the input ranking
+/// (max SVM discriminant across files). `protein_qvalue` is the
+/// propagated output -- the value `propagate_protein_qvalues` will
+/// write to `FdrEntry.run_protein_qvalue` (1.0 if the peptide is
+/// not in `protein_fdr.peptide_qvalues`, matching the
+/// `propagate_protein_qvalues` default). Rows sorted by
+/// `(is_decoy, modified_sequence)` for stable diff.
+///
+/// Gated by `OSPREY_DUMP_PROTEIN_FDR=1`. When `OSPREY_PROTEIN_FDR_ONLY=1`
+/// is also set, exits the process after writing.
+pub fn dump_stage6_protein_fdr(
+    best_scores: &HashMap<Arc<str>, PeptideScore>,
+    peptide_qvalues: &HashMap<String, f64>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_PROTEIN_FDR") {
+        return;
+    }
+
+    let path = "rust_stage6_protein_fdr.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "is_decoy\tmodified_sequence\tbest_qvalue\tscore\tprotein_qvalue"
+    )
+    .ok();
+
+    let mut rows: Vec<(&Arc<str>, &PeptideScore)> = best_scores.iter().collect();
+    rows.sort_by(|a, b| {
+        a.1.is_decoy
+            .cmp(&b.1.is_decoy)
+            .then_with(|| a.0.as_ref().cmp(b.0.as_ref()))
+    });
+
+    for (modseq, ps) in &rows {
+        let q = peptide_qvalues.get(modseq.as_ref()).copied().unwrap_or(1.0);
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}",
+            if ps.is_decoy { "true" } else { "false" },
+            modseq,
+            format_f64_roundtrip(ps.best_qvalue),
+            format_f64_roundtrip(ps.score),
+            format_f64_roundtrip(q),
+        )
+        .ok();
+    }
+    log::info!(
+        "Wrote Stage 6 first-pass protein FDR dump: {} ({} rows)",
+        path,
+        rows.len()
+    );
+
+    exit_if_only("OSPREY_PROTEIN_FDR_ONLY", "Stage 6 protein FDR dump");
+}
+
+/// Dump the per-point LOESS fit state of every refit RTCalibration to
+/// `rust_stage6_loess_fit.tsv`. Mirrors
+/// `OspreyDiagnostics.WriteStage6LoessFitDump`.
+///
+/// One row per `(file_name, idx)` into the refit's `library_rts` +
+/// `fitted_values` + `abs_residuals` arrays. Rows sorted by
+/// `(file_name, idx)` for stable diff. The refit dump captures scalar
+/// stats (R²/SD/MAD); this dump captures the LOESS curve itself so a
+/// stats-vs-smoother bisection is possible: if `(library_rt,
+/// fitted_value, abs_residual)` match cross-impl, the divergence is
+/// in the stats computation. If `fitted_value` diverges, the LOESS
+/// smoother arithmetic itself differs.
+///
+/// Gated by `OSPREY_DUMP_LOESS_FIT=1`. When `OSPREY_LOESS_FIT_ONLY=1`
+/// is also set, exits the process after writing.
+pub fn dump_stage6_loess_fit(
+    refined_calibrations: &HashMap<String, osprey_chromatography::RTCalibration>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_LOESS_FIT") {
+        return;
+    }
+
+    let path = "rust_stage6_loess_fit.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(f, "file_name\tidx\tlibrary_rt\tfitted_value\tabs_residual").ok();
+
+    let mut file_names: Vec<&String> = refined_calibrations.keys().collect();
+    file_names.sort();
+
+    let mut total_rows = 0usize;
+    for file_name in &file_names {
+        let cal = &refined_calibrations[file_name.as_str()];
+        let params = cal.export_model_params();
+        let n = params
+            .library_rts
+            .len()
+            .min(params.fitted_rts.len())
+            .min(params.abs_residuals.len());
+        for i in 0..n {
+            writeln!(
+                f,
+                "{}\t{}\t{}\t{}\t{}",
+                file_name,
+                i,
+                format_f64_roundtrip(params.library_rts[i]),
+                format_f64_roundtrip(params.fitted_rts[i]),
+                format_f64_roundtrip(params.abs_residuals[i]),
+            )
+            .ok();
+        }
+        total_rows += n;
+    }
+    log::info!(
+        "Wrote Stage 6 LOESS fit dump: {} ({} rows across {} files)",
+        path,
+        total_rows,
+        file_names.len()
+    );
+
+    exit_if_only("OSPREY_LOESS_FIT_ONLY", "Stage 6 LOESS fit dump");
+}
+
+/// Dump the per-file refined-calibration statistics produced by
+/// `refit_calibration_with_consensus` to `rust_stage6_refit.tsv`.
+/// Mirrors `OspreySharp.FDR.Reconciliation.CalibrationRefit.Refit`.
+///
+/// Gated by `OSPREY_DUMP_REFIT=1`. When `OSPREY_REFIT_ONLY=1` is also
+/// set, exits the process after writing. Columns: `file_name, n_points,
+/// r_squared, residual_sd, mad`. Rows are emitted only for files where
+/// the refit produced a calibration (insufficient-points failures are
+/// absent), sorted by `file_name` for stable diff.
+pub fn dump_stage6_refit(
+    refined_calibrations: &HashMap<String, osprey_chromatography::RTCalibration>,
+) {
+    if !is_dump_enabled("OSPREY_DUMP_REFIT") {
+        return;
+    }
+
+    let path = "rust_stage6_refit.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(f, "file_name\tn_points\tr_squared\tresidual_sd\tmad").ok();
+
+    let mut rows: Vec<(&str, _)> = refined_calibrations
+        .iter()
+        .map(|(name, cal)| (name.as_str(), cal.stats()))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (file_name, stats) in &rows {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}",
+            file_name,
+            stats.n_points,
+            format_f64_roundtrip(stats.r_squared),
+            format_f64_roundtrip(stats.residual_std),
+            format_f64_roundtrip(stats.mad),
+        )
+        .ok();
+    }
+    log::info!("Wrote Stage 6 refit dump: {} ({} rows)", path, rows.len());
+
+    exit_if_only("OSPREY_REFIT_ONLY", "Stage 6 refit dump");
 }
 
 #[cfg(test)]
