@@ -3356,6 +3356,15 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     // batch_cwt dropped here — frees ~2.4 GB
                 }
 
+                // Stage 6 cross-impl bisection dump for the planner output.
+                // Gated by OSPREY_DUMP_RECONCILIATION=1; exits when
+                // OSPREY_RECONCILIATION_ONLY=1 is also set. Pairs with
+                // OspreySharp's WriteStage6ReconciliationDump.
+                crate::diagnostics::dump_stage6_reconciliation(
+                    &reconciliation_actions,
+                    &per_file_entries,
+                );
+
                 // Gap-fill: identify passing precursors missing from each file
                 // Uses run-level FDR: any precursor passing in at least one replicate
                 per_file_gap_fill = identify_gap_fill_targets(
