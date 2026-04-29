@@ -3304,9 +3304,16 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     })
                     .collect();
 
-                // Stage 6 cross-impl bisection dump for refined-calibration
-                // statistics. Gated by OSPREY_DUMP_REFIT=1; exits when
-                // OSPREY_REFIT_ONLY=1 is also set.
+                // Stage 6 cross-impl bisection dumps for refined-calibration
+                // state:
+                //   - dump_stage6_loess_fit: per-point library_rt /
+                //     fitted_value / abs_residual triples from each refit
+                //     RTCalibration. Gated by OSPREY_DUMP_LOESS_FIT=1; exits
+                //     when OSPREY_LOESS_FIT_ONLY=1 is also set.
+                //   - dump_stage6_refit: scalar stats (n_points, R^2,
+                //     residual_std, mad) per refit. Gated by
+                //     OSPREY_DUMP_REFIT=1; exits when OSPREY_REFIT_ONLY=1
+                //     is also set.
                 crate::diagnostics::dump_stage6_loess_fit(&refined_calibrations);
                 crate::diagnostics::dump_stage6_refit(&refined_calibrations);
 
