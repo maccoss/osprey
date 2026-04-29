@@ -462,7 +462,16 @@ n_threads: 0  # 0 = auto-detect
     pub fn library_identity_hash(&self) -> String {
         let lib_path = self.library_source.path();
         let mut hasher = Sha256::new();
-        let file_name = lib_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        // `to_string_lossy` keeps a rare non-UTF-8 file name from
+        // collapsing to "" (which would let an unrelated missing file
+        // hash the same way). When `file_name()` is None (path ends in
+        // `..` or `/`), fall back to "" to match the OspreySharp port,
+        // which uses `Path.GetFileName(libPath)` and yields empty
+        // string for the same edge cases.
+        let file_name = lib_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         hasher.update(format!("file_name:{}\n", file_name).as_bytes());
         if let Ok(meta) = std::fs::metadata(lib_path) {
             hasher.update(format!("size:{}\n", meta.len()).as_bytes());
