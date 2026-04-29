@@ -450,14 +450,20 @@ n_threads: 0  # 0 = auto-detect
         format!("{:x}", hasher.finalize())
     }
 
-    /// Compute a fast identity hash for the library file (path + size + mtime).
-    /// Uses filesystem metadata only — no content hashing.
-    /// `mtime` is serialized as Unix seconds (integer) so the C# port can
-    /// produce a bit-identical hash for cross-impl `--join-only` validation.
+    /// Compute a fast identity hash for the library file from the file name,
+    /// size, and mtime. Filesystem metadata only; no content hashing. The
+    /// directory portion is deliberately NOT in the hash so the same library
+    /// identifies identically across Rust / .NET / OS variations (drive
+    /// letter case, forward vs back slash, relative vs absolute, HPC
+    /// node-local vs shared paths). Mirrors the `reconciliation_parameter_hash`
+    /// precedent that hashes only sorted file stems for the input set.
+    /// `mtime` is serialized as Unix seconds (integer) so the C# port
+    /// produces a bit-identical hash for cross-impl `--join-only`.
     pub fn library_identity_hash(&self) -> String {
         let lib_path = self.library_source.path();
         let mut hasher = Sha256::new();
-        hasher.update(format!("path:{}\n", lib_path.display()).as_bytes());
+        let file_name = lib_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        hasher.update(format!("file_name:{}\n", file_name).as_bytes());
         if let Ok(meta) = std::fs::metadata(lib_path) {
             hasher.update(format!("size:{}\n", meta.len()).as_bytes());
             if let Ok(mtime) = meta.modified() {
