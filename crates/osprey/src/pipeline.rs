@@ -3386,6 +3386,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             per_file_gap_fill = HashMap::new();
         }
 
+        // Stage 6 cross-impl bisection dump for the planner output. Fires
+        // unconditionally when OSPREY_DUMP_RECONCILIATION=1 is set so the
+        // empty / cached / skipped paths still produce a header-only TSV
+        // and still honor OSPREY_RECONCILIATION_ONLY for early exit.
+        // Pairs with OspreySharp's WriteStage6ReconciliationDump.
+        crate::diagnostics::dump_stage6_reconciliation(&reconciliation_actions, &per_file_entries);
+
         let total_reconciliation: usize = reconciliation_actions
             .values()
             .filter(|a| !matches!(a, ReconcileAction::Keep))
