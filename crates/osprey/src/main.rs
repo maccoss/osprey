@@ -168,21 +168,39 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
-    /// HPC: run Stages 1-4 only and exit. Per-file `.scores.parquet` is
-    /// written next to each input mzML. No FDR is run and no blib is written.
-    /// Mutually exclusive with --join-only.
+    /// HPC modifier: run only the per-file fan-out from the entry
+    /// point, skipping the next join. With `-i ...` (Stage 1 entry):
+    /// runs Stages 1-4 only — per-file `.scores.parquet` is written
+    /// next to each input mzML, no FDR, no blib. With
+    /// `--join-at-pass=<N>`: skip the join at <N> and run only the
+    /// per-file phase that follows it. Mutually exclusive with
+    /// --join-only.
     #[arg(long)]
     no_join: bool,
 
-    /// HPC: skip Stages 1-4 entirely and run Stage 5+ from existing
-    /// `.scores.parquet` caches passed via --input-scores. Requires
-    /// --library and --output. Mutually exclusive with --no-join and --input.
+    /// HPC modifier: run only the join phase at the entry point,
+    /// stopping before the per-file fan-out that follows. Used when an
+    /// HPC coordinator finishes a join (e.g. Stage 5 first-pass
+    /// Percolator + reconciliation planning) and wants to ship the
+    /// resulting plan files to N worker nodes for the per-file phase.
+    /// Requires `--join-at-pass=<N>`; not valid alone. Mutually
+    /// exclusive with --no-join.
     #[arg(long)]
     join_only: bool,
 
+    /// HPC: enter the pipeline at a specific join checkpoint, consuming
+    /// the per-file Parquet score files for that pass via
+    /// --input-scores. `1` = consume Stage 4 outputs (raw scoring) and
+    /// run Stages 5-8. `2` = consume Stage 6 outputs (reconciled
+    /// scoring) and run Stages 7-8. Combine with `--join-only` to stop
+    /// after the next join, or `--no-join` to skip the next join and run
+    /// only the per-file phase. Mutually exclusive with --input.
+    #[arg(long, value_name = "N")]
+    join_at_pass: Option<u8>,
+
     /// HPC: one or more `.scores.parquet` files (or a single directory
     /// scanned non-recursively for `*.scores.parquet`). Required when
-    /// --join-only is set; ignored otherwise.
+    /// --join-at-pass is set; ignored otherwise.
     #[arg(long, num_args = 1..)]
     input_scores: Option<Vec<PathBuf>>,
 
@@ -193,6 +211,79 @@ struct Args {
     /// per-column-chunk metadata, so this flag only governs writes.
     #[arg(long)]
     parquet_compression: Option<String>,
+}
+
+/// Normalize the HPC entry-point + modifier flags before validation.
+/// Resolves the (`--join-at-pass=<N>`, `--join-only`, `--no-join`) triple
+/// into the single `args.join_only` boolean that downstream code already
+/// reads (and leaves `args.no_join` alone since its semantics are
+/// unchanged for the Stage 1 entry point).
+///
+/// Modifier semantics:
+/// - `--join-only` runs only the next join from the entry point.
+/// - `--no-join` runs only the per-file fan-out from the entry point.
+///
+/// Entry points:
+/// - `-i ...` (no `--join-at-pass`): Stage 1 (raw mzML).
+/// - `--join-at-pass=1 --input-scores ...`: post-Stage-4 (raw parquets).
+/// - `--join-at-pass=2 --input-scores ...`: post-Stage-6 (reconciled
+///   parquets).
+///
+/// PR 1 (this commit) wires the rename only — combinations that need
+/// the Stage 5 → Stage 6 boundary persistence (`--join-at-pass=1`
+/// combined with either modifier) error out as "not yet implemented",
+/// and `--join-at-pass=2` errors the same way until the Stage 6 →
+/// Stage 7 path lands.
+fn normalize_hpc_args(args: &mut Args) -> Result<()> {
+    // Modifiers are mutually exclusive: can't be both per-file-only and
+    // join-only simultaneously.
+    if args.no_join && args.join_only {
+        anyhow::bail!("--no-join and --join-only are mutually exclusive modifiers.");
+    }
+
+    // `--join-only` is a modifier of `--join-at-pass=<N>`; standalone use
+    // has no entry point to modify. The old standalone spelling that meant
+    // "run Stages 5-8 from Stage 4 parquets" is now `--join-at-pass=1`.
+    if args.join_only && args.join_at_pass.is_none() {
+        anyhow::bail!(
+            "--join-only is a modifier and requires --join-at-pass=<N>. \
+             To run Stages 5-8 from Stage 4 parquets, use --join-at-pass=1 --input-scores ..."
+        );
+    }
+
+    match args.join_at_pass {
+        Some(1) => {
+            // PR 2 will implement these modifier combinations against
+            // persisted Stage 5 → Stage 6 boundary files.
+            if args.join_only {
+                anyhow::bail!(
+                    "--join-at-pass=1 --join-only (run only Stage 5) is not yet implemented."
+                );
+            }
+            if args.no_join {
+                anyhow::bail!(
+                    "--join-at-pass=1 --no-join (run only Stage 6 from persisted Stage 5 outputs) is not yet implemented."
+                );
+            }
+            // Plain `--join-at-pass=1`: route through the existing
+            // Stage 5+ entry path that reads `args.join_only`.
+            args.join_only = true;
+        }
+        Some(2) => {
+            anyhow::bail!(
+                "--join-at-pass=2 (Stage 6 reconciled-parquet input) is not yet implemented."
+            );
+        }
+        Some(n) => {
+            anyhow::bail!("--join-at-pass must be 1 or 2 (got {}).", n);
+        }
+        None => {
+            // Stage 1 entry point (with `-i ...`). `--no-join` keeps its
+            // existing meaning: do per-file work only, which is exactly
+            // Stages 1-4. No remapping needed.
+        }
+    }
+    Ok(())
 }
 
 /// Validate the HPC mode flags (`--no-join`, `--join-only`,
@@ -254,7 +345,7 @@ fn resolve_input_scores(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // Initialize two-tier logging: clean terminal output + verbose log file.
     // Terminal shows info-level with elapsed time prefixes by default.
@@ -286,6 +377,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    normalize_hpc_args(&mut args)?;
     validate_hpc_args(&args)?;
     if args.no_join && args.output.is_some() {
         log::warn!(
@@ -610,6 +702,133 @@ mod tests {
     fn validate_default_mode_is_unaffected() {
         let args = parse(&["-i", "a.mzML", "-l", "ref.blib", "-o", "out.blib"]);
         validate_hpc_args(&args).unwrap();
+    }
+
+    // --- normalize_hpc_args (--join-at-pass) ----------------------------
+
+    #[test]
+    fn normalize_join_at_pass_1_sets_join_only() {
+        let mut args = parse(&[
+            "--join-at-pass=1",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert!(!args.join_only);
+        normalize_hpc_args(&mut args).unwrap();
+        assert!(args.join_only);
+    }
+
+    #[test]
+    fn normalize_join_at_pass_2_errors_until_implemented() {
+        let mut args = parse(&[
+            "--join-at-pass=2",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(normalize_hpc_args(&mut args), "not yet implemented");
+    }
+
+    #[test]
+    fn normalize_join_at_pass_invalid_value_errors() {
+        let mut args = parse(&[
+            "--join-at-pass=3",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(normalize_hpc_args(&mut args), "must be 1 or 2");
+    }
+
+    #[test]
+    fn normalize_join_at_pass_1_with_join_only_modifier_errors_until_implemented() {
+        // PR 2 will implement "run only Stage 5" via persisted plan files.
+        let mut args = parse(&[
+            "--join-at-pass=1",
+            "--join-only",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(normalize_hpc_args(&mut args), "not yet implemented");
+    }
+
+    #[test]
+    fn normalize_join_at_pass_1_with_no_join_modifier_errors_until_implemented() {
+        // PR 2 will implement "run only Stage 6 from persisted Stage 5
+        // outputs" once the boundary files exist.
+        let mut args = parse(&[
+            "--join-at-pass=1",
+            "--no-join",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(normalize_hpc_args(&mut args), "not yet implemented");
+    }
+
+    #[test]
+    fn normalize_join_only_alone_errors_no_entry_point() {
+        let mut args = parse(&[
+            "--join-only",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(normalize_hpc_args(&mut args), "modifier");
+    }
+
+    #[test]
+    fn normalize_no_join_and_join_only_modifiers_are_mutex() {
+        let mut args = parse(&[
+            "--join-at-pass=1",
+            "--no-join",
+            "--join-only",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(normalize_hpc_args(&mut args), "mutually exclusive");
+    }
+
+    #[test]
+    fn normalize_no_join_alone_unchanged() {
+        // The Stage 1 entry path with `-i ...` + `--no-join` keeps its
+        // existing meaning: do per-file work only = Stages 1-4.
+        let mut args = parse(&["--no-join", "-i", "a.mzML", "-l", "ref.blib"]);
+        normalize_hpc_args(&mut args).unwrap();
+        assert!(args.no_join);
+        assert!(!args.join_only);
+    }
+
+    #[test]
+    fn normalize_default_mode_is_a_noop() {
+        let mut args = parse(&["-i", "a.mzML", "-l", "ref.blib", "-o", "out.blib"]);
+        normalize_hpc_args(&mut args).unwrap();
+        assert!(!args.join_only);
+        assert!(args.join_at_pass.is_none());
     }
 
     // --- resolve_input_scores -------------------------------------------
