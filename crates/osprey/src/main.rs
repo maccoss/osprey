@@ -286,9 +286,12 @@ fn normalize_hpc_args(args: &mut Args) -> Result<()> {
     Ok(())
 }
 
-/// Validate the HPC mode flags (`--no-join`, `--join-only`,
-/// `--input-scores`) for mutual exclusion and required-companion errors.
-/// Does not warn (warnings stay in `main`).
+/// Validate the normalized HPC mode flags (`--no-join`, `--join-only`,
+/// `--join-at-pass`, and `--input-scores`) for mutual exclusion and
+/// required-companion errors. Expects `normalize_hpc_args` to have already
+/// run (so the `args.join_only` boolean reflects either the legacy
+/// `--join-only` spelling or the canonical `--join-at-pass=1`). Does not
+/// warn (warnings stay in `main`).
 fn validate_hpc_args(args: &Args) -> Result<()> {
     if args.no_join && args.join_only {
         anyhow::bail!("--no-join and --join-only are mutually exclusive.");
@@ -522,8 +525,13 @@ fn main() -> Result<()> {
     }
     if args.join_only {
         let resolved = resolve_input_scores(args.input_scores.unwrap())?;
+        // `args.join_only` is set either by the legacy `--join-only` flag
+        // (which `normalize_hpc_args` rejected unless paired with
+        // `--join-at-pass=<N>`) or by `--join-at-pass=1`. Today only the
+        // pass-1 path reaches here, so the message references the
+        // canonical flag the user typed.
         log::info!(
-            "--join-only: skipping Stages 1-4, loading {} `.scores.parquet` file(s)",
+            "--join-at-pass=1: skipping Stages 1-4, loading {} `.scores.parquet` file(s)",
             resolved.len()
         );
         config.input_scores = Some(resolved);
@@ -632,25 +640,38 @@ mod tests {
 
     #[test]
     fn validate_no_join_and_join_only_is_mutex() {
+        // Defense-in-depth: real CLI invocations of this combination are
+        // caught earlier by `normalize_hpc_args` (covered by
+        // `normalize_no_join_and_join_only_modifiers_are_mutex`); this
+        // test asserts `validate_hpc_args` still catches it on its own
+        // if normalize were ever bypassed.
         let args = parse(&["--no-join", "--join-only", "-i", "x.mzML", "-l", "x.blib"]);
         assert_err_contains(validate_hpc_args(&args), "mutually exclusive");
     }
 
+    // The three `validate_join_at_pass_1_*` tests below model the actual
+    // `main` flow: parse raw `--join-at-pass=1` args (the canonical
+    // spelling), run `normalize_hpc_args` to fold it into the internal
+    // `args.join_only` boolean, and only then call `validate_hpc_args`.
+    // This matches what real CLI invocations produce — standalone
+    // `--join-only` is rejected by `normalize_hpc_args` and never reaches
+    // `validate_hpc_args` (covered by the separate `normalize_*` tests).
+
     #[test]
-    fn validate_join_only_requires_input_scores() {
-        let args = parse(&["--join-only", "-l", "x.blib", "-o", "y.blib"]);
+    fn validate_join_at_pass_1_requires_input_scores() {
+        let mut args = parse(&["--join-at-pass=1", "-l", "x.blib", "-o", "y.blib"]);
+        normalize_hpc_args(&mut args).unwrap();
         let err = validate_hpc_args(&args)
             .expect_err("expected error")
             .to_string();
-        // Error refers to the canonical flag a user types to reach this branch.
         assert!(err.contains("--join-at-pass=1"), "got: {}", err);
         assert!(err.contains("--input-scores"), "got: {}", err);
     }
 
     #[test]
-    fn validate_join_only_rejects_input_mzml() {
-        let args = parse(&[
-            "--join-only",
+    fn validate_join_at_pass_1_rejects_input_mzml() {
+        let mut args = parse(&[
+            "--join-at-pass=1",
             "-i",
             "a.mzML",
             "--input-scores",
@@ -660,6 +681,7 @@ mod tests {
             "-o",
             "y.blib",
         ]);
+        normalize_hpc_args(&mut args).unwrap();
         let err = validate_hpc_args(&args)
             .expect_err("expected error")
             .to_string();
@@ -668,8 +690,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_join_only_requires_library_and_output() {
-        let args = parse(&["--join-only", "--input-scores", "a.scores.parquet"]);
+    fn validate_join_at_pass_1_requires_library_and_output() {
+        let mut args = parse(&["--join-at-pass=1", "--input-scores", "a.scores.parquet"]);
+        normalize_hpc_args(&mut args).unwrap();
         let err = validate_hpc_args(&args)
             .expect_err("expected error")
             .to_string();
@@ -702,9 +725,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_join_only_happy_path() {
-        let args = parse(&[
-            "--join-only",
+    fn validate_join_at_pass_1_happy_path() {
+        let mut args = parse(&[
+            "--join-at-pass=1",
             "--input-scores",
             "a.scores.parquet",
             "b.scores.parquet",
@@ -713,6 +736,7 @@ mod tests {
             "-o",
             "out.blib",
         ]);
+        normalize_hpc_args(&mut args).unwrap();
         validate_hpc_args(&args).unwrap();
     }
 
