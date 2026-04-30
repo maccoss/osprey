@@ -294,14 +294,19 @@ fn validate_hpc_args(args: &Args) -> Result<()> {
         anyhow::bail!("--no-join and --join-only are mutually exclusive.");
     }
     if args.join_only {
+        // Reachable only via `--join-at-pass=1` after `normalize_hpc_args`
+        // (standalone `--join-only` errors there). Error text references the
+        // canonical flag the user typed.
         if args.input.is_some() {
-            anyhow::bail!("--join-only cannot be combined with --input. Use --input-scores.");
+            anyhow::bail!(
+                "--join-at-pass=1 cannot be combined with --input. Use --input-scores instead."
+            );
         }
         if args.input_scores.is_none() {
-            anyhow::bail!("--join-only requires --input-scores <path...>.");
+            anyhow::bail!("--join-at-pass=1 requires --input-scores <path...>.");
         }
         if args.library.is_none() || args.output.is_none() {
-            anyhow::bail!("--join-only requires --library and --output.");
+            anyhow::bail!("--join-at-pass=1 requires --library and --output.");
         }
     }
     if args.no_join {
@@ -634,7 +639,12 @@ mod tests {
     #[test]
     fn validate_join_only_requires_input_scores() {
         let args = parse(&["--join-only", "-l", "x.blib", "-o", "y.blib"]);
-        assert_err_contains(validate_hpc_args(&args), "--input-scores");
+        let err = validate_hpc_args(&args)
+            .expect_err("expected error")
+            .to_string();
+        // Error refers to the canonical flag a user types to reach this branch.
+        assert!(err.contains("--join-at-pass=1"), "got: {}", err);
+        assert!(err.contains("--input-scores"), "got: {}", err);
     }
 
     #[test]
@@ -650,13 +660,21 @@ mod tests {
             "-o",
             "y.blib",
         ]);
-        assert_err_contains(validate_hpc_args(&args), "--input");
+        let err = validate_hpc_args(&args)
+            .expect_err("expected error")
+            .to_string();
+        assert!(err.contains("--join-at-pass=1"), "got: {}", err);
+        assert!(err.contains("--input"), "got: {}", err);
     }
 
     #[test]
     fn validate_join_only_requires_library_and_output() {
         let args = parse(&["--join-only", "--input-scores", "a.scores.parquet"]);
-        assert_err_contains(validate_hpc_args(&args), "--library and --output");
+        let err = validate_hpc_args(&args)
+            .expect_err("expected error")
+            .to_string();
+        assert!(err.contains("--join-at-pass=1"), "got: {}", err);
+        assert!(err.contains("--library and --output"), "got: {}", err);
     }
 
     #[test]
