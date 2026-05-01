@@ -13,12 +13,15 @@
 //! the refined RT calibration (LOESS refit on consensus peptides).
 //!
 //! Field order is alphabetical at every nesting level — both at the
-//! top-level envelope and within each entry — so `serde_json::to_writer_pretty`
-//! and `System.Text.Json.JsonSerializer` produce identical bytes when
-//! given the same input. Numeric fields use the language's default
-//! shortest-roundtrip f64 emitter (Rust ryu, .NET `R`); cross-impl byte
-//! parity holds for typical values, with the harness falling back to
-//! bit-aware comparison at the rare ties where ryu and `R` disagree.
+//! top-level envelope and within each entry — so the JSON output matches
+//! the C# emitter byte-for-byte. Numeric fields are routed through
+//! `osprey_core::diagnostics::format_f64_roundtrip` on both sides
+//! (rather than each language's default shortest-roundtrip path), giving
+//! a single canonical fixed-point decimal form (no scientific notation)
+//! that is byte-identical across runtimes for every f64 input. The
+//! Newtonsoft `R`/Grisu and Rust `ryu` formatters disagree on the
+//! decimal-vs-scientific threshold for small values, so neither default
+//! is suitable for cross-impl byte parity.
 //!
 //! Mirrors `OspreySharp.IO.ReconciliationFile` on the C# side. Cross-impl
 //! byte parity is verified by a sibling test in both languages.
@@ -28,10 +31,112 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use osprey_chromatography::RTCalibration;
+use osprey_core::diagnostics::format_f64_roundtrip;
 use osprey_core::FdrEntry;
 use serde::{Deserialize, Serialize};
+use serde_json::ser::{Formatter, PrettyFormatter};
 
 use crate::reconciliation::{GapFillTarget, ReconcileAction};
+
+/// JSON formatter that delegates layout to `serde_json`'s
+/// `PrettyFormatter` but routes every f64 through
+/// `format_f64_roundtrip`. Together with the matching
+/// `RoundtripJsonConverter` on the C# side this guarantees that every
+/// f64 in the reconciliation envelope is emitted as the same shortest-
+/// roundtrip fixed-point decimal on both runtimes — sidestepping the
+/// ryu-vs-Grisu threshold disagreement on values like `4.58e-5` that
+/// would otherwise silently break cross-impl byte parity.
+struct RoundtripPrettyFormatter<'a> {
+    inner: PrettyFormatter<'a>,
+}
+
+impl<'a> RoundtripPrettyFormatter<'a> {
+    fn new() -> Self {
+        Self {
+            inner: PrettyFormatter::new(),
+        }
+    }
+}
+
+impl<'a> Formatter for RoundtripPrettyFormatter<'a> {
+    fn write_f64<W>(&mut self, writer: &mut W, value: f64) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        // format_f64_roundtrip returns "NaN" / "inf" / "-inf" for non-
+        // finite values which are not valid JSON numbers; reconciliation
+        // arrays should never carry those, but guard anyway by failing
+        // the write rather than emitting a malformed token.
+        if !value.is_finite() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("non-finite f64 in reconciliation JSON: {}", value),
+            ));
+        }
+        writer.write_all(format_f64_roundtrip(value).as_bytes())
+    }
+
+    // Delegate the indent-aware methods to the wrapped PrettyFormatter
+    // so 2-space indentation and key/value spacing are preserved.
+    fn begin_array<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.inner.begin_array(writer)
+    }
+    fn end_array<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.inner.end_array(writer)
+    }
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.inner.begin_array_value(writer, first)
+    }
+    fn end_array_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.inner.end_array_value(writer)
+    }
+    fn begin_object<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.inner.begin_object(writer)
+    }
+    fn end_object<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.inner.end_object(writer)
+    }
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.inner.begin_object_key(writer, first)
+    }
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        self.inner.begin_object_value(writer)
+    }
+    fn end_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        // PrettyFormatter tracks `has_value` here to decide whether
+        // end_object should emit a newline before the closing brace; if
+        // we don't delegate, every object collapses to `<value>}` with
+        // no trailing newline.
+        self.inner.end_object_value(writer)
+    }
+}
 
 /// Top-level JSON envelope. Field declaration order is alphabetical so
 /// `serde_json::to_writer_pretty` emits keys in alphabetical order and
@@ -221,11 +326,13 @@ pub fn write_reconciliation_file(path: &Path, file: &ReconciliationFile) -> Resu
         let f = std::fs::File::create(&tmp_path)
             .map_err(|e| anyhow!("Failed to create {}: {}", tmp_path.display(), e))?;
         let mut writer = std::io::BufWriter::new(f);
-        serde_json::to_writer_pretty(&mut writer, file)
+        let formatter = RoundtripPrettyFormatter::new();
+        let mut serializer = serde_json::Serializer::with_formatter(&mut writer, formatter);
+        file.serialize(&mut serializer)
             .map_err(|e| anyhow!("Failed to serialize reconciliation JSON: {}", e))?;
-        // serde_json::to_writer_pretty does not write a trailing newline;
-        // emit one explicitly so the file ends with `}\n` (POSIX text
-        // file convention) and the C# side mirrors it.
+        // The serializer does not write a trailing newline; emit one
+        // explicitly so the file ends with `}\n` (POSIX text file
+        // convention) and the C# side mirrors it.
         use std::io::Write;
         writer.write_all(b"\n")?;
     }
