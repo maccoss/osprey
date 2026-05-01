@@ -2647,16 +2647,33 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
     // multi-file fan-back-in WITH reconciliation enabled. Reject early
     // rather than running Stages 1-5 only to silently skip the boundary
     // write at line ~3555 (gated on `config.reconciliation.enabled &&
-    // config.input_files.len() > 1`). The CLI-side check in
-    // `validate_hpc_args` covers `--input-scores` count; this guards
-    // against `reconciliation.enabled = false` set via YAML config.
-    if config.stop_after_stage5 && !config.reconciliation.enabled {
-        return Err(OspreyError::ConfigError(
-            "--join-at-pass=1 --join-only requires reconciliation.enabled = true \
-             (got false from config). The Stage 5 → Stage 6 boundary file pair \
-             is only meaningful when reconciliation runs."
-                .into(),
-        ));
+    // config.input_files.len() > 1`).
+    //
+    // Both checks live here (not in `validate_hpc_args` on `args`)
+    // because at this point `config.input_scores` reflects the
+    // post-`resolve_input_scores` expanded list — the CLI-time `args`
+    // vec contains a single entry for the directory form
+    // (`--input-scores my_dir/`) regardless of how many parquets it
+    // expands to.
+    if config.stop_after_stage5 {
+        let n_inputs = config.input_scores.as_ref().map(|v| v.len()).unwrap_or(0);
+        if n_inputs < 2 {
+            return Err(OspreyError::config(format!(
+                "--join-at-pass=1 --join-only requires 2+ input parquets \
+                 (got {} after resolving --input-scores). The Stage 5 → \
+                 Stage 6 boundary file pair is only meaningful for \
+                 multi-file fan-back-in.",
+                n_inputs
+            )));
+        }
+        if !config.reconciliation.enabled {
+            return Err(OspreyError::config(
+                "--join-at-pass=1 --join-only requires reconciliation.enabled = true \
+                 (got false from config). The Stage 5 → Stage 6 boundary file pair \
+                 is only meaningful when reconciliation runs."
+                    .to_string(),
+            ));
+        }
     }
 
     // Load library
@@ -9531,7 +9548,7 @@ mod tests {
             std::fs::copy(&path, &out).unwrap();
         }
 
-        // File size sanity check: 32-byte header + N * 48 bytes.
+        // File size sanity check: 32-byte header + N * 52 bytes.
         let size = std::fs::metadata(&path).unwrap().len() as usize;
         assert_eq!(
             size,

@@ -320,24 +320,14 @@ fn validate_hpc_args(args: &Args) -> Result<()> {
         if args.library.is_none() || args.output.is_none() {
             anyhow::bail!("--join-at-pass=1 requires --library and --output.");
         }
-        // `--join-at-pass=1 --join-only` exists to write the Stage 5 → Stage 6
-        // boundary file pair for HPC fan-back-in. Both halves of that pair
-        // (`<stem>.1st-pass.fdr_scores.bin` + `<stem>.reconciliation.json`)
-        // are only meaningful when there are siblings to reconcile against;
-        // a single-file run has no consensus and no gap-fill, so the
-        // boundary write is a no-op. Reject early rather than running
-        // Stages 1-5 only to silently produce nothing useful.
-        if args.join_only_modifier {
-            let n_inputs = args.input_scores.as_ref().map(|v| v.len()).unwrap_or(0);
-            if n_inputs < 2 {
-                anyhow::bail!(
-                    "--join-at-pass=1 --join-only requires --input-scores with 2+ parquet files \
-                     (got {}). The Stage 5 → Stage 6 boundary file pair is only meaningful for \
-                     multi-file fan-back-in.",
-                    n_inputs
-                );
-            }
-        }
+        // The `--join-at-pass=1 --join-only` precondition that requires
+        // 2+ resolved input parquets and `reconciliation.enabled = true`
+        // lives in `run_analysis`, not here. At this point in the
+        // pipeline `args.input_scores` is still the raw clap vec, which
+        // for the directory form (`--input-scores my_dir/`) is just `[1]`
+        // regardless of how many `*.scores.parquet` files are inside —
+        // `resolve_input_scores` expands that later. Checking the count
+        // here would falsely reject the directory form.
     }
     if args.no_join {
         if args.input_scores.is_some() {
