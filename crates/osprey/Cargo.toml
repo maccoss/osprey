@@ -31,6 +31,8 @@ env_logger = { workspace = true }
 indicatif = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 pathdiff = "0.2"
 arrow = { workspace = true }
 parquet = { workspace = true }

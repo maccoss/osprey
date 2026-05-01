@@ -660,6 +660,16 @@ impl RTCalibration {
         &self.abs_residuals
     }
 
+    /// Library RTs used as x-coordinates for the fit (sorted).
+    pub fn library_rts(&self) -> &[f64] {
+        &self.library_rts
+    }
+
+    /// Fitted values at each calibration point (corresponds to library_rts).
+    pub fn fitted_values(&self) -> &[f64] {
+        &self.fitted_values
+    }
+
     /// Get calibration statistics
     pub fn stats(&self) -> RTCalibrationStats {
         let n = self.library_rts.len();

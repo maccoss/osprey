@@ -105,6 +105,12 @@ pub struct OspreyConfig {
     /// + `--input-scores`. When this is `Some`, `input_files` is ignored.
     #[serde(default)]
     pub input_scores: Option<Vec<PathBuf>>,
+    /// When true, exit after Stage 5 + reconciliation planning, having written the
+    /// boundary files (`<stem>.<phase>-pass.fdr_scores.bin` and
+    /// `<stem>.reconciliation.json`) for each input. Skips Stage 6 + 7 + 8.
+    /// Set by the `--join-at-pass=1 --join-only` flag combination.
+    #[serde(default)]
+    pub stop_after_stage5: bool,
     /// Compression codec for `.scores.parquet` writes. Default `Zstd` keeps
     /// production behavior identical to the historical Osprey default.
     /// `Snappy` is offered as a cross-impl interop affordance: OspreySharp
@@ -155,6 +161,7 @@ impl Default for OspreyConfig {
             n_threads: num_cpus(),
             no_join: false,
             input_scores: None,
+            stop_after_stage5: false,
             parquet_compression: ParquetCompression::default(),
         }
     }

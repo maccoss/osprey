@@ -52,6 +52,9 @@ pub mod diagnostics;
 // Cross-run peak reconciliation
 pub mod reconciliation;
 
+// Per-file Stage 5 → Stage 6 boundary file (`<stem>.reconciliation.json`)
+pub mod reconciliation_io;
+
 // Runtime peptide trace (env-var gated)
 pub mod trace;
 
