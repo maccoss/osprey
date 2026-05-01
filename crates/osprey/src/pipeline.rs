@@ -1236,15 +1236,18 @@ fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
 // sidecar persists both halves together so a downstream Stage 6 worker
 // can run without re-deriving anything.
 //
-// The body is post-compaction: every record corresponds to a stub that
-// passed first-pass FDR. Records carry the `entry_id` of the entry
-// they describe so a Stage 6 worker can assemble the post-compaction
-// stub set by joining the full parquet against the sidecar's entry_id
-// set — the worker doesn't need to re-run Percolator to know which
-// rows survive compaction. In skip-Percolator mode the order matches
-// the in-memory Vec position-for-position, so the per-position
-// `entries[i].entry_id == record.entry_id` check also serves as a
-// corruption-detector.
+// Records are written pre-compaction at the Stage 5 → Stage 6
+// boundary: every input entry contributes one record so q-values are
+// preserved even for entries that may not survive later compaction.
+// The pre-compaction call site is at the bottom of the first-pass
+// FDR block in `run_analysis`, just before the compaction loop runs.
+// Each record carries the entry's `entry_id` for identity verification
+// (the per-position `entries[i].entry_id == record.entry_id` check
+// during load doubles as a corruption detector); the loader matches
+// records to stubs by position + count rather than by joining on
+// `entry_id`. A Stage 6 worker therefore consumes the sidecar by
+// reloading the same FdrEntry sequence from the per-file parquet
+// cache and applying records in order.
 //
 // Format:
 //   magic           [0..8]   = b"OSPRYFDR"
@@ -1318,7 +1321,11 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
 /// Load per-file FDR scores from sidecar into FdrEntry stubs. Returns true if successful.
 /// Refuses to load if the file's magic/version don't match v2 or if the entry
 /// count in the header disagrees with the stub list (indicates parquet drift).
-fn load_fdr_scores_sidecar(path: &std::path::Path, entries: &mut [FdrEntry]) -> bool {
+fn load_fdr_scores_sidecar(
+    path: &std::path::Path,
+    entries: &mut [FdrEntry],
+    expected_pass: u8,
+) -> bool {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(_) => return false,
@@ -1347,6 +1354,19 @@ fn load_fdr_scores_sidecar(path: &std::path::Path, entries: &mut [FdrEntry]) -> 
             path.display(),
             version,
             FDR_SIDECAR_VERSION
+        );
+        return false;
+    }
+    // Reject mismatched pass bytes so a 2nd-pass sidecar can never be
+    // silently loaded into 1st-pass stubs (or vice versa) — the q-values
+    // would scramble without any visible error.
+    let pass = data[9];
+    if pass != expected_pass {
+        log::warn!(
+            "Score sidecar {} has pass byte {} but caller expected {}, ignoring",
+            path.display(),
+            pass,
+            expected_pass
         );
         return false;
     }
@@ -1430,13 +1450,19 @@ fn input_path_for_file_name(config: &OspreyConfig, file_name: &str) -> Option<st
 }
 
 /// Write FDR score sidecars for all files.
+/// Returns the number of files for which the sidecar write failed (0 means
+/// success). Callers in `--join-at-pass=1 --join-only` mode treat any
+/// failure as fatal — see the `stop_after_stage5` block — because the
+/// downstream Stage 6 worker would otherwise be missing a sidecar and
+/// either refuse to run or produce wrong results.
 fn persist_fdr_scores(
     per_file_entries: &[(String, Vec<FdrEntry>)],
     config: &OspreyConfig,
     path_fn: fn(&std::path::Path) -> std::path::PathBuf,
     label: &str,
     pass: u8,
-) {
+) -> usize {
+    let mut failures = 0usize;
     for (file_name, entries) in per_file_entries.iter() {
         if let Some(input_file) = input_path_for_file_name(config, file_name) {
             let sidecar_path = path_fn(&input_file);
@@ -1447,9 +1473,18 @@ fn persist_fdr_scores(
                     file_name,
                     e
                 );
+                failures += 1;
             }
+        } else {
+            log::warn!(
+                "No input path for `{}` — skipping {} score sidecar",
+                file_name,
+                label
+            );
+            failures += 1;
         }
     }
+    failures
 }
 
 /// Write per-file scored entries to parquet with optional key-value metadata.
@@ -2607,6 +2642,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         ));
     }
 
+    // `--join-at-pass=1 --join-only` (i.e., stop_after_stage5) writes the
+    // Stage 5 → Stage 6 boundary file pair, which is only meaningful for
+    // multi-file fan-back-in WITH reconciliation enabled. Reject early
+    // rather than running Stages 1-5 only to silently skip the boundary
+    // write at line ~3555 (gated on `config.reconciliation.enabled &&
+    // config.input_files.len() > 1`). The CLI-side check in
+    // `validate_hpc_args` covers `--input-scores` count; this guards
+    // against `reconciliation.enabled = false` set via YAML config.
+    if config.stop_after_stage5 && !config.reconciliation.enabled {
+        return Err(OspreyError::ConfigError(
+            "--join-at-pass=1 --join-only requires reconciliation.enabled = true \
+             (got false from config). The Stage 5 → Stage 6 boundary file pair \
+             is only meaningful when reconciliation runs."
+                .into(),
+        ));
+    }
+
     // Load library
     log::info!(
         "Loading spectral library from {:?}",
@@ -2713,8 +2765,8 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             // FDR sidecars (best-effort)
             let pass2 = fdr_scores_path_pass2(&synthetic);
             let pass1 = fdr_scores_path_pass1(&synthetic);
-            if !load_fdr_scores_sidecar(&pass2, &mut stubs)
-                && !load_fdr_scores_sidecar(&pass1, &mut stubs)
+            if !load_fdr_scores_sidecar(&pass2, &mut stubs, 2)
+                && !load_fdr_scores_sidecar(&pass1, &mut stubs, 1)
             {
                 all_scores_loaded = false;
             }
@@ -2790,13 +2842,13 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                         // Try loading SVM scores from sidecar (prefer 2nd-pass, fall back to 1st-pass)
                         let pass2 = fdr_scores_path_pass2(input_file);
                         let pass1 = fdr_scores_path_pass1(input_file);
-                        if load_fdr_scores_sidecar(&pass2, &mut stubs) {
+                        if load_fdr_scores_sidecar(&pass2, &mut stubs, 2) {
                             log::debug!(
                                 "Loaded {} cached scores + 2nd-pass SVM scores from {}",
                                 stubs.len(),
                                 scores_path.display()
                             );
-                        } else if load_fdr_scores_sidecar(&pass1, &mut stubs) {
+                        } else if load_fdr_scores_sidecar(&pass1, &mut stubs, 1) {
                             log::debug!(
                                 "Loaded {} cached scores + 1st-pass SVM scores from {}",
                                 stubs.len(),
@@ -3175,15 +3227,29 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
 
         crate::trace::log_fdr_qvalues(&per_file_entries, "first-pass");
 
-        // Persist first-pass SVM scores to sidecar files
+        // Persist first-pass SVM scores to sidecar files. In
+        // `--join-at-pass=1 --join-only` mode this sidecar is half of the
+        // Stage 5 → Stage 6 boundary file pair, so any failure is fatal —
+        // a Stage 6 worker arriving and finding no sidecar would either
+        // refuse to start or scramble its FdrEntry stubs at v2 record
+        // alignment time. In normal end-to-end mode the sidecar is a
+        // resume-only optimization and best-effort is fine.
         log::debug!("Persisting 1st-pass FDR scores...");
-        persist_fdr_scores(
+        let failures = persist_fdr_scores(
             &per_file_entries,
             &config,
             fdr_scores_path_pass1,
             "1st-pass",
             1,
         );
+        if failures > 0 && config.stop_after_stage5 {
+            return Err(OspreyError::config(format!(
+                "--join-at-pass=1 --join-only: {}/{} 1st-pass fdr_scores.bin sidecar writes failed; \
+                 boundary file pair is incomplete. See warnings above.",
+                failures,
+                per_file_entries.len()
+            )));
+        }
     }
 
     // Stage 5 diagnostic dump. Gated by OSPREY_DUMP_PERCOLATOR=1; exits the
@@ -3552,27 +3618,44 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // joined work above.
         let search_hash = config.search_parameter_hash();
         let library_hash = config.library_identity_hash();
+        // Pre-group reconciliation actions by file name to avoid the
+        // O(num_files * num_actions) walk that the previous
+        // implementation performed inside `from_planner_output` (one
+        // full HashMap traversal per file).
+        let mut actions_by_file: HashMap<&str, Vec<(usize, &ReconcileAction)>> = HashMap::new();
+        for ((fname, vec_idx), action) in &reconciliation_actions {
+            actions_by_file
+                .entry(fname.as_str())
+                .or_default()
+                .push((*vec_idx, action));
+        }
+        let n_total_files = per_file_entries.len();
+        let mut recon_write_failures = 0usize;
         for (file_name, file_entries) in &per_file_entries {
             let Some(input_path) = input_path_for_file_name(&config, file_name) else {
                 log::warn!(
                     "No input path for `{}` — skipping reconciliation.json",
                     file_name
                 );
+                recon_write_failures += 1;
                 continue;
             };
             let recon_path = crate::reconciliation_io::reconciliation_path(&input_path);
-            let recon_file = crate::reconciliation_io::ReconciliationFile::from_planner_output(
-                file_name,
-                file_entries,
-                &reconciliation_actions,
-                per_file_gap_fill
-                    .get(file_name)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]),
-                refined_calibrations.get(file_name),
-                &search_hash,
-                &library_hash,
-            );
+            let file_actions = actions_by_file
+                .get(file_name.as_str())
+                .map(|v| v.as_slice());
+            let recon_file =
+                crate::reconciliation_io::ReconciliationFile::from_planner_output_pre_grouped(
+                    file_entries,
+                    file_actions.unwrap_or(&[]),
+                    per_file_gap_fill
+                        .get(file_name)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]),
+                    refined_calibrations.get(file_name),
+                    &search_hash,
+                    &library_hash,
+                );
             if let Err(e) =
                 crate::reconciliation_io::write_reconciliation_file(&recon_path, &recon_file)
             {
@@ -3581,6 +3664,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     file_name,
                     e
                 );
+                recon_write_failures += 1;
             } else {
                 log::info!(
                     "Wrote reconciliation.json for {} ({} use_cwt + {} forced + {} gap-fill)",
@@ -3593,12 +3677,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
 
         // `--join-at-pass=1 --join-only` (Stage 5 + planning, then stop):
-        // the boundary files for every input are now on disk; bail out
-        // before per-file rescore + Stage 7-8.
+        // any partial-success here means the Stage 6 worker would be
+        // missing an envelope and either refuse to start or score the
+        // wrong files, so escalate to a fatal error rather than logging
+        // a misleading "boundary files written" message and exiting 0.
         if config.stop_after_stage5 {
+            if recon_write_failures > 0 {
+                return Err(OspreyError::config(format!(
+                    "--join-at-pass=1 --join-only: {}/{} reconciliation.json writes failed; \
+                     boundary file pair is incomplete. See warnings above.",
+                    recon_write_failures, n_total_files,
+                )));
+            }
             log::info!(
                 "--join-at-pass=1 --join-only: Stage 5 + reconciliation planning complete; \
-                 boundary files written. Exiting before Stage 6 rescore."
+                 wrote {} reconciliation.json + matching fdr_scores.bin sidecar pair(s). \
+                 Exiting before Stage 6 rescore.",
+                n_total_files,
             );
             return Ok(());
         }
@@ -4047,7 +4142,10 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         let has_reconciliation = config.reconciliation.enabled && config.input_files.len() > 1;
         if has_reconciliation {
             log::debug!("Persisting 2nd-pass FDR scores...");
-            persist_fdr_scores(
+            // 2nd-pass is a resume-only optimization (skip-Percolator on
+            // reruns); the return value is logged via per-file warnings
+            // already, so no need to escalate here.
+            let _ = persist_fdr_scores(
                 &per_file_entries,
                 &config,
                 fdr_scores_path_pass2,
@@ -9444,7 +9542,7 @@ mod tests {
         let mut loaded: Vec<FdrEntry> = (0..entries.len() as u32)
             .map(|i| make_fdr_entry(i, 0.0, 0.0, 0.0))
             .collect();
-        assert!(load_fdr_scores_sidecar(&path, &mut loaded));
+        assert!(load_fdr_scores_sidecar(&path, &mut loaded, 1));
 
         for (orig, got) in entries.iter().zip(loaded.iter()) {
             assert_eq!(orig.score.to_bits(), got.score.to_bits());
@@ -9485,9 +9583,31 @@ mod tests {
             make_fdr_entry(2, 0.0, 0.0, 0.0),
         ];
         // v2 reader should reject (no magic) and leave entries untouched.
-        assert!(!load_fdr_scores_sidecar(&path, &mut entries));
+        assert!(!load_fdr_scores_sidecar(&path, &mut entries, 1));
         for e in &entries {
             assert_eq!(e.score, 0.0);
+        }
+    }
+
+    #[test]
+    fn fdr_scores_sidecar_pass_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pass_mismatch.fdr_scores.bin");
+        let entries = vec![
+            make_fdr_entry(0, -3.5, 0.001, 0.02),
+            make_fdr_entry(1, -2.1, 0.005, 0.04),
+        ];
+        // Write a 1st-pass sidecar.
+        write_fdr_scores_sidecar(&path, &entries, 1).unwrap();
+
+        // Reader expecting 2nd-pass should reject without scrambling stubs.
+        let mut stubs = vec![
+            make_fdr_entry(0, 0.0, 0.0, 0.0),
+            make_fdr_entry(1, 0.0, 0.0, 0.0),
+        ];
+        assert!(!load_fdr_scores_sidecar(&path, &mut stubs, 2));
+        for s in &stubs {
+            assert_eq!(s.score, 0.0);
         }
     }
 
@@ -9503,6 +9623,6 @@ mod tests {
             make_fdr_entry(0, 0.0, 0.0, 0.0),
             make_fdr_entry(1, 0.0, 0.0, 0.0),
         ];
-        assert!(!load_fdr_scores_sidecar(&path, &mut wrong_count));
+        assert!(!load_fdr_scores_sidecar(&path, &mut wrong_count, 1));
     }
 }

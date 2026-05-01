@@ -206,6 +206,11 @@ impl ReconciliationFile {
     /// across all files) down to entries belonging to `file_name`,
     /// resolves each `vec_idx` to its `entry_id` via `file_entries`, and
     /// splits non-Keep actions into the two homogeneous arrays.
+    ///
+    /// O(num_actions) per call; callers writing many files in a row
+    /// should prefer [`Self::from_planner_output_pre_grouped`] together
+    /// with a single up-front grouping to keep the total cost
+    /// O(num_actions) rather than O(num_files * num_actions).
     pub fn from_planner_output(
         file_name: &str,
         file_entries: &[FdrEntry],
@@ -215,12 +220,43 @@ impl ReconciliationFile {
         search_hash: &str,
         library_hash: &str,
     ) -> Self {
+        let file_actions: Vec<(usize, &ReconcileAction)> = reconciliation_actions
+            .iter()
+            .filter_map(|((fname, vec_idx), action)| {
+                if fname == file_name {
+                    Some((*vec_idx, action))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Self::from_planner_output_pre_grouped(
+            file_entries,
+            &file_actions,
+            gap_fill_targets,
+            refined_calibration,
+            search_hash,
+            library_hash,
+        )
+    }
+
+    /// Build the wire envelope when the caller has already grouped
+    /// reconciliation actions by file. `file_actions` is the slice of
+    /// `(vec_idx, action)` entries that belong to this file (Keep actions
+    /// included or not — they are filtered here either way). Use this
+    /// when emitting envelopes for many files so the per-file cost stays
+    /// O(actions_for_this_file) rather than O(total_actions).
+    pub fn from_planner_output_pre_grouped(
+        file_entries: &[FdrEntry],
+        file_actions: &[(usize, &ReconcileAction)],
+        gap_fill_targets: &[GapFillTarget],
+        refined_calibration: Option<&RTCalibration>,
+        search_hash: &str,
+        library_hash: &str,
+    ) -> Self {
         let mut use_cwt: Vec<UseCwtPeakEntry> = Vec::new();
         let mut forced: Vec<ForcedIntegrationEntry> = Vec::new();
-        for ((fname, vec_idx), action) in reconciliation_actions {
-            if fname != file_name {
-                continue;
-            }
+        for (vec_idx, action) in file_actions {
             let entry_id = match file_entries.get(*vec_idx) {
                 Some(e) => e.entry_id,
                 None => continue,
@@ -306,7 +342,14 @@ pub fn reconciliation_path(input_path: &Path) -> std::path::PathBuf {
 }
 
 /// Write the boundary file as pretty JSON with 2-space indent + LF line
-/// endings. Atomic write via temp file in the same directory.
+/// endings. Stages through a sibling `.tmp` file in the same directory
+/// and renames into place; this avoids leaving a partially-written
+/// destination on serializer failure, but the rename is not strictly
+/// atomic when the destination already exists (the existing file is
+/// removed first). A crash between the remove and the rename leaves
+/// the `.tmp` next to the missing destination, which the next run
+/// either overwrites or — if the writer fails identically — leaves
+/// recoverable by hand.
 pub fn write_reconciliation_file(path: &Path, file: &ReconciliationFile) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).map_err(|e| {
@@ -339,8 +382,14 @@ pub fn write_reconciliation_file(path: &Path, file: &ReconciliationFile) -> Resu
     if path.exists() {
         std::fs::remove_file(path).ok();
     }
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| anyhow!("Failed to atomically rename to {}: {}", path.display(), e))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        anyhow!(
+            "Failed to rename {} to {}: {}",
+            tmp_path.display(),
+            path.display(),
+            e
+        )
+    })?;
     Ok(())
 }
 
