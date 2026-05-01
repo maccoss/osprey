@@ -1227,8 +1227,44 @@ fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
     parent.join(format!("{}.2nd-pass.fdr_scores.bin", stem))
 }
 
-/// Write per-file FDR scores to a sidecar binary file (little-endian f64 array).
-fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry]) -> Result<()> {
+// Binary FDR-scores sidecar format (`<stem>.<phase>-pass.fdr_scores.bin`).
+// "FDR scores" here means the full set of statistics that describe the
+// FDR state of an entry after a Percolator pass: the (uncalibrated) SVM
+// discriminant, plus the calibrated q-values + PEP that target-decoy
+// competition produces. Storey-Tibshirani q-value estimation is what
+// turns the uncalibrated SVM score into a true FDR score, and the
+// sidecar persists both halves together so a downstream Stage 6 worker
+// can run without re-deriving anything.
+//
+// The body is positional + post-compaction: index `i` in the file
+// corresponds to `entries[i]` in the in-memory Vec, which is
+// already filtered to passing entries. There's no per-entry "passed"
+// flag — every entry in the sidecar passed first-pass FDR by
+// construction.
+//
+// Format:
+//   magic           [0..8]   = b"OSPRYFDR"
+//   version         [8]      = u8 (= 2)
+//   pass            [9]      = u8 (1 = first-pass, 2 = second-pass)
+//   reserved        [10..16] = 6 bytes (zero)
+//   entry_count     [16..24] = u64 little-endian
+//   reserved        [24..32] = 8 bytes (zero)
+//   body            [32..]   = entry_count * 48 bytes, where each record is:
+//                              [0..8]   svm_score                    f64 LE
+//                              [8..16]  run_precursor_qvalue         f64 LE
+//                              [16..24] run_peptide_qvalue           f64 LE
+//                              [24..32] experiment_precursor_qvalue  f64 LE
+//                              [32..40] experiment_peptide_qvalue    f64 LE
+//                              [40..48] pep                          f64 LE
+//
+// Total file size is `32 + 48 * entry_count`.
+const FDR_SIDECAR_MAGIC: &[u8; 8] = b"OSPRYFDR";
+const FDR_SIDECAR_VERSION: u8 = 2;
+const FDR_SIDECAR_HEADER_LEN: usize = 32;
+const FDR_SIDECAR_RECORD_LEN: usize = 48;
+
+/// Write per-file FDR scores to a sidecar binary file (v2 format).
+fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: u8) -> Result<()> {
     let tmp_path = std::env::temp_dir().join(format!(
         "osprey_{}_{}",
         std::process::id(),
@@ -1244,9 +1280,29 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry]) -> Res
         ))
     })?;
     use std::io::Write;
+
+    // 32-byte header
+    let mut header = [0u8; FDR_SIDECAR_HEADER_LEN];
+    header[0..8].copy_from_slice(FDR_SIDECAR_MAGIC);
+    header[8] = FDR_SIDECAR_VERSION;
+    header[9] = pass;
+    // bytes 10..16 reserved (zero)
+    header[16..24].copy_from_slice(&(entries.len() as u64).to_le_bytes());
+    // bytes 24..32 reserved (zero)
+    file.write_all(&header)
+        .map_err(|e| OspreyError::OutputError(format!("Failed to write header: {}", e)))?;
+
+    // Body: 48 bytes per entry
+    let mut record = [0u8; FDR_SIDECAR_RECORD_LEN];
     for entry in entries {
-        file.write_all(&entry.score.to_le_bytes())
-            .map_err(|e| OspreyError::OutputError(format!("Failed to write score: {}", e)))?;
+        record[0..8].copy_from_slice(&entry.score.to_le_bytes());
+        record[8..16].copy_from_slice(&entry.run_precursor_qvalue.to_le_bytes());
+        record[16..24].copy_from_slice(&entry.run_peptide_qvalue.to_le_bytes());
+        record[24..32].copy_from_slice(&entry.experiment_precursor_qvalue.to_le_bytes());
+        record[32..40].copy_from_slice(&entry.experiment_peptide_qvalue.to_le_bytes());
+        record[40..48].copy_from_slice(&entry.pep.to_le_bytes());
+        file.write_all(&record)
+            .map_err(|e| OspreyError::OutputError(format!("Failed to write record: {}", e)))?;
     }
     drop(file);
     osprey_core::copy_and_verify(&tmp_path, path)?;
@@ -1254,12 +1310,52 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry]) -> Res
 }
 
 /// Load per-file FDR scores from sidecar into FdrEntry stubs. Returns true if successful.
+/// Refuses to load if the file's magic/version don't match v2 or if the entry
+/// count in the header disagrees with the stub list (indicates parquet drift).
 fn load_fdr_scores_sidecar(path: &std::path::Path, entries: &mut [FdrEntry]) -> bool {
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(_) => return false,
     };
-    let expected_len = entries.len() * 8;
+    if data.len() < FDR_SIDECAR_HEADER_LEN {
+        log::warn!(
+            "Score sidecar {} truncated (size {} < header length {}), ignoring",
+            path.display(),
+            data.len(),
+            FDR_SIDECAR_HEADER_LEN
+        );
+        return false;
+    }
+    if &data[0..8] != FDR_SIDECAR_MAGIC {
+        log::warn!(
+            "Score sidecar {} has wrong magic bytes (got {:?}); pre-v2 format is no longer supported, ignoring",
+            path.display(),
+            &data[0..8]
+        );
+        return false;
+    }
+    let version = data[8];
+    if version != FDR_SIDECAR_VERSION {
+        log::warn!(
+            "Score sidecar {} has unsupported version {} (expected {}), ignoring",
+            path.display(),
+            version,
+            FDR_SIDECAR_VERSION
+        );
+        return false;
+    }
+    // bytes 10..16 reserved
+    let header_count = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
+    if header_count != entries.len() {
+        log::warn!(
+            "Score sidecar {} entry count mismatch (header {} vs stubs {}), ignoring",
+            path.display(),
+            header_count,
+            entries.len()
+        );
+        return false;
+    }
+    let expected_len = FDR_SIDECAR_HEADER_LEN + entries.len() * FDR_SIDECAR_RECORD_LEN;
     if data.len() != expected_len {
         log::warn!(
             "Score sidecar {} size mismatch ({} vs expected {}), ignoring",
@@ -1270,9 +1366,16 @@ fn load_fdr_scores_sidecar(path: &std::path::Path, entries: &mut [FdrEntry]) -> 
         return false;
     }
     for (i, entry) in entries.iter_mut().enumerate() {
-        let offset = i * 8;
-        let bytes: [u8; 8] = data[offset..offset + 8].try_into().unwrap();
-        entry.score = f64::from_le_bytes(bytes);
+        let off = FDR_SIDECAR_HEADER_LEN + i * FDR_SIDECAR_RECORD_LEN;
+        entry.score = f64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        entry.run_precursor_qvalue =
+            f64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+        entry.run_peptide_qvalue = f64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
+        entry.experiment_precursor_qvalue =
+            f64::from_le_bytes(data[off + 24..off + 32].try_into().unwrap());
+        entry.experiment_peptide_qvalue =
+            f64::from_le_bytes(data[off + 32..off + 40].try_into().unwrap());
+        entry.pep = f64::from_le_bytes(data[off + 40..off + 48].try_into().unwrap());
     }
     true
 }
@@ -1283,6 +1386,7 @@ fn persist_fdr_scores(
     config: &OspreyConfig,
     path_fn: fn(&std::path::Path) -> std::path::PathBuf,
     label: &str,
+    pass: u8,
 ) {
     for (file_name, entries) in per_file_entries.iter() {
         if let Some(input_file) = config.input_files.iter().find(|p| {
@@ -1291,7 +1395,7 @@ fn persist_fdr_scores(
                 .is_some_and(|s| s == file_name)
         }) {
             let sidecar_path = path_fn(input_file);
-            if let Err(e) = write_fdr_scores_sidecar(&sidecar_path, entries) {
+            if let Err(e) = write_fdr_scores_sidecar(&sidecar_path, entries, pass) {
                 log::warn!(
                     "Failed to write {} score sidecar for {}: {}",
                     label,
@@ -3033,6 +3137,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             &config,
             fdr_scores_path_pass1,
             "1st-pass",
+            1,
         );
     }
 
@@ -3842,6 +3947,7 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                 &config,
                 fdr_scores_path_pass2,
                 "2nd-pass",
+                2,
             );
         }
     }
@@ -9170,5 +9276,128 @@ mod tests {
         let res = check_md(Some("garbage"), Some(VALID_SEARCH), Some(VALID_LIB)).unwrap();
         let warn = res.expect("expected a warning");
         assert!(warn.contains("could not parse"), "got: {}", warn);
+    }
+
+    // ---- fdr_scores.bin v2 round-trip ----------------------------------
+
+    fn make_fdr_entry(id: u32, score: f64, q: f64, pep: f64) -> FdrEntry {
+        FdrEntry {
+            entry_id: id,
+            parquet_index: id,
+            is_decoy: false,
+            charge: 2,
+            scan_number: 0,
+            apex_rt: 0.0,
+            start_rt: 0.0,
+            end_rt: 0.0,
+            coelution_sum: 0.0,
+            score,
+            run_precursor_qvalue: q,
+            run_peptide_qvalue: q + 1.0e-9,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: q + 2.0e-9,
+            experiment_peptide_qvalue: q + 3.0e-9,
+            experiment_protein_qvalue: 1.0,
+            pep,
+            modified_sequence: "PEPTIDE".into(),
+        }
+    }
+
+    #[test]
+    fn fdr_scores_sidecar_v2_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        // write_fdr_scores_sidecar stages through std::env::temp_dir() with
+        // a tmp name keyed on `<pid>_<filename>`, so parallel tests using
+        // the same `<filename>` would race on the same staging path.
+        // Each test uses a unique filename to avoid that.
+        let path = dir.path().join("v2_round_trip.1st-pass.fdr_scores.bin");
+        let entries = vec![
+            make_fdr_entry(0, -3.5, 0.001, 0.02),
+            make_fdr_entry(1, -3.4, 0.002, 0.05),
+            make_fdr_entry(2, -3.3, 0.003, 0.08),
+        ];
+        write_fdr_scores_sidecar(&path, &entries, 1).unwrap();
+
+        // Cross-impl byte-parity hook: when the harness runs this test
+        // with `OSPREY_CROSS_IMPL_FDR_SIDECAR_OUT=<path>` set, copy our
+        // output to that path so a sibling test on the OspreySharp side
+        // (using the same input data) can be byte-compared against ours.
+        // Same hardcoded entries on both sides; same format spec; the
+        // output files must match bit-for-bit.
+        if let Ok(out) = std::env::var("OSPREY_CROSS_IMPL_FDR_SIDECAR_OUT") {
+            std::fs::copy(&path, &out).unwrap();
+        }
+
+        // File size sanity check: 32-byte header + N * 48 bytes.
+        let size = std::fs::metadata(&path).unwrap().len() as usize;
+        assert_eq!(
+            size,
+            FDR_SIDECAR_HEADER_LEN + entries.len() * FDR_SIDECAR_RECORD_LEN
+        );
+
+        // Stubs with cleared FDR fields — the loader must repopulate them.
+        let mut loaded: Vec<FdrEntry> = (0..entries.len() as u32)
+            .map(|i| make_fdr_entry(i, 0.0, 0.0, 0.0))
+            .collect();
+        assert!(load_fdr_scores_sidecar(&path, &mut loaded));
+
+        for (orig, got) in entries.iter().zip(loaded.iter()) {
+            assert_eq!(orig.score.to_bits(), got.score.to_bits());
+            assert_eq!(
+                orig.run_precursor_qvalue.to_bits(),
+                got.run_precursor_qvalue.to_bits()
+            );
+            assert_eq!(
+                orig.run_peptide_qvalue.to_bits(),
+                got.run_peptide_qvalue.to_bits()
+            );
+            assert_eq!(
+                orig.experiment_precursor_qvalue.to_bits(),
+                got.experiment_precursor_qvalue.to_bits()
+            );
+            assert_eq!(
+                orig.experiment_peptide_qvalue.to_bits(),
+                got.experiment_peptide_qvalue.to_bits()
+            );
+            assert_eq!(orig.pep.to_bits(), got.pep.to_bits());
+        }
+    }
+
+    #[test]
+    fn fdr_scores_sidecar_v1_format_rejected() {
+        // Old v1 format: just N * 8 bytes of f64 scores, no header.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1_rejected.1st-pass.fdr_scores.bin");
+        let v1_payload: Vec<u8> = [0.1f64, 0.2, 0.3]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        std::fs::write(&path, &v1_payload).unwrap();
+
+        let mut entries = vec![
+            make_fdr_entry(0, 0.0, 0.0, 0.0),
+            make_fdr_entry(1, 0.0, 0.0, 0.0),
+            make_fdr_entry(2, 0.0, 0.0, 0.0),
+        ];
+        // v2 reader should reject (no magic) and leave entries untouched.
+        assert!(!load_fdr_scores_sidecar(&path, &mut entries));
+        for e in &entries {
+            assert_eq!(e.score, 0.0);
+        }
+    }
+
+    #[test]
+    fn fdr_scores_sidecar_count_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count_mismatch.1st-pass.fdr_scores.bin");
+        let entries = vec![make_fdr_entry(0, -3.5, 0.001, 0.02)];
+        write_fdr_scores_sidecar(&path, &entries, 1).unwrap();
+
+        // Try to load with a different stub count — should refuse.
+        let mut wrong_count = vec![
+            make_fdr_entry(0, 0.0, 0.0, 0.0),
+            make_fdr_entry(1, 0.0, 0.0, 0.0),
+        ];
+        assert!(!load_fdr_scores_sidecar(&path, &mut wrong_count));
     }
 }
