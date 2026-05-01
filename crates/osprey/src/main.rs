@@ -198,6 +198,15 @@ struct Args {
     #[arg(long, value_name = "N")]
     join_at_pass: Option<u8>,
 
+    /// Internal: tracks whether the user explicitly typed `--join-only`
+    /// as a modifier (vs. legacy standalone). Set by `normalize_hpc_args`
+    /// when `--join-at-pass=<N> --join-only` is in effect; consumed by
+    /// the post-planning early-exit logic so plain `--join-at-pass=1`
+    /// continues into Stage 6 while the modified form stops at the
+    /// boundary. Hidden from CLI; not user-settable.
+    #[arg(skip)]
+    join_only_modifier: bool,
+
     /// HPC: one or more `.scores.parquet` files (or a single directory
     /// scanned non-recursively for `*.scores.parquet`). Required when
     /// --join-at-pass is set; ignored otherwise.
@@ -253,20 +262,20 @@ fn normalize_hpc_args(args: &mut Args) -> Result<()> {
 
     match args.join_at_pass {
         Some(1) => {
-            // PR 2 will implement these modifier combinations against
-            // persisted Stage 5 → Stage 6 boundary files.
-            if args.join_only {
-                anyhow::bail!(
-                    "--join-at-pass=1 --join-only (run only Stage 5) is not yet implemented."
-                );
-            }
             if args.no_join {
                 anyhow::bail!(
                     "--join-at-pass=1 --no-join (run only Stage 6 from persisted Stage 5 outputs) is not yet implemented."
                 );
             }
-            // Plain `--join-at-pass=1`: route through the existing
-            // Stage 5+ entry path that reads `args.join_only`.
+            // `--join-at-pass=1 --join-only` (modifier present) means
+            // "run only the Stage 5 join phase, write boundary files,
+            // exit before Stage 6 rescore." Plain `--join-at-pass=1`
+            // (no modifier) runs Stages 5 through 8. In both cases
+            // `args.join_only` is set so the existing Stage 5+ entry
+            // path reads it; the modifier-vs-plain distinction is
+            // captured in `args.join_only_modifier` for the post-
+            // planning early-exit decision.
+            args.join_only_modifier = args.join_only;
             args.join_only = true;
         }
         Some(2) => {
@@ -511,6 +520,7 @@ fn main() -> Result<()> {
     // These don't go through ConfigOverrides because they're CLI-only and
     // not commonly set in YAML (HPC orchestration is the use case).
     config.no_join = args.no_join;
+    config.stop_after_stage5 = args.join_only_modifier;
     if let Some(ref s) = args.parquet_compression {
         config.parquet_compression = match s.to_lowercase().as_str() {
             "zstd" => ParquetCompression::Zstd,
@@ -793,8 +803,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_join_at_pass_1_with_join_only_modifier_errors_until_implemented() {
-        // PR 2 will implement "run only Stage 5" via persisted plan files.
+    fn normalize_join_at_pass_1_with_join_only_modifier_sets_stop_flag() {
+        // `--join-at-pass=1 --join-only` means "run only Stage 5 + planning,
+        // write boundary files, exit." Both `args.join_only` (existing
+        // Stage 5+ entry path) and `args.join_only_modifier` (signaling
+        // the post-planning early exit) should be set.
         let mut args = parse(&[
             "--join-at-pass=1",
             "--join-only",
@@ -805,7 +818,9 @@ mod tests {
             "-o",
             "out.blib",
         ]);
-        assert_err_contains(normalize_hpc_args(&mut args), "not yet implemented");
+        normalize_hpc_args(&mut args).unwrap();
+        assert!(args.join_only);
+        assert!(args.join_only_modifier);
     }
 
     #[test]

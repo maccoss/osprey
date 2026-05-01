@@ -1236,11 +1236,15 @@ fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
 // sidecar persists both halves together so a downstream Stage 6 worker
 // can run without re-deriving anything.
 //
-// The body is positional + post-compaction: index `i` in the file
-// corresponds to `entries[i]` in the in-memory Vec, which is
-// already filtered to passing entries. There's no per-entry "passed"
-// flag — every entry in the sidecar passed first-pass FDR by
-// construction.
+// The body is post-compaction: every record corresponds to a stub that
+// passed first-pass FDR. Records carry the `entry_id` of the entry
+// they describe so a Stage 6 worker can assemble the post-compaction
+// stub set by joining the full parquet against the sidecar's entry_id
+// set — the worker doesn't need to re-run Percolator to know which
+// rows survive compaction. In skip-Percolator mode the order matches
+// the in-memory Vec position-for-position, so the per-position
+// `entries[i].entry_id == record.entry_id` check also serves as a
+// corruption-detector.
 //
 // Format:
 //   magic           [0..8]   = b"OSPRYFDR"
@@ -1249,19 +1253,20 @@ fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
 //   reserved        [10..16] = 6 bytes (zero)
 //   entry_count     [16..24] = u64 little-endian
 //   reserved        [24..32] = 8 bytes (zero)
-//   body            [32..]   = entry_count * 48 bytes, where each record is:
-//                              [0..8]   svm_score                    f64 LE
-//                              [8..16]  run_precursor_qvalue         f64 LE
-//                              [16..24] run_peptide_qvalue           f64 LE
-//                              [24..32] experiment_precursor_qvalue  f64 LE
-//                              [32..40] experiment_peptide_qvalue    f64 LE
-//                              [40..48] pep                          f64 LE
+//   body            [32..]   = entry_count * 52 bytes, where each record is:
+//                              [0..4]   entry_id                     u32 LE
+//                              [4..12]  svm_score                    f64 LE
+//                              [12..20] run_precursor_qvalue         f64 LE
+//                              [20..28] run_peptide_qvalue           f64 LE
+//                              [28..36] experiment_precursor_qvalue  f64 LE
+//                              [36..44] experiment_peptide_qvalue    f64 LE
+//                              [44..52] pep                          f64 LE
 //
-// Total file size is `32 + 48 * entry_count`.
+// Total file size is `32 + 52 * entry_count`.
 const FDR_SIDECAR_MAGIC: &[u8; 8] = b"OSPRYFDR";
 const FDR_SIDECAR_VERSION: u8 = 2;
 const FDR_SIDECAR_HEADER_LEN: usize = 32;
-const FDR_SIDECAR_RECORD_LEN: usize = 48;
+const FDR_SIDECAR_RECORD_LEN: usize = 52;
 
 /// Write per-file FDR scores to a sidecar binary file (v2 format).
 fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: u8) -> Result<()> {
@@ -1292,15 +1297,16 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
     file.write_all(&header)
         .map_err(|e| OspreyError::OutputError(format!("Failed to write header: {}", e)))?;
 
-    // Body: 48 bytes per entry
+    // Body: 52 bytes per entry (entry_id + 6 f64s)
     let mut record = [0u8; FDR_SIDECAR_RECORD_LEN];
     for entry in entries {
-        record[0..8].copy_from_slice(&entry.score.to_le_bytes());
-        record[8..16].copy_from_slice(&entry.run_precursor_qvalue.to_le_bytes());
-        record[16..24].copy_from_slice(&entry.run_peptide_qvalue.to_le_bytes());
-        record[24..32].copy_from_slice(&entry.experiment_precursor_qvalue.to_le_bytes());
-        record[32..40].copy_from_slice(&entry.experiment_peptide_qvalue.to_le_bytes());
-        record[40..48].copy_from_slice(&entry.pep.to_le_bytes());
+        record[0..4].copy_from_slice(&entry.entry_id.to_le_bytes());
+        record[4..12].copy_from_slice(&entry.score.to_le_bytes());
+        record[12..20].copy_from_slice(&entry.run_precursor_qvalue.to_le_bytes());
+        record[20..28].copy_from_slice(&entry.run_peptide_qvalue.to_le_bytes());
+        record[28..36].copy_from_slice(&entry.experiment_precursor_qvalue.to_le_bytes());
+        record[36..44].copy_from_slice(&entry.experiment_peptide_qvalue.to_le_bytes());
+        record[44..52].copy_from_slice(&entry.pep.to_le_bytes());
         file.write_all(&record)
             .map_err(|e| OspreyError::OutputError(format!("Failed to write record: {}", e)))?;
     }
@@ -1367,17 +1373,60 @@ fn load_fdr_scores_sidecar(path: &std::path::Path, entries: &mut [FdrEntry]) -> 
     }
     for (i, entry) in entries.iter_mut().enumerate() {
         let off = FDR_SIDECAR_HEADER_LEN + i * FDR_SIDECAR_RECORD_LEN;
-        entry.score = f64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+        let record_entry_id = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        if record_entry_id != entry.entry_id {
+            log::warn!(
+                "Score sidecar {} record {} entry_id mismatch (file={}, stub={}), ignoring",
+                path.display(),
+                i,
+                record_entry_id,
+                entry.entry_id
+            );
+            return false;
+        }
+        entry.score = f64::from_le_bytes(data[off + 4..off + 12].try_into().unwrap());
         entry.run_precursor_qvalue =
-            f64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
-        entry.run_peptide_qvalue = f64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
+            f64::from_le_bytes(data[off + 12..off + 20].try_into().unwrap());
+        entry.run_peptide_qvalue = f64::from_le_bytes(data[off + 20..off + 28].try_into().unwrap());
         entry.experiment_precursor_qvalue =
-            f64::from_le_bytes(data[off + 24..off + 32].try_into().unwrap());
+            f64::from_le_bytes(data[off + 28..off + 36].try_into().unwrap());
         entry.experiment_peptide_qvalue =
-            f64::from_le_bytes(data[off + 32..off + 40].try_into().unwrap());
-        entry.pep = f64::from_le_bytes(data[off + 40..off + 48].try_into().unwrap());
+            f64::from_le_bytes(data[off + 36..off + 44].try_into().unwrap());
+        entry.pep = f64::from_le_bytes(data[off + 44..off + 52].try_into().unwrap());
     }
     true
+}
+
+/// Resolve the input file path matching `file_name` for sidecar location.
+/// In normal mode the path comes from `config.input_files`; in `--join-only`
+/// mode `input_files` is empty, so the sidecar path is derived from the
+/// matching `--input-scores` parquet via `synthetic_input_from_parquet`.
+fn input_path_for_file_name(config: &OspreyConfig, file_name: &str) -> Option<std::path::PathBuf> {
+    let direct = config
+        .input_files
+        .iter()
+        .find(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s == file_name)
+        })
+        .cloned();
+    if direct.is_some() {
+        return direct;
+    }
+    // --join-only: the parquet's stem (with the `.scores` suffix
+    // stripped) IS the canonical file_name. Synthesize the sibling
+    // mzML path so all the existing sidecar path helpers keep working.
+    config.input_scores.as_ref().and_then(|paths| {
+        paths
+            .iter()
+            .map(|p| synthetic_input_from_parquet(p))
+            .find(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s == file_name)
+            })
+    })
 }
 
 /// Write FDR score sidecars for all files.
@@ -1389,12 +1438,8 @@ fn persist_fdr_scores(
     pass: u8,
 ) {
     for (file_name, entries) in per_file_entries.iter() {
-        if let Some(input_file) = config.input_files.iter().find(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s == file_name)
-        }) {
-            let sidecar_path = path_fn(input_file);
+        if let Some(input_file) = input_path_for_file_name(config, file_name) {
+            let sidecar_path = path_fn(&input_file);
             if let Err(e) = write_fdr_scores_sidecar(&sidecar_path, entries, pass) {
                 log::warn!(
                     "Failed to write {} score sidecar for {}: {}",
@@ -3497,6 +3542,66 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         // and still honor OSPREY_RECONCILIATION_ONLY for early exit.
         // Pairs with OspreySharp's WriteStage6ReconciliationDump.
         crate::diagnostics::dump_stage6_reconciliation(&reconciliation_actions, &per_file_entries);
+
+        // Write the per-file `<stem>.reconciliation.json` boundary file
+        // for each input. Pairs with the `.<phase>-pass.fdr_scores.bin`
+        // sidecar already persisted earlier in Stage 5; together they
+        // capture everything a Stage 6 worker invoked under
+        // `--join-at-pass=1 --no-join` needs to do per-file rescore +
+        // gap-fill + parquet write-back without re-running any of the
+        // joined work above.
+        let search_hash = config.search_parameter_hash();
+        let library_hash = config.library_identity_hash();
+        for (file_name, file_entries) in &per_file_entries {
+            let Some(input_path) = input_path_for_file_name(&config, file_name) else {
+                log::warn!(
+                    "No input path for `{}` — skipping reconciliation.json",
+                    file_name
+                );
+                continue;
+            };
+            let recon_path = crate::reconciliation_io::reconciliation_path(&input_path);
+            let recon_file = crate::reconciliation_io::ReconciliationFile::from_planner_output(
+                file_name,
+                file_entries,
+                &reconciliation_actions,
+                per_file_gap_fill
+                    .get(file_name)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+                refined_calibrations.get(file_name),
+                &search_hash,
+                &library_hash,
+            );
+            if let Err(e) =
+                crate::reconciliation_io::write_reconciliation_file(&recon_path, &recon_file)
+            {
+                log::warn!(
+                    "Failed to write reconciliation.json for {}: {}",
+                    file_name,
+                    e
+                );
+            } else {
+                log::info!(
+                    "Wrote reconciliation.json for {} ({} use_cwt + {} forced + {} gap-fill)",
+                    file_name,
+                    recon_file.use_cwt_peak_actions.len(),
+                    recon_file.forced_integration_actions.len(),
+                    recon_file.gap_fill_targets.len(),
+                );
+            }
+        }
+
+        // `--join-at-pass=1 --join-only` (Stage 5 + planning, then stop):
+        // the boundary files for every input are now on disk; bail out
+        // before per-file rescore + Stage 7-8.
+        if config.stop_after_stage5 {
+            log::info!(
+                "--join-at-pass=1 --join-only: Stage 5 + reconciliation planning complete; \
+                 boundary files written. Exiting before Stage 6 rescore."
+            );
+            return Ok(());
+        }
 
         let total_reconciliation: usize = reconciliation_actions
             .values()
