@@ -61,3 +61,6 @@ pub mod trace;
 // Pipeline
 mod pipeline;
 pub use pipeline::run_analysis;
+
+// Per-file rescore worker (--join-at-pass=1 --no-join)
+pub mod rescore;

@@ -1197,7 +1197,7 @@ fn scores_path_for_input(input_path: &std::path::Path) -> std::path::PathBuf {
 /// path-derivation helpers (FDR sidecars, calibration JSON) without
 /// duplicating them. The synthetic path is never opened — only its components
 /// are inspected.
-fn synthetic_input_from_parquet(parquet_path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn synthetic_input_from_parquet(parquet_path: &std::path::Path) -> std::path::PathBuf {
     let stem = parquet_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1208,7 +1208,7 @@ fn synthetic_input_from_parquet(parquet_path: &std::path::Path) -> std::path::Pa
 }
 
 /// Path for per-file first-pass FDR score sidecar.
-fn fdr_scores_path_pass1(input_path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn fdr_scores_path_pass1(input_path: &std::path::Path) -> std::path::PathBuf {
     let stem = input_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1321,7 +1321,7 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
 /// Load per-file FDR scores from sidecar into FdrEntry stubs. Returns true if successful.
 /// Refuses to load if the file's magic/version don't match v2 or if the entry
 /// count in the header disagrees with the stub list (indicates parquet drift).
-fn load_fdr_scores_sidecar(
+pub(crate) fn load_fdr_scores_sidecar(
     path: &std::path::Path,
     entries: &mut [FdrEntry],
     expected_pass: u8,
@@ -2166,7 +2166,7 @@ fn load_pin_features_from_parquet(path: &std::path::Path) -> Result<Vec<Vec<f64>
 /// start_rt, end_rt, modified_sequence, fragment_coelution_sum)
 /// using a ProjectionMask. `modified_sequence` values are interned via the
 /// shared `seq_interner` to deduplicate strings across files.
-fn load_fdr_stubs_from_parquet(
+pub(crate) fn load_fdr_stubs_from_parquet(
     path: &std::path::Path,
     seq_interner: &mut HashSet<Arc<str>>,
 ) -> Result<Vec<FdrEntry>> {
@@ -2674,6 +2674,29 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
                     .to_string(),
             ));
         }
+    }
+
+    // `--join-at-pass=1 --no-join` is the per-file rescore worker mode
+    // (the second per-file fan-out, between the two joins). Dispatch
+    // here so the heavy library-load + Stages 1-4 setup below is
+    // skipped — the worker reads its inputs entirely from the
+    // boundary files + per-file parquet, plus the spectra it reloads
+    // from the sibling mzML during the rescore engine itself (next
+    // slice). This first slice only hydrates the in-memory state and
+    // logs a "loaded what I expected" summary so the wire-through is
+    // observable end-to-end before the engine is ported.
+    if config.no_join && config.input_scores.is_some() {
+        log::info!(
+            "--join-at-pass=1 --no-join: hydrating per-file rescore inputs from \
+             {} parquet(s) + boundary files",
+            config.input_scores.as_ref().map(|v| v.len()).unwrap_or(0)
+        );
+        let _inputs = crate::rescore::hydrate_and_log(&config)?;
+        log::info!(
+            "--join-at-pass=1 --no-join: hydration complete; rescore engine + gap-fill \
+             + parquet write-back not yet implemented (next slice)"
+        );
+        return Ok(());
     }
 
     // Load library

@@ -262,21 +262,29 @@ fn normalize_hpc_args(args: &mut Args) -> Result<()> {
 
     match args.join_at_pass {
         Some(1) => {
+            // `--join-at-pass=1 --no-join` is the per-file rescore
+            // worker mode: input is post-pass-1 parquets + the Stage 5
+            // boundary files persisted earlier, skip the join, run only
+            // the per-file work that follows it. The pipeline detects
+            // this combo via `config.no_join && config.input_scores.is_some()`
+            // and dispatches to `crate::rescore`. No flag remap needed
+            // here — `args.no_join` already carries the right signal.
             if args.no_join {
-                anyhow::bail!(
-                    "--join-at-pass=1 --no-join (run only Stage 6 from persisted Stage 5 outputs) is not yet implemented."
-                );
+                // Leave args.no_join = true and args.join_only = false.
+                // Fall through past the join_only_modifier branch below.
+            } else {
+                // `--join-at-pass=1 --join-only` (modifier present)
+                // means "run only the Stage 5 join phase, write
+                // boundary files, exit before Stage 6 rescore." Plain
+                // `--join-at-pass=1` (no modifier) runs Stages 5
+                // through 8. In both cases `args.join_only` is set so
+                // the existing Stage 5+ entry path reads it; the
+                // modifier-vs-plain distinction is captured in
+                // `args.join_only_modifier` for the post-planning
+                // early-exit decision.
+                args.join_only_modifier = args.join_only;
+                args.join_only = true;
             }
-            // `--join-at-pass=1 --join-only` (modifier present) means
-            // "run only the Stage 5 join phase, write boundary files,
-            // exit before Stage 6 rescore." Plain `--join-at-pass=1`
-            // (no modifier) runs Stages 5 through 8. In both cases
-            // `args.join_only` is set so the existing Stage 5+ entry
-            // path reads it; the modifier-vs-plain distinction is
-            // captured in `args.join_only_modifier` for the post-
-            // planning early-exit decision.
-            args.join_only_modifier = args.join_only;
-            args.join_only = true;
         }
         Some(2) => {
             anyhow::bail!(
@@ -330,11 +338,43 @@ fn validate_hpc_args(args: &Args) -> Result<()> {
         // here would falsely reject the directory form.
     }
     if args.no_join {
-        if args.input_scores.is_some() {
-            anyhow::bail!("--no-join cannot be combined with --input-scores.");
-        }
-        if args.input.is_none() {
-            anyhow::bail!("--no-join requires --input <mzML...>.");
+        // `--join-at-pass=1 --no-join` is the per-file rescore worker
+        // mode and takes its inputs via `--input-scores` (parquets +
+        // sibling boundary files). Standalone `--no-join` keeps its
+        // existing meaning (Stages 1-4 only) and takes mzML via
+        // `--input`. Reject the cross — input-scores without
+        // join-at-pass=1, or mzML with join-at-pass=1 --no-join.
+        match args.join_at_pass {
+            Some(1) => {
+                if args.input_scores.is_none() {
+                    anyhow::bail!(
+                        "--join-at-pass=1 --no-join (per-file rescore worker) requires \
+                         --input-scores <path...>."
+                    );
+                }
+                if args.input.is_some() {
+                    anyhow::bail!(
+                        "--join-at-pass=1 --no-join cannot be combined with --input. \
+                         Use --input-scores; mzML paths are derived from the parquet stems."
+                    );
+                }
+                if args.library.is_none() || args.output.is_none() {
+                    anyhow::bail!("--join-at-pass=1 --no-join requires --library and --output.");
+                }
+            }
+            None => {
+                // Standalone `--no-join`: Stages 1-4 worker.
+                if args.input_scores.is_some() {
+                    anyhow::bail!("--no-join cannot be combined with --input-scores.");
+                }
+                if args.input.is_none() {
+                    anyhow::bail!("--no-join requires --input <mzML...>.");
+                }
+            }
+            Some(_) => {
+                // Other --join-at-pass values are already rejected in
+                // normalize_hpc_args; nothing to validate here.
+            }
         }
     }
     Ok(())
@@ -541,15 +581,24 @@ fn main() -> Result<()> {
             }
         };
     }
-    if args.join_only {
+    if args.input_scores.is_some() {
+        // `--input-scores` reaches this point only after
+        // `validate_hpc_args` accepted it, which means we are in one of
+        // two HPC modes: `--join-at-pass=1` (with or without
+        // `--join-only` modifier — `args.join_only` is true) or
+        // `--join-at-pass=1 --no-join` (per-file rescore worker —
+        // `args.no_join` is true). Both consume the parquets via the
+        // same expansion + assignment path; the downstream dispatch
+        // picks the right pipeline branch.
         let resolved = resolve_input_scores(args.input_scores.unwrap())?;
-        // `args.join_only` is set either by the legacy `--join-only` flag
-        // (which `normalize_hpc_args` rejected unless paired with
-        // `--join-at-pass=<N>`) or by `--join-at-pass=1`. Today only the
-        // pass-1 path reaches here, so the message references the
-        // canonical flag the user typed.
+        let mode_label = if args.no_join {
+            "--join-at-pass=1 --no-join"
+        } else {
+            "--join-at-pass=1"
+        };
         log::info!(
-            "--join-at-pass=1: skipping Stages 1-4, loading {} `.scores.parquet` file(s)",
+            "{}: skipping Stages 1-4, loading {} `.scores.parquet` file(s)",
+            mode_label,
             resolved.len()
         );
         config.input_scores = Some(resolved);
@@ -743,6 +792,51 @@ mod tests {
     }
 
     #[test]
+    fn validate_join_at_pass_1_no_join_requires_input_scores() {
+        let args = parse(&[
+            "--join-at-pass=1",
+            "--no-join",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(validate_hpc_args(&args), "--input-scores");
+    }
+
+    #[test]
+    fn validate_join_at_pass_1_no_join_rejects_input_mzml() {
+        let args = parse(&[
+            "--join-at-pass=1",
+            "--no-join",
+            "-i",
+            "a.mzML",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(validate_hpc_args(&args), "cannot be combined with --input");
+    }
+
+    #[test]
+    fn validate_join_at_pass_1_no_join_happy_path() {
+        let args = parse(&[
+            "--join-at-pass=1",
+            "--no-join",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        validate_hpc_args(&args).unwrap();
+    }
+
+    #[test]
     fn validate_join_at_pass_1_happy_path() {
         let mut args = parse(&[
             "--join-at-pass=1",
@@ -832,9 +926,12 @@ mod tests {
     }
 
     #[test]
-    fn normalize_join_at_pass_1_with_no_join_modifier_errors_until_implemented() {
-        // PR 2 will implement "run only Stage 6 from persisted Stage 5
-        // outputs" once the boundary files exist.
+    fn normalize_join_at_pass_1_with_no_join_modifier_passes_through() {
+        // `--join-at-pass=1 --no-join` is the per-file rescore worker
+        // mode. `normalize_hpc_args` leaves `args.no_join = true` and
+        // does NOT set `args.join_only`; the pipeline detects the combo
+        // via `config.no_join && config.input_scores.is_some()` and
+        // dispatches to `crate::rescore`.
         let mut args = parse(&[
             "--join-at-pass=1",
             "--no-join",
@@ -845,7 +942,19 @@ mod tests {
             "-o",
             "out.blib",
         ]);
-        assert_err_contains(normalize_hpc_args(&mut args), "not yet implemented");
+        normalize_hpc_args(&mut args).expect("normalize_hpc_args should accept the combo");
+        assert!(
+            args.no_join,
+            "no_join must remain true for the worker dispatch"
+        );
+        assert!(
+            !args.join_only,
+            "join_only must remain false; otherwise the join entry path would run"
+        );
+        assert!(
+            !args.join_only_modifier,
+            "join_only_modifier is only set for the join-only modifier form"
+        );
     }
 
     #[test]
