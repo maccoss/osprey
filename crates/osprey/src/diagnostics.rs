@@ -262,11 +262,7 @@ fn mp_inputs_writer() -> Option<&'static Mutex<std::fs::File>> {
 /// fragment within `peak_xics` (so order-sensitive bugs surface);
 /// `frag_idx` is the library fragment index (so the same fragment can
 /// be matched between dumps regardless of `peak_xics` ordering).
-pub fn dump_mp_inputs(
-    entry_id: u32,
-    apex_scan: u32,
-    peak_xics: &[(usize, Vec<(f64, f64)>)],
-) {
+pub fn dump_mp_inputs(entry_id: u32, apex_scan: u32, peak_xics: &[(usize, Vec<(f64, f64)>)]) {
     let Some(writer) = mp_inputs_writer() else {
         return;
     };
@@ -357,11 +353,7 @@ fn predict_rt_writer() -> Option<&'static Mutex<std::fs::File>> {
 /// same file_name are silently dropped (tracked via a separate
 /// HashSet behind the same mutex). Call once per file at the top of
 /// the rescore loop.
-pub fn dump_predict_rt_arrays(
-    file_name: &str,
-    library_rts: &[f64],
-    fitted_values: &[f64],
-) {
+pub fn dump_predict_rt_arrays(file_name: &str, library_rts: &[f64], fitted_values: &[f64]) {
     let Some(writer) = predict_rt_writer() else {
         return;
     };

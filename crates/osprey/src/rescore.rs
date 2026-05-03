@@ -331,11 +331,15 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
              Expected `run_analysis` to synthesize via synthetic_input_from_parquet.",
         ));
     }
-    let parquet_paths = config.input_scores.as_ref().ok_or_else(|| {
-        OspreyError::config(
-            "run_rescore: --input-scores is required (validated upstream by validate_hpc_args)",
-        )
-    })?.clone();
+    let parquet_paths = config
+        .input_scores
+        .as_ref()
+        .ok_or_else(|| {
+            OspreyError::config(
+                "run_rescore: --input-scores is required (validated upstream by validate_hpc_args)",
+            )
+        })?
+        .clone();
 
     // Build file_name → input_files index, mirroring the in-process
     // setup at pipeline.rs `let mut file_name_to_idx`.
@@ -453,9 +457,7 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         for ((file_name, idx), action) in reconciliation_actions_pre.drain() {
             // Need entry_id at the pre-compaction idx. per_file_entries is
             // still pre-compaction here, so the lookup is safe.
-            if let Some((_, entries)) = per_file_entries
-                .iter()
-                .find(|(name, _)| name == &file_name)
+            if let Some((_, entries)) = per_file_entries.iter().find(|(name, _)| name == &file_name)
             {
                 if let Some(e) = entries.get(idx) {
                     actions_by_id.insert((file_name, e.entry_id), action);
@@ -474,16 +476,12 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         let entries_after: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
 
         // Rebuild reconciliation_actions with post-compaction vec_idx.
-        reconciliation_actions =
-            HashMap::with_capacity(actions_by_id.len());
+        reconciliation_actions = HashMap::with_capacity(actions_by_id.len());
         let mut dropped_actions = 0usize;
         for (file_name, entries) in &per_file_entries {
             for (new_idx, e) in entries.iter().enumerate() {
-                if let Some(action) =
-                    actions_by_id.remove(&(file_name.clone(), e.entry_id))
-                {
-                    reconciliation_actions
-                        .insert((file_name.clone(), new_idx), action);
+                if let Some(action) = actions_by_id.remove(&(file_name.clone(), e.entry_id)) {
+                    reconciliation_actions.insert((file_name.clone(), new_idx), action);
                 }
             }
         }
@@ -523,10 +521,7 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
             )
         })
         .collect();
-    let n_consensus: usize = per_file_consensus_targets
-        .values()
-        .map(|v| v.len())
-        .sum();
+    let n_consensus: usize = per_file_consensus_targets.values().map(|v| v.len()).sum();
     let n_actions: usize = reconciliation_actions.len();
     let n_gap_fill: usize = per_file_gap_fill.values().map(|v| v.len()).sum();
     log::info!(

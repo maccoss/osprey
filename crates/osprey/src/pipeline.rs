@@ -1427,8 +1427,7 @@ pub(crate) fn load_fdr_scores_sidecar(
         entry.experiment_peptide_qvalue =
             f64::from_le_bytes(data[off + 36..off + 44].try_into().unwrap());
         entry.pep = f64::from_le_bytes(data[off + 44..off + 52].try_into().unwrap());
-        entry.run_protein_qvalue =
-            f64::from_le_bytes(data[off + 52..off + 60].try_into().unwrap());
+        entry.run_protein_qvalue = f64::from_le_bytes(data[off + 52..off + 60].try_into().unwrap());
     }
     true
 }
