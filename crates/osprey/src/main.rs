@@ -313,6 +313,18 @@ fn validate_hpc_args(args: &Args) -> Result<()> {
     if args.no_join && args.join_only {
         anyhow::bail!("--no-join and --join-only are mutually exclusive.");
     }
+    // `--input-scores` is only meaningful in `--join-at-pass=1` modes
+    // (with or without a phase-shape modifier). Without that gate, an
+    // invocation like `osprey -i sample.mzML --input-scores cache.parquet`
+    // would silently route through the join path inside `run_analysis`
+    // and skip mzML scoring entirely. Reject it up front with a clear
+    // error so the user can pick the mode they actually meant.
+    if args.input_scores.is_some() && args.join_at_pass.is_none() {
+        anyhow::bail!(
+            "--input-scores requires --join-at-pass=1 (with or without --join-only / --no-join). \
+             For Stage 1-4 mzML scoring, drop --input-scores and pass --input <mzML...>."
+        );
+    }
     if args.join_only {
         // Reachable only via `--join-at-pass=1` after `normalize_hpc_args`
         // (standalone `--join-only` errors there). Error text references the
@@ -714,6 +726,31 @@ mod tests {
         // if normalize were ever bypassed.
         let args = parse(&["--no-join", "--join-only", "-i", "x.mzML", "-l", "x.blib"]);
         assert_err_contains(validate_hpc_args(&args), "mutually exclusive");
+    }
+
+    #[test]
+    fn validate_input_scores_without_join_at_pass_is_rejected() {
+        // Without this guard, `osprey -i sample.mzML --input-scores
+        // cache.parquet ...` would parse, then run_analysis would see
+        // `config.input_scores = Some(...)` and silently route through
+        // the join path, skipping the user's mzML scoring entirely.
+        // Reject up front with a clear error pointing the user at the
+        // mode they probably meant.
+        let args = parse(&[
+            "-i",
+            "sample.mzML",
+            "--input-scores",
+            "cache.scores.parquet",
+            "-l",
+            "x.blib",
+            "-o",
+            "y.blib",
+        ]);
+        let err = validate_hpc_args(&args)
+            .expect_err("expected error")
+            .to_string();
+        assert!(err.contains("--input-scores"), "got: {}", err);
+        assert!(err.contains("--join-at-pass=1"), "got: {}", err);
     }
 
     // The three `validate_join_at_pass_1_*` tests below model the actual

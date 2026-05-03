@@ -11,21 +11,25 @@
 //! boundary overrides, runs the gap-fill two-pass, and writes the
 //! reconciled per-file parquet that the second join then consumes.
 //!
-//! This module currently implements only the **hydration** layer — the
-//! rescore engine, gap-fill, and parquet write-back will land in
-//! follow-up commits. The hydration layer's contract is:
+//! End-to-end shape:
 //!
 //! ```text
 //! .scores.parquet              ─┐
-//! .1st-pass.fdr_scores.bin     ─┼──> RescoreInputs
-//! .reconciliation.json         ─┘
+//! .1st-pass.fdr_scores.bin     ─┼──> hydrate_for_rescore ──> RescoreInputs
+//! .reconciliation.json         ─┘                              │
+//!                                                              ▼
+//!                                            run_rescore (compaction +
+//!                                              reconciliation_actions
+//!                                              re-keying + per-file
+//!                                              rescore loop + parquet
+//!                                              write-back)
 //! ```
 //!
 //! `RescoreInputs` is the same in-memory shape the in-process pipeline
-//! holds at the Stage 5 → Stage 6 seam. A future bit-parity check
-//! between an end-to-end run and a `--join-at-pass=1 --join-only`
-//! followed by `--join-at-pass=1 --no-join` chain validates that the
-//! boundary files capture all the state the rescore needs.
+//! holds at the Stage 5 → Stage 6 seam. The bit-parity contract is
+//! enforced by `Compare-Stage6-Worker.ps1` (Phase A in-process vs
+//! Phase C worker-on-renamed-folder, byte-compare reconciled
+//! `.scores.parquet`) — currently 3/3 PASS on Stellar and Astral.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -451,19 +455,25 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         }
 
         // Save (file, entry_id) → action before per_file_entries shrinks
-        // so we can rebuild (file, new_vec_idx) → action below.
+        // so we can rebuild (file, new_vec_idx) → action below. Use a
+        // file_name → entries lookup map so the per-action lookup is O(1)
+        // instead of O(num_files) on the inner find().
+        let entries_by_name: HashMap<&str, &Vec<FdrEntry>> = per_file_entries
+            .iter()
+            .map(|(name, entries)| (name.as_str(), entries))
+            .collect();
         let mut actions_by_id: HashMap<(String, u32), ReconcileAction> =
             HashMap::with_capacity(reconciliation_actions_pre.len());
         for ((file_name, idx), action) in reconciliation_actions_pre.drain() {
             // Need entry_id at the pre-compaction idx. per_file_entries is
             // still pre-compaction here, so the lookup is safe.
-            if let Some((_, entries)) = per_file_entries.iter().find(|(name, _)| name == &file_name)
-            {
+            if let Some(entries) = entries_by_name.get(file_name.as_str()) {
                 if let Some(e) = entries.get(idx) {
                     actions_by_id.insert((file_name, e.entry_id), action);
                 }
             }
         }
+        drop(entries_by_name);
 
         let entries_before: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
         for (_, entries) in per_file_entries.iter_mut() {
@@ -526,7 +536,7 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
     let n_gap_fill: usize = per_file_gap_fill.values().map(|v| v.len()).sum();
     log::info!(
         "Hydrated {} file(s); rescoring {} consensus + {} reconciliation entries, plus {} \
-         gap-fill candidates per file",
+         total gap-fill candidates",
         per_file_entries.len(),
         n_consensus,
         n_actions,

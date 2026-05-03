@@ -308,18 +308,26 @@ pub fn dump_mp_inputs(entry_id: u32, apex_scan: u32, peak_xics: &[(usize, Vec<(f
 //   `RTCalibration` is affecting `predict()` beyond what
 //   `from_model_params` reconstructs.
 //
-// Gated by `OSPREY_DUMP_PREDICT_RT=<path>`. Two-section TSV output:
+// Gated by `OSPREY_DUMP_PREDICT_RT=<path>`. Two-section TSV output
+// sharing the same five-column header. The third column ("array_or_apex")
+// is the array kind for cal_arrays rows and a literal `-` placeholder
+// for predict_calls rows (reserved for a future apex_scan extension if
+// the per-call site ever has it in scope):
 //
 //     # SECTION cal_arrays
-//     #   file_name | array_kind ("library_rts" | "fitted_values") | idx | value
+//     #   "cal_arrays" | file_name | array_kind ("library_rts" | "fitted_values") | idx | value
 //     # SECTION predict_calls
-//     #   entry_id | apex_scan | library_rt | expected_rt
+//     #   "predict_calls" | entry_id | "-" | library_rt | expected_rt
 //
-// Workflow:
+// Both sections are append-only (the cal_arrays writer does not dedup
+// per file_name; if the rescore loop reuses a file's calibration twice,
+// expect duplicate cal_arrays rows). The bisection workflow handles
+// duplicates with `sort -u`:
+//
 //     OSPREY_DUMP_PREDICT_RT=/tmp/inproc_rt.tsv  osprey ...   # in-process
 //     OSPREY_DUMP_PREDICT_RT=/tmp/worker_rt.tsv  osprey ...   # worker
-//     sort /tmp/inproc_rt.tsv > /tmp/i.sorted
-//     sort /tmp/worker_rt.tsv > /tmp/w.sorted
+//     sort -u /tmp/inproc_rt.tsv > /tmp/i.sorted
+//     sort -u /tmp/worker_rt.tsv > /tmp/w.sorted
 //     diff /tmp/i.sorted /tmp/w.sorted
 
 static PREDICT_RT_DUMP: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
@@ -349,10 +357,11 @@ fn predict_rt_writer() -> Option<&'static Mutex<std::fs::File>> {
 }
 
 /// Dump the cal's `library_rts` and `fitted_values` arrays once per
-/// file, full f64 precision. Idempotent: subsequent calls for the
-/// same file_name are silently dropped (tracked via a separate
-/// HashSet behind the same mutex). Call once per file at the top of
-/// the rescore loop.
+/// file, full f64 precision. Append-only — the writer does NOT dedup
+/// per file_name, so repeated calls for the same file produce
+/// repeated rows. The bisection workflow uses `sort -u` post-hoc to
+/// collapse duplicates. Call from the top of the rescore loop where
+/// the cal is first selected.
 pub fn dump_predict_rt_arrays(file_name: &str, library_rts: &[f64], fitted_values: &[f64]) {
     let Some(writer) = predict_rt_writer() else {
         return;

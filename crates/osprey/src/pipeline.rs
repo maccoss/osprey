@@ -1236,15 +1236,18 @@ fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
 // sidecar persists both halves together so a downstream Stage 6 worker
 // can run without re-deriving anything.
 //
-// Records are written pre-compaction AND pre-protein-FDR at the
-// Stage 5 → Stage 6 boundary: every input entry contributes one
-// record so the worker can reconstruct the exact in-memory state
-// the in-process pipeline holds at the same seam, including the
-// information needed to apply the same compaction predicate
-// (peptide-FDR OR protein-rescue) — see v3 release note below for
-// why `run_protein_qvalue` is in the record. The pre-compaction
-// call site is at the bottom of the first-pass FDR block in
-// `run_analysis`, just before the compaction loop runs. Each
+// Records are written pre-compaction but POST first-pass protein
+// FDR at the Stage 5 → Stage 6 boundary: every input entry
+// contributes one record so the worker can reconstruct the exact
+// in-memory state the in-process pipeline holds at the same seam,
+// including the information needed to apply the same compaction
+// predicate (peptide-FDR OR protein-rescue). The persist call is
+// placed AFTER `propagate_protein_qvalues` populates
+// `run_protein_qvalue` on every stub so the persisted value is
+// real (not the default 1.0); see the v3 release note below for
+// why `run_protein_qvalue` is in the record. The call site is in
+// the first-pass FDR block in `run_analysis`, just before the
+// compaction loop runs. Each
 // record carries the entry's `entry_id` for identity verification
 // (the per-position `entries[i].entry_id == record.entry_id` check
 // during load doubles as a corruption detector); the loader matches
