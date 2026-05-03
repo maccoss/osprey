@@ -8,9 +8,10 @@ Osprey produces several intermediate files during analysis. These files enable f
 |---|---|---|---|---|
 | `*.calibration.json` | JSON | RT and mass calibration parameters | 5–50 KB | Yes (across runs with same LC-MS setup) |
 | `*.spectra.bin` | Custom binary | Decoded spectra for fast reload | 2–5 GB (larger than mzML) | Auto-created on first run |
-| `*.scores.parquet` | Apache Parquet (ZSTD) | Full scored entries with features, fragments, CWT candidates | 100 MB–2 GB | Validated via parameter hash |
-| `*.1st-pass.fdr_scores.bin` | Raw binary (f64 LE) | SVM discriminant scores after first-pass Percolator | ~9 MB per file | Enables skipping Percolator on rerun |
-| `*.2nd-pass.fdr_scores.bin` | Raw binary (f64 LE) | SVM discriminant scores after second-pass Percolator | ~9 MB per file | Enables skipping Percolator on rerun |
+| `*.scores.parquet` | Apache Parquet (ZSTD or Snappy) | Full scored entries with features, fragments, CWT candidates | 100 MB–2 GB | Validated via parameter hash |
+| `*.1st-pass.fdr_scores.bin` | Custom binary (versioned) | SVM scores + 4 q-values + PEP + protein q-value per entry, after first-pass Percolator | ~14 MB per 240k entries | Stage 5 → Stage 6 boundary file |
+| `*.2nd-pass.fdr_scores.bin` | Custom binary (versioned) | SVM scores + 4 q-values + PEP + protein q-value per entry, after second-pass Percolator | ~14 MB per 240k entries | Enables skipping Percolator on rerun |
+| `*.reconciliation.json` | JSON (alphabetical keys, roundtrip-stable f64) | Stage 5 reconciliation planner output: action list, gap-fill targets, refined RT calibration | 1–20 MB | Stage 5 → Stage 6 boundary file |
 | `*.blib` | SQLite (BiblioSpec) | Final output for Skyline | 50–500 MB | N/A (output) |
 
 ---
@@ -259,7 +260,10 @@ python -c "import pyarrow.parquet as pq; print(pq.read_metadata('sample.scores.p
 
 **Source**: `crates/osprey/src/pipeline.rs` (`write_fdr_scores_sidecar()`, `load_fdr_scores_sidecar()`)
 
-Lightweight binary files that persist the SVM discriminant scores from Percolator training. These files enable skipping the expensive Percolator SVM training and scoring step on subsequent runs with the same parameters.
+Per-file persistence of FDR state at the Stage 5 → Stage 6 boundary (first-pass) and after second-pass FDR. Carries the SVM discriminant score plus all q-values needed for downstream filtering and protein-FDR-aware compaction. Two roles:
+
+1. **Skip-Percolator optimization on reruns**: with both sidecars present and parquet `ValidReconciled`, Osprey skips Percolator training entirely on the next run with matching parameters.
+2. **Stage 6 worker boundary file**: the `.1st-pass.fdr_scores.bin` is one half of the boundary file pair consumed by `--join-at-pass=1 --no-join` (see [Section 5 below](#5-reconciliation-boundary-file-stemreconciliationjson) and [docs/18 — HPC Scoring Split](18-hpc-scoring-split.md)).
 
 ### Why Two Passes?
 
@@ -270,23 +274,45 @@ Osprey runs Percolator twice in a multi-file experiment:
 
 Each pass produces different SVM scores, so both are persisted independently.
 
-### Format
+### Format (v3)
 
-Raw little-endian `f64` array, one value per entry, in Parquet row order:
+Versioned binary with a 32-byte header followed by fixed-width records:
 
 ```text
-[f64 score_0][f64 score_1][f64 score_2]...[f64 score_N-1]
+Header (32 bytes):
+  [0..8]   magic            = b"OSPRYFDR"
+  [8]      version          = u8 (= 3)
+  [9]      pass             = u8 (1 = first-pass, 2 = second-pass)
+  [10..16] reserved (zero)
+  [16..24] entry_count      = u64 LE
+  [24..32] reserved (zero)
+
+Body (60 bytes per entry, in Parquet row order):
+  [0..4]   entry_id                     u32 LE
+  [4..12]  svm_score                    f64 LE
+  [12..20] run_precursor_qvalue         f64 LE
+  [20..28] run_peptide_qvalue           f64 LE
+  [28..36] experiment_precursor_qvalue  f64 LE
+  [36..44] experiment_peptide_qvalue    f64 LE
+  [44..52] pep                          f64 LE
+  [52..60] run_protein_qvalue           f64 LE
 ```
 
-- **Entry count**: Must exactly match the number of entries in the corresponding `.scores.parquet`
-- **Byte size**: `N_entries × 8 bytes` (e.g., 1.1M entries = ~9 MB)
-- **Validation**: On load, the file size is checked against `entries.len() * 8`. Mismatches are silently ignored (scores will be recomputed).
+Total file size is `32 + 60 × entry_count`.
+
+**v2 → v3 (May 2026)**: Added `run_protein_qvalue` to support the Stage 6 worker. The in-process pipeline filters pre-Stage-6 entries by `run_peptide_qvalue ≤ 0.01 OR run_protein_qvalue ≤ 0.01` (the protein-rescue branch); the v2 sidecar carried only the first half of that predicate, so a worker rehydrating from v2 couldn't reproduce in-process compaction when `--protein-fdr` is set. The persist call also moved to *after* first-pass protein FDR populates `run_protein_qvalue`, so the persisted value reflects real protein q-values rather than the default 1.0.
+
+### Validation
+
+- **Magic + version**: Loader rejects files with a different magic byte or version.
+- **Entry count**: `entry_count` in the header must match `entries.len()` from the corresponding parquet (per-record entry_id is also checked at load to detect parquet drift).
+- **Pass mismatch**: A first-pass loader called with `expected_pass = 2` returns false; the worker uses `expected_pass = 1` because reconciliation actions were planned against first-pass q-values.
 
 ### When Created/Used
 
-- **Written**: After each Percolator FDR pass completes (first-pass after Phase 4, second-pass after Phase 5 reconciliation)
-- **Loaded**: On subsequent runs, during stub loading from cached Parquet. The second-pass sidecar is preferred; the first-pass sidecar is used as fallback.
-- **Safe to delete**: Yes — Percolator will retrain on next run
+- **Written**: After each Percolator FDR pass completes. The first-pass write is now placed *after* `propagate_protein_qvalues` so `run_protein_qvalue` is meaningful, and *before* compaction so all entries are persisted.
+- **Loaded**: On subsequent runs, during stub loading from cached parquet. The second-pass sidecar is preferred; the first-pass sidecar is the fallback.
+- **Safe to delete**: Yes for the second-pass file. The first-pass file is required by `--join-at-pass=1 --no-join` (Stage 6 worker mode); deleting it forces re-running the Stage 5 join.
 
 ### Skip-Percolator Optimization
 
@@ -300,7 +326,83 @@ In this fast path, Osprey runs only `compute_fdr_from_stubs()` — target-decoy 
 
 ---
 
-## 5. BiblioSpec Output (`*.blib`)
+## 5. Reconciliation Boundary File (`*.reconciliation.json`)
+
+**Source**: `crates/osprey/src/reconciliation_io.rs` (`write_reconciliation_file()`, `read_reconciliation_file()`)
+
+Per-file JSON envelope written at the end of Stage 5 (cross-run consensus + per-file LOESS refit + reconciliation planning) and consumed by the Stage 6 worker (`--join-at-pass=1 --no-join`). Together with the `<stem>.1st-pass.fdr_scores.bin` sidecar, this file is one half of the **Stage 5 → Stage 6 boundary file pair** that lets a fan-out cluster pick up per-file rescore work without re-running any of the joined Stage 5 computation.
+
+### Cross-Implementation Byte Parity
+
+Field order is **alphabetical at every nesting level** so `serde_json::to_writer_pretty` and the matching C# `Newtonsoft.Json` emitter produce byte-identical output. Numeric fields are routed through `osprey_core::diagnostics::format_f64_roundtrip` on both sides — a single canonical fixed-point decimal form (no scientific notation) that is byte-identical across runtimes for every f64 input. The Newtonsoft `R`/Grisu and Rust `ryu` formatters disagree on the decimal-vs-scientific threshold for small values, so neither default is suitable for cross-impl byte parity. A `RoundtripPrettyFormatter` wraps `serde_json::ser::PrettyFormatter` to delegate layout and override only `write_f64`.
+
+The Rust `serde_json` dependency must be built with the `float_roundtrip` feature flag enabled (see workspace `Cargo.toml`). Without it, the default parser loses 1 ULP on some shortest-roundtrip strings (e.g., `"3.1575921556296254"` returns bits `0x...878` with default parse, `0x...877` with `float_roundtrip` and `f64::from_str`). A regression test in `reconciliation_io.rs` asserts bit-exact round-trip for known-tricky values.
+
+### Schema
+
+```json
+{
+  "forced_integration_actions": [
+    { "entry_id": 12345, "expected_rt": 18.4321, "half_width": 0.05 }
+  ],
+  "format_version": 1,
+  "gap_fill_targets": [
+    {
+      "charge": 2,
+      "decoy_entry_id": 2147495679,
+      "expected_rt": 14.2,
+      "half_width": 0.04,
+      "modified_sequence": "PEPTIDE[+57.0215]K",
+      "target_entry_id": 12001
+    }
+  ],
+  "library_hash": "de620a21cb001009...",
+  "refined_rt_calibration": {
+    "abs_residuals": [0.001, 0.002, ...],
+    "fitted_rts": [1.5, 2.3, ...],
+    "library_rts": [1.0, 2.0, ...],
+    "residual_sd": 0.014
+  },
+  "search_hash": "4f1a8b3e7c5d2901...",
+  "use_cwt_peak_actions": [
+    {
+      "apex_rt": 18.4321,
+      "candidate_idx": 2,
+      "end_rt": 18.6,
+      "entry_id": 67890,
+      "start_rt": 18.2
+    }
+  ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `forced_integration_actions` | Reconciliation actions of type `ForcedIntegration` (the planner found no overlapping CWT candidate, so the worker integrates at the expected RT ± half-width). |
+| `use_cwt_peak_actions` | Reconciliation actions of type `UseCwtPeak` (the worker switches to alternate stored CWT candidate `candidate_idx` whose apex is closer to the consensus RT). |
+| `gap_fill_targets` | Precursors that passed FDR in a sibling replicate but missed in this file. The worker integrates at `expected_rt ± half_width` to recover the missing detection plus its paired decoy. |
+| `refined_rt_calibration` | LOESS refit on consensus peptides (or `null` if the refit failed for this file — falls back to the original first-pass calibration). The worker reconstructs an `RTCalibration` via `RTCalibration::from_model_params`. |
+| `search_hash` / `library_hash` | The same hashes stored in the parquet footer; the worker validates these match the per-file parquet before proceeding. |
+
+`Keep` actions (the third planner outcome) are **not persisted** because they require no per-file work. Splitting the actions into two homogeneous arrays (`use_cwt_peak_actions` / `forced_integration_actions`) avoids the discriminator-field gymnastics that a `serde(tag = "...")` enum would produce in cross-impl JSON.
+
+### Validation
+
+- `format_version`: Loader rejects files with `format_version != RECONCILIATION_FORMAT_VERSION` (currently 1).
+- `serde(deny_unknown_fields)`: Schema drift on either side fails fast.
+- `entry_id` join: During hydration, every action's `entry_id` is joined against the per-file FdrEntry stub list; an action whose entry_id is not present in the parquet aborts with a "parquet drift?" diagnostic.
+
+### When Created/Used
+
+- **Written**: At the tail of Stage 5 in the in-process pipeline, and explicitly by `--join-at-pass=1 --join-only` (the "stop after planning" mode).
+- **Read**: By `--join-at-pass=1 --no-join` (the per-file Stage 6 worker), one file at a time alongside its `.1st-pass.fdr_scores.bin` and `.scores.parquet` siblings.
+- **Safe to delete**: Yes, but doing so requires re-running the Stage 5 join to regenerate.
+
+For the full HPC orchestration story including `--join-at-pass=<N>` flag semantics, see [docs/18 — HPC Scoring Split](18-hpc-scoring-split.md).
+
+---
+
+## 6. BiblioSpec Output (`*.blib`)
 
 The final output file in SQLite BiblioSpec format. See [08 - BiblioSpec Output Schema](08-blib-output-schema.md) for complete documentation of the schema, Osprey extension tables, and Skyline integration.
 
