@@ -44,7 +44,9 @@ Working draft for the next release. Append entries here as features and fixes la
 
 ## Performance
 
-<!-- none yet -->
+- **Stage 6 per-file rescore is now embarrassingly parallel under HPC fan-out.** The in-process pipeline processes Stage 6 (spectra reload → boundary-overrides rescore → gap-fill two-pass → reconciled parquet write-back) **sequentially** because each file loads ~3 GB of spectra + full Parquet entries; running it in parallel on a single node would OOM on large experiments. The new `--join-at-pass=1 --no-join` worker mode externalizes that loop: each Slurm/PBS array job rescores one file end-to-end, so 240 files can be rescored on 240 nodes simultaneously instead of one-at-a-time. On a typical multi-replicate experiment Stage 6 is a substantial fraction of total runtime; fanning it out across N nodes gives near-linear speedup until the surrounding fan-in joins (Stage 5 + Stages 7-8) become the bottleneck. Bit-parity with the in-process flow is enforced by `Compare-Stage6-Worker.ps1` (currently 3/3 PASS on Stellar across all 40 columns × 463k rows).
+
+- **Worker compaction action re-keying is O(num_actions) instead of O(num_actions × num_files).** When the Stage 6 worker re-keys reconciliation actions from pre-compaction `(file, vec_idx)` to post-compaction `(file, new_vec_idx)`, it now builds a `file_name → entries` HashMap once up front so each per-action lookup is constant-time. Previously the inner lookup walked the per-file Vec list. Negligible on observed Stellar runtimes (the Stage 6 loop is dominated by spectra I/O and rescoring compute) but eliminates the worst-case quadratic asymptote.
 
 ## Breaking Changes
 
