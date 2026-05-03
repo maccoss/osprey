@@ -408,11 +408,108 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
     // boundary file pair.
     let RescoreInputs {
         mut per_file_entries,
-        reconciliation_actions,
+        reconciliation_actions: mut reconciliation_actions_pre,
         refined_calibrations,
         per_file_gap_fill,
         mut seq_interner,
     } = hydrate_for_rescore(&config)?;
+
+    // Reproduce the in-process compaction (pipeline.rs first-pass FDR
+    // block): drop pre-compaction entries whose base_id didn't make
+    // the cut. Without this, the worker's `per_file_entries` carries
+    // ~3.5x more rows than the in-process path, and
+    // `select_post_fdr_consensus` + downstream scoring see entries
+    // that the in-process flow filtered out — observed as a 324-row
+    // divergence in median_polish features (Session 5 bisection).
+    // The .fdr_scores.bin v3 sidecar carries `run_protein_qvalue`
+    // precisely so this step works whether or not `--protein-fdr` is
+    // set.
+    //
+    // Compaction also invalidates the `(file_name, vec_idx)` keys in
+    // `reconciliation_actions` (which were assigned by hydration
+    // against the pre-compaction stub list). Re-key by entry_id then
+    // walk the compacted list to assign new indices.
+    let mut reconciliation_actions: HashMap<(String, usize), ReconcileAction>;
+    {
+        let peptide_gate = config.reconciliation_compaction_fdr;
+        let protein_gate = config.protein_fdr;
+        let mut first_pass_base_ids: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+        for (_, entries) in &per_file_entries {
+            for e in entries {
+                if !e.is_decoy
+                    && (e.run_peptide_qvalue <= peptide_gate
+                        || e.run_protein_qvalue <= protein_gate)
+                {
+                    first_pass_base_ids.insert(e.entry_id & 0x7FFF_FFFF);
+                }
+            }
+        }
+
+        // Save (file, entry_id) → action before per_file_entries shrinks
+        // so we can rebuild (file, new_vec_idx) → action below.
+        let mut actions_by_id: HashMap<(String, u32), ReconcileAction> =
+            HashMap::with_capacity(reconciliation_actions_pre.len());
+        for ((file_name, idx), action) in reconciliation_actions_pre.drain() {
+            // Need entry_id at the pre-compaction idx. per_file_entries is
+            // still pre-compaction here, so the lookup is safe.
+            if let Some((_, entries)) = per_file_entries
+                .iter()
+                .find(|(name, _)| name == &file_name)
+            {
+                if let Some(e) = entries.get(idx) {
+                    actions_by_id.insert((file_name, e.entry_id), action);
+                }
+            }
+        }
+
+        let entries_before: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
+        for (_, entries) in per_file_entries.iter_mut() {
+            entries.retain(|e| {
+                let base_id = e.entry_id & 0x7FFF_FFFF;
+                first_pass_base_ids.contains(&base_id)
+            });
+            entries.shrink_to_fit();
+        }
+        let entries_after: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
+
+        // Rebuild reconciliation_actions with post-compaction vec_idx.
+        reconciliation_actions =
+            HashMap::with_capacity(actions_by_id.len());
+        let mut dropped_actions = 0usize;
+        for (file_name, entries) in &per_file_entries {
+            for (new_idx, e) in entries.iter().enumerate() {
+                if let Some(action) =
+                    actions_by_id.remove(&(file_name.clone(), e.entry_id))
+                {
+                    reconciliation_actions
+                        .insert((file_name.clone(), new_idx), action);
+                }
+            }
+        }
+        // Any actions left in actions_by_id reference entries that were
+        // compacted away. That shouldn't happen for a healthy boundary
+        // file (the planner only emits actions for entries that pass
+        // FDR), so log if it does.
+        dropped_actions += actions_by_id.len();
+        if dropped_actions > 0 {
+            log::warn!(
+                "Worker compaction dropped {} reconciliation actions whose entries \
+                 didn't survive compaction (boundary file may have been written by an \
+                 older binary or with different config)",
+                dropped_actions
+            );
+        }
+
+        log::info!(
+            "Worker compaction: {} -> {} entries ({} survived peptide-FDR or protein-rescue), \
+             {} reconciliation actions retained",
+            entries_before,
+            entries_after,
+            first_pass_base_ids.len(),
+            reconciliation_actions.len(),
+        );
+    }
 
     // Multi-charge consensus targets are a pure function of the
     // hydrated FdrEntry list + run_fdr threshold, so the worker can

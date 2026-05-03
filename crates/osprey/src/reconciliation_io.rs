@@ -471,6 +471,50 @@ mod tests {
         }
     }
 
+    /// Regression guard for `serde_json`'s default f64 parser, which is
+    /// not always correctly rounded — for the shortest-roundtrip string
+    /// `"3.1575921556296254"` it returns bits `0x...878` while
+    /// `f64::from_str` returns the correct `0x...877`. Our boundary file
+    /// round-trips f64 calibration arrays through this parser, and a
+    /// 1-ULP drift propagates to per-entry `rt_deviation` divergence
+    /// at Stage 6 (Session 5 bisection). The fix is the
+    /// `float_roundtrip` feature in the workspace `Cargo.toml`. This
+    /// test asserts every f64 it touches round-trips bit-exactly so a
+    /// future feature-flag regression or serde_json upgrade is caught.
+    #[test]
+    fn serde_json_f64_roundtrip_is_bit_exact() {
+        // Values that diverged in the cross-impl bisection of file_20's
+        // refined RT calibration's `fitted_values` array.
+        let candidates = [
+            3.1575921556296254_f64,
+            3.1585537473115846_f64,
+            3.1741410573166426_f64,
+            // Stress: subnormal-near, integer-valued, and a typical
+            // q-value so the test fires for the broader Stage-N JSON
+            // path beyond just calibration arrays.
+            f64::from_bits(0x0010_0000_0000_0000), // smallest normal
+            1.0_f64,
+            0.0123_f64,
+        ];
+        for &v in &candidates {
+            let s = osprey_core::diagnostics::format_f64_roundtrip(v);
+            let parsed: f64 = serde_json::from_str(&s).unwrap_or_else(|e| {
+                panic!("serde_json failed to parse {:?}: {}", s, e);
+            });
+            assert_eq!(
+                v.to_bits(),
+                parsed.to_bits(),
+                "f64 round-trip lost bits: input={:?} ({:#x}) -> str={:?} -> parsed={:?} ({:#x}). \
+                 Likely cause: serde_json `float_roundtrip` feature is not enabled (see workspace Cargo.toml).",
+                v,
+                v.to_bits(),
+                s,
+                parsed,
+                parsed.to_bits()
+            );
+        }
+    }
+
     #[test]
     fn reconciliation_file_round_trip() {
         let dir = tempfile::tempdir().unwrap();

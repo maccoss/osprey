@@ -1236,12 +1236,16 @@ fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
 // sidecar persists both halves together so a downstream Stage 6 worker
 // can run without re-deriving anything.
 //
-// Records are written pre-compaction at the Stage 5 → Stage 6
-// boundary: every input entry contributes one record so q-values are
-// preserved even for entries that may not survive later compaction.
-// The pre-compaction call site is at the bottom of the first-pass
-// FDR block in `run_analysis`, just before the compaction loop runs.
-// Each record carries the entry's `entry_id` for identity verification
+// Records are written pre-compaction AND pre-protein-FDR at the
+// Stage 5 → Stage 6 boundary: every input entry contributes one
+// record so the worker can reconstruct the exact in-memory state
+// the in-process pipeline holds at the same seam, including the
+// information needed to apply the same compaction predicate
+// (peptide-FDR OR protein-rescue) — see v3 release note below for
+// why `run_protein_qvalue` is in the record. The pre-compaction
+// call site is at the bottom of the first-pass FDR block in
+// `run_analysis`, just before the compaction loop runs. Each
+// record carries the entry's `entry_id` for identity verification
 // (the per-position `entries[i].entry_id == record.entry_id` check
 // during load doubles as a corruption detector); the loader matches
 // records to stubs by position + count rather than by joining on
@@ -1249,14 +1253,14 @@ fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
 // reloading the same FdrEntry sequence from the per-file parquet
 // cache and applying records in order.
 //
-// Format:
+// Format (v3):
 //   magic           [0..8]   = b"OSPRYFDR"
-//   version         [8]      = u8 (= 2)
+//   version         [8]      = u8 (= 3)
 //   pass            [9]      = u8 (1 = first-pass, 2 = second-pass)
 //   reserved        [10..16] = 6 bytes (zero)
 //   entry_count     [16..24] = u64 little-endian
 //   reserved        [24..32] = 8 bytes (zero)
-//   body            [32..]   = entry_count * 52 bytes, where each record is:
+//   body            [32..]   = entry_count * 60 bytes, where each record is:
 //                              [0..4]   entry_id                     u32 LE
 //                              [4..12]  svm_score                    f64 LE
 //                              [12..20] run_precursor_qvalue         f64 LE
@@ -1264,12 +1268,21 @@ fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
 //                              [28..36] experiment_precursor_qvalue  f64 LE
 //                              [36..44] experiment_peptide_qvalue    f64 LE
 //                              [44..52] pep                          f64 LE
+//                              [52..60] run_protein_qvalue           f64 LE
 //
-// Total file size is `32 + 52 * entry_count`.
+// Total file size is `32 + 60 * entry_count`.
+//
+// v2 → v3 (2026-05-02): added `run_protein_qvalue` to support the
+// Stage 6 worker's compaction step. The in-process pipeline filters
+// pre-Stage-6 entries by `run_peptide_qvalue <= 0.01` OR
+// `run_protein_qvalue <= 0.01` (the protein-rescue branch); the v2
+// sidecar carried only the first half of that predicate, so a
+// rehydrated worker couldn't reproduce in-process compaction when
+// `--protein-fdr` is set. v3 closes that gap.
 const FDR_SIDECAR_MAGIC: &[u8; 8] = b"OSPRYFDR";
-const FDR_SIDECAR_VERSION: u8 = 2;
+const FDR_SIDECAR_VERSION: u8 = 3;
 const FDR_SIDECAR_HEADER_LEN: usize = 32;
-const FDR_SIDECAR_RECORD_LEN: usize = 52;
+const FDR_SIDECAR_RECORD_LEN: usize = 60;
 
 /// Write per-file FDR scores to a sidecar binary file (v2 format).
 fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: u8) -> Result<()> {
@@ -1300,7 +1313,7 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
     file.write_all(&header)
         .map_err(|e| OspreyError::OutputError(format!("Failed to write header: {}", e)))?;
 
-    // Body: 52 bytes per entry (entry_id + 6 f64s)
+    // Body: 60 bytes per entry (entry_id + 7 f64s)
     let mut record = [0u8; FDR_SIDECAR_RECORD_LEN];
     for entry in entries {
         record[0..4].copy_from_slice(&entry.entry_id.to_le_bytes());
@@ -1310,6 +1323,7 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
         record[28..36].copy_from_slice(&entry.experiment_precursor_qvalue.to_le_bytes());
         record[36..44].copy_from_slice(&entry.experiment_peptide_qvalue.to_le_bytes());
         record[44..52].copy_from_slice(&entry.pep.to_le_bytes());
+        record[52..60].copy_from_slice(&entry.run_protein_qvalue.to_le_bytes());
         file.write_all(&record)
             .map_err(|e| OspreyError::OutputError(format!("Failed to write record: {}", e)))?;
     }
@@ -1319,7 +1333,7 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
 }
 
 /// Load per-file FDR scores from sidecar into FdrEntry stubs. Returns true if successful.
-/// Refuses to load if the file's magic/version don't match v2 or if the entry
+/// Refuses to load if the file's magic/version don't match v3 or if the entry
 /// count in the header disagrees with the stub list (indicates parquet drift).
 pub(crate) fn load_fdr_scores_sidecar(
     path: &std::path::Path,
@@ -1413,6 +1427,8 @@ pub(crate) fn load_fdr_scores_sidecar(
         entry.experiment_peptide_qvalue =
             f64::from_le_bytes(data[off + 36..off + 44].try_into().unwrap());
         entry.pep = f64::from_le_bytes(data[off + 44..off + 52].try_into().unwrap());
+        entry.run_protein_qvalue =
+            f64::from_le_bytes(data[off + 52..off + 60].try_into().unwrap());
     }
     true
 }
@@ -2858,6 +2874,20 @@ pub(crate) fn rescore_per_file_loop(
             .get(file_name.as_str())
             .or_else(|| per_file_calibrations.get(file_name.as_str()));
 
+        // Bisection dump: per-file calibration arrays. Together with the
+        // per-call `dump_predict_rt_call` at the predict site, this
+        // narrows down whether an in-process vs worker `rt_deviation`
+        // divergence comes from the cal arrays differing (JSON
+        // round-trip lossy) or from `predict()` producing different
+        // output for byte-identical inputs (hidden RTCalibration state).
+        if let Some(cal) = rt_cal {
+            crate::diagnostics::dump_predict_rt_arrays(
+                file_name,
+                cal.library_rts(),
+                cal.fitted_values(),
+            );
+        }
+
         let cal_params: Option<CalibrationParams> = input_file.parent().and_then(|input_dir| {
             let cal_path = calibration_path_for_input(input_file, input_dir);
             if cal_path.exists() {
@@ -3731,28 +3761,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         crate::trace::log_fdr_qvalues(&per_file_entries, "first-pass");
 
         // Persist first-pass SVM scores to sidecar files. In
-        // `--join-at-pass=1 --join-only` mode this sidecar is half of the
-        // Stage 5 → Stage 6 boundary file pair, so any failure is fatal —
-        // a Stage 6 worker arriving and finding no sidecar would either
-        // refuse to start or scramble its FdrEntry stubs at v2 record
-        // alignment time. In normal end-to-end mode the sidecar is a
-        // resume-only optimization and best-effort is fine.
-        log::debug!("Persisting 1st-pass FDR scores...");
-        let failures = persist_fdr_scores(
-            &per_file_entries,
-            &config,
-            fdr_scores_path_pass1,
-            "1st-pass",
-            1,
-        );
-        if failures > 0 && config.stop_after_stage5 {
-            return Err(OspreyError::config(format!(
-                "--join-at-pass=1 --join-only: {}/{} 1st-pass fdr_scores.bin sidecar writes failed; \
-                 boundary file pair is incomplete. See warnings above.",
-                failures,
-                per_file_entries.len()
-            )));
-        }
+        // The 1st-pass fdr_scores.bin sidecar write is deferred to AFTER
+        // first-pass protein FDR runs below — v3 of the sidecar carries
+        // `run_protein_qvalue` so the Stage 6 worker can apply the same
+        // protein-rescue compaction predicate the in-process pipeline
+        // does. Writing here would persist a default `run_protein_qvalue
+        // = 1.0` and silently break protein-rescue parity in the worker.
     }
 
     // Stage 5 diagnostic dump. Gated by OSPREY_DUMP_PERCOLATOR=1; exits the
@@ -3821,6 +3835,34 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             n_at_1pct,
             config.run_fdr * 100.0,
         );
+    }
+
+    // Persist the 1st-pass fdr_scores.bin sidecar AFTER first-pass
+    // protein FDR has populated `run_protein_qvalue` on every stub.
+    // Sidecar v3 carries that field so the Stage 6 worker can apply
+    // the same protein-rescue compaction predicate the in-process
+    // pipeline runs at the next code block. Still pre-compaction —
+    // every input entry contributes one record, just with the right
+    // protein q-value populated. In `--join-at-pass=1 --join-only`
+    // mode this sidecar is half of the Stage 5 → Stage 6 boundary
+    // file pair, so any failure is fatal.
+    if !can_skip_fdr {
+        log::debug!("Persisting 1st-pass FDR scores...");
+        let failures = persist_fdr_scores(
+            &per_file_entries,
+            &config,
+            fdr_scores_path_pass1,
+            "1st-pass",
+            1,
+        );
+        if failures > 0 && config.stop_after_stage5 {
+            return Err(OspreyError::config(format!(
+                "--join-at-pass=1 --join-only: {}/{} 1st-pass fdr_scores.bin sidecar writes failed; \
+                 boundary file pair is incomplete. See warnings above.",
+                failures,
+                per_file_entries.len()
+            )));
+        }
     }
 
     // Collect first-pass passing base_ids for compaction.
@@ -6437,6 +6479,12 @@ fn compute_features_at_peak(
             })
             .collect();
 
+        // Bisection dump: capture the inputs to every tukey_median_polish
+        // call so an in-process vs --no-join worker run can be diffed at
+        // this exact layer. Gated by OSPREY_DUMP_MP_INPUTS=<path>; no-op
+        // when unset. See diagnostics::dump_mp_inputs for the workflow.
+        crate::diagnostics::dump_mp_inputs(entry.id, apex_spectrum.scan_number, &peak_xics);
+
         if let Some(ref mp) = tukey_median_polish(&peak_xics, 10, 0.01) {
             let cos = median_polish_libcosine(mp, &entry.fragments);
             let rsq = median_polish_rsquared(mp);
@@ -6949,6 +6997,17 @@ fn run_search(
                         let expected_rt = rt_calibration
                             .map(|cal| cal.predict(entry.retention_time))
                             .unwrap_or(entry.retention_time);
+
+                        // Bisection dump: capture predict() input/output for
+                        // every rescored entry. Pair with one-time per-file
+                        // dump of cal arrays at the rescore loop top so an
+                        // in-process vs worker diff narrows whether the cal
+                        // arrays differ or just the predict() outputs.
+                        crate::diagnostics::dump_predict_rt_call(
+                            entry.id,
+                            entry.retention_time,
+                            expected_rt,
+                        );
 
                         // Filter spectra within RT range.
                         // For boundary overrides: use the given boundaries + margin for SNR context.
@@ -9638,18 +9697,23 @@ mod tests {
     }
 
     #[test]
-    fn fdr_scores_sidecar_v2_round_trip() {
+    fn fdr_scores_sidecar_v3_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         // write_fdr_scores_sidecar stages through std::env::temp_dir() with
         // a tmp name keyed on `<pid>_<filename>`, so parallel tests using
         // the same `<filename>` would race on the same staging path.
         // Each test uses a unique filename to avoid that.
-        let path = dir.path().join("v2_round_trip.1st-pass.fdr_scores.bin");
-        let entries = vec![
+        let path = dir.path().join("v3_round_trip.1st-pass.fdr_scores.bin");
+        let mut entries = vec![
             make_fdr_entry(0, -3.5, 0.001, 0.02),
             make_fdr_entry(1, -3.4, 0.002, 0.05),
             make_fdr_entry(2, -3.3, 0.003, 0.08),
         ];
+        // Distinct run_protein_qvalue per entry so the round-trip assertion
+        // catches a writer that drops the field or zeros it.
+        entries[0].run_protein_qvalue = 0.0042;
+        entries[1].run_protein_qvalue = 0.0123;
+        entries[2].run_protein_qvalue = 0.95;
         write_fdr_scores_sidecar(&path, &entries, 1).unwrap();
 
         // Cross-impl byte-parity hook: when the harness runs this test
@@ -9662,7 +9726,7 @@ mod tests {
             std::fs::copy(&path, &out).unwrap();
         }
 
-        // File size sanity check: 32-byte header + N * 52 bytes.
+        // File size sanity check: 32-byte header + N * 60 bytes (v3).
         let size = std::fs::metadata(&path).unwrap().len() as usize;
         assert_eq!(
             size,
@@ -9694,6 +9758,10 @@ mod tests {
                 got.experiment_peptide_qvalue.to_bits()
             );
             assert_eq!(orig.pep.to_bits(), got.pep.to_bits());
+            assert_eq!(
+                orig.run_protein_qvalue.to_bits(),
+                got.run_protein_qvalue.to_bits()
+            );
         }
     }
 

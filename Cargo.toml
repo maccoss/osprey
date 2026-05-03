@@ -45,7 +45,13 @@ base64 = "0.22"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
+# `float_roundtrip` is essential: without it, serde_json's default
+# f64 parser is best-effort and loses 1 ULP on some shortest-roundtrip
+# strings (e.g., "3.1575921556296254" → bits 0x...877 with std parse,
+# 0x...878 with serde_json default). The Stage 5 → Stage 6 boundary
+# files round-trip f64 calibration arrays through this parser, so the
+# bug shows up as a silent 1-ULP drift in the rehydrated calibration.
+serde_json = { version = "1.0", features = ["raw_value", "float_roundtrip"] }
 serde_yaml = "0.9"
 
 # CLI
