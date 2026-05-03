@@ -581,7 +581,7 @@ fn main() -> Result<()> {
             }
         };
     }
-    if args.input_scores.is_some() {
+    if let Some(input_scores) = args.input_scores.take() {
         // `--input-scores` reaches this point only after
         // `validate_hpc_args` accepted it, which means we are in one of
         // two HPC modes: `--join-at-pass=1` (with or without
@@ -590,7 +590,7 @@ fn main() -> Result<()> {
         // `args.no_join` is true). Both consume the parquets via the
         // same expansion + assignment path; the downstream dispatch
         // picks the right pipeline branch.
-        let resolved = resolve_input_scores(args.input_scores.unwrap())?;
+        let resolved = resolve_input_scores(input_scores)?;
         let mode_label = if args.no_join {
             "--join-at-pass=1 --no-join"
         } else {

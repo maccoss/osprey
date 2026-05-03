@@ -2628,7 +2628,465 @@ fn write_parquet_report(
 /// Uses DIA-NN-style fragment XIC extraction and pairwise correlation scoring.
 /// Calibrates retention time per file, searches for peptide candidates, performs
 /// FDR control, and writes results to blib format for Skyline integration.
-pub fn run_analysis(config: OspreyConfig) -> Result<()> {
+/// Aggregate counters returned by [`rescore_per_file_loop`]. Used by the
+/// caller to log a single summary line and to gate second-pass FDR.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RescoreStats {
+    pub total_rescored: usize,
+    pub total_reconciliation: usize,
+    pub total_gap_cwt: usize,
+    pub total_gap_forced: usize,
+}
+
+/// Per-file rescore + gap-fill + reconciled parquet write-back.
+///
+/// This is the body of Stage 6 (the second per-file fan-out, between
+/// the two joins). Lifted into a function so both the in-process
+/// pipeline and the `--join-at-pass=1 --no-join` worker invocation
+/// (`crate::rescore`) drive the same code path: the worker hydrates the
+/// in-memory state from the Stage 5 → Stage 6 boundary file pair and
+/// then calls this function exactly the way `run_analysis` does.
+///
+/// Inputs (shapes mirror what `run_analysis` already holds in scope at
+/// the original call site):
+///
+/// * `per_file_entries` — post-compaction FdrEntry stubs, mutated in
+///   place: re-scored entries get their stub overwritten (preserving
+///   the original `parquet_index` for write-back), and gap-fill entries
+///   are appended with `parquet_index = u32::MAX` until the parquet
+///   write-back assigns them a real row index.
+/// * `per_file_consensus_targets` — multi-charge consensus targets for
+///   re-scoring (computed by `select_post_fdr_consensus` outside this
+///   function so the cross-impl `dump_stage6_multicharge` diagnostic
+///   stays observable upstream).
+/// * `reconciliation_actions` — non-Keep planner output; `Keep` actions
+///   are filtered to nothing here.
+/// * `refined_calibrations` — Stage 5 LOESS-refit per-file calibrations;
+///   preferred over `per_file_calibrations` when present.
+/// * `per_file_calibrations` — original first-pass per-file
+///   calibrations (fallback for files where the LOESS refit failed).
+/// * `per_file_gap_fill` — gap-fill targets per file (precursors that
+///   passed FDR in a sibling replicate but missed in this one).
+/// * `per_file_cache_paths` — `<stem>.scores.parquet` per file; the
+///   write-back step rewrites this file with reconciled scores.
+/// * `library` — full library (targets + decoys) used to build
+///   per-file subset libraries for the override-aware `run_search`.
+/// * `file_name_to_idx` — file_name → index into `config.input_files`.
+/// * `seq_interner` — modified-sequence interner for newly-appended
+///   gap-fill stubs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rescore_per_file_loop(
+    per_file_entries: &mut [(String, Vec<FdrEntry>)],
+    per_file_consensus_targets: &HashMap<String, Vec<(usize, f64, f64, f64)>>,
+    reconciliation_actions: &HashMap<(String, usize), crate::reconciliation::ReconcileAction>,
+    refined_calibrations: &HashMap<String, RTCalibration>,
+    per_file_calibrations: &HashMap<String, RTCalibration>,
+    per_file_gap_fill: &HashMap<String, Vec<crate::reconciliation::GapFillTarget>>,
+    per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
+    library: &[LibraryEntry],
+    file_name_to_idx: &HashMap<String, usize>,
+    config: &OspreyConfig,
+    seq_interner: &mut HashSet<Arc<str>>,
+) -> Result<RescoreStats> {
+    use crate::reconciliation::ReconcileAction;
+    let total_reconciliation: usize = reconciliation_actions
+        .values()
+        .filter(|a| !matches!(a, ReconcileAction::Keep))
+        .count();
+    // 3. Load spectra once per file and re-score both consensus + reconciliation targets.
+    //    For re-scoring, we reload full CoelutionScoredEntry from parquet, rescore,
+    //    save updated entries back to parquet, and update FdrEntry stubs.
+    //    Files are processed in parallel for throughput.
+
+    // Pre-group reconciliation actions by file name for efficient per-file lookup
+    let mut per_file_reconciliation_targets: HashMap<String, Vec<(usize, f64, f64, f64)>> =
+        HashMap::new();
+    for ((file_name, idx), action) in reconciliation_actions {
+        let (start, apex, end) = match action {
+            ReconcileAction::Keep => continue,
+            ReconcileAction::UseCwtPeak {
+                start_rt,
+                apex_rt,
+                end_rt,
+                ..
+            } => (*start_rt, *apex_rt, *end_rt),
+            ReconcileAction::ForcedIntegration {
+                expected_rt,
+                half_width,
+            } => (
+                expected_rt - half_width,
+                *expected_rt,
+                expected_rt + half_width,
+            ),
+        };
+        per_file_reconciliation_targets
+            .entry(file_name.clone())
+            .or_default()
+            .push((*idx, apex, start, end));
+    }
+
+    let mut total_rescored: usize = 0;
+    let mut total_gap_cwt: usize = 0;
+    let mut total_gap_forced: usize = 0;
+
+    // Process files sequentially to limit peak memory — each file loads spectra
+    // (~1.5 GB). Per-file re-scoring is already internally parallelized.
+    let n_total_files = per_file_entries.len();
+    for (file_num, (file_name, fdr_entries)) in per_file_entries.iter_mut().enumerate() {
+        // Collect consensus targets for this file
+        let consensus_targets = per_file_consensus_targets
+            .get(file_name.as_str())
+            .cloned()
+            .unwrap_or_default();
+
+        // Collect reconciliation targets for this file (pre-grouped)
+        let reconciliation_targets = per_file_reconciliation_targets
+            .get(file_name.as_str())
+            .cloned()
+            .unwrap_or_default();
+
+        // Collect gap-fill targets for this file
+        let gap_fill_targets = per_file_gap_fill
+            .get(file_name.as_str())
+            .cloned()
+            .unwrap_or_default();
+
+        // Merge both target sets, deduplicating by entry index
+        // (if an entry appears in both consensus and reconciliation,
+        // prefer the reconciliation target since it's inter-replicate informed)
+        let mut combined_targets: HashMap<usize, (f64, f64, f64)> = HashMap::new();
+        for (idx, apex, start, end) in &consensus_targets {
+            combined_targets.insert(*idx, (*apex, *start, *end));
+        }
+        for (idx, apex, start, end) in &reconciliation_targets {
+            combined_targets.insert(*idx, (*apex, *start, *end));
+        }
+
+        let all_targets: Vec<(usize, f64, f64, f64)> = combined_targets
+            .into_iter()
+            .map(|(idx, (apex, start, end))| (idx, apex, start, end))
+            .collect();
+
+        // Skip file if no work to do (no re-scoring targets AND no gap-fill targets)
+        if all_targets.is_empty() && gap_fill_targets.is_empty() {
+            continue;
+        }
+
+        let input_idx = match file_name_to_idx.get(file_name.as_str()) {
+            Some(idx) => *idx,
+            None => continue,
+        };
+        let input_file = &config.input_files[input_idx];
+
+        let n_multi_charge = consensus_targets.len();
+        let n_inter_replicate = reconciliation_targets.len();
+        let n_gap_fill = gap_fill_targets.len();
+        log::info!(
+            "Re-scoring file {}/{}: {}",
+            file_num + 1,
+            n_total_files,
+            file_name,
+        );
+        log::debug!(
+            "  {} entries ({} consensus, {} reconciliation, {} gap-fill, {} unique after dedup)",
+            all_targets.len() + n_gap_fill * 2,
+            n_multi_charge,
+            n_inter_replicate,
+            n_gap_fill,
+            all_targets.len(),
+        );
+
+        // Build boundary overrides keyed by entry_id and track idx mapping
+        let mut boundary_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
+        let mut entry_id_to_idx: HashMap<u32, usize> = HashMap::new();
+        let mut subset_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &(idx, apex, start, end) in &all_targets {
+            let entry_id = fdr_entries[idx].entry_id;
+            boundary_overrides.insert(entry_id, (apex, start, end));
+            entry_id_to_idx.insert(entry_id, idx);
+            subset_ids.insert(entry_id);
+        }
+
+        // Build subset library containing only entries that need re-scoring
+        let subset_library: Vec<LibraryEntry> = library
+            .iter()
+            .filter(|e| subset_ids.contains(&e.id))
+            .cloned()
+            .collect();
+
+        // Build gap-fill library subset (targets + decoys, separate from re-scoring)
+        let mut gap_fill_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for gf in &gap_fill_targets {
+            gap_fill_ids.insert(gf.target_entry_id);
+            gap_fill_ids.insert(gf.decoy_entry_id);
+        }
+        let gap_fill_library: Vec<LibraryEntry> = if !gap_fill_ids.is_empty() {
+            library
+                .iter()
+                .filter(|e| gap_fill_ids.contains(&e.id))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Load spectra and calibration for this file
+        let (spectra, ms1_index) = {
+            let cache_path = spectra_cache_path(input_file);
+            if cache_path.exists() {
+                match load_spectra_cache(&cache_path) {
+                    Ok(result) => {
+                        log::debug!(
+                            "Loaded {} MS2 spectra from cache '{}'",
+                            result.0.len(),
+                            cache_path.display()
+                        );
+                        result
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
+                        load_all_spectra(input_file)?
+                    }
+                }
+            } else {
+                load_all_spectra(input_file)?
+            }
+        };
+
+        // Use refined calibration if available, fall back to original
+        let rt_cal = refined_calibrations
+            .get(file_name.as_str())
+            .or_else(|| per_file_calibrations.get(file_name.as_str()));
+
+        let cal_params: Option<CalibrationParams> = input_file.parent().and_then(|input_dir| {
+            let cal_path = calibration_path_for_input(input_file, input_dir);
+            if cal_path.exists() {
+                load_calibration(&cal_path).ok()
+            } else {
+                None
+            }
+        });
+
+        // --- Re-score existing entries (consensus + reconciliation) ---
+        let mut overlay: HashMap<usize, CoelutionScoredEntry> = HashMap::new();
+        if !all_targets.is_empty() {
+            let rescored = run_search(
+                &subset_library,
+                &spectra,
+                &ms1_index,
+                cal_params.as_ref(),
+                rt_cal,
+                config,
+                file_name,
+                Some(&boundary_overrides),
+                "Re-scoring",
+            )?;
+
+            for entry in rescored {
+                if let Some(&idx) = entry_id_to_idx.get(&entry.entry_id) {
+                    overlay.insert(idx, entry);
+                }
+            }
+        }
+
+        // --- Gap-fill: score missing precursors (two-pass: CWT then forced) ---
+        let mut n_gap_cwt = 0usize;
+        let mut n_gap_forced = 0usize;
+        if !gap_fill_targets.is_empty() {
+            // Pass 1 (CWT): Run without boundary overrides, pre-filter disabled.
+            // This lets CWT peak detection find natural peaks at the consensus RT.
+            let mut gap_config = config.clone();
+            gap_config.prefilter_enabled = false;
+            let cwt_results = run_search(
+                &gap_fill_library,
+                &spectra,
+                &ms1_index,
+                cal_params.as_ref(),
+                rt_cal,
+                &gap_config,
+                file_name,
+                None,
+                "Gap-fill CWT",
+            )?;
+
+            // Track which entry_ids got CWT results
+            let cwt_hit_ids: std::collections::HashSet<u32> =
+                cwt_results.iter().map(|e| e.entry_id).collect();
+            n_gap_cwt = cwt_results.len();
+
+            // Append CWT results as new FdrEntry stubs (gap-fill: no Parquet row)
+            let gap_fill_start_idx = fdr_entries.len();
+            for (i, entry) in cwt_results.into_iter().enumerate() {
+                let mut stub = entry.to_fdr_entry();
+                stub.parquet_index = u32::MAX; // gap-fill sentinel
+                stub.modified_sequence = intern_seq(seq_interner, &stub.modified_sequence);
+                fdr_entries.push(stub);
+                overlay.insert(gap_fill_start_idx + i, entry);
+            }
+
+            // Pass 2 (Forced): Entries that CWT missed get forced integration
+            // at consensus RT ± half_width
+            let mut forced_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
+            let mut forced_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for gf in &gap_fill_targets {
+                // Add target if CWT missed it
+                if !cwt_hit_ids.contains(&gf.target_entry_id) {
+                    let start = gf.expected_rt - gf.half_width;
+                    let end = gf.expected_rt + gf.half_width;
+                    forced_overrides.insert(gf.target_entry_id, (gf.expected_rt, start, end));
+                    forced_ids.insert(gf.target_entry_id);
+                }
+                // Add decoy if CWT missed it
+                if !cwt_hit_ids.contains(&gf.decoy_entry_id) {
+                    let start = gf.expected_rt - gf.half_width;
+                    let end = gf.expected_rt + gf.half_width;
+                    forced_overrides.insert(gf.decoy_entry_id, (gf.expected_rt, start, end));
+                    forced_ids.insert(gf.decoy_entry_id);
+                }
+            }
+
+            if !forced_overrides.is_empty() {
+                let forced_library: Vec<LibraryEntry> = gap_fill_library
+                    .iter()
+                    .filter(|e| forced_ids.contains(&e.id))
+                    .cloned()
+                    .collect();
+
+                let forced_results = run_search(
+                    &forced_library,
+                    &spectra,
+                    &ms1_index,
+                    cal_params.as_ref(),
+                    rt_cal,
+                    config,
+                    file_name,
+                    Some(&forced_overrides),
+                    "Gap-fill forced",
+                )?;
+
+                n_gap_forced = forced_results.len();
+
+                // Append forced results as new FdrEntry stubs (gap-fill: no Parquet row)
+                let forced_start_idx = fdr_entries.len();
+                for (i, entry) in forced_results.into_iter().enumerate() {
+                    let mut stub = entry.to_fdr_entry();
+                    stub.parquet_index = u32::MAX; // gap-fill sentinel
+                    stub.modified_sequence = intern_seq(seq_interner, &stub.modified_sequence);
+                    fdr_entries.push(stub);
+                    overlay.insert(forced_start_idx + i, entry);
+                }
+            }
+
+            total_gap_cwt += n_gap_cwt;
+            total_gap_forced += n_gap_forced;
+        }
+
+        // Drop spectra before updating stubs to free ~1.5-3 GB
+        drop(spectra);
+
+        // Count existing re-scored entries (not gap-fill)
+        let existing_rescore_indices: std::collections::HashSet<usize> =
+            entry_id_to_idx.values().copied().collect();
+        let n_existing_rescored = overlay
+            .keys()
+            .filter(|idx| existing_rescore_indices.contains(idx))
+            .count();
+        total_rescored += n_existing_rescored + n_gap_cwt + n_gap_forced;
+
+        if !all_targets.is_empty() || n_gap_cwt + n_gap_forced > 0 {
+            log::debug!(
+                "  {} of {} existing entries re-scored, {} gap-fill ({} CWT, {} forced)",
+                n_existing_rescored,
+                all_targets.len(),
+                n_gap_cwt + n_gap_forced,
+                n_gap_cwt,
+                n_gap_forced,
+            );
+        }
+
+        // Update FdrEntry stubs from overlay for existing re-scored entries
+        // (gap-fill entries were already appended with stubs during scoring above)
+        for &idx in &existing_rescore_indices {
+            if let Some(entry) = overlay.get(&idx) {
+                let mut stub = entry.to_fdr_entry();
+                // Preserve the original parquet_index from the existing stub
+                stub.parquet_index = fdr_entries[idx].parquet_index;
+                stub.modified_sequence = intern_seq(seq_interner, &stub.modified_sequence);
+                fdr_entries[idx] = stub;
+            }
+        }
+        // Write reconciled entries (overlay) back to Parquet, then drop overlay.
+        // This avoids accumulating ~28 GB of overlay data across 240 files.
+        // The blib output step will reload from this reconciled Parquet.
+        if !overlay.is_empty() {
+            // Merge overlay into a complete entry list for this file:
+            // load original parquet, replace re-scored entries, append gap-fill entries.
+            let scores_path = per_file_cache_paths.get(file_name.as_str());
+            if let Some(cache_path) = scores_path {
+                if let Ok(mut full_entries) = load_scores_parquet(cache_path) {
+                    // Replace re-scored entries using parquet_index (not Vec position).
+                    // After first-pass compaction, Vec position != Parquet row index.
+                    // Using Vec position would overwrite the wrong entry in the Parquet
+                    // file and leave the actual target entry unchanged.
+                    for &idx in &existing_rescore_indices {
+                        if let Some(entry) = overlay.remove(&idx) {
+                            let pq_idx = fdr_entries[idx].parquet_index as usize;
+                            if pq_idx < full_entries.len() {
+                                full_entries[pq_idx] = entry;
+                            } else {
+                                log::warn!(
+                                    "Rescore write-back: parquet_index {} out of range for {} ({} rows)",
+                                    pq_idx,
+                                    file_name,
+                                    full_entries.len(),
+                                );
+                            }
+                        }
+                    }
+                    // Append gap-fill entries (remaining overlay entries beyond parquet range).
+                    // Update the corresponding fdr_entries stubs' parquet_index to point to
+                    // the actual Parquet row they will occupy after write-back. Without this,
+                    // gap-fill stubs keep parquet_index = u32::MAX and Phase 2 of the next
+                    // Percolator run can't load their features.
+                    let gap_start_pq_row = full_entries.len();
+                    let mut gap_entries: Vec<(usize, CoelutionScoredEntry)> =
+                        overlay.into_iter().collect();
+                    gap_entries.sort_by_key(|(idx, _)| *idx);
+                    for (gap_offset, (vec_idx, entry)) in gap_entries.into_iter().enumerate() {
+                        let new_pq_row = (gap_start_pq_row + gap_offset) as u32;
+                        full_entries.push(entry);
+                        // The vec_idx in the overlay matches the position in fdr_entries
+                        // (gap-fill entries were appended to fdr_entries in order)
+                        if vec_idx < fdr_entries.len() {
+                            fdr_entries[vec_idx].parquet_index = new_pq_row;
+                        }
+                    }
+                    // Write back to Parquet with reconciliation metadata
+                    let recon_metadata = build_reconciled_metadata(config);
+                    let codec = parquet_compression_codec(config.parquet_compression);
+                    if let Err(e) = write_scores_parquet_with_metadata(
+                        cache_path,
+                        &full_entries,
+                        Some(recon_metadata),
+                        codec,
+                    ) {
+                        log::warn!("Failed to write reconciled scores for {}: {}", file_name, e);
+                    }
+                }
+            }
+            // Overlay is consumed — no memory accumulation
+        }
+    }
+
+    Ok(RescoreStats {
+        total_rescored,
+        total_reconciliation,
+        total_gap_cwt,
+        total_gap_forced,
+    })
+}
+
+pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // Validate config: --join-only feeds per-file state from --input-scores
     // parquets and ignores --input-files; default + --no-join modes both
     // require mzML inputs.
@@ -2640,6 +3098,23 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         return Err(OspreyError::ConfigError(
             "--join-only: --input-scores list is empty".into(),
         ));
+    }
+
+    // `--join-at-pass=1` modes (with or without `--no-join` /
+    // `--join-only`) feed per-file state from the `--input-scores`
+    // parquets but downstream code still needs `config.input_files`
+    // populated to find sibling mzML / spectra cache / calibration
+    // JSON for the per-file fan-out phases (Stage 6 rescore in
+    // particular). Synthesize the mzML paths from the parquet stems
+    // here, before any pipeline phase reads `config.input_files`. The
+    // synthesis is idempotent — re-running Stage 6 on already-
+    // reconciled parquets points at the same mzMLs.
+    if join_only && config.input_files.is_empty() {
+        let parquets = config.input_scores.as_ref().unwrap();
+        config.input_files = parquets
+            .iter()
+            .map(|p| synthetic_input_from_parquet(p.as_path()))
+            .collect();
     }
 
     // `--join-at-pass=1 --join-only` (i.e., stop_after_stage5) writes the
@@ -2676,29 +3151,6 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // `--join-at-pass=1 --no-join` is the per-file rescore worker mode
-    // (the second per-file fan-out, between the two joins). Dispatch
-    // here so the heavy library-load + Stages 1-4 setup below is
-    // skipped — the worker reads its inputs entirely from the
-    // boundary files + per-file parquet, plus the spectra it reloads
-    // from the sibling mzML during the rescore engine itself (next
-    // slice). This first slice only hydrates the in-memory state and
-    // logs a "loaded what I expected" summary so the wire-through is
-    // observable end-to-end before the engine is ported.
-    if config.no_join && config.input_scores.is_some() {
-        log::info!(
-            "--join-at-pass=1 --no-join: hydrating per-file rescore inputs from \
-             {} parquet(s) + boundary files",
-            config.input_scores.as_ref().map(|v| v.len()).unwrap_or(0)
-        );
-        let _inputs = crate::rescore::hydrate_and_log(&config)?;
-        log::info!(
-            "--join-at-pass=1 --no-join: hydration complete; rescore engine + gap-fill \
-             + parquet write-back not yet implemented (next slice)"
-        );
-        return Ok(());
-    }
-
     // Load library
     log::info!(
         "Loading spectral library from {:?}",
@@ -2733,6 +3185,17 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
         library = valid_targets;
         library.extend(decoys);
         log::info!("Total library size: {} (targets + decoys)", library.len());
+    }
+
+    // `--join-at-pass=1 --no-join` is the per-file rescore worker mode
+    // (the second per-file fan-out, between the two joins). The worker
+    // reads its inputs entirely from the boundary files + per-file
+    // parquet (no Stages 1-4 work, no first-pass FDR), then drives the
+    // same `rescore_per_file_loop` the in-process pipeline calls below.
+    // Library load + decoy generation above feed the worker's
+    // subset-library construction.
+    if config.no_join && config.input_scores.is_some() {
+        return crate::rescore::run_rescore(config, library);
     }
 
     // Set up output directories
@@ -3738,400 +4201,28 @@ pub fn run_analysis(config: OspreyConfig) -> Result<()> {
             return Ok(());
         }
 
-        let total_reconciliation: usize = reconciliation_actions
-            .values()
-            .filter(|a| !matches!(a, ReconcileAction::Keep))
-            .count();
-        // 3. Load spectra once per file and re-score both consensus + reconciliation targets.
-        //    For re-scoring, we reload full CoelutionScoredEntry from parquet, rescore,
-        //    save updated entries back to parquet, and update FdrEntry stubs.
-        //    Files are processed in parallel for throughput.
-
-        // Pre-group reconciliation actions by file name for efficient per-file lookup
-        let mut per_file_reconciliation_targets: HashMap<String, Vec<(usize, f64, f64, f64)>> =
-            HashMap::new();
-        for ((file_name, idx), action) in &reconciliation_actions {
-            let (start, apex, end) = match action {
-                ReconcileAction::Keep => continue,
-                ReconcileAction::UseCwtPeak {
-                    start_rt,
-                    apex_rt,
-                    end_rt,
-                    ..
-                } => (*start_rt, *apex_rt, *end_rt),
-                ReconcileAction::ForcedIntegration {
-                    expected_rt,
-                    half_width,
-                } => (
-                    expected_rt - half_width,
-                    *expected_rt,
-                    expected_rt + half_width,
-                ),
-            };
-            per_file_reconciliation_targets
-                .entry(file_name.clone())
-                .or_default()
-                .push((*idx, apex, start, end));
-        }
-
-        let mut total_rescored: usize = 0;
-        let mut total_gap_cwt: usize = 0;
-        let mut total_gap_forced: usize = 0;
-
-        // Process files sequentially to limit peak memory — each file loads spectra
-        // (~1.5 GB). Per-file re-scoring is already internally parallelized.
-        let n_total_files = per_file_entries.len();
-        for (file_num, (file_name, fdr_entries)) in per_file_entries.iter_mut().enumerate() {
-            // Collect consensus targets for this file
-            let consensus_targets = per_file_consensus_targets
-                .get(file_name.as_str())
-                .cloned()
-                .unwrap_or_default();
-
-            // Collect reconciliation targets for this file (pre-grouped)
-            let reconciliation_targets = per_file_reconciliation_targets
-                .get(file_name.as_str())
-                .cloned()
-                .unwrap_or_default();
-
-            // Collect gap-fill targets for this file
-            let gap_fill_targets = per_file_gap_fill
-                .get(file_name.as_str())
-                .cloned()
-                .unwrap_or_default();
-
-            // Merge both target sets, deduplicating by entry index
-            // (if an entry appears in both consensus and reconciliation,
-            // prefer the reconciliation target since it's inter-replicate informed)
-            let mut combined_targets: HashMap<usize, (f64, f64, f64)> = HashMap::new();
-            for (idx, apex, start, end) in &consensus_targets {
-                combined_targets.insert(*idx, (*apex, *start, *end));
-            }
-            for (idx, apex, start, end) in &reconciliation_targets {
-                combined_targets.insert(*idx, (*apex, *start, *end));
-            }
-
-            let all_targets: Vec<(usize, f64, f64, f64)> = combined_targets
-                .into_iter()
-                .map(|(idx, (apex, start, end))| (idx, apex, start, end))
-                .collect();
-
-            // Skip file if no work to do (no re-scoring targets AND no gap-fill targets)
-            if all_targets.is_empty() && gap_fill_targets.is_empty() {
-                continue;
-            }
-
-            let input_idx = match file_name_to_idx.get(file_name.as_str()) {
-                Some(idx) => *idx,
-                None => continue,
-            };
-            let input_file = &config.input_files[input_idx];
-
-            let n_multi_charge = consensus_targets.len();
-            let n_inter_replicate = reconciliation_targets.len();
-            let n_gap_fill = gap_fill_targets.len();
-            log::info!(
-                "Re-scoring file {}/{}: {}",
-                file_num + 1,
-                n_total_files,
-                file_name,
-            );
-            log::debug!(
-                "  {} entries ({} consensus, {} reconciliation, {} gap-fill, {} unique after dedup)",
-                all_targets.len() + n_gap_fill * 2,
-                n_multi_charge,
-                n_inter_replicate,
-                n_gap_fill,
-                all_targets.len(),
-            );
-
-            // Build boundary overrides keyed by entry_id and track idx mapping
-            let mut boundary_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
-            let mut entry_id_to_idx: HashMap<u32, usize> = HashMap::new();
-            let mut subset_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for &(idx, apex, start, end) in &all_targets {
-                let entry_id = fdr_entries[idx].entry_id;
-                boundary_overrides.insert(entry_id, (apex, start, end));
-                entry_id_to_idx.insert(entry_id, idx);
-                subset_ids.insert(entry_id);
-            }
-
-            // Build subset library containing only entries that need re-scoring
-            let subset_library: Vec<LibraryEntry> = library
-                .iter()
-                .filter(|e| subset_ids.contains(&e.id))
-                .cloned()
-                .collect();
-
-            // Build gap-fill library subset (targets + decoys, separate from re-scoring)
-            let mut gap_fill_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for gf in &gap_fill_targets {
-                gap_fill_ids.insert(gf.target_entry_id);
-                gap_fill_ids.insert(gf.decoy_entry_id);
-            }
-            let gap_fill_library: Vec<LibraryEntry> = if !gap_fill_ids.is_empty() {
-                library
-                    .iter()
-                    .filter(|e| gap_fill_ids.contains(&e.id))
-                    .cloned()
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-            // Load spectra and calibration for this file
-            let (spectra, ms1_index) = {
-                let cache_path = spectra_cache_path(input_file);
-                if cache_path.exists() {
-                    match load_spectra_cache(&cache_path) {
-                        Ok(result) => {
-                            log::debug!(
-                                "Loaded {} MS2 spectra from cache '{}'",
-                                result.0.len(),
-                                cache_path.display()
-                            );
-                            result
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to load spectra cache, falling back to mzML: {}", e);
-                            load_all_spectra(input_file)?
-                        }
-                    }
-                } else {
-                    load_all_spectra(input_file)?
-                }
-            };
-
-            // Use refined calibration if available, fall back to original
-            let rt_cal = refined_calibrations
-                .get(file_name.as_str())
-                .or_else(|| per_file_calibrations.get(file_name.as_str()));
-
-            let cal_params: Option<CalibrationParams> = input_file.parent().and_then(|input_dir| {
-                let cal_path = calibration_path_for_input(input_file, input_dir);
-                if cal_path.exists() {
-                    load_calibration(&cal_path).ok()
-                } else {
-                    None
-                }
-            });
-
-            // --- Re-score existing entries (consensus + reconciliation) ---
-            let mut overlay: HashMap<usize, CoelutionScoredEntry> = HashMap::new();
-            if !all_targets.is_empty() {
-                let rescored = run_search(
-                    &subset_library,
-                    &spectra,
-                    &ms1_index,
-                    cal_params.as_ref(),
-                    rt_cal,
-                    &config,
-                    file_name,
-                    Some(&boundary_overrides),
-                    "Re-scoring",
-                )?;
-
-                for entry in rescored {
-                    if let Some(&idx) = entry_id_to_idx.get(&entry.entry_id) {
-                        overlay.insert(idx, entry);
-                    }
-                }
-            }
-
-            // --- Gap-fill: score missing precursors (two-pass: CWT then forced) ---
-            let mut n_gap_cwt = 0usize;
-            let mut n_gap_forced = 0usize;
-            if !gap_fill_targets.is_empty() {
-                // Pass 1 (CWT): Run without boundary overrides, pre-filter disabled.
-                // This lets CWT peak detection find natural peaks at the consensus RT.
-                let mut gap_config = config.clone();
-                gap_config.prefilter_enabled = false;
-                let cwt_results = run_search(
-                    &gap_fill_library,
-                    &spectra,
-                    &ms1_index,
-                    cal_params.as_ref(),
-                    rt_cal,
-                    &gap_config,
-                    file_name,
-                    None,
-                    "Gap-fill CWT",
-                )?;
-
-                // Track which entry_ids got CWT results
-                let cwt_hit_ids: std::collections::HashSet<u32> =
-                    cwt_results.iter().map(|e| e.entry_id).collect();
-                n_gap_cwt = cwt_results.len();
-
-                // Append CWT results as new FdrEntry stubs (gap-fill: no Parquet row)
-                let gap_fill_start_idx = fdr_entries.len();
-                for (i, entry) in cwt_results.into_iter().enumerate() {
-                    let mut stub = entry.to_fdr_entry();
-                    stub.parquet_index = u32::MAX; // gap-fill sentinel
-                    stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
-                    fdr_entries.push(stub);
-                    overlay.insert(gap_fill_start_idx + i, entry);
-                }
-
-                // Pass 2 (Forced): Entries that CWT missed get forced integration
-                // at consensus RT ± half_width
-                let mut forced_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
-                let mut forced_ids: std::collections::HashSet<u32> =
-                    std::collections::HashSet::new();
-                for gf in &gap_fill_targets {
-                    // Add target if CWT missed it
-                    if !cwt_hit_ids.contains(&gf.target_entry_id) {
-                        let start = gf.expected_rt - gf.half_width;
-                        let end = gf.expected_rt + gf.half_width;
-                        forced_overrides.insert(gf.target_entry_id, (gf.expected_rt, start, end));
-                        forced_ids.insert(gf.target_entry_id);
-                    }
-                    // Add decoy if CWT missed it
-                    if !cwt_hit_ids.contains(&gf.decoy_entry_id) {
-                        let start = gf.expected_rt - gf.half_width;
-                        let end = gf.expected_rt + gf.half_width;
-                        forced_overrides.insert(gf.decoy_entry_id, (gf.expected_rt, start, end));
-                        forced_ids.insert(gf.decoy_entry_id);
-                    }
-                }
-
-                if !forced_overrides.is_empty() {
-                    let forced_library: Vec<LibraryEntry> = gap_fill_library
-                        .iter()
-                        .filter(|e| forced_ids.contains(&e.id))
-                        .cloned()
-                        .collect();
-
-                    let forced_results = run_search(
-                        &forced_library,
-                        &spectra,
-                        &ms1_index,
-                        cal_params.as_ref(),
-                        rt_cal,
-                        &config,
-                        file_name,
-                        Some(&forced_overrides),
-                        "Gap-fill forced",
-                    )?;
-
-                    n_gap_forced = forced_results.len();
-
-                    // Append forced results as new FdrEntry stubs (gap-fill: no Parquet row)
-                    let forced_start_idx = fdr_entries.len();
-                    for (i, entry) in forced_results.into_iter().enumerate() {
-                        let mut stub = entry.to_fdr_entry();
-                        stub.parquet_index = u32::MAX; // gap-fill sentinel
-                        stub.modified_sequence =
-                            intern_seq(&mut seq_interner, &stub.modified_sequence);
-                        fdr_entries.push(stub);
-                        overlay.insert(forced_start_idx + i, entry);
-                    }
-                }
-
-                total_gap_cwt += n_gap_cwt;
-                total_gap_forced += n_gap_forced;
-            }
-
-            // Drop spectra before updating stubs to free ~1.5-3 GB
-            drop(spectra);
-
-            // Count existing re-scored entries (not gap-fill)
-            let existing_rescore_indices: std::collections::HashSet<usize> =
-                entry_id_to_idx.values().copied().collect();
-            let n_existing_rescored = overlay
-                .keys()
-                .filter(|idx| existing_rescore_indices.contains(idx))
-                .count();
-            total_rescored += n_existing_rescored + n_gap_cwt + n_gap_forced;
-
-            if !all_targets.is_empty() || n_gap_cwt + n_gap_forced > 0 {
-                log::debug!(
-                    "  {} of {} existing entries re-scored, {} gap-fill ({} CWT, {} forced)",
-                    n_existing_rescored,
-                    all_targets.len(),
-                    n_gap_cwt + n_gap_forced,
-                    n_gap_cwt,
-                    n_gap_forced,
-                );
-            }
-
-            // Update FdrEntry stubs from overlay for existing re-scored entries
-            // (gap-fill entries were already appended with stubs during scoring above)
-            for &idx in &existing_rescore_indices {
-                if let Some(entry) = overlay.get(&idx) {
-                    let mut stub = entry.to_fdr_entry();
-                    // Preserve the original parquet_index from the existing stub
-                    stub.parquet_index = fdr_entries[idx].parquet_index;
-                    stub.modified_sequence = intern_seq(&mut seq_interner, &stub.modified_sequence);
-                    fdr_entries[idx] = stub;
-                }
-            }
-            // Write reconciled entries (overlay) back to Parquet, then drop overlay.
-            // This avoids accumulating ~28 GB of overlay data across 240 files.
-            // The blib output step will reload from this reconciled Parquet.
-            if !overlay.is_empty() {
-                // Merge overlay into a complete entry list for this file:
-                // load original parquet, replace re-scored entries, append gap-fill entries.
-                let scores_path = per_file_cache_paths.get(file_name.as_str());
-                if let Some(cache_path) = scores_path {
-                    if let Ok(mut full_entries) = load_scores_parquet(cache_path) {
-                        // Replace re-scored entries using parquet_index (not Vec position).
-                        // After first-pass compaction, Vec position != Parquet row index.
-                        // Using Vec position would overwrite the wrong entry in the Parquet
-                        // file and leave the actual target entry unchanged.
-                        for &idx in &existing_rescore_indices {
-                            if let Some(entry) = overlay.remove(&idx) {
-                                let pq_idx = fdr_entries[idx].parquet_index as usize;
-                                if pq_idx < full_entries.len() {
-                                    full_entries[pq_idx] = entry;
-                                } else {
-                                    log::warn!(
-                                        "Rescore write-back: parquet_index {} out of range for {} ({} rows)",
-                                        pq_idx,
-                                        file_name,
-                                        full_entries.len(),
-                                    );
-                                }
-                            }
-                        }
-                        // Append gap-fill entries (remaining overlay entries beyond parquet range).
-                        // Update the corresponding fdr_entries stubs' parquet_index to point to
-                        // the actual Parquet row they will occupy after write-back. Without this,
-                        // gap-fill stubs keep parquet_index = u32::MAX and Phase 2 of the next
-                        // Percolator run can't load their features.
-                        let gap_start_pq_row = full_entries.len();
-                        let mut gap_entries: Vec<(usize, CoelutionScoredEntry)> =
-                            overlay.into_iter().collect();
-                        gap_entries.sort_by_key(|(idx, _)| *idx);
-                        for (gap_offset, (vec_idx, entry)) in gap_entries.into_iter().enumerate() {
-                            let new_pq_row = (gap_start_pq_row + gap_offset) as u32;
-                            full_entries.push(entry);
-                            // The vec_idx in the overlay matches the position in fdr_entries
-                            // (gap-fill entries were appended to fdr_entries in order)
-                            if vec_idx < fdr_entries.len() {
-                                fdr_entries[vec_idx].parquet_index = new_pq_row;
-                            }
-                        }
-                        // Write back to Parquet with reconciliation metadata
-                        let recon_metadata = build_reconciled_metadata(&config);
-                        let codec = parquet_compression_codec(config.parquet_compression);
-                        if let Err(e) = write_scores_parquet_with_metadata(
-                            cache_path,
-                            &full_entries,
-                            Some(recon_metadata),
-                            codec,
-                        ) {
-                            log::warn!(
-                                "Failed to write reconciled scores for {}: {}",
-                                file_name,
-                                e
-                            );
-                        }
-                    }
-                }
-                // Overlay is consumed — no memory accumulation
-            }
-        }
+        // Stage 6 — per-file rescore + gap-fill + reconciled parquet
+        // write-back. Lifted into `rescore_per_file_loop` so the
+        // `--join-at-pass=1 --no-join` worker drives the same code path
+        // after hydrating the boundary file pair.
+        let RescoreStats {
+            total_rescored,
+            total_reconciliation,
+            total_gap_cwt,
+            total_gap_forced,
+        } = rescore_per_file_loop(
+            &mut per_file_entries,
+            &per_file_consensus_targets,
+            &reconciliation_actions,
+            &refined_calibrations,
+            &per_file_calibrations,
+            &per_file_gap_fill,
+            &per_file_cache_paths,
+            &library,
+            &file_name_to_idx,
+            &config,
+            &mut seq_interner,
+        )?;
 
         // 4. Single second-pass FDR after all re-scoring
         if total_rescored > 0 {
@@ -6478,7 +6569,7 @@ fn compute_features_at_peak(
 ///
 /// Groups where NO charge state passes FDR are skipped entirely — they have
 /// no impact on reported results and re-scoring them is wasted work.
-fn select_post_fdr_consensus(
+pub(crate) fn select_post_fdr_consensus(
     entries: &[FdrEntry],
     fdr_threshold: f64,
 ) -> Vec<(usize, f64, f64, f64)> {

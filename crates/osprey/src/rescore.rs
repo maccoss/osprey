@@ -31,11 +31,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use osprey_chromatography::RTCalibration;
-use osprey_core::{FdrEntry, OspreyConfig, OspreyError, Result};
+use osprey_core::{FdrEntry, LibraryEntry, OspreyConfig, OspreyError, Result};
+
+use osprey_chromatography::{calibration_path_for_input, load_calibration};
 
 use crate::pipeline::{
     fdr_scores_path_pass1, load_fdr_scores_sidecar, load_fdr_stubs_from_parquet,
-    synthetic_input_from_parquet,
+    rescore_per_file_loop, select_post_fdr_consensus, synthetic_input_from_parquet,
 };
 use crate::reconciliation::{GapFillTarget, ReconcileAction};
 use crate::reconciliation_io::{
@@ -70,6 +72,11 @@ pub struct RescoreInputs {
     /// Per-file gap-fill targets parsed from `reconciliation.json`'s
     /// `gap_fill_targets` array.
     pub per_file_gap_fill: HashMap<String, Vec<GapFillTarget>>,
+    /// Modified-sequence interner shared with the parquet stub loader.
+    /// Passed through to the rescore engine so any newly appended
+    /// gap-fill stubs reuse the same `Arc<str>` identities that the
+    /// hydrated stubs already hold.
+    pub seq_interner: HashSet<Arc<str>>,
 }
 
 impl RescoreInputs {
@@ -291,14 +298,187 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
         reconciliation_actions,
         refined_calibrations,
         per_file_gap_fill,
+        seq_interner,
     })
+}
+
+/// Top-level entry point for the `--join-at-pass=1 --no-join` per-file
+/// rescore worker. Synthesizes the missing in-process state from the
+/// Stage 5 → Stage 6 boundary files + per-file parquet + per-file
+/// calibration JSON, then drives the same
+/// [`rescore_per_file_loop`] the in-process pipeline calls. The
+/// resulting reconciled per-file `.scores.parquet` files are what a
+/// downstream `--join-at-pass=2` invocation consumes for second-pass
+/// FDR and blib output.
+///
+/// Library + decoys are passed in by the caller (`run_analysis` loaded
+/// them just before dispatching here) so the worker doesn't repeat
+/// that setup.
+pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<()> {
+    log::info!(
+        "--join-at-pass=1 --no-join: per-file rescore worker starting on {} parquet(s)",
+        config.input_scores.as_ref().map(|v| v.len()).unwrap_or(0)
+    );
+
+    // `config.input_files` was already synthesized from `input_scores`
+    // at the top of `run_analysis` via `synthetic_input_from_parquet`,
+    // so the rescore loop's `file_name_to_idx` lookup +
+    // spectra/calibration path derivation point at the right mzML
+    // siblings. Validate it here as defense in depth.
+    if config.input_files.is_empty() {
+        return Err(OspreyError::config(
+            "run_rescore: config.input_files was not populated from --input-scores. \
+             Expected `run_analysis` to synthesize via synthetic_input_from_parquet.",
+        ));
+    }
+    let parquet_paths = config.input_scores.as_ref().ok_or_else(|| {
+        OspreyError::config(
+            "run_rescore: --input-scores is required (validated upstream by validate_hpc_args)",
+        )
+    })?.clone();
+
+    // Build file_name → input_files index, mirroring the in-process
+    // setup at pipeline.rs `let mut file_name_to_idx`.
+    let mut file_name_to_idx: HashMap<String, usize> = HashMap::new();
+    for (idx, input_file) in config.input_files.iter().enumerate() {
+        if let Some(stem) = input_file.file_stem().and_then(|s| s.to_str()) {
+            file_name_to_idx.insert(stem.to_string(), idx);
+        }
+    }
+
+    // Per-file `.scores.parquet` paths for the reconciled write-back at
+    // the tail of `rescore_per_file_loop`. These are the parquets the
+    // user passed via `--input-scores`.
+    let mut per_file_cache_paths: HashMap<String, std::path::PathBuf> = HashMap::new();
+    for (parquet, input_file) in parquet_paths.iter().zip(config.input_files.iter()) {
+        if let Some(stem) = input_file.file_stem().and_then(|s| s.to_str()) {
+            per_file_cache_paths.insert(stem.to_string(), parquet.clone());
+        }
+    }
+
+    // Per-file ORIGINAL RT calibrations (first-pass LOESS fit from
+    // Stages 1-3) loaded from sibling `<stem>.calibration.json` files.
+    // Used by the rescore loop only as fallback when the boundary
+    // file's refined cal is null (i.e., Stage 5's LOESS refit failed
+    // for that file). Same construction as
+    // pipeline.rs:3273-3296 in the in-process `--join-at-pass=1`
+    // setup.
+    let mut per_file_calibrations: HashMap<String, RTCalibration> = HashMap::new();
+    for input_file in &config.input_files {
+        let stem = match input_file.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let input_dir = match input_file.parent() {
+            Some(d) => d,
+            None => continue,
+        };
+        let cal_path = calibration_path_for_input(input_file, input_dir);
+        if !cal_path.exists() {
+            continue;
+        }
+        let cal_params = match load_calibration(&cal_path) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!(
+                    "run_rescore: failed to read calibration JSON {}: {}",
+                    cal_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        if let Some(ref mp) = cal_params.rt_calibration.model_params {
+            match RTCalibration::from_model_params(mp, cal_params.rt_calibration.residual_sd) {
+                Ok(rt_cal) => {
+                    per_file_calibrations.insert(stem, rt_cal);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "run_rescore: failed to reconstruct original calibration for {}: {}",
+                        cal_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Hydrate post-Percolator FDR state + planner output from the
+    // boundary file pair.
+    let RescoreInputs {
+        mut per_file_entries,
+        reconciliation_actions,
+        refined_calibrations,
+        per_file_gap_fill,
+        mut seq_interner,
+    } = hydrate_for_rescore(&config)?;
+
+    // Multi-charge consensus targets are a pure function of the
+    // hydrated FdrEntry list + run_fdr threshold, so the worker can
+    // recompute them locally without needing them in the boundary file.
+    let per_file_consensus_targets: HashMap<String, Vec<(usize, f64, f64, f64)>> = per_file_entries
+        .iter()
+        .map(|(file_name, entries)| {
+            (
+                file_name.clone(),
+                select_post_fdr_consensus(entries, config.run_fdr),
+            )
+        })
+        .collect();
+    let n_consensus: usize = per_file_consensus_targets
+        .values()
+        .map(|v| v.len())
+        .sum();
+    let n_actions: usize = reconciliation_actions.len();
+    let n_gap_fill: usize = per_file_gap_fill.values().map(|v| v.len()).sum();
+    log::info!(
+        "Hydrated {} file(s); rescoring {} consensus + {} reconciliation entries, plus {} \
+         gap-fill candidates per file",
+        per_file_entries.len(),
+        n_consensus,
+        n_actions,
+        n_gap_fill,
+    );
+
+    // Drive the same per-file rescore loop the in-process pipeline
+    // uses. The function loads spectra from the synthetic mzML paths,
+    // runs `run_search` with boundary overrides, executes the gap-fill
+    // two-pass, and rewrites each per-file `.scores.parquet` with
+    // reconciled scores + appended gap-fill rows + reconciliation
+    // metadata.
+    let stats = rescore_per_file_loop(
+        &mut per_file_entries,
+        &per_file_consensus_targets,
+        &reconciliation_actions,
+        &refined_calibrations,
+        &per_file_calibrations,
+        &per_file_gap_fill,
+        &per_file_cache_paths,
+        &library,
+        &file_name_to_idx,
+        &config,
+        &mut seq_interner,
+    )?;
+
+    log::info!(
+        "--join-at-pass=1 --no-join: rescore complete — {} entries re-scored \
+         ({} reconciliation + consensus, {} gap-fill via CWT, {} gap-fill via forced \
+         integration). Reconciled .scores.parquet files written.",
+        stats.total_rescored,
+        stats.total_reconciliation,
+        stats.total_gap_cwt,
+        stats.total_gap_forced,
+    );
+
+    Ok(())
 }
 
 /// Format-version + boundary-pair sanity checks; thin wrapper over
 /// `hydrate_for_rescore` that logs counts at info level so a worker
 /// invocation has a visible "I loaded what I expected" signal even when
-/// the rescore engine isn't wired yet. Used by the `--join-at-pass=1
-/// --no-join` mode while that path is still under construction.
+/// the rescore engine isn't wired yet. Retained for diagnostic use; the
+/// production path is `run_rescore`.
 pub fn hydrate_and_log(config: &OspreyConfig) -> Result<RescoreInputs> {
     let inputs = hydrate_for_rescore(config)?;
     log::info!(
