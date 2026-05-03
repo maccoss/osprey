@@ -491,4 +491,39 @@ mod tests {
         assert!((loaded.ms1_calibration.mean + 2.5).abs() < 0.001);
         assert!(loaded.ms1_calibration.histogram.is_some());
     }
+
+    /// Regression test for the RTModelParams f64 deserializer routing
+    /// through `f64::from_str` instead of serde_json's default fast number
+    /// parser. The default parser is not correctly rounded for some
+    /// full-precision f64 literals; the literal "1.9140296182650374"
+    /// is one such case observed when round-tripping ryu-written
+    /// calibration JSON (decimal -> f64 -> decimal -> f64). Asserts
+    /// every parsed element matches the f64 produced by `f64::from_str`
+    /// bit-for-bit, which is also what .NET BCL's double.Parse produces.
+    #[test]
+    fn rt_model_params_deserializes_borderline_f64_via_str_parser() {
+        let literal = "1.9140296182650374";
+        let json = format!(
+            r#"{{
+                "library_rts": [{0}],
+                "fitted_rts": [0.0, {0}],
+                "abs_residuals": [{0}]
+            }}"#,
+            literal
+        );
+
+        let params: RTModelParams =
+            serde_json::from_str(&json).expect("RTModelParams should deserialize");
+        let expected = literal
+            .parse::<f64>()
+            .expect("borderline literal should parse as f64");
+
+        assert_eq!(params.library_rts.len(), 1);
+        assert_eq!(params.fitted_rts.len(), 2);
+        assert_eq!(params.abs_residuals.len(), 1);
+
+        assert_eq!(params.library_rts[0].to_bits(), expected.to_bits());
+        assert_eq!(params.fitted_rts[1].to_bits(), expected.to_bits());
+        assert_eq!(params.abs_residuals[0].to_bits(), expected.to_bits());
+    }
 }

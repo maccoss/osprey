@@ -177,9 +177,9 @@ pub fn compute_consensus_rts(
     // and outputs of inverse_predict so consensus_library_rt divergence
     // can be localized to either the loaded apex_rt (Parquet decode) or
     // the LOESS inverse-interpolation step. Off unless
-    // OSPREY_DUMP_INV_PREDICT is set.
-    type InvPredictRecord = (String, String, bool, f64, f64, f64);
-    let mut inv_predict_records: Option<Vec<InvPredictRecord>> =
+    // OSPREY_DUMP_INV_PREDICT is set. The record shape is owned by the
+    // diagnostics module so the dump format and this trace stay in sync.
+    let mut inv_predict_records: Option<Vec<crate::diagnostics::InvPredictRecord>> =
         if std::env::var("OSPREY_DUMP_INV_PREDICT").is_ok() {
             Some(Vec::new())
         } else {

@@ -861,6 +861,104 @@ pub fn dump_stage6_refit(
     exit_if_only("OSPREY_REFIT_ONLY", "Stage 6 refit dump");
 }
 
+/// Dump the per-(file, entry) `ReconcileAction` map produced by
+/// `plan_reconciliation` to `rust_stage6_reconciliation.tsv`. Pairs with
+/// the C# `WriteStage6ReconciliationDump` for cross-impl byte-parity at
+/// the planning step, before per-file rescoring runs.
+///
+/// Gated by `OSPREY_DUMP_RECONCILIATION=1`. When `OSPREY_RECONCILIATION_ONLY=1`
+/// is also set, exits the process after writing. Columns:
+/// `file_name, entry_id, action, apex_or_expected_rt, start_rt, end_rt,
+/// half_width, candidate_index`. Only non-Keep actions are emitted (matches
+/// the C# planner's contract -- Keep entries are absent from the map).
+/// Rows sorted by `(file_name, entry_id)` for stable diff.
+pub fn dump_stage6_reconciliation(
+    actions: &HashMap<(String, usize), crate::reconciliation::ReconcileAction>,
+    per_file_entries: &[(String, Vec<osprey_core::FdrEntry>)],
+) {
+    if !is_dump_enabled("OSPREY_DUMP_RECONCILIATION") {
+        return;
+    }
+
+    let path = "rust_stage6_reconciliation.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    // Map (file_name -> &[FdrEntry]) so we can resolve list-index to entry_id.
+    let entries_by_file: HashMap<&str, &[osprey_core::FdrEntry]> = per_file_entries
+        .iter()
+        .map(|(name, e)| (name.as_str(), e.as_slice()))
+        .collect();
+
+    use crate::reconciliation::ReconcileAction;
+    let mut rows: Vec<(&str, u32, &ReconcileAction)> = Vec::with_capacity(actions.len());
+    for ((file, idx), action) in actions {
+        if matches!(action, ReconcileAction::Keep) {
+            continue;
+        }
+        let Some(entries) = entries_by_file.get(file.as_str()) else {
+            continue;
+        };
+        if *idx >= entries.len() {
+            continue;
+        }
+        rows.push((file.as_str(), entries[*idx].entry_id, action));
+    }
+    rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+
+    writeln!(
+        f,
+        "file_name\tentry_id\taction\tapex_or_expected_rt\tstart_rt\tend_rt\thalf_width\tcandidate_index"
+    )
+    .ok();
+    for (file_name, entry_id, action) in &rows {
+        match action {
+            ReconcileAction::UseCwtPeak {
+                candidate_idx,
+                start_rt,
+                apex_rt,
+                end_rt,
+            } => {
+                writeln!(
+                    f,
+                    "{}\t{}\tuse_cwt_peak\t{}\t{}\t{}\t\t{}",
+                    file_name,
+                    entry_id,
+                    format_f64_roundtrip(*apex_rt),
+                    format_f64_roundtrip(*start_rt),
+                    format_f64_roundtrip(*end_rt),
+                    candidate_idx,
+                )
+                .ok();
+            }
+            ReconcileAction::ForcedIntegration {
+                expected_rt,
+                half_width,
+            } => {
+                writeln!(
+                    f,
+                    "{}\t{}\tforced_integration\t{}\t\t\t{}\t",
+                    file_name,
+                    entry_id,
+                    format_f64_roundtrip(*expected_rt),
+                    format_f64_roundtrip(*half_width),
+                )
+                .ok();
+            }
+            ReconcileAction::Keep => unreachable!("filtered above"),
+        }
+    }
+    log::info!(
+        "Wrote Stage 6 reconciliation dump: {} ({} rows)",
+        path,
+        rows.len()
+    );
+
+    exit_if_only("OSPREY_RECONCILIATION_ONLY", "Stage 6 reconciliation dump");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
