@@ -207,6 +207,210 @@ pub fn dump_mp_diag(
 }
 
 // --------------------------------------------------------------------------
+// Bisection: per-entry inputs to tukey_median_polish
+// --------------------------------------------------------------------------
+//
+// Captures the (frag_idx, scan_idx, rt, intensity) matrix that goes into
+// every `tukey_median_polish` call from the rescore path, keyed by
+// (entry_id, apex_scan_number). Gated by
+// `OSPREY_DUMP_MP_INPUTS=<path>`; thread-safe append + lazy file open
+// behind a `Mutex<File>` so it can fire from parallel rayon scoring.
+//
+// Workflow:
+//   OSPREY_DUMP_MP_INPUTS=/tmp/inproc_mp_inputs.tsv  osprey ... # in-process
+//   OSPREY_DUMP_MP_INPUTS=/tmp/worker_mp_inputs.tsv  osprey ... # worker
+//   sort -k1,1n -k2,2n -k3,3n /tmp/inproc_mp_inputs.tsv > /tmp/inproc.sorted
+//   sort -k1,1n -k2,2n -k3,3n /tmp/worker_mp_inputs.tsv > /tmp/worker.sorted
+//   diff /tmp/inproc.sorted /tmp/worker.sorted
+//
+// PASS = byte-identical sorted dumps. FAIL = the very first divergence
+// between in-process and worker at the median-polish input layer.
+
+use std::sync::{Mutex, OnceLock};
+
+static MP_INPUTS_DUMP: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+fn mp_inputs_writer() -> Option<&'static Mutex<std::fs::File>> {
+    MP_INPUTS_DUMP
+        .get_or_init(|| {
+            let path = std::env::var("OSPREY_DUMP_MP_INPUTS").ok()?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)
+                .ok()?;
+            // Header comment; tools that sort the rows by the first three
+            // numeric columns (entry_id, apex_scan, frag_pos) stay
+            // hash-stable across runs regardless of rayon scheduling.
+            writeln!(
+                file,
+                "# entry_id\tapex_scan\tfrag_pos\tfrag_idx\tscan_idx\trt\tintensity"
+            )
+            .ok();
+            log::info!(
+                "[BISECT] OSPREY_DUMP_MP_INPUTS active: writing tukey_median_polish inputs to {}",
+                path
+            );
+            Some(Mutex::new(file))
+        })
+        .as_ref()
+}
+
+/// Dump the inputs to a single `tukey_median_polish` call for cross-
+/// implementation bisection. `frag_pos` is the position of each
+/// fragment within `peak_xics` (so order-sensitive bugs surface);
+/// `frag_idx` is the library fragment index (so the same fragment can
+/// be matched between dumps regardless of `peak_xics` ordering).
+pub fn dump_mp_inputs(entry_id: u32, apex_scan: u32, peak_xics: &[(usize, Vec<(f64, f64)>)]) {
+    let Some(writer) = mp_inputs_writer() else {
+        return;
+    };
+    let Ok(mut file) = writer.lock() else {
+        return;
+    };
+    // Build the dump for this call into a single buffer so the lock is
+    // held for one write, not 6 × N_scans writes per entry.
+    let mut buf = String::new();
+    for (frag_pos, (frag_idx, xic)) in peak_xics.iter().enumerate() {
+        for (scan_idx, (rt, intensity)) in xic.iter().enumerate() {
+            buf.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                entry_id,
+                apex_scan,
+                frag_pos,
+                frag_idx,
+                scan_idx,
+                format_f64_roundtrip(*rt),
+                format_f64_roundtrip(*intensity),
+            ));
+        }
+    }
+    let _ = file.write_all(buf.as_bytes());
+}
+
+// --------------------------------------------------------------------------
+// Bisection: per-call inputs + outputs to RTCalibration::predict
+// --------------------------------------------------------------------------
+//
+// Captures (entry_id, library_rt_input, expected_rt_output) for every
+// `cal.predict(entry.retention_time)` call from the rescore search
+// path, plus a one-time dump per (file_name) of the calibration's
+// `library_rts` and `fitted_values` arrays. Together these tell us:
+//
+// - If the per-call output differs between in-process and worker for
+//   the SAME entry_id (same library_rt input, since both sides load
+//   the same library), then the calibration object differs.
+// - If the per-file array dump differs between sides, the JSON
+//   round-trip through `format_f64_roundtrip` is not preserving f64
+//   bits exactly for some values — fix the serialization.
+// - If arrays match but per-call output differs, some hidden state in
+//   `RTCalibration` is affecting `predict()` beyond what
+//   `from_model_params` reconstructs.
+//
+// Gated by `OSPREY_DUMP_PREDICT_RT=<path>`. Two-section TSV output
+// sharing the same five-column header. The third column ("array_or_apex")
+// is the array kind for cal_arrays rows and a literal `-` placeholder
+// for predict_calls rows (reserved for a future apex_scan extension if
+// the per-call site ever has it in scope):
+//
+//     # SECTION cal_arrays
+//     #   "cal_arrays" | file_name | array_kind ("library_rts" | "fitted_values") | idx | value
+//     # SECTION predict_calls
+//     #   "predict_calls" | entry_id | "-" | library_rt | expected_rt
+//
+// Both sections are append-only (the cal_arrays writer does not dedup
+// per file_name; if the rescore loop reuses a file's calibration twice,
+// expect duplicate cal_arrays rows). The bisection workflow handles
+// duplicates with `sort -u`:
+//
+//     OSPREY_DUMP_PREDICT_RT=/tmp/inproc_rt.tsv  osprey ...   # in-process
+//     OSPREY_DUMP_PREDICT_RT=/tmp/worker_rt.tsv  osprey ...   # worker
+//     sort -u /tmp/inproc_rt.tsv > /tmp/i.sorted
+//     sort -u /tmp/worker_rt.tsv > /tmp/w.sorted
+//     diff /tmp/i.sorted /tmp/w.sorted
+
+static PREDICT_RT_DUMP: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+fn predict_rt_writer() -> Option<&'static Mutex<std::fs::File>> {
+    PREDICT_RT_DUMP
+        .get_or_init(|| {
+            let path = std::env::var("OSPREY_DUMP_PREDICT_RT").ok()?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)
+                .ok()?;
+            writeln!(
+                file,
+                "# section\tfile_name_or_entry_id\tarray_or_apex\tidx_or_lib_rt\tvalue_or_expected_rt"
+            )
+            .ok();
+            log::info!(
+                "[BISECT] OSPREY_DUMP_PREDICT_RT active: writing predict() inputs/outputs to {}",
+                path
+            );
+            Some(Mutex::new(file))
+        })
+        .as_ref()
+}
+
+/// Dump the cal's `library_rts` and `fitted_values` arrays once per
+/// file, full f64 precision. Append-only — the writer does NOT dedup
+/// per file_name, so repeated calls for the same file produce
+/// repeated rows. The bisection workflow uses `sort -u` post-hoc to
+/// collapse duplicates. Call from the top of the rescore loop where
+/// the cal is first selected.
+pub fn dump_predict_rt_arrays(file_name: &str, library_rts: &[f64], fitted_values: &[f64]) {
+    let Some(writer) = predict_rt_writer() else {
+        return;
+    };
+    let Ok(mut file) = writer.lock() else {
+        return;
+    };
+    let mut buf = String::new();
+    for (i, v) in library_rts.iter().enumerate() {
+        buf.push_str(&format!(
+            "cal_arrays\t{}\tlibrary_rts\t{}\t{}\n",
+            file_name,
+            i,
+            format_f64_roundtrip(*v)
+        ));
+    }
+    for (i, v) in fitted_values.iter().enumerate() {
+        buf.push_str(&format!(
+            "cal_arrays\t{}\tfitted_values\t{}\t{}\n",
+            file_name,
+            i,
+            format_f64_roundtrip(*v)
+        ));
+    }
+    let _ = file.write_all(buf.as_bytes());
+}
+
+/// Dump a single `predict()` input + output pair. Called from the
+/// rescore search path right after `expected_rt = cal.predict(...)`.
+/// The same entry_id may appear many times (once per per-window
+/// candidate scoring iteration); deduplicate post-hoc with
+/// `sort -u`.
+pub fn dump_predict_rt_call(entry_id: u32, library_rt: f64, expected_rt: f64) {
+    let Some(writer) = predict_rt_writer() else {
+        return;
+    };
+    let Ok(mut file) = writer.lock() else {
+        return;
+    };
+    let line = format!(
+        "predict_calls\t{}\t-\t{}\t{}\n",
+        entry_id,
+        format_f64_roundtrip(library_rt),
+        format_f64_roundtrip(expected_rt),
+    );
+    let _ = file.write_all(line.as_bytes());
+}
+
+// --------------------------------------------------------------------------
 // Per-entry main-search XIC dump
 // --------------------------------------------------------------------------
 
