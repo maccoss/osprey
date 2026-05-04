@@ -422,6 +422,15 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         mut seq_interner,
     } = hydrate_for_rescore(&config)?;
 
+    // Cross-impl bisection seam (mirrors the dump call from
+    // `pipeline.rs` post-Percolator). Lets a worker run produce the
+    // same `rust_stage5_percolator.tsv` an in-process run produces, so
+    // the C# worker (which fires the matching `WriteStage5PercolatorDump`
+    // call from `RescoreWorker.Run`) can be byte-compared against the
+    // Rust worker via `Compare-Percolator.ps1`. Gated by
+    // `OSPREY_DUMP_PERCOLATOR=1`; no-op otherwise.
+    crate::diagnostics::dump_stage5_percolator(&per_file_entries);
+
     // Reproduce the in-process compaction (pipeline.rs first-pass FDR
     // block): drop pre-compaction entries whose base_id didn't make
     // the cut. Without this, the worker's `per_file_entries` carries

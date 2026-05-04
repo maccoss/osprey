@@ -564,15 +564,22 @@ impl SearchXicDump {
 
 /// Dump per-precursor Stage 5 (Percolator FDR) state to
 /// `rust_stage5_percolator.tsv` so cross-impl parity can be checked at
-/// end-of-first-pass-FDR, before compaction or first-pass protein FDR.
+/// end-of-first-pass-FDR, before compaction.
 ///
 /// Gated by `OSPREY_DUMP_PERCOLATOR=1`. When `OSPREY_PERCOLATOR_ONLY=1`
 /// is also set, exits the process after writing. Columns:
 /// `file_name, entry_id, charge, modified_sequence, is_decoy, score, pep,
-/// run_precursor_q, run_peptide_q, experiment_precursor_q,
+/// run_precursor_q, run_peptide_q, run_protein_q, experiment_precursor_q,
 /// experiment_peptide_q`. Rows sorted by `(file_name, entry_id)` for
 /// stable human inspection; `Compare-Percolator.ps1` hash-joins on the
 /// composite key and is sort-order-agnostic.
+///
+/// `run_protein_qvalue` is the default `1.0` when this dump fires from
+/// `pipeline.rs` (the dump runs BEFORE first-pass protein FDR populates
+/// real values), and the real persisted value when this dump fires from
+/// `rescore::run_rescore` (the worker hydrates the v3 sidecar which
+/// carries post-protein-FDR values). The C# `WriteStage5PercolatorDump`
+/// has the same dual-call shape and the same column ordering.
 pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrEntry>)]) {
     if !is_dump_enabled("OSPREY_DUMP_PERCOLATOR") {
         return;
@@ -586,7 +593,7 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
 
     writeln!(
         f,
-        "file_name\tentry_id\tcharge\tmodified_sequence\tis_decoy\tscore\tpep\trun_precursor_q\trun_peptide_q\texperiment_precursor_q\texperiment_peptide_q"
+        "file_name\tentry_id\tcharge\tmodified_sequence\tis_decoy\tscore\tpep\trun_precursor_q\trun_peptide_q\trun_protein_q\texperiment_precursor_q\texperiment_peptide_q"
     )
     .ok();
 
@@ -600,7 +607,7 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
     for (file_name, e) in &rows {
         writeln!(
             f,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             file_name,
             e.entry_id,
             e.charge,
@@ -610,6 +617,7 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
             format_f64_roundtrip(e.pep),
             format_f64_roundtrip(e.run_precursor_qvalue),
             format_f64_roundtrip(e.run_peptide_qvalue),
+            format_f64_roundtrip(e.run_protein_qvalue),
             format_f64_roundtrip(e.experiment_precursor_qvalue),
             format_f64_roundtrip(e.experiment_peptide_qvalue),
         )
