@@ -572,6 +572,13 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         &mut seq_interner,
     )?;
 
+    // Cross-impl bisection seam: dump the per-precursor q-values
+    // immediately after the rescore loop. Mirrors the in-process
+    // call site at the tail of pipeline.rs::run_analysis's Stage 6
+    // block. The OspreySharp side has the matching
+    // WriteStage6RescoredDump call.
+    crate::diagnostics::dump_stage6_rescored(&per_file_entries);
+
     log::info!(
         "--join-at-pass=1 --no-join: rescore complete — {} entries re-scored \
          ({} reconciliation + consensus, {} gap-fill via CWT, {} gap-fill via forced \

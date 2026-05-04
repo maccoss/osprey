@@ -4268,6 +4268,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             &mut seq_interner,
         )?;
 
+        // Cross-impl bisection seam: dump the per-precursor q-values
+        // immediately after the rescore loop (consensus + reconciliation
+        // overlay + gap-fill stubs appended). Mirrors the
+        // OspreySharp-side WriteStage6RescoredDump call.
+        crate::diagnostics::dump_stage6_rescored(&per_file_entries);
+
         // 4. Single second-pass FDR after all re-scoring
         if total_rescored > 0 {
             log::debug!(

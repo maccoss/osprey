@@ -633,6 +633,70 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
     exit_if_only("OSPREY_PERCOLATOR_ONLY", "Stage 5 Percolator dump");
 }
 
+/// Dump per-precursor state to `rust_stage6_rescored.tsv` AFTER the
+/// per-file rescore loop completes. Same column shape as
+/// `dump_stage5_percolator` so `Compare-Percolator.ps1` can be reused
+/// for the diff. Catches divergence in the boundary-overrides
+/// rescore + gap-fill output BEFORE drilling into the inner-loop
+/// `OSPREY_DUMP_MP_INPUTS` / `OSPREY_DUMP_PREDICT_RT` bisection
+/// ladder.
+///
+/// Gated by `OSPREY_DUMP_RESCORED=1`. When `OSPREY_RESCORED_ONLY=1`
+/// is also set, exits the process after writing. Fired from BOTH
+/// the in-process pipeline (after `rescore_per_file_loop` in
+/// `pipeline.rs::run_analysis`) and the worker
+/// (`rescore::run_rescore`); the OspreySharp side has the matching
+/// `WriteStage6RescoredDump` call from `AnalysisPipeline.Run` and
+/// `AnalysisPipeline.RunWorker`.
+pub fn dump_stage6_rescored(per_file_entries: &[(String, Vec<osprey_core::FdrEntry>)]) {
+    if !is_dump_enabled("OSPREY_DUMP_RESCORED") {
+        return;
+    }
+
+    let path = "rust_stage6_rescored.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "file_name\tentry_id\tcharge\tmodified_sequence\tis_decoy\tscore\tpep\trun_precursor_q\trun_peptide_q\trun_protein_q\texperiment_precursor_q\texperiment_peptide_q"
+    )
+    .ok();
+
+    let mut rows: Vec<(&str, &osprey_core::FdrEntry)> = per_file_entries
+        .iter()
+        .flat_map(|(file_name, entries)| entries.iter().map(move |e| (file_name.as_str(), e)))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.entry_id.cmp(&b.1.entry_id)));
+
+    let mut n_written = 0usize;
+    for (file_name, e) in &rows {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            file_name,
+            e.entry_id,
+            e.charge,
+            e.modified_sequence,
+            if e.is_decoy { "true" } else { "false" },
+            format_f64_roundtrip(e.score),
+            format_f64_roundtrip(e.pep),
+            format_f64_roundtrip(e.run_precursor_qvalue),
+            format_f64_roundtrip(e.run_peptide_qvalue),
+            format_f64_roundtrip(e.run_protein_qvalue),
+            format_f64_roundtrip(e.experiment_precursor_qvalue),
+            format_f64_roundtrip(e.experiment_peptide_qvalue),
+        )
+        .ok();
+        n_written += 1;
+    }
+    log::info!("Wrote Stage 6 rescored dump: {} ({} rows)", path, n_written);
+
+    exit_if_only("OSPREY_RESCORED_ONLY", "Stage 6 rescored dump");
+}
+
 /// Dump the per-peptide consensus RT planning state to
 /// `rust_stage6_consensus.tsv` for cross-impl parity at the start of
 /// Stage 6, before any per-file rescoring. Mirrors
