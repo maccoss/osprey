@@ -411,6 +411,100 @@ pub fn dump_predict_rt_call(entry_id: u32, library_rt: f64, expected_rt: f64) {
 }
 
 // --------------------------------------------------------------------------
+// Per-(file, entry) CWT path summary for cross-impl bisection
+// --------------------------------------------------------------------------
+//
+// Captures one row per scoring call describing the CWT detection /
+// fallback / apex-acceptance pipeline outcome. Six tab-separated
+// columns: file_name, entry_id, n_cwt_peaks, n_final_peaks,
+// n_scored, scored. Use to localize where the rescore set diverges
+// between Rust and the C# port.
+//
+//   OSPREY_DUMP_CWT_PATH=/tmp/rust_cwt.tsv  osprey ...   # Rust
+//   OSPREY_DUMP_CWT_PATH=1                  OspreySharp  # C# (writes cs_stage6_cwt_path.tsv)
+
+static CWT_PATH_DUMP: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+fn cwt_path_writer() -> Option<&'static Mutex<std::fs::File>> {
+    CWT_PATH_DUMP
+        .get_or_init(|| {
+            let path = std::env::var("OSPREY_DUMP_CWT_PATH").ok()?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)
+                .ok()?;
+            writeln!(
+                file,
+                "file_name\tentry_id\tn_cwt_peaks\tn_final_peaks\tn_scored\tscored\tsigma\tconsensus_l1\tconsensus_max_abs\tconsensus_argmax"
+            )
+            .ok();
+            log::info!(
+                "[BISECT] OSPREY_DUMP_CWT_PATH active: writing CWT path summary to {}",
+                path
+            );
+            Some(Mutex::new(file))
+        })
+        .as_ref()
+}
+
+/// Append one per-(file, entry) CWT path summary row. The four
+/// consensus-signal scalars (sigma, l1, max_abs, argmax) are computed
+/// inside this function from `xics` so the production hot path
+/// doesn't pay for the recompute when `OSPREY_DUMP_CWT_PATH` is
+/// unset (the OnceLock writer returns None and the function bails
+/// before touching xics).
+pub fn dump_cwt_path(
+    file_name: &str,
+    entry_id: u32,
+    n_cwt_peaks: usize,
+    n_final_peaks: usize,
+    n_scored: usize,
+    scored: bool,
+    xics: &[(usize, Vec<(f64, f64)>)],
+) {
+    let Some(writer) = cwt_path_writer() else {
+        return;
+    };
+    let (sigma, l1, max_abs, argmax) = match osprey_chromatography::cwt::get_consensus_signal(xics)
+    {
+        Some((cons, sig)) => {
+            let mut l1 = 0.0f64;
+            let mut max_abs = 0.0f64;
+            let mut argmax: i32 = -1;
+            for (i, v) in cons.iter().enumerate() {
+                let a = v.abs();
+                l1 += a;
+                if a > max_abs {
+                    max_abs = a;
+                    argmax = i as i32;
+                }
+            }
+            (sig, l1, max_abs, argmax)
+        }
+        None => (0.0, 0.0, 0.0, -1),
+    };
+    let Ok(mut file) = writer.lock() else {
+        return;
+    };
+    let line = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        file_name,
+        entry_id,
+        n_cwt_peaks,
+        n_final_peaks,
+        n_scored,
+        if scored { 1 } else { 0 },
+        format_f64_roundtrip(sigma),
+        format_f64_roundtrip(l1),
+        format_f64_roundtrip(max_abs),
+        argmax
+    );
+    let _ = file.write_all(line.as_bytes());
+}
+
+// --------------------------------------------------------------------------
 // Per-entry main-search XIC dump
 // --------------------------------------------------------------------------
 
@@ -511,6 +605,22 @@ impl SearchXicDump {
                 writeln!(f, "xic\t{}\t{}\t{:.10}\t{:.10}", frag_idx, i, rt, intensity).ok();
             }
         }
+
+        // CWT CONSENSUS: per-scan median consensus value across the
+        // fragment CWT coefficients. Cross-impl diff at this section
+        // pinpoints the first scan where the consensus signal diverges
+        // -- the seam upstream of peak detection. Use
+        // format_f64_roundtrip so f64 bits compare exactly between
+        // Rust and C#.
+        if let Some((consensus, sigma)) = osprey_chromatography::cwt::get_consensus_signal(xics) {
+            writeln!(f, "# CWT CONSENSUS (sigma, scan_idx, value)").ok();
+            writeln!(f, "# sigma={}", format_f64_roundtrip(sigma)).ok();
+            writeln!(f, "consensus\tscan_idx\tvalue").ok();
+            for (i, v) in consensus.iter().enumerate() {
+                writeln!(f, "consensus\t{}\t{}", i, format_f64_roundtrip(*v)).ok();
+            }
+        }
+
         log::info!(
             "[BISECT] Search XIC dump for entry {}: {} xics, {} scans -> {}",
             entry.id,

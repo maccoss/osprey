@@ -404,6 +404,58 @@ pub fn detect_cwt_consensus_peaks(
     peaks
 }
 
+// ============================================================================
+// DIAGNOSTIC-ONLY (cross-impl bisection)
+// ============================================================================
+//
+// Helpers below are NOT used by the production scoring pipeline. They expose
+// internal state of `detect_cwt_consensus_peaks` so the dumps in
+// `osprey/src/diagnostics.rs` can characterize the consensus signal without
+// duplicating the convolve / median code. If the diagnostic dumps are
+// retired, these helpers can be deleted.
+
+/// Diagnostic helper: run the first half of
+/// [`detect_cwt_consensus_peaks`] (sigma, kernel, convolve, median consensus)
+/// and return the consensus signal + sigma. Returns `None` when the input
+/// is too small for CWT (matches the validation in
+/// `detect_cwt_consensus_peaks`).
+///
+/// Sole callers: `osprey::diagnostics::dump_cwt_path` and
+/// `osprey::diagnostics::SearchXicDump::dump_header`. Production code does
+/// not use this helper.
+pub fn get_consensus_signal(xics: &[(usize, Vec<(f64, f64)>)]) -> Option<(Vec<f64>, f64)> {
+    if xics.len() < 2 {
+        return None;
+    }
+    let n_scans = xics[0].1.len();
+    if n_scans < 5 {
+        return None;
+    }
+    if xics.iter().any(|(_, xic)| xic.len() != n_scans) {
+        return None;
+    }
+    let intensities: Vec<Vec<f64>> = xics
+        .iter()
+        .map(|(_, xic)| xic.iter().map(|(_, v)| *v).collect())
+        .collect();
+    let sigma = estimate_cwt_scale(xics);
+    let kernel_radius = ((5.0 * sigma).ceil() as usize).min(n_scans / 2);
+    let kernel = mexican_hat_kernel(sigma, kernel_radius);
+    let cwt_coeffs: Vec<Vec<f64>> = intensities
+        .iter()
+        .map(|signal| convolve_same(signal, &kernel))
+        .collect();
+    let mut consensus = vec![0.0; n_scans];
+    let mut buf = vec![0.0; xics.len()];
+    for s in 0..n_scans {
+        for f in 0..xics.len() {
+            buf[f] = cwt_coeffs[f][s];
+        }
+        consensus[s] = small_median(&mut buf);
+    }
+    Some((consensus, sigma))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

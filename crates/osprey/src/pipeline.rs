@@ -7227,8 +7227,12 @@ fn run_search(
 
                         // Detect candidate peaks using CWT consensus across all transitions.
                         let full_polish = tukey_median_polish(&xics, 10, 0.01);
+                        // Captured for the OSPREY_DUMP_CWT_PATH diagnostic; not
+                        // used by production scoring.
+                        let n_cwt_peaks: usize;
                         let candidates = {
                             let cwt_candidates = detect_cwt_consensus_peaks(&xics, 0.0);
+                            n_cwt_peaks = cwt_candidates.len();
                             if cwt_candidates.is_empty() {
                                 let mp_candidates = full_polish
                                     .as_ref()
@@ -7245,6 +7249,9 @@ fn run_search(
                         };
 
                         if candidates.is_empty() {
+                            crate::diagnostics::dump_cwt_path(
+                                file_name, entry.id, n_cwt_peaks, 0, 0, false, &xics,
+                            );
                             return None;
                         }
 
@@ -7332,6 +7339,15 @@ fn run_search(
                         // (all detected apexes were outside rt_tolerance of expected_rt),
                         // there is no in-tolerance peak for this entry.
                         if scored_candidates.is_empty() {
+                            crate::diagnostics::dump_cwt_path(
+                                file_name,
+                                entry.id,
+                                n_cwt_peaks,
+                                candidates.len(),
+                                0,
+                                false,
+                                &xics,
+                            );
                             return None;
                         }
 
@@ -7446,6 +7462,15 @@ fn run_search(
                         if let Some(ref mut entry) = result {
                             entry.cwt_candidates = cwt_top_n;
                         }
+                        crate::diagnostics::dump_cwt_path(
+                            file_name,
+                            entry.id,
+                            n_cwt_peaks,
+                            candidates.len(),
+                            scored_candidates.len(),
+                            result.is_some(),
+                            &xics,
+                        );
                         result
                     })
                     .collect::<Vec<_>>();
