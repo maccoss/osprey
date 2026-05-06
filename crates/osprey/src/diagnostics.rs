@@ -516,6 +516,26 @@ pub fn dump_cwt_path(
 /// files for every listed entry id encountered during the main search and
 /// lets the pipeline run to completion so downstream analysis is also
 /// available.
+/// Module-level entry point for the per-fragment apex-match dump used in
+/// the Astral Mode A bisection. Lazy-inits a `SearchXicDump` so the
+/// `OSPREY_DIAG_SEARCH_ENTRY_IDS` env-var parse happens at most once per
+/// process, then forwards to `SearchXicDump::dump_fragment_match`.
+pub fn dump_fragment_match(
+    entry: &LibraryEntry,
+    apex_spectrum: &Spectrum,
+    tol_da: f64,
+    tol_ppm: f64,
+) {
+    use std::sync::OnceLock;
+    static DUMPER: OnceLock<SearchXicDump> = OnceLock::new();
+    DUMPER.get_or_init(SearchXicDump::new).dump_fragment_match(
+        entry,
+        apex_spectrum,
+        tol_da,
+        tol_ppm,
+    );
+}
+
 pub struct SearchXicDump {
     target_ids: Option<std::collections::HashSet<u32>>,
 }
@@ -669,6 +689,94 @@ impl SearchXicDump {
             best_bp.start_index, best_bp.apex_index, best_bp.end_index
         )
         .ok();
+    }
+
+    /// Cross-impl bisection helper: dump per-fragment match info at the
+    /// apex spectrum to `rust_fragmatch_entry_<id>_scan_<scan>.txt`. Mirrors
+    /// the C# `cs_fragmatch_entry_<id>_scan_<scan>.txt` format so the two
+    /// can be diffed directly. Each row is the library fragment annotation
+    /// (ion_type/ordinal/charge), library m/z, tolerance window, and the
+    /// matched flag (1 if at least one observed peak falls in the window).
+    /// For each fragment, also writes one `peak` line per observed peak in
+    /// the tolerance window so we can inspect what spectrum content the
+    /// scorer actually saw — and whether it differs cross-impl after
+    /// per-file MS2 calibration is applied.
+    pub fn dump_fragment_match(
+        &self,
+        entry: &LibraryEntry,
+        apex_spectrum: &Spectrum,
+        tol_da: f64,
+        tol_ppm: f64,
+    ) {
+        if !self.is_active_for(entry.id) {
+            return;
+        }
+        let dump_path = format!(
+            "rust_fragmatch_entry_{}_scan_{}.txt",
+            entry.id, apex_spectrum.scan_number
+        );
+        let Ok(mut f) = std::fs::File::create(&dump_path) else {
+            return;
+        };
+        let unit = if tol_ppm > 0.0 { "Ppm" } else { "Mz" };
+        let tol_val = if tol_ppm > 0.0 { tol_ppm } else { tol_da };
+        writeln!(
+            f,
+            "# entry_id={} scan={} modseq={} seq={} is_decoy={} n_fragments={} n_peaks={} tol={} {}",
+            entry.id,
+            apex_spectrum.scan_number,
+            entry.modified_sequence,
+            entry.sequence,
+            if entry.is_decoy { 1 } else { 0 },
+            entry.fragments.len(),
+            apex_spectrum.mzs.len(),
+            tol_val,
+            unit
+        )
+        .ok();
+        writeln!(
+            f,
+            "ion_type\tordinal\tcharge\tlib_mz\ttol_da\tlower\tupper\tmatched"
+        )
+        .ok();
+        for frag in &entry.fragments {
+            let frag_tol = tol_da.max(frag.mz * tol_ppm / 1e6);
+            let lower = frag.mz - frag_tol;
+            let upper = frag.mz + frag_tol;
+            // Mirror match_fragments inclusion logic: any peak in [lower, upper] counts.
+            let matched = apex_spectrum
+                .mzs
+                .iter()
+                .any(|&mz| mz >= lower && mz <= upper);
+            writeln!(
+                f,
+                "{:?}\t{}\t{}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{}",
+                frag.annotation.ion_type,
+                frag.annotation.ordinal,
+                frag.annotation.charge,
+                frag.mz,
+                frag_tol,
+                lower,
+                upper,
+                if matched { 1 } else { 0 }
+            )
+            .ok();
+            for (i, &mz) in apex_spectrum.mzs.iter().enumerate() {
+                if mz < lower {
+                    continue;
+                }
+                if mz > upper {
+                    break;
+                }
+                let inten = apex_spectrum.intensities.get(i).copied().unwrap_or(0.0_f32);
+                writeln!(
+                    f,
+                    "  peak\t{:?}\t{}\t{:.17}\t{:.6}",
+                    frag.annotation.ion_type, frag.annotation.ordinal, mz, inten
+                )
+                .ok();
+            }
+        }
     }
 }
 

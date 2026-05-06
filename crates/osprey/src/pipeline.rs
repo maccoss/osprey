@@ -6370,6 +6370,11 @@ fn compute_features_at_peak(
 
     // 4. Mass accuracy at apex
     let frag_matches = ctx.scorer.match_fragments(apex_spectrum, entry);
+    // Cross-impl bisection diagnostic: dump per-fragment match + the
+    // observed peaks in each fragment's tolerance window so the same
+    // info can be diffed against C# `cs_fragmatch_entry_<id>_scan_<scan>.txt`.
+    // Gated on OSPREY_DIAG_SEARCH_ENTRY_IDS (zero overhead when unset).
+    crate::diagnostics::dump_fragment_match(entry, apex_spectrum, ctx.tol_da, ctx.tol_ppm);
     let fragment_tolerance_unit = if ctx.tol_ppm > 0.0 {
         ToleranceUnit::Ppm
     } else {
