@@ -1678,20 +1678,26 @@ impl SpectralScorer {
             obs_preprocessed.push(best_intensity.sqrt());
         }
 
-        if lib_preprocessed.len() < 2 {
-            return SpectralScore::default();
-        }
-
-        // L2 normalize for cosine. When either norm is too small (no matched
+        // L2 normalize for cosine. The cosine and per-fragment correlations
+        // are undefined when (a) fewer than 2 library fragments fall in the
+        // spectrum's m/z range or (b) either norm is too small (no matched
         // observed intensity, or the library has no non-zero intensities in
-        // range) the cosine is undefined; treat that as zero but still
-        // populate the presence/counting features below. Tying all features
-        // to the norm gate caused short/low-signal peptides to report zero
-        // matches even when match_fragments clearly found some.
+        // range). Treat all of those as zero cosine but still populate the
+        // presence/counting features below — those depend only on `matches`
+        // (from `match_fragments`, which runs across the full library
+        // regardless of in-range count). A prior implementation early-
+        // returned `SpectralScore::default()` when `lib_preprocessed.len() <
+        // 2`, silently zeroing `consecutive_ions`, `explained_intensity`,
+        // and the other counting features for any peptide whose library
+        // fragments mostly sit below the DIA detector's m/z floor — even
+        // when `match_fragments` clearly found one in-range hit. The
+        // `cosine_ok` flag below merges the in-range count and norm gates
+        // so the same fall-through pattern as the norm fix (committed
+        // earlier) covers the in-range case too.
         let lib_norm = lib_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
         let obs_norm = obs_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
 
-        let cosine_ok = lib_norm >= 1e-10 && obs_norm >= 1e-10;
+        let cosine_ok = lib_preprocessed.len() >= 2 && lib_norm >= 1e-10 && obs_norm >= 1e-10;
 
         let dot_product: f64 = if cosine_ok {
             lib_preprocessed
@@ -4871,6 +4877,98 @@ mod tests {
         assert!(
             score.explained_intensity > 0.99,
             "explained_intensity must reflect matches (3 of 3 obs peaks matched), got {}",
+            score.explained_intensity
+        );
+    }
+
+    /// Regression guard companion to
+    /// `lib_cosine_counting_features_survive_zero_norm`: when fewer than 2
+    /// library fragments fall in the spectrum's m/z range, the cosine /
+    /// per-fragment correlations are undefined — but the counting features
+    /// are still meaningful because `match_fragments` runs across the full
+    /// library regardless of in-range count.
+    ///
+    /// Originally surfaced as Mode A in the Astral Stage 6 cross-impl
+    /// bisection: a decoy peptide with five fragments at m/z {69.5, 88.1,
+    /// 138.1, 175.1, 331.2} was scored against a DIA MS2 spectrum whose
+    /// detector floor sat above 175 — only the y2 fragment (331.2) was in
+    /// range, and `match_fragments` correctly found a peak in its tolerance
+    /// window. The C# OspreySharp port reported `consecutive_ions = 1` for
+    /// that match; this Rust impl reported 0 because `lib_preprocessed.len()
+    /// < 2` short-circuited the function back to `SpectralScore::default()`,
+    /// dropping the counting features alongside the (correctly undefined)
+    /// cosine. Counting features must NOT depend on whether at least two
+    /// fragments are in range.
+    #[test]
+    fn lib_cosine_counting_features_survive_few_in_range_fragments() {
+        let scorer = SpectralScorer::new().with_tolerance_ppm(10.0);
+        let mk_b = |mz: f64, ordinal: u8| LibraryFragment {
+            mz,
+            relative_intensity: 1.0,
+            annotation: FragmentAnnotation {
+                ion_type: IonType::B,
+                ordinal,
+                charge: 1,
+                neutral_loss: None,
+            },
+        };
+        let mk_y = |mz: f64, ordinal: u8| LibraryFragment {
+            mz,
+            relative_intensity: 1.0,
+            annotation: FragmentAnnotation {
+                ion_type: IonType::Y,
+                ordinal,
+                charge: 1,
+                neutral_loss: None,
+            },
+        };
+
+        let mut entry = LibraryEntry::new(1, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
+        entry.fragments = vec![
+            mk_b(100.0, 1),
+            mk_b(150.0, 2),
+            mk_y(180.0, 1),
+            mk_y(200.0, 2),
+            mk_y(331.22, 3), // only this one is in spectrum range below
+        ];
+
+        // Spectrum starts at m/z 300 — four of the five library fragments
+        // are below `spec_mz_min` and get filtered out of `lib_preprocessed`.
+        // Only the y3 at 331.22 falls in range AND has a peak in tolerance.
+        let spectrum = Spectrum {
+            scan_number: 1,
+            retention_time: 10.0,
+            precursor_mz: 500.0,
+            isolation_window: IsolationWindow::symmetric(500.0, 12.5),
+            mzs: vec![300.0, 331.22, 400.0, 500.0],
+            intensities: vec![100.0, 200.0, 100.0, 100.0],
+        };
+
+        let score = scorer.lib_cosine(&spectrum, &entry);
+
+        // Cosine + correlation features are undefined with only 1 in-range
+        // library fragment and must zero out.
+        assert_eq!(
+            score.lib_cosine, 0.0,
+            "cosine undefined with <2 in-range fragments"
+        );
+        assert_eq!(score.pearson_correlation, 0.0);
+        assert_eq!(score.spearman_correlation, 0.0);
+
+        // Counting features must reflect the y3 match — match_fragments
+        // doesn't filter by in-range count.
+        assert_eq!(
+            score.n_matched, 1,
+            "n_matched must populate independent of in-range fragment count"
+        );
+        assert_eq!(
+            score.consecutive_ions, 1,
+            "consecutive_ions must populate independent of in-range fragment count"
+        );
+        assert!(
+            score.explained_intensity > 0.0,
+            "explained_intensity must populate (1 fragment matched 200/500 of total intensity), \
+             got {}",
             score.explained_intensity
         );
     }
