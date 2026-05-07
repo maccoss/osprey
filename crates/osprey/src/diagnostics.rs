@@ -11,7 +11,7 @@
 
 use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::{LibraryEntry, Spectrum, XICPeakBounds};
-use osprey_fdr::protein::PeptideScore;
+use osprey_fdr::protein::{PeptideScore, ProteinFdrResult, ProteinParsimonyResult};
 use osprey_scoring::{SpectralScorer, TukeyMedianPolishResult};
 use std::collections::HashMap;
 use std::io::Write;
@@ -1245,6 +1245,122 @@ pub fn dump_stage6_protein_fdr(
     );
 
     exit_if_only("OSPREY_PROTEIN_FDR_ONLY", "Stage 6 protein FDR dump");
+}
+
+/// Dump per-protein-group state at the end of second-pass picked-protein
+/// FDR (Stage 7 authoritative protein FDR) to `rust_stage7_protein_fdr.tsv`.
+/// Mirrors what the OspreySharp port of `compute_protein_fdr` emits.
+///
+/// One row per protein group present in the parsimony result. The
+/// `is_target_winner` column captures the pairwise pick outcome:
+/// `true` if the target side scored at or above the decoy side for this
+/// group (or the group has only a target side); `false` otherwise. Groups
+/// with no winner -- both sides absent because no peptide passed the
+/// gate -- are emitted with `group_qvalue = 1.0`, `best_peptide_score = NaN`,
+/// `is_target_winner = false`.
+///
+/// Sort order: `(is_target_winner DESC, group_qvalue ASC, group_id ASC)`.
+/// Targets-first keeps the calibration-relevant rows (target winners) at
+/// the top of the file; secondary keys make the diff stable.
+///
+/// Columns: `group_id`, `accessions`, `n_unique`, `n_shared`,
+/// `best_peptide_score`, `group_qvalue`, `is_target_winner`.
+///
+/// Gated by `OSPREY_DUMP_STAGE7_PROTEIN_FDR=1`. When
+/// `OSPREY_STAGE7_PROTEIN_FDR_ONLY=1` is also set, exits the process after
+/// writing for fast bisection cycle.
+pub fn dump_stage7_protein_fdr(parsimony: &ProteinParsimonyResult, fdr_result: &ProteinFdrResult) {
+    if !is_dump_enabled("OSPREY_DUMP_STAGE7_PROTEIN_FDR") {
+        return;
+    }
+
+    let path = "rust_stage7_protein_fdr.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "group_id\taccessions\tn_unique\tn_shared\tbest_peptide_score\tgroup_qvalue\tis_target_winner"
+    )
+    .ok();
+
+    struct Row<'a> {
+        group_id: u32,
+        accessions: String,
+        n_unique: usize,
+        n_shared: usize,
+        best_peptide_score: f64,
+        group_qvalue: f64,
+        is_target_winner: bool,
+        _accessions_ref: std::marker::PhantomData<&'a str>,
+    }
+
+    let mut rows: Vec<Row<'_>> = parsimony
+        .groups
+        .iter()
+        .map(|g| {
+            // group_qvalues / group_scores contain only TARGET winners
+            // (per ProteinFdrResult doc). Presence in either map ⇔ target
+            // won the pair for this group.
+            let is_target_winner = fdr_result.group_qvalues.contains_key(&g.id);
+            let group_qvalue = fdr_result.group_qvalues.get(&g.id).copied().unwrap_or(1.0);
+            let best_peptide_score = fdr_result
+                .group_scores
+                .get(&g.id)
+                .copied()
+                .unwrap_or(f64::NAN);
+
+            // Stable accession ordering: parsimony.accessions is built by
+            // iterating a HashMap, so sort here for deterministic dump.
+            let mut accs = g.accessions.clone();
+            accs.sort();
+            let accessions = accs.join(";");
+
+            Row {
+                group_id: g.id,
+                accessions,
+                n_unique: g.unique_peptides.len(),
+                n_shared: g.shared_peptides.len(),
+                best_peptide_score,
+                group_qvalue,
+                is_target_winner,
+                _accessions_ref: std::marker::PhantomData,
+            }
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        // Target winners first (DESC on bool ≡ true before false).
+        b.is_target_winner
+            .cmp(&a.is_target_winner)
+            .then(a.group_qvalue.total_cmp(&b.group_qvalue))
+            .then(a.group_id.cmp(&b.group_id))
+    });
+
+    for r in &rows {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            r.group_id,
+            r.accessions,
+            r.n_unique,
+            r.n_shared,
+            format_f64_roundtrip(r.best_peptide_score),
+            format_f64_roundtrip(r.group_qvalue),
+            if r.is_target_winner { "true" } else { "false" },
+        )
+        .ok();
+    }
+
+    log::info!(
+        "Wrote Stage 7 second-pass protein FDR dump: {} ({} rows)",
+        path,
+        rows.len()
+    );
+
+    exit_if_only("OSPREY_STAGE7_PROTEIN_FDR_ONLY", "Stage 7 protein FDR dump");
 }
 
 /// Dump the per-point LOESS fit state of every refit RTCalibration to

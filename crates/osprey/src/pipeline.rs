@@ -4400,6 +4400,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             parsimony.groups.len()
         );
 
+        // Stage 7 cross-impl bisection dump (no-op unless
+        // OSPREY_DUMP_STAGE7_PROTEIN_FDR=1). Fires before propagation so the
+        // dumped state captures the picked-protein computation in isolation.
+        crate::diagnostics::dump_stage7_protein_fdr(&parsimony, &protein_fdr_result);
+
         // Propagate protein q-values into FdrEntry stubs — experiment side only.
         // The run side was already set by first-pass protein FDR and is used
         // only as a gate (not for final output).
