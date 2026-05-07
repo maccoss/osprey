@@ -4268,6 +4268,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             &mut seq_interner,
         )?;
 
+        // Cross-impl bisection seam: dump the per-precursor q-values
+        // immediately after the rescore loop (consensus + reconciliation
+        // overlay + gap-fill stubs appended). Mirrors the
+        // OspreySharp-side WriteStage6RescoredDump call.
+        crate::diagnostics::dump_stage6_rescored(&per_file_entries);
+
         // 4. Single second-pass FDR after all re-scoring
         if total_rescored > 0 {
             log::debug!(
@@ -6364,6 +6370,11 @@ fn compute_features_at_peak(
 
     // 4. Mass accuracy at apex
     let frag_matches = ctx.scorer.match_fragments(apex_spectrum, entry);
+    // Cross-impl bisection diagnostic: dump per-fragment match + the
+    // observed peaks in each fragment's tolerance window so the same
+    // info can be diffed against C# `cs_fragmatch_entry_<id>_scan_<scan>.txt`.
+    // Gated on OSPREY_DIAG_SEARCH_ENTRY_IDS (zero overhead when unset).
+    crate::diagnostics::dump_fragment_match(entry, apex_spectrum, ctx.tol_da, ctx.tol_ppm);
     let fragment_tolerance_unit = if ctx.tol_ppm > 0.0 {
         ToleranceUnit::Ppm
     } else {
@@ -7221,8 +7232,12 @@ fn run_search(
 
                         // Detect candidate peaks using CWT consensus across all transitions.
                         let full_polish = tukey_median_polish(&xics, 10, 0.01);
+                        // Captured for the OSPREY_DUMP_CWT_PATH diagnostic; not
+                        // used by production scoring.
+                        let n_cwt_peaks: usize;
                         let candidates = {
                             let cwt_candidates = detect_cwt_consensus_peaks(&xics, 0.0);
+                            n_cwt_peaks = cwt_candidates.len();
                             if cwt_candidates.is_empty() {
                                 let mp_candidates = full_polish
                                     .as_ref()
@@ -7239,6 +7254,9 @@ fn run_search(
                         };
 
                         if candidates.is_empty() {
+                            crate::diagnostics::dump_cwt_path(
+                                file_name, entry.id, n_cwt_peaks, 0, 0, false, &xics,
+                            );
                             return None;
                         }
 
@@ -7326,6 +7344,15 @@ fn run_search(
                         // (all detected apexes were outside rt_tolerance of expected_rt),
                         // there is no in-tolerance peak for this entry.
                         if scored_candidates.is_empty() {
+                            crate::diagnostics::dump_cwt_path(
+                                file_name,
+                                entry.id,
+                                n_cwt_peaks,
+                                candidates.len(),
+                                0,
+                                false,
+                                &xics,
+                            );
                             return None;
                         }
 
@@ -7440,6 +7467,15 @@ fn run_search(
                         if let Some(ref mut entry) = result {
                             entry.cwt_candidates = cwt_top_n;
                         }
+                        crate::diagnostics::dump_cwt_path(
+                            file_name,
+                            entry.id,
+                            n_cwt_peaks,
+                            candidates.len(),
+                            scored_candidates.len(),
+                            result.is_some(),
+                            &xics,
+                        );
                         result
                     })
                     .collect::<Vec<_>>();

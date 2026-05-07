@@ -411,6 +411,105 @@ pub fn dump_predict_rt_call(entry_id: u32, library_rt: f64, expected_rt: f64) {
 }
 
 // --------------------------------------------------------------------------
+// Per-(file, entry) CWT path summary for cross-impl bisection
+// --------------------------------------------------------------------------
+//
+// Captures one row per scoring call describing the CWT detection /
+// fallback / apex-acceptance pipeline outcome. Ten tab-separated
+// columns: file_name, entry_id, n_cwt_peaks, n_final_peaks,
+// n_scored, scored, sigma, consensus_l1, consensus_max_abs,
+// consensus_argmax. The four consensus-signal stats (sigma + L1 +
+// max-abs + argmax of the median CWT consensus across fragment XICs)
+// give a single-number signature that distinguishes "convolve /
+// median diverged" from "downstream peak finder diverged" without
+// dumping the full per-scan consensus signal. Use to localize where
+// the rescore set diverges between Rust and the C# port.
+//
+//   OSPREY_DUMP_CWT_PATH=/tmp/rust_cwt.tsv  osprey ...   # Rust
+//   OSPREY_DUMP_CWT_PATH=1                  OspreySharp  # C# (writes cs_stage6_cwt_path.tsv)
+
+static CWT_PATH_DUMP: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+fn cwt_path_writer() -> Option<&'static Mutex<std::fs::File>> {
+    CWT_PATH_DUMP
+        .get_or_init(|| {
+            let path = std::env::var("OSPREY_DUMP_CWT_PATH").ok()?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&path)
+                .ok()?;
+            writeln!(
+                file,
+                "file_name\tentry_id\tn_cwt_peaks\tn_final_peaks\tn_scored\tscored\tsigma\tconsensus_l1\tconsensus_max_abs\tconsensus_argmax"
+            )
+            .ok();
+            log::info!(
+                "[BISECT] OSPREY_DUMP_CWT_PATH active: writing CWT path summary to {}",
+                path
+            );
+            Some(Mutex::new(file))
+        })
+        .as_ref()
+}
+
+/// Append one per-(file, entry) CWT path summary row. The four
+/// consensus-signal scalars (sigma, l1, max_abs, argmax) are computed
+/// inside this function from `xics` so the production hot path
+/// doesn't pay for the recompute when `OSPREY_DUMP_CWT_PATH` is
+/// unset (the OnceLock writer returns None and the function bails
+/// before touching xics).
+pub fn dump_cwt_path(
+    file_name: &str,
+    entry_id: u32,
+    n_cwt_peaks: usize,
+    n_final_peaks: usize,
+    n_scored: usize,
+    scored: bool,
+    xics: &[(usize, Vec<(f64, f64)>)],
+) {
+    let Some(writer) = cwt_path_writer() else {
+        return;
+    };
+    let (sigma, l1, max_abs, argmax) = match osprey_chromatography::cwt::get_consensus_signal(xics)
+    {
+        Some((cons, sig)) => {
+            let mut l1 = 0.0f64;
+            let mut max_abs = 0.0f64;
+            let mut argmax: i32 = -1;
+            for (i, v) in cons.iter().enumerate() {
+                let a = v.abs();
+                l1 += a;
+                if a > max_abs {
+                    max_abs = a;
+                    argmax = i as i32;
+                }
+            }
+            (sig, l1, max_abs, argmax)
+        }
+        None => (0.0, 0.0, 0.0, -1),
+    };
+    let Ok(mut file) = writer.lock() else {
+        return;
+    };
+    let line = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        file_name,
+        entry_id,
+        n_cwt_peaks,
+        n_final_peaks,
+        n_scored,
+        if scored { 1 } else { 0 },
+        format_f64_roundtrip(sigma),
+        format_f64_roundtrip(l1),
+        format_f64_roundtrip(max_abs),
+        argmax
+    );
+    let _ = file.write_all(line.as_bytes());
+}
+
+// --------------------------------------------------------------------------
 // Per-entry main-search XIC dump
 // --------------------------------------------------------------------------
 
@@ -422,6 +521,26 @@ pub fn dump_predict_rt_call(entry_id: u32, library_rt: f64, expected_rt: f64) {
 /// files for every listed entry id encountered during the main search and
 /// lets the pipeline run to completion so downstream analysis is also
 /// available.
+/// Module-level entry point for the per-fragment apex-match dump used in
+/// the Astral Mode A bisection. Lazy-inits a `SearchXicDump` so the
+/// `OSPREY_DIAG_SEARCH_ENTRY_IDS` env-var parse happens at most once per
+/// process, then forwards to `SearchXicDump::dump_fragment_match`.
+pub fn dump_fragment_match(
+    entry: &LibraryEntry,
+    apex_spectrum: &Spectrum,
+    tol_da: f64,
+    tol_ppm: f64,
+) {
+    use std::sync::OnceLock;
+    static DUMPER: OnceLock<SearchXicDump> = OnceLock::new();
+    DUMPER.get_or_init(SearchXicDump::new).dump_fragment_match(
+        entry,
+        apex_spectrum,
+        tol_da,
+        tol_ppm,
+    );
+}
+
 pub struct SearchXicDump {
     target_ids: Option<std::collections::HashSet<u32>>,
 }
@@ -511,6 +630,22 @@ impl SearchXicDump {
                 writeln!(f, "xic\t{}\t{}\t{:.10}\t{:.10}", frag_idx, i, rt, intensity).ok();
             }
         }
+
+        // CWT CONSENSUS: per-scan median consensus value across the
+        // fragment CWT coefficients. Cross-impl diff at this section
+        // pinpoints the first scan where the consensus signal diverges
+        // -- the seam upstream of peak detection. Use
+        // format_f64_roundtrip so f64 bits compare exactly between
+        // Rust and C#.
+        if let Some((consensus, sigma)) = osprey_chromatography::cwt::get_consensus_signal(xics) {
+            writeln!(f, "# CWT CONSENSUS (sigma, scan_idx, value)").ok();
+            writeln!(f, "# sigma={}", format_f64_roundtrip(sigma)).ok();
+            writeln!(f, "consensus\tscan_idx\tvalue").ok();
+            for (i, v) in consensus.iter().enumerate() {
+                writeln!(f, "consensus\t{}\t{}", i, format_f64_roundtrip(*v)).ok();
+            }
+        }
+
         log::info!(
             "[BISECT] Search XIC dump for entry {}: {} xics, {} scans -> {}",
             entry.id,
@@ -560,19 +695,114 @@ impl SearchXicDump {
         )
         .ok();
     }
+
+    /// Cross-impl bisection helper: dump per-fragment match info at the
+    /// apex spectrum to `rust_fragmatch_entry_<id>_scan_<scan>.txt`. Mirrors
+    /// the C# `cs_fragmatch_entry_<id>_scan_<scan>.txt` format so the two
+    /// can be diffed directly. Each row is the library fragment annotation
+    /// (ion_type/ordinal/charge), library m/z, tolerance window, and the
+    /// matched flag (1 if at least one observed peak falls in the window).
+    /// For each fragment, also writes one `peak` line per observed peak in
+    /// the tolerance window so we can inspect what spectrum content the
+    /// scorer actually saw — and whether it differs cross-impl after
+    /// per-file MS2 calibration is applied.
+    pub fn dump_fragment_match(
+        &self,
+        entry: &LibraryEntry,
+        apex_spectrum: &Spectrum,
+        tol_da: f64,
+        tol_ppm: f64,
+    ) {
+        if !self.is_active_for(entry.id) {
+            return;
+        }
+        let dump_path = format!(
+            "rust_fragmatch_entry_{}_scan_{}.txt",
+            entry.id, apex_spectrum.scan_number
+        );
+        let Ok(mut f) = std::fs::File::create(&dump_path) else {
+            return;
+        };
+        let unit = if tol_ppm > 0.0 { "Ppm" } else { "Mz" };
+        let tol_val = if tol_ppm > 0.0 { tol_ppm } else { tol_da };
+        writeln!(
+            f,
+            "# entry_id={} scan={} modseq={} seq={} is_decoy={} n_fragments={} n_peaks={} tol={} {}",
+            entry.id,
+            apex_spectrum.scan_number,
+            entry.modified_sequence,
+            entry.sequence,
+            if entry.is_decoy { 1 } else { 0 },
+            entry.fragments.len(),
+            apex_spectrum.mzs.len(),
+            tol_val,
+            unit
+        )
+        .ok();
+        writeln!(
+            f,
+            "ion_type\tordinal\tcharge\tlib_mz\ttol_da\tlower\tupper\tmatched"
+        )
+        .ok();
+        for frag in &entry.fragments {
+            let frag_tol = tol_da.max(frag.mz * tol_ppm / 1e6);
+            let lower = frag.mz - frag_tol;
+            let upper = frag.mz + frag_tol;
+            // Mirror match_fragments inclusion logic: any peak in [lower, upper] counts.
+            let matched = apex_spectrum
+                .mzs
+                .iter()
+                .any(|&mz| mz >= lower && mz <= upper);
+            writeln!(
+                f,
+                "{:?}\t{}\t{}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{}",
+                frag.annotation.ion_type,
+                frag.annotation.ordinal,
+                frag.annotation.charge,
+                frag.mz,
+                frag_tol,
+                lower,
+                upper,
+                if matched { 1 } else { 0 }
+            )
+            .ok();
+            for (i, &mz) in apex_spectrum.mzs.iter().enumerate() {
+                if mz < lower {
+                    continue;
+                }
+                if mz > upper {
+                    break;
+                }
+                let inten = apex_spectrum.intensities.get(i).copied().unwrap_or(0.0_f32);
+                writeln!(
+                    f,
+                    "  peak\t{:?}\t{}\t{:.17}\t{:.6}",
+                    frag.annotation.ion_type, frag.annotation.ordinal, mz, inten
+                )
+                .ok();
+            }
+        }
+    }
 }
 
 /// Dump per-precursor Stage 5 (Percolator FDR) state to
 /// `rust_stage5_percolator.tsv` so cross-impl parity can be checked at
-/// end-of-first-pass-FDR, before compaction or first-pass protein FDR.
+/// end-of-first-pass-FDR, before compaction.
 ///
 /// Gated by `OSPREY_DUMP_PERCOLATOR=1`. When `OSPREY_PERCOLATOR_ONLY=1`
 /// is also set, exits the process after writing. Columns:
 /// `file_name, entry_id, charge, modified_sequence, is_decoy, score, pep,
-/// run_precursor_q, run_peptide_q, experiment_precursor_q,
+/// run_precursor_q, run_peptide_q, run_protein_q, experiment_precursor_q,
 /// experiment_peptide_q`. Rows sorted by `(file_name, entry_id)` for
 /// stable human inspection; `Compare-Percolator.ps1` hash-joins on the
 /// composite key and is sort-order-agnostic.
+///
+/// `run_protein_qvalue` is the default `1.0` when this dump fires from
+/// `pipeline.rs` (the dump runs BEFORE first-pass protein FDR populates
+/// real values), and the real persisted value when this dump fires from
+/// `rescore::run_rescore` (the worker hydrates the v3 sidecar which
+/// carries post-protein-FDR values). The C# `WriteStage5PercolatorDump`
+/// has the same dual-call shape and the same column ordering.
 pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrEntry>)]) {
     if !is_dump_enabled("OSPREY_DUMP_PERCOLATOR") {
         return;
@@ -586,7 +816,7 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
 
     writeln!(
         f,
-        "file_name\tentry_id\tcharge\tmodified_sequence\tis_decoy\tscore\tpep\trun_precursor_q\trun_peptide_q\texperiment_precursor_q\texperiment_peptide_q"
+        "file_name\tentry_id\tcharge\tmodified_sequence\tis_decoy\tscore\tpep\trun_precursor_q\trun_peptide_q\trun_protein_q\texperiment_precursor_q\texperiment_peptide_q"
     )
     .ok();
 
@@ -600,7 +830,7 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
     for (file_name, e) in &rows {
         writeln!(
             f,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             file_name,
             e.entry_id,
             e.charge,
@@ -610,6 +840,7 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
             format_f64_roundtrip(e.pep),
             format_f64_roundtrip(e.run_precursor_qvalue),
             format_f64_roundtrip(e.run_peptide_qvalue),
+            format_f64_roundtrip(e.run_protein_qvalue),
             format_f64_roundtrip(e.experiment_precursor_qvalue),
             format_f64_roundtrip(e.experiment_peptide_qvalue),
         )
@@ -623,6 +854,70 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
     );
 
     exit_if_only("OSPREY_PERCOLATOR_ONLY", "Stage 5 Percolator dump");
+}
+
+/// Dump per-precursor state to `rust_stage6_rescored.tsv` AFTER the
+/// per-file rescore loop completes. Same column shape as
+/// `dump_stage5_percolator` so `Compare-Percolator.ps1` can be reused
+/// for the diff. Catches divergence in the boundary-overrides
+/// rescore + gap-fill output BEFORE drilling into the inner-loop
+/// `OSPREY_DUMP_MP_INPUTS` / `OSPREY_DUMP_PREDICT_RT` bisection
+/// ladder.
+///
+/// Gated by `OSPREY_DUMP_RESCORED=1`. When `OSPREY_RESCORED_ONLY=1`
+/// is also set, exits the process after writing. Fired from BOTH
+/// the in-process pipeline (after `rescore_per_file_loop` in
+/// `pipeline.rs::run_analysis`) and the worker
+/// (`rescore::run_rescore`); the OspreySharp side has the matching
+/// `WriteStage6RescoredDump` call from `AnalysisPipeline.Run` and
+/// `AnalysisPipeline.RunWorker`.
+pub fn dump_stage6_rescored(per_file_entries: &[(String, Vec<osprey_core::FdrEntry>)]) {
+    if !is_dump_enabled("OSPREY_DUMP_RESCORED") {
+        return;
+    }
+
+    let path = "rust_stage6_rescored.tsv";
+    let Ok(mut f) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+
+    writeln!(
+        f,
+        "file_name\tentry_id\tcharge\tmodified_sequence\tis_decoy\tscore\tpep\trun_precursor_q\trun_peptide_q\trun_protein_q\texperiment_precursor_q\texperiment_peptide_q"
+    )
+    .ok();
+
+    let mut rows: Vec<(&str, &osprey_core::FdrEntry)> = per_file_entries
+        .iter()
+        .flat_map(|(file_name, entries)| entries.iter().map(move |e| (file_name.as_str(), e)))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0).then(a.1.entry_id.cmp(&b.1.entry_id)));
+
+    let mut n_written = 0usize;
+    for (file_name, e) in &rows {
+        writeln!(
+            f,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            file_name,
+            e.entry_id,
+            e.charge,
+            e.modified_sequence,
+            if e.is_decoy { "true" } else { "false" },
+            format_f64_roundtrip(e.score),
+            format_f64_roundtrip(e.pep),
+            format_f64_roundtrip(e.run_precursor_qvalue),
+            format_f64_roundtrip(e.run_peptide_qvalue),
+            format_f64_roundtrip(e.run_protein_qvalue),
+            format_f64_roundtrip(e.experiment_precursor_qvalue),
+            format_f64_roundtrip(e.experiment_peptide_qvalue),
+        )
+        .ok();
+        n_written += 1;
+    }
+    log::info!("Wrote Stage 6 rescored dump: {} ({} rows)", path, n_written);
+
+    exit_if_only("OSPREY_RESCORED_ONLY", "Stage 6 rescored dump");
 }
 
 /// Dump the per-peptide consensus RT planning state to
