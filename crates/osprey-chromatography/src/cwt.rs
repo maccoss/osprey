@@ -417,8 +417,9 @@ pub fn detect_cwt_consensus_peaks(
 /// Diagnostic helper: run the first half of
 /// [`detect_cwt_consensus_peaks`] (sigma, kernel, convolve, median consensus)
 /// and return the consensus signal + sigma. Returns `None` when the input
-/// is too small for CWT (matches the validation in
-/// `detect_cwt_consensus_peaks`).
+/// is too small for CWT or when every XIC intensity is zero (matches the
+/// full validation in `detect_cwt_consensus_peaks`, including the
+/// `has_signal` short-circuit at line 238).
 ///
 /// Sole callers: `osprey::diagnostics::dump_cwt_path` and
 /// `osprey::diagnostics::SearchXicDump::dump_header`. Production code does
@@ -438,6 +439,15 @@ pub fn get_consensus_signal(xics: &[(usize, Vec<(f64, f64)>)]) -> Option<(Vec<f6
         .iter()
         .map(|(_, xic)| xic.iter().map(|(_, v)| *v).collect())
         .collect();
+    // Mirror `detect_cwt_consensus_peaks`'s `has_signal` guard so the
+    // diagnostic agrees with production on which entries reach CWT
+    // detection at all. Without this, an all-zero-intensity input would
+    // emit a (zero) consensus and a sigma here, while production rejects
+    // it up front and never scores it.
+    let has_signal = intensities.iter().any(|row| row.iter().any(|&v| v > 0.0));
+    if !has_signal {
+        return None;
+    }
     let sigma = estimate_cwt_scale(xics);
     let kernel_radius = ((5.0 * sigma).ceil() as usize).min(n_scans / 2);
     let kernel = mexican_hat_kernel(sigma, kernel_radius);

@@ -415,10 +415,15 @@ pub fn dump_predict_rt_call(entry_id: u32, library_rt: f64, expected_rt: f64) {
 // --------------------------------------------------------------------------
 //
 // Captures one row per scoring call describing the CWT detection /
-// fallback / apex-acceptance pipeline outcome. Six tab-separated
+// fallback / apex-acceptance pipeline outcome. Ten tab-separated
 // columns: file_name, entry_id, n_cwt_peaks, n_final_peaks,
-// n_scored, scored. Use to localize where the rescore set diverges
-// between Rust and the C# port.
+// n_scored, scored, sigma, consensus_l1, consensus_max_abs,
+// consensus_argmax. The four consensus-signal stats (sigma + L1 +
+// max-abs + argmax of the median CWT consensus across fragment XICs)
+// give a single-number signature that distinguishes "convolve /
+// median diverged" from "downstream peak finder diverged" without
+// dumping the full per-scan consensus signal. Use to localize where
+// the rescore set diverges between Rust and the C# port.
 //
 //   OSPREY_DUMP_CWT_PATH=/tmp/rust_cwt.tsv  osprey ...   # Rust
 //   OSPREY_DUMP_CWT_PATH=1                  OspreySharp  # C# (writes cs_stage6_cwt_path.tsv)
