@@ -3381,13 +3381,19 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             // groups on Stellar 3-file).
             let pass2 = fdr_scores_path_pass2(&synthetic);
             let pass1 = fdr_scores_path_pass1(&synthetic);
-            let loaded = if config.expect_reconciled_input {
-                load_fdr_scores_sidecar(&pass1, &mut stubs, 1)
-                    || load_fdr_scores_sidecar(&pass2, &mut stubs, 2)
-            } else {
-                load_fdr_scores_sidecar(&pass2, &mut stubs, 2)
-                    || load_fdr_scores_sidecar(&pass1, &mut stubs, 1)
-            };
+            // Tuple-bind the (primary, fallback) ordering once. Both branches
+            // of `||` have side effects (each loader mutates `stubs`) so the
+            // boolean OR is only equivalent at the type level -- ordering
+            // matters at the value level. Bind once + load once so clippy's
+            // `if_same_then_else` doesn't see two near-identical arms.
+            let (first_path, first_pass, second_path, second_pass) =
+                if config.expect_reconciled_input {
+                    (&pass1, 1u8, &pass2, 2u8)
+                } else {
+                    (&pass2, 2u8, &pass1, 1u8)
+                };
+            let loaded = load_fdr_scores_sidecar(first_path, &mut stubs, first_pass)
+                || load_fdr_scores_sidecar(second_path, &mut stubs, second_pass);
             if !loaded {
                 all_scores_loaded = false;
             }
