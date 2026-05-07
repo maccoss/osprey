@@ -287,9 +287,33 @@ fn normalize_hpc_args(args: &mut Args) -> Result<()> {
             }
         }
         Some(2) => {
-            anyhow::bail!(
-                "--join-at-pass=2 (Stage 6 reconciled-parquet input) is not yet implemented."
-            );
+            // `--join-at-pass=2` enters the pipeline at the post-Stage-6
+            // boundary, consuming reconciled `.scores.parquet` files
+            // (`META_RECONCILED = "true"` in the footer). The pipeline's
+            // existing `--join-only` branch handles this transparently: it
+            // loads stubs, detects via `validate_scores_cache` that the
+            // parquets are `ValidReconciled`, and the `can_skip_fdr` path
+            // skips both the Percolator first-pass and the reconciliation
+            // block, jumping straight to second-pass q-value recomputation
+            // + protein parsimony / picked-protein FDR (Stage 7) +
+            // blib output (Stage 8). Setting `args.join_only` here routes
+            // through that branch.
+            //
+            // No phase-shape modifiers are valid: there is no per-file
+            // phase after the Stage 7 join (Stages 7-8 are the final
+            // join), so `--no-join` and `--join-only` have no semantic
+            // meaning here and must be rejected up front.
+            if args.no_join {
+                anyhow::bail!(
+                    "--join-at-pass=2 --no-join is not valid (no per-file phase follows the Stage 7 join)."
+                );
+            }
+            if args.join_only {
+                anyhow::bail!(
+                    "--join-at-pass=2 --join-only is not valid (Stage 7 is the final join, nothing to skip past)."
+                );
+            }
+            args.join_only = true;
         }
         Some(n) => {
             anyhow::bail!("--join-at-pass must be 1 or 2 (got {}).", n);
@@ -581,6 +605,7 @@ fn main() -> Result<()> {
     // not commonly set in YAML (HPC orchestration is the use case).
     config.no_join = args.no_join;
     config.stop_after_stage5 = args.join_only_modifier;
+    config.expect_reconciled_input = matches!(args.join_at_pass, Some(2));
     if let Some(ref s) = args.parquet_compression {
         config.parquet_compression = match s.to_lowercase().as_str() {
             "zstd" => ParquetCompression::Zstd,
@@ -914,7 +939,13 @@ mod tests {
     }
 
     #[test]
-    fn normalize_join_at_pass_2_errors_until_implemented() {
+    fn normalize_join_at_pass_2_routes_through_join_only_branch() {
+        // `--join-at-pass=2` (no modifier) enters the post-Stage-6 boundary.
+        // The pipeline's existing `--join-only` branch handles
+        // reconciled-parquet input transparently via `validate_scores_cache`
+        // returning `ValidReconciled`, so `normalize_hpc_args` just sets
+        // `args.join_only = true`. No `join_only_modifier` because there
+        // is no per-file phase after the Stage 7 join to skip.
         let mut args = parse(&[
             "--join-at-pass=2",
             "--input-scores",
@@ -924,7 +955,43 @@ mod tests {
             "-o",
             "out.blib",
         ]);
-        assert_err_contains(normalize_hpc_args(&mut args), "not yet implemented");
+        assert!(!args.join_only);
+        normalize_hpc_args(&mut args).unwrap();
+        assert!(args.join_only);
+        assert!(!args.join_only_modifier);
+    }
+
+    #[test]
+    fn normalize_join_at_pass_2_with_no_join_modifier_errors() {
+        let mut args = parse(&[
+            "--join-at-pass=2",
+            "--no-join",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(
+            normalize_hpc_args(&mut args),
+            "no per-file phase follows the Stage 7 join",
+        );
+    }
+
+    #[test]
+    fn normalize_join_at_pass_2_with_join_only_modifier_errors() {
+        let mut args = parse(&[
+            "--join-at-pass=2",
+            "--join-only",
+            "--input-scores",
+            "a.scores.parquet",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+        ]);
+        assert_err_contains(normalize_hpc_args(&mut args), "Stage 7 is the final join");
     }
 
     #[test]

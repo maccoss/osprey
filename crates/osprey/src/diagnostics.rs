@@ -1280,24 +1280,26 @@ pub fn dump_stage7_protein_fdr(parsimony: &ProteinParsimonyResult, fdr_result: &
         return;
     };
 
+    // `accessions` is the canonical protein-group identifier in the dump;
+    // `build_protein_parsimony` assigns numeric `group_id` in HashMap
+    // iteration order, which would inject per-run noise into a cross-impl
+    // bisection. Joining on accessions instead keeps the dump stable.
     writeln!(
         f,
-        "group_id\taccessions\tn_unique\tn_shared\tbest_peptide_score\tgroup_qvalue\tis_target_winner"
+        "accessions\tn_unique\tn_shared\tbest_peptide_score\tgroup_qvalue\tis_target_winner"
     )
     .ok();
 
-    struct Row<'a> {
-        group_id: u32,
+    struct Row {
         accessions: String,
         n_unique: usize,
         n_shared: usize,
         best_peptide_score: f64,
         group_qvalue: f64,
         is_target_winner: bool,
-        _accessions_ref: std::marker::PhantomData<&'a str>,
     }
 
-    let mut rows: Vec<Row<'_>> = parsimony
+    let mut rows: Vec<Row> = parsimony
         .groups
         .iter()
         .map(|g| {
@@ -1319,31 +1321,31 @@ pub fn dump_stage7_protein_fdr(parsimony: &ProteinParsimonyResult, fdr_result: &
             let accessions = accs.join(";");
 
             Row {
-                group_id: g.id,
                 accessions,
                 n_unique: g.unique_peptides.len(),
                 n_shared: g.shared_peptides.len(),
                 best_peptide_score,
                 group_qvalue,
                 is_target_winner,
-                _accessions_ref: std::marker::PhantomData,
             }
         })
         .collect();
 
     rows.sort_by(|a, b| {
-        // Target winners first (DESC on bool ≡ true before false).
+        // Target winners first (DESC on bool ≡ true before false). Final
+        // tiebreak is the sorted-accessions string, NOT group_id, because
+        // `build_protein_parsimony` assigns group IDs in HashMap iteration
+        // order (random per run); accession lists are stable across runs.
         b.is_target_winner
             .cmp(&a.is_target_winner)
             .then(a.group_qvalue.total_cmp(&b.group_qvalue))
-            .then(a.group_id.cmp(&b.group_id))
+            .then_with(|| a.accessions.cmp(&b.accessions))
     });
 
     for r in &rows {
         writeln!(
             f,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            r.group_id,
+            "{}\t{}\t{}\t{}\t{}\t{}",
             r.accessions,
             r.n_unique,
             r.n_shared,
