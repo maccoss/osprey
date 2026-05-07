@@ -1259,12 +1259,16 @@ pub fn dump_stage6_protein_fdr(
 /// gate -- are emitted with `group_qvalue = 1.0`, `best_peptide_score = NaN`,
 /// `is_target_winner = false`.
 ///
-/// Sort order: `(is_target_winner DESC, group_qvalue ASC, group_id ASC)`.
+/// Sort order: `(is_target_winner DESC, group_qvalue ASC, accessions ASC)`.
 /// Targets-first keeps the calibration-relevant rows (target winners) at
-/// the top of the file; secondary keys make the diff stable.
+/// the top of the file; secondary keys make the diff stable. The numeric
+/// `group_id` is intentionally NOT a sort key (or a column) -- see below.
 ///
-/// Columns: `group_id`, `accessions`, `n_unique`, `n_shared`,
-/// `best_peptide_score`, `group_qvalue`, `is_target_winner`.
+/// Columns: `accessions`, `n_unique`, `n_shared`, `best_peptide_score`,
+/// `group_qvalue`, `is_target_winner`. The numeric `group_id` is omitted
+/// because `build_protein_parsimony` assigns it in HashMap iteration order,
+/// which would inject per-run noise into a cross-impl bisection. Joining on
+/// `accessions` keeps the dump stable.
 ///
 /// Gated by `OSPREY_DUMP_STAGE7_PROTEIN_FDR=1`. When
 /// `OSPREY_STAGE7_PROTEIN_FDR_ONLY=1` is also set, exits the process after

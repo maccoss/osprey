@@ -350,19 +350,24 @@ fn validate_hpc_args(args: &Args) -> Result<()> {
         );
     }
     if args.join_only {
-        // Reachable only via `--join-at-pass=1` after `normalize_hpc_args`
-        // (standalone `--join-only` errors there). Error text references the
-        // canonical flag the user typed.
+        // Reachable via `--join-at-pass=1` (with or without `--join-only`
+        // modifier) OR `--join-at-pass=2`, both of which set
+        // `args.join_only = true` in `normalize_hpc_args`. Standalone
+        // `--join-only` errors there. Error text reflects the actual pass
+        // the user typed so a misconfigured `--join-at-pass=2` doesn't
+        // surface diagnostics that quote `--join-at-pass=1`.
+        let pass = args.join_at_pass.unwrap_or(1);
         if args.input.is_some() {
             anyhow::bail!(
-                "--join-at-pass=1 cannot be combined with --input. Use --input-scores instead."
+                "--join-at-pass={} cannot be combined with --input. Use --input-scores instead.",
+                pass
             );
         }
         if args.input_scores.is_none() {
-            anyhow::bail!("--join-at-pass=1 requires --input-scores <path...>.");
+            anyhow::bail!("--join-at-pass={} requires --input-scores <path...>.", pass);
         }
         if args.library.is_none() || args.output.is_none() {
-            anyhow::bail!("--join-at-pass=1 requires --library and --output.");
+            anyhow::bail!("--join-at-pass={} requires --library and --output.", pass);
         }
         // The `--join-at-pass=1 --join-only` precondition that requires
         // 2+ resolved input parquets and `reconciliation.enabled = true`

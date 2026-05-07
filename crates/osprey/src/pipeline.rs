@@ -3315,10 +3315,20 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 match validate_scores_cache(path, &config) {
                     CacheValidity::ValidReconciled => {}
                     CacheValidity::ValidFirstPass => {
+                        // `validate_scores_cache` returns ValidFirstPass in two
+                        // distinct cases: (a) a Stage-4 raw parquet whose
+                        // `osprey.reconciled` metadata is unset/false, and
+                        // (b) a reconciled parquet whose stored
+                        // `osprey.reconciliation_hash` no longer matches the
+                        // current reconciliation config. Surface both.
                         return Err(OspreyError::ConfigError(format!(
-                            "--join-at-pass=2 requires reconciled (post-Stage-6) input, but {} \
-                             is a Stage 4 (raw) parquet. Use --join-at-pass=1 for raw inputs, \
-                             or run a full pipeline first to produce reconciled parquets.",
+                            "--join-at-pass=2 requires a reconciled (post-Stage-6) parquet \
+                             whose reconciliation hash matches the current config, but {} \
+                             does not. Either it is a Stage 4 (raw) parquet -- in which case \
+                             use --join-at-pass=1, or run a full pipeline first to produce \
+                             reconciled parquets -- or it was reconciled under different \
+                             reconciliation parameters (re-run reconciliation with the \
+                             current config to refresh).",
                             path.display()
                         )));
                     }
