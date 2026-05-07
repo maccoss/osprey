@@ -3050,6 +3050,16 @@ pub(crate) fn rescore_per_file_loop(
         // Write reconciled entries (overlay) back to Parquet, then drop overlay.
         // This avoids accumulating ~28 GB of overlay data across 240 files.
         // The blib output step will reload from this reconciled Parquet.
+        //
+        // When the overlay is empty (zero rescore actions) we still rewrite
+        // the parquet so its footer carries `META_RECONCILED = "true"`. The
+        // data is unchanged but the marker is required for `--join-at-pass=2`
+        // to validate the file as post-Stage-6 reconciled. Without this, a
+        // subsequent operator running `--join-at-pass=2` against these
+        // parquets would either be rejected by the strict gate or silently
+        // re-run Stage 5-6 via `can_skip_fdr=false` -- both defeat the
+        // cached fast-cycle the entry point exists for.
+        let need_metadata_only_rewrite = overlay.is_empty();
         if !overlay.is_empty() {
             // Merge overlay into a complete entry list for this file:
             // load original parquet, replace re-scored entries, append gap-fill entries.
@@ -3107,6 +3117,29 @@ pub(crate) fn rescore_per_file_loop(
                 }
             }
             // Overlay is consumed — no memory accumulation
+        } else if need_metadata_only_rewrite {
+            // No overlay this file — but tag the parquet as reconciled so
+            // `--join-at-pass=2` recognizes it as post-Stage-6 input. Reload
+            // and rewrite with the same data plus reconciliation metadata.
+            let scores_path = per_file_cache_paths.get(file_name.as_str());
+            if let Some(cache_path) = scores_path {
+                if let Ok(full_entries) = load_scores_parquet(cache_path) {
+                    let recon_metadata = build_reconciled_metadata(config);
+                    let codec = parquet_compression_codec(config.parquet_compression);
+                    if let Err(e) = write_scores_parquet_with_metadata(
+                        cache_path,
+                        &full_entries,
+                        Some(recon_metadata),
+                        codec,
+                    ) {
+                        log::warn!(
+                            "Failed to mark scores parquet reconciled for {}: {}",
+                            file_name,
+                            e
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3256,6 +3289,10 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     let mut seq_interner: HashSet<Arc<str>> = HashSet::new();
     // Track whether all files loaded SVM scores from sidecars (enables skipping Percolator)
     let mut all_scores_loaded = true;
+    // For `--join-at-pass=2`: track the 2nd-pass FDR sidecar path per file so
+    // we can reload 2nd-pass scores after first-pass FDR + compaction (which
+    // ran against 1st-pass scores) but before the second-pass q-value recompute.
+    let mut pass2_sidecar_paths: HashMap<String, std::path::PathBuf> = HashMap::new();
 
     if join_only {
         // --join-only: load per-file FdrEntry stubs directly from each
@@ -3267,6 +3304,49 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // Aborts with a clear, file-named error if the operator points
         // the merge node at parquets from a different scoring run.
         validate_scores_parquet_group(parquets, &config)?;
+        // Guard: --join-at-pass=2 asserts every input is post-Stage-6
+        // reconciled. Without this, raw Stage 4 parquets would silently
+        // route through the same `can_skip_fdr=false` path as
+        // `--join-at-pass=1` and run the full Stages 5-6 pipeline,
+        // defeating the operator's intent and undermining the cached
+        // fast-cycle the entry point was wired for.
+        if config.expect_reconciled_input {
+            for path in parquets {
+                match validate_scores_cache(path, &config) {
+                    CacheValidity::ValidReconciled => {}
+                    CacheValidity::ValidFirstPass => {
+                        // `validate_scores_cache` returns ValidFirstPass in two
+                        // distinct cases: (a) a Stage-4 raw parquet whose
+                        // `osprey.reconciled` metadata is unset/false, and
+                        // (b) a reconciled parquet whose stored
+                        // `osprey.reconciliation_hash` no longer matches the
+                        // current reconciliation config. Surface both.
+                        return Err(OspreyError::ConfigError(format!(
+                            "--join-at-pass=2 requires a reconciled (post-Stage-6) parquet \
+                             whose reconciliation hash matches the current config, but {} \
+                             does not. Either it is a Stage 4 (raw) parquet -- in which case \
+                             use --join-at-pass=1, or run a full pipeline first to produce \
+                             reconciled parquets -- or it was reconciled under different \
+                             reconciliation parameters (re-run reconciliation with the \
+                             current config to refresh).",
+                            path.display()
+                        )));
+                    }
+                    CacheValidity::Stale(reason) => {
+                        return Err(OspreyError::ConfigError(format!(
+                            "--join-at-pass=2: cache for {} is stale ({}). Re-run the upstream \
+                             pipeline to refresh the reconciled scores parquet.",
+                            path.display(),
+                            reason
+                        )));
+                    }
+                }
+            }
+            log::info!(
+                "--join-at-pass=2: all {} input parquet(s) verified as reconciled",
+                parquets.len()
+            );
+        }
         log::info!(
             "--join-only: loading {} per-file score parquet(s)",
             parquets.len()
@@ -3297,14 +3377,39 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 }
             };
 
-            // FDR sidecars (best-effort)
+            // FDR sidecars (best-effort).
+            //
+            // Default order: prefer 2nd-pass scores (reflect reconciliation) and
+            // fall back to 1st-pass. For `--join-at-pass=2` we *invert* the
+            // preference -- the first-pass protein FDR + protein-rescue
+            // compaction below need q-values derived from 1st-pass scores to
+            // match a straight-through pipeline. The 2nd-pass scores are
+            // reloaded after compaction so the second-pass q-value recompute
+            // uses them. Without this swap, run_peptide_qvalue would be
+            // computed from 2nd-pass scores during compaction and the
+            // post-compaction pool size diverges (~6500 vs ~6200 protein
+            // groups on Stellar 3-file).
             let pass2 = fdr_scores_path_pass2(&synthetic);
             let pass1 = fdr_scores_path_pass1(&synthetic);
-            if !load_fdr_scores_sidecar(&pass2, &mut stubs, 2)
-                && !load_fdr_scores_sidecar(&pass1, &mut stubs, 1)
-            {
+            // Tuple-bind the (primary, fallback) ordering once. Both branches
+            // of `||` have side effects (each loader mutates `stubs`) so the
+            // boolean OR is only equivalent at the type level -- ordering
+            // matters at the value level. Bind once + load once so clippy's
+            // `if_same_then_else` doesn't see two near-identical arms.
+            let (first_path, first_pass, second_path, second_pass) =
+                if config.expect_reconciled_input {
+                    (&pass1, 1u8, &pass2, 2u8)
+                } else {
+                    (&pass2, 2u8, &pass1, 1u8)
+                };
+            let loaded = load_fdr_scores_sidecar(first_path, &mut stubs, first_pass)
+                || load_fdr_scores_sidecar(second_path, &mut stubs, second_pass);
+            if !loaded {
                 all_scores_loaded = false;
             }
+            // Remember the 2nd-pass sidecar path so we can reload it after
+            // compaction in the `expect_reconciled_input` path.
+            pass2_sidecar_paths.insert(file_name.clone(), pass2.clone());
 
             // Calibration JSON (best-effort, used by inter-replicate reconciliation)
             if let Some(input_dir) = synthetic.parent() {
@@ -3715,13 +3820,28 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         && config.fdr_method != FdrMethod::Simple;
 
     if can_skip_fdr {
-        // SVM scores loaded from sidecars -- recompute q-values using two-pass FDR
-        log::info!("");
-        log::info!(
-            "SVM scores loaded from cache. Recomputing q-values (skipping Percolator training)..."
-        );
-        // First-pass: compute q-values on all entries
-        percolator::compute_fdr_from_stubs(&mut per_file_entries, config.run_fdr, None);
+        if config.expect_reconciled_input {
+            // `--join-at-pass=2`: q-values come straight from the v3 sidecar
+            // record (entry_id + score + 4 q-values + pep + run_protein_qvalue).
+            // Calling compute_fdr_from_stubs would re-derive them from the
+            // currently-loaded scores, which DRIFTS from the original Stage 5
+            // run when the sidecar swap below kicks in (1st-pass scores during
+            // first-pass protein FDR + compaction, 2nd-pass scores afterward).
+            // Bit-parity vs the straight-through pipeline requires using the
+            // sidecar values directly.
+            log::info!("");
+            log::info!(
+                "--join-at-pass=2: q-values loaded from FDR sidecars (skipping recomputation)"
+            );
+        } else {
+            // SVM scores loaded from sidecars -- recompute q-values using two-pass FDR
+            log::info!("");
+            log::info!(
+                "SVM scores loaded from cache. Recomputing q-values (skipping Percolator training)..."
+            );
+            // First-pass: compute q-values on all entries
+            percolator::compute_fdr_from_stubs(&mut per_file_entries, config.run_fdr, None);
+        }
     } else {
         // Dispatch FDR control based on method
         log::info!("");
@@ -3787,7 +3907,13 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // Produces run_protein_qvalue on every FdrEntry stub. Used downstream for:
     //   (a) protein-aware compaction (rescue borderline peptides from strong proteins)
     //   (b) reconciliation consensus selection (strong proteins anchor consensus)
-    if !can_skip_fdr {
+    //
+    // For `--join-at-pass=2` we also run this even when `can_skip_fdr` is true:
+    // skipping it would leave `run_protein_qvalue` at its default 1.0, which
+    // makes the protein-rescue branch of compaction below silently inactive
+    // and lets the second-pass protein FDR see a different (pre-compaction)
+    // pool than the straight-through pipeline does.
+    if !can_skip_fdr || config.expect_reconciled_input {
         use osprey_fdr::protein;
         log::info!("");
         log::info!("First-pass protein FDR");
@@ -3896,7 +4022,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // Compact FDR stubs: drop entries for precursors that didn't pass compaction.
     // Keeps passing targets + their paired decoys (by base_id).
     // The parquet_index field preserves the original row index for CWT/feature lookup.
-    if !can_skip_fdr {
+    // For `--join-at-pass=2` compaction is essential: the second-pass protein
+    // FDR runs on this filtered pool, and skipping the filter would put
+    // non-passing decoy peptides into the picked-protein null distribution
+    // (those decoys lost their target-decoy peptide-level competition, so
+    // including them re-introduces survivorship-bias-style asymmetry).
+    if !can_skip_fdr || config.expect_reconciled_input {
         let entries_before: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
         for (_, entries) in per_file_entries.iter_mut() {
             entries.retain(|e| {
@@ -3916,22 +4047,57 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         );
     }
 
+    // For `--join-at-pass=2`: now that compaction has finished using
+    // 1st-pass-derived q-values, swap entry.score over to 2nd-pass scores so
+    // the second-pass q-value recompute below sees the right rank ordering.
+    // No-op if no 2nd-pass sidecar exists for a given file (best-effort).
+    if config.expect_reconciled_input {
+        let mut reloaded = 0usize;
+        for (file_name, entries) in per_file_entries.iter_mut() {
+            if let Some(p2) = pass2_sidecar_paths.get(file_name) {
+                if load_fdr_scores_sidecar(p2, entries, 2) {
+                    reloaded += 1;
+                }
+            }
+        }
+        log::debug!(
+            "--join-at-pass=2: reloaded 2nd-pass scores for {}/{} files post-compaction",
+            reloaded,
+            per_file_entries.len()
+        );
+    }
+
     // Post-FDR re-scoring: multi-charge consensus + inter-replicate reconciliation.
     // Skipped entirely when all files are already reconciled with scores loaded.
     let per_file_overlays: RescoreOverlay = HashMap::new();
     if can_skip_fdr {
         log::info!("");
         log::info!("Skipping reconciliation (cached)");
-        // Second-pass FDR: restrict to first-pass passing precursors (same as real pipeline)
-        log::debug!(
-            "Recomputing second-pass q-values on {} first-pass precursors + paired decoys...",
-            first_pass_base_ids.len(),
-        );
-        percolator::compute_fdr_from_stubs(
-            &mut per_file_entries,
-            config.run_fdr,
-            Some(&first_pass_base_ids),
-        );
+        if config.expect_reconciled_input {
+            // The 2nd-pass sidecar reload above already populated the
+            // post-second-pass q-values directly. compute_fdr_from_stubs would
+            // re-derive them from the loaded 2nd-pass scores, which on a
+            // 0-action-reconciliation dataset (where the straight-through
+            // pipeline skipped second-pass FDR via `total_rescored == 0`)
+            // produces values that differ from the persisted sidecar by the
+            // small drift between the percolator output and the lightweight
+            // recompute. Trust the sidecar.
+            log::debug!(
+                "--join-at-pass=2: second-pass q-values already loaded from sidecar (skipping recomputation for {} first-pass precursors + paired decoys)",
+                first_pass_base_ids.len(),
+            );
+        } else {
+            // Second-pass FDR: restrict to first-pass passing precursors (same as real pipeline)
+            log::debug!(
+                "Recomputing second-pass q-values on {} first-pass precursors + paired decoys...",
+                first_pass_base_ids.len(),
+            );
+            percolator::compute_fdr_from_stubs(
+                &mut per_file_entries,
+                config.run_fdr,
+                Some(&first_pass_base_ids),
+            );
+        }
     } else {
         use crate::reconciliation::{
             compute_consensus_rts, identify_gap_fill_targets, plan_reconciliation,
@@ -4399,6 +4565,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             protein_fdr_threshold * 100.0,
             parsimony.groups.len()
         );
+
+        // Stage 7 cross-impl bisection dump (no-op unless
+        // OSPREY_DUMP_STAGE7_PROTEIN_FDR=1). Fires before propagation so the
+        // dumped state captures the picked-protein computation in isolation.
+        crate::diagnostics::dump_stage7_protein_fdr(&parsimony, &protein_fdr_result);
 
         // Propagate protein q-values into FdrEntry stubs — experiment side only.
         // The run side was already set by first-pass protein FDR and is used

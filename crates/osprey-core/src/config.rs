@@ -111,6 +111,14 @@ pub struct OspreyConfig {
     /// Set by the `--join-at-pass=1 --join-only` flag combination.
     #[serde(default)]
     pub stop_after_stage5: bool,
+    /// When true, the pipeline asserts every `--input-scores` parquet has
+    /// `osprey.reconciled = "true"` in its footer metadata, bailing out early
+    /// otherwise. Set by `--join-at-pass=2` to enforce that the operator pointed
+    /// the Stage 7 entry at post-Stage-6 reconciled parquets, not at raw
+    /// Stage 4 outputs (which would silently re-run Stages 5-6 via the
+    /// `--join-at-pass=1` codepath and defeat the cached fast-cycle intent).
+    #[serde(default)]
+    pub expect_reconciled_input: bool,
     /// Compression codec for `.scores.parquet` writes. Default `Zstd` keeps
     /// production behavior identical to the historical Osprey default.
     /// `Snappy` is offered as a cross-impl interop affordance: OspreySharp
@@ -162,6 +170,7 @@ impl Default for OspreyConfig {
             no_join: false,
             input_scores: None,
             stop_after_stage5: false,
+            expect_reconciled_input: false,
             parquet_compression: ParquetCompression::default(),
         }
     }
