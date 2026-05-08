@@ -40,7 +40,18 @@ parquet = "58"
 mzdata = "0.63"
 rusqlite = { version = "0.39", features = ["bundled"] }
 csv = "1.3"
-flate2 = "1.0"
+# Use flate2's `zlib-default` feature (vendored stock zlib via libz-sys)
+# rather than the default `miniz_oxide` Rust backend. zlib-default
+# produces deflate output bit-compatible with Skyline's existing
+# BlibData writer (DotNetZip / Ionic.Zlib level 6 — see
+# pwiz/pwiz_tools/Skyline/Util/Extensions/UtilDB.cs:109-200) AND with
+# pwiz_tools/BiblioSpec C++ (which uses stock zlib). Without this,
+# miniz_oxide leaves a small handful of byte-level blob mismatches
+# (~20 on Stellar 3-file) on .blib RefSpectraPeaks vs the C# /
+# Skyline standard. ProteoWizard owns the BLIB format spec so the
+# convergence point is C# / Skyline / Ionic.Zlib level 6, not the
+# Rust default backend.
+flate2 = { version = "1.0", default-features = false, features = ["zlib-default"] }
 base64 = "0.22"
 
 # Serialization
