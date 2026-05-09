@@ -27,7 +27,12 @@ use std::path::Path;
 use super::MS1Index;
 
 const MAGIC: &[u8; 8] = b"OSPRSPC\0";
-const VERSION: u32 = 1;
+// VERSION 2 (2026-05-09): mzML load now sorts non-monotonic centroids before
+// caching, so caches written by VERSION 1 may contain unsorted peaks that
+// produce undefined-behavior divergence in fragment matching. Old caches are
+// invalidated on this version bump so the fresh load path (which sorts)
+// re-populates them.
+const VERSION: u32 = 2;
 
 /// Save spectra to a binary cache file for fast reload.
 pub fn save_spectra_cache(path: &Path, spectra: &[Spectrum], ms1_index: &MS1Index) -> Result<()> {
