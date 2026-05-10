@@ -1389,7 +1389,23 @@ pub(crate) fn load_fdr_scores_sidecar(
     }
     // bytes 10..16 reserved
     let header_count = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
-    let expected_len = FDR_SIDECAR_HEADER_LEN + header_count * FDR_SIDECAR_RECORD_LEN;
+    // Use checked arithmetic — a malicious or corrupt sidecar with a
+    // huge `header_count` would otherwise wrap `expected_len` in release
+    // mode and let the size check pass spuriously.
+    let expected_len = match header_count
+        .checked_mul(FDR_SIDECAR_RECORD_LEN)
+        .and_then(|n| n.checked_add(FDR_SIDECAR_HEADER_LEN))
+    {
+        Some(n) => n,
+        None => {
+            log::warn!(
+                "Score sidecar {} header_count {} overflows usize when multiplied by record length, ignoring",
+                path.display(),
+                header_count
+            );
+            return false;
+        }
+    };
     if data.len() != expected_len {
         log::warn!(
             "Score sidecar {} size mismatch ({} vs expected {} for header_count {}), ignoring",
@@ -10082,5 +10098,27 @@ mod tests {
 
         let mut unrelated = vec![make_fdr_entry(42, 0.0, 0.0, 0.0)];
         assert!(!load_fdr_scores_sidecar(&path, &mut unrelated, 1));
+    }
+
+    #[test]
+    fn fdr_scores_sidecar_oversized_header_rejected() {
+        // A corrupt or malicious sidecar with a huge `header_count`
+        // would otherwise wrap usize when computing
+        // `HEADER + header_count * RECORD_LEN` and let the size check
+        // pass spuriously. The checked-arithmetic guard rejects the
+        // load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.1st-pass.fdr_scores.bin");
+
+        // Build a minimal header-only file with header_count = u64::MAX.
+        let mut header = [0u8; FDR_SIDECAR_HEADER_LEN];
+        header[0..8].copy_from_slice(FDR_SIDECAR_MAGIC);
+        header[8] = FDR_SIDECAR_VERSION;
+        header[9] = 1; // 1st-pass
+        header[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        let mut entries = vec![make_fdr_entry(0, 0.0, 0.0, 0.0)];
+        assert!(!load_fdr_scores_sidecar(&path, &mut entries, 1));
     }
 }
