@@ -1389,38 +1389,78 @@ pub(crate) fn load_fdr_scores_sidecar(
     }
     // bytes 10..16 reserved
     let header_count = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
-    if header_count != entries.len() {
-        log::warn!(
-            "Score sidecar {} entry count mismatch (header {} vs stubs {}), ignoring",
-            path.display(),
-            header_count,
-            entries.len()
-        );
-        return false;
-    }
-    let expected_len = FDR_SIDECAR_HEADER_LEN + entries.len() * FDR_SIDECAR_RECORD_LEN;
-    if data.len() != expected_len {
-        log::warn!(
-            "Score sidecar {} size mismatch ({} vs expected {}), ignoring",
-            path.display(),
-            data.len(),
-            expected_len
-        );
-        return false;
-    }
-    for (i, entry) in entries.iter_mut().enumerate() {
-        let off = FDR_SIDECAR_HEADER_LEN + i * FDR_SIDECAR_RECORD_LEN;
-        let record_entry_id = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
-        if record_entry_id != entry.entry_id {
+    // Use checked arithmetic — a malicious or corrupt sidecar with a
+    // huge `header_count` would otherwise wrap `expected_len` in release
+    // mode and let the size check pass spuriously.
+    let expected_len = match header_count
+        .checked_mul(FDR_SIDECAR_RECORD_LEN)
+        .and_then(|n| n.checked_add(FDR_SIDECAR_HEADER_LEN))
+    {
+        Some(n) => n,
+        None => {
             log::warn!(
-                "Score sidecar {} record {} entry_id mismatch (file={}, stub={}), ignoring",
+                "Score sidecar {} header_count {} overflows usize when multiplied by record length, ignoring",
                 path.display(),
-                i,
-                record_entry_id,
-                entry.entry_id
+                header_count
             );
             return false;
         }
+    };
+    if data.len() != expected_len {
+        log::warn!(
+            "Score sidecar {} size mismatch ({} vs expected {} for header_count {}), ignoring",
+            path.display(),
+            data.len(),
+            expected_len,
+            header_count
+        );
+        return false;
+    }
+
+    // Records are matched to entries by `entry_id`, not by position.
+    // The 1st-pass sidecar is written PRE-gap-fill at the Stage 5
+    // boundary, so its record count is smaller than the reconciled
+    // parquet's row count after Stage 6 appends gap-fill stubs.
+    // The 2nd-pass sidecar is written POST-compaction + post-rescore,
+    // so its record count is also smaller than the full reconciled
+    // parquet load. Position-based matching with strict count
+    // equality fails in either case, silently degrading multi-file
+    // `--join-at-pass=2` to a re-train of Percolator from scratch
+    // on the wrong input set (the post-rescore parquet rather than
+    // the post-compaction subset the original 2nd-pass scored).
+    // Caller is expected to pass a SUPERSET of the sidecar's
+    // entries (the reconciled parquet for `--join-at-pass=2`);
+    // entries not present in the sidecar keep their default
+    // (Score=0, q=1) values.
+    //
+    // Single-file degenerates to a 1:1 lookup with no perf cost
+    // vs the previous positional walk.
+    let mut by_entry_id: HashMap<u32, usize> = HashMap::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        by_entry_id.insert(entry.entry_id, i);
+    }
+
+    for rec in 0..header_count {
+        let off = FDR_SIDECAR_HEADER_LEN + rec * FDR_SIDECAR_RECORD_LEN;
+        let record_entry_id = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        let Some(&entry_idx) = by_entry_id.get(&record_entry_id) else {
+            // Sidecar carries an entry_id the caller's stub list does
+            // not contain. The caller is expected to pass a superset
+            // (post-rescore reconciled parquet for the 1st-pass
+            // sidecar, etc.) — a record that fails to find its
+            // entry_id signals the sidecar was written from a
+            // different parquet (or a different binary version with
+            // different entry_id assignment). That is corruption,
+            // not the gap-fill / post-compaction case we tolerate.
+            log::warn!(
+                "Score sidecar {} record {} entry_id {} not found in caller's stubs, ignoring",
+                path.display(),
+                rec,
+                record_entry_id
+            );
+            return false;
+        };
+        let entry = &mut entries[entry_idx];
         entry.score = f64::from_le_bytes(data[off + 4..off + 12].try_into().unwrap());
         entry.run_precursor_qvalue =
             f64::from_le_bytes(data[off + 12..off + 20].try_into().unwrap());
@@ -10020,17 +10060,65 @@ mod tests {
     }
 
     #[test]
-    fn fdr_scores_sidecar_count_mismatch_rejected() {
+    fn fdr_scores_sidecar_superset_entries_accepted() {
+        // Caller may pass a SUPERSET of the sidecar's entries — a real
+        // case for `--join-at-pass=2` where the post-rescore parquet
+        // load has gap-fill rows the 1st-pass sidecar (written
+        // pre-gap-fill) does not. Sidecar records overlay matching
+        // entry_ids; entries with no matching record keep their default
+        // (Score=0, q=1) values.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("count_mismatch.1st-pass.fdr_scores.bin");
+        let path = dir.path().join("superset.1st-pass.fdr_scores.bin");
         let entries = vec![make_fdr_entry(0, -3.5, 0.001, 0.02)];
         write_fdr_scores_sidecar(&path, &entries, 1).unwrap();
 
-        // Try to load with a different stub count — should refuse.
-        let mut wrong_count = vec![
+        // entry_id=99 stands in for a gap-fill stub (no sidecar record).
+        let mut entries = vec![
             make_fdr_entry(0, 0.0, 0.0, 0.0),
-            make_fdr_entry(1, 0.0, 0.0, 0.0),
+            make_fdr_entry(99, 0.0, 0.0, 0.0),
         ];
-        assert!(!load_fdr_scores_sidecar(&path, &mut wrong_count, 1));
+        assert!(load_fdr_scores_sidecar(&path, &mut entries, 1));
+        assert_eq!(entries[0].score, -3.5);
+        assert_eq!(entries[0].run_precursor_qvalue, 0.001);
+        // Gap-fill stub at index 1: untouched.
+        assert_eq!(entries[1].score, 0.0);
+    }
+
+    #[test]
+    fn fdr_scores_sidecar_stale_record_rejected() {
+        // If a sidecar record's entry_id has no match in the caller's
+        // stub list, reject the sidecar — the entries were either
+        // written from a different parquet or by a different binary
+        // version. That is corruption, not the gap-fill / post-
+        // compaction case we tolerate.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.1st-pass.fdr_scores.bin");
+        let entries = vec![make_fdr_entry(0, -3.5, 0.001, 0.02)];
+        write_fdr_scores_sidecar(&path, &entries, 1).unwrap();
+
+        let mut unrelated = vec![make_fdr_entry(42, 0.0, 0.0, 0.0)];
+        assert!(!load_fdr_scores_sidecar(&path, &mut unrelated, 1));
+    }
+
+    #[test]
+    fn fdr_scores_sidecar_oversized_header_rejected() {
+        // A corrupt or malicious sidecar with a huge `header_count`
+        // would otherwise wrap usize when computing
+        // `HEADER + header_count * RECORD_LEN` and let the size check
+        // pass spuriously. The checked-arithmetic guard rejects the
+        // load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.1st-pass.fdr_scores.bin");
+
+        // Build a minimal header-only file with header_count = u64::MAX.
+        let mut header = [0u8; FDR_SIDECAR_HEADER_LEN];
+        header[0..8].copy_from_slice(FDR_SIDECAR_MAGIC);
+        header[8] = FDR_SIDECAR_VERSION;
+        header[9] = 1; // 1st-pass
+        header[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        let mut entries = vec![make_fdr_entry(0, 0.0, 0.0, 0.0)];
+        assert!(!load_fdr_scores_sidecar(&path, &mut entries, 1));
     }
 }
