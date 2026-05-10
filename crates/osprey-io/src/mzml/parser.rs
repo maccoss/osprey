@@ -18,6 +18,44 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
+/// Some mzML producers emit peaks that are not strictly ascending in m/z
+/// (observed in a HeLa Astral 3 mz DIA file: ~1 row in 1.7M had a single
+/// inverted pair of consecutive centroids). Downstream fragment matching
+/// binary-searches the spectrum; the Rust `partition_point` and the C# port's
+/// `BinarySearchLowerBound` use procedurally different step patterns, so an
+/// unsorted region produces UB-style divergence between the two impls. This
+/// helper sorts when an inversion is detected so downstream consumers see a
+/// well-defined ordering. The leading O(n) sortedness check is the
+/// common-case fast path; the actual sort only runs on inversions.
+fn ensure_sorted(mzs: Vec<f64>, intensities: Vec<f32>, scan_number: u32) -> (Vec<f64>, Vec<f32>) {
+    if mzs.len() < 2 || mzs.windows(2).all(|w| w[0] <= w[1]) {
+        return (mzs, intensities);
+    }
+    // Defensive guard: a malformed mzML where the m/z and intensity arrays
+    // are not the same length would panic on `intensities[i]` during the
+    // permutation step. Skip sorting in that case and let downstream length
+    // checks decide what to do with the spectrum.
+    if mzs.len() != intensities.len() {
+        log::warn!(
+            "[unsorted-spectrum] scan_number={} mz/intensity length mismatch ({} vs {}); skipping sort",
+            scan_number,
+            mzs.len(),
+            intensities.len()
+        );
+        return (mzs, intensities);
+    }
+    log::info!(
+        "[unsorted-spectrum] scan_number={} n_peaks={}",
+        scan_number,
+        mzs.len()
+    );
+    let mut idx: Vec<usize> = (0..mzs.len()).collect();
+    idx.sort_by(|&a, &b| mzs[a].total_cmp(&mzs[b]));
+    let sorted_mzs: Vec<f64> = idx.iter().map(|&i| mzs[i]).collect();
+    let sorted_int: Vec<f32> = idx.iter().map(|&i| intensities[i]).collect();
+    (sorted_mzs, sorted_int)
+}
+
 /// Reader for mzML files
 pub struct MzmlReader {
     path: PathBuf,
@@ -124,6 +162,8 @@ impl MzmlReader {
                 (mzs, intensities)
             }
         };
+
+        let (mzs, intensities) = ensure_sorted(mzs, intensities, scan_number);
 
         Ok(Some(Spectrum {
             scan_number,
@@ -325,6 +365,8 @@ pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1In
                     }
                 };
 
+                let (mzs, intensities) = ensure_sorted(mzs, intensities, scan_number);
+
                 ms1_spectra.push(MS1Spectrum {
                     scan_number,
                     retention_time,
@@ -387,6 +429,11 @@ pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1In
                         (mzs, intensities)
                     }
                 };
+
+                // See `convert_spectrum` for the rationale; some mzML
+                // producers emit peaks not strictly ascending in m/z, and
+                // downstream binary-search consumers need a sorted spectrum.
+                let (mzs, intensities) = ensure_sorted(mzs, intensities, scan_number);
 
                 ms2_spectra.push(Spectrum {
                     scan_number,
@@ -472,6 +519,8 @@ pub fn load_ms1_spectra<P: AsRef<Path>>(path: P) -> Result<MS1Index> {
             }
         };
 
+        let (mzs, intensities) = ensure_sorted(mzs, intensities, scan_number);
+
         ms1_spectra.push(MS1Spectrum {
             scan_number,
             retention_time,
@@ -499,5 +548,53 @@ mod tests {
         let window = IsolationWindow::symmetric(500.0, 12.5);
         assert!((window.center - 500.0).abs() < 1e-6);
         assert!((window.width() - 25.0).abs() < 1e-6);
+    }
+
+    /// Already-sorted input: ensure_sorted returns the inputs unchanged
+    /// (fast path; no permutation, no extra allocations).
+    #[test]
+    fn ensure_sorted_already_sorted_fast_path() {
+        let mzs = vec![100.0, 200.0, 300.0];
+        let intensities = vec![1.0_f32, 2.0, 3.0];
+        let (sorted_mzs, sorted_int) = ensure_sorted(mzs.clone(), intensities.clone(), 1);
+        assert_eq!(sorted_mzs, mzs);
+        assert_eq!(sorted_int, intensities);
+    }
+
+    /// Single inversion: both arrays reorder consistently so each
+    /// intensity stays paired with its original m/z value.
+    #[test]
+    fn ensure_sorted_inversion_reorders_both_arrays() {
+        let mzs = vec![100.0, 300.0, 200.0];
+        let intensities = vec![1.0_f32, 3.0, 2.0];
+        let (sorted_mzs, sorted_int) = ensure_sorted(mzs, intensities, 1);
+        assert_eq!(sorted_mzs, vec![100.0, 200.0, 300.0]);
+        assert_eq!(sorted_int, vec![1.0_f32, 2.0, 3.0]);
+    }
+
+    /// Stable sort: equal m/z values keep their original relative order
+    /// (matches `slice::sort_by` and the C# port's stable LINQ OrderBy).
+    /// The deliberate inversion at the end (200.0 before 100.0) forces
+    /// the sort path; the duplicate-m/z pair at the front must retain
+    /// input order in the result.
+    #[test]
+    fn ensure_sorted_equal_mz_preserves_order() {
+        let mzs = vec![100.0, 100.0, 200.0, 100.0];
+        let intensities = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let (sorted_mzs, sorted_int) = ensure_sorted(mzs, intensities, 1);
+        assert_eq!(sorted_mzs, vec![100.0, 100.0, 100.0, 200.0]);
+        assert_eq!(sorted_int, vec![1.0_f32, 2.0, 4.0, 3.0]);
+    }
+
+    /// Length mismatch (malformed mzML): skip sorting and return the
+    /// inputs untouched so downstream length checks can act on the
+    /// malformed spectrum without panicking on out-of-bounds indexing.
+    #[test]
+    fn ensure_sorted_length_mismatch_skips() {
+        let mzs = vec![300.0, 100.0, 200.0];
+        let intensities = vec![1.0_f32, 2.0]; // shorter than mzs
+        let (out_mzs, out_int) = ensure_sorted(mzs.clone(), intensities.clone(), 1);
+        assert_eq!(out_mzs, mzs);
+        assert_eq!(out_int, intensities);
     }
 }
