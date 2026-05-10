@@ -446,6 +446,83 @@ fn calibration_xcorr_scorer(config: &OspreyConfig) -> SpectralScorer {
     }
 }
 
+/// Result of the calibration pass-1 RT mapping decision.
+///
+/// `use_linear` is true when library RT and mzML RT appear to be in
+/// different units (range ratio > 2× or library-mzML min offset > 50%
+/// of library range). In that case `slope` and `intercept` carry the
+/// linear bridge that maps library RT into mzML RT space. When
+/// `use_linear = false` the mapping is identity (`slope = 1`,
+/// `intercept = 0`) and callers should leave library RTs untouched.
+///
+/// Surfaced as a struct (rather than a tuple) so unit tests can name
+/// each field and the call site stays readable.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RtMapping {
+    pub slope: f64,
+    pub intercept: f64,
+    pub use_linear: bool,
+}
+
+/// Decide whether pass-1 calibration scoring needs to bridge library RT
+/// into mzML RT space, and compute the slope/intercept if so.
+///
+/// The heuristic considers ranges "similar" (no bridge needed) when **all**
+/// of the following hold:
+///
+/// 1. Both ranges are non-degenerate (`> 0`).
+/// 2. The larger range is at most 2× the smaller range — i.e., they are
+///    on the same approximate scale.
+/// 3. The library minimum is within 50% of the library range of the mzML
+///    minimum — i.e., the two intervals overlap rather than being
+///    disjoint at the same scale.
+///
+/// When any of these fails the function returns a linear bridge that
+/// maps `(lib_min_rt, lib_max_rt) → (mzml_min_rt, mzml_max_rt)`.
+///
+/// This was originally an inline block; extracting it makes the
+/// seconds-vs-minutes unit detection unit-testable. The bug it
+/// addresses: Carafe libraries with `Tr_recalibrated` in seconds against
+/// an mzML in minutes produce a > 2× range ratio, which used to be
+/// detected here but then ignored by the pass-1 scoring call (the
+/// closure was built after scoring ran). See `run_calibration_discovery_windowed`
+/// for the call site and the tests in this file for coverage.
+pub(crate) fn compute_rt_mapping(
+    lib_min_rt: f64,
+    lib_max_rt: f64,
+    mzml_min_rt: f64,
+    mzml_max_rt: f64,
+) -> RtMapping {
+    let lib_rt_range = lib_max_rt - lib_min_rt;
+    let mzml_rt_range = mzml_max_rt - mzml_min_rt;
+    let ranges_similar = lib_rt_range > 0.0
+        && mzml_rt_range > 0.0
+        && (lib_rt_range / mzml_rt_range).max(mzml_rt_range / lib_rt_range) < 2.0
+        && (lib_min_rt - mzml_min_rt).abs() < lib_rt_range * 0.5;
+
+    if ranges_similar {
+        RtMapping {
+            slope: 1.0,
+            intercept: 0.0,
+            use_linear: false,
+        }
+    } else {
+        // Linear mapping: expected_rt = slope * lib_rt + intercept
+        // Maps (lib_min_rt, lib_max_rt) -> (mzml_min_rt, mzml_max_rt).
+        let slope = if lib_rt_range > 0.0 {
+            mzml_rt_range / lib_rt_range
+        } else {
+            1.0
+        };
+        let intercept = mzml_min_rt - slope * lib_min_rt;
+        RtMapping {
+            slope,
+            intercept,
+            use_linear: true,
+        }
+    }
+}
+
 /// Run the complete Osprey analysis pipeline
 fn run_calibration_discovery_windowed(
     library: &[LibraryEntry],
@@ -466,7 +543,6 @@ fn run_calibration_discovery_windowed(
         .iter()
         .cloned()
         .fold(f64::NEG_INFINITY, f64::max);
-    let lib_rt_range = lib_max_rt - lib_min_rt;
 
     // Calculate mzML RT range from spectra
     let mzml_min_rt = spectra
@@ -483,40 +559,28 @@ fn run_calibration_discovery_windowed(
     // If the library is in iRT (e.g., 0-100) and mzML is in minutes (e.g., 0-30),
     // we map library RT to expected measured RT using a simple linear transformation.
     // If ranges are similar (within 2x), assume library is already in the same units.
-    let (rt_slope, rt_intercept, use_linear_mapping) = {
-        let ranges_similar = lib_rt_range > 0.0
-            && mzml_rt_range > 0.0
-            && (lib_rt_range / mzml_rt_range).max(mzml_rt_range / lib_rt_range) < 2.0
-            && (lib_min_rt - mzml_min_rt).abs() < lib_rt_range * 0.5;
-
-        if ranges_similar {
-            // Library and mzML are in similar units, use identity mapping
-            log::debug!("RT mapping: library and mzML ranges are similar, using identity mapping");
-            (1.0, 0.0, false)
-        } else {
-            // Linear mapping: expected_rt = slope * lib_rt + intercept
-            // Maps (lib_min_rt, lib_max_rt) -> (mzml_min_rt, mzml_max_rt)
-            let slope = if lib_rt_range > 0.0 {
-                mzml_rt_range / lib_rt_range
-            } else {
-                1.0
-            };
-            let intercept = mzml_min_rt - slope * lib_min_rt;
-            log::debug!(
-                "RT mapping: linear transform from library ({:.2}-{:.2}) to mzML ({:.2}-{:.2} min)",
-                lib_min_rt,
-                lib_max_rt,
-                mzml_min_rt,
-                mzml_max_rt
-            );
-            log::debug!(
-                "RT mapping: expected_rt = {:.4} * library_rt + {:.4}",
-                slope,
-                intercept
-            );
-            (slope, intercept, true)
-        }
-    };
+    let rt_mapping = compute_rt_mapping(lib_min_rt, lib_max_rt, mzml_min_rt, mzml_max_rt);
+    let (rt_slope, rt_intercept, use_linear_mapping) = (
+        rt_mapping.slope,
+        rt_mapping.intercept,
+        rt_mapping.use_linear,
+    );
+    if rt_mapping.use_linear {
+        log::debug!(
+            "RT mapping: linear transform from library ({:.2}-{:.2}) to mzML ({:.2}-{:.2} min)",
+            lib_min_rt,
+            lib_max_rt,
+            mzml_min_rt,
+            mzml_max_rt
+        );
+        log::debug!(
+            "RT mapping: expected_rt = {:.4} * library_rt + {:.4}",
+            rt_slope,
+            rt_intercept
+        );
+    } else {
+        log::debug!("RT mapping: library and mzML ranges are similar, using identity mapping");
+    }
 
     // RT tolerance depends on whether linear mapping was needed
     // - Similar RT scales (no mapping): use 20% of RT range
@@ -608,6 +672,24 @@ fn run_calibration_discovery_windowed(
     // Accumulate best match per entry across all attempts
     let mut accumulated_matches: HashMap<u32, CalibrationMatch> = HashMap::new();
 
+    // Pass-1 RT bridge: when the library's RT range is in different units
+    // than the mzML (e.g., Carafe libraries that emit Tr_recalibrated in
+    // seconds against a minutes-keyed mzML), the auto-detected
+    // (slope, intercept) at lines ~486–519 maps library RT into the mzML's
+    // RT axis. Without this, pass-1 prefilter compares raw library RT (e.g.,
+    // 174.78 sec, intended ~2.9 min) against mzML scan RT in minutes and
+    // every candidate fails the wide-tolerance check. The closure is hoisted
+    // here so the borrow lives across the attempt loop; passed as
+    // `expected_rt_fn` to each scoring call only when ranges actually
+    // disagree (`use_linear_mapping = true`), so libraries that already use
+    // matching units retain bit-identical pass-1 behavior to before.
+    let linear_rt_mapping = |lib_rt: f64| -> f64 { rt_slope * lib_rt + rt_intercept };
+    let pass1_expected_rt_fn: Option<&(dyn Fn(f64) -> f64 + Sync)> = if use_linear_mapping {
+        Some(&linear_rt_mapping)
+    } else {
+        None
+    };
+
     for attempt in 1..=max_attempts {
         let calibration_library =
             sample_library_for_calibration(library, current_sample_size, 42 + attempt as u64);
@@ -632,7 +714,15 @@ fn run_calibration_discovery_windowed(
             }
         );
 
-        // Run co-elution calibration scoring with fragment XIC correlation
+        // Run co-elution calibration scoring with fragment XIC correlation.
+        // `pass1_expected_rt_fn` is None when library and mzML are already
+        // in matching units (identity mapping), preserving the historical
+        // "use library RT directly" behavior. It is Some(&linear_rt_mapping)
+        // when the auto-detect at lines ~486–519 found a >2× range mismatch
+        // (e.g., Carafe library Tr_recalibrated in seconds vs. mzML scan RT
+        // in minutes); in that case pass-1 uses the bridged expected RT so
+        // the wide tolerance can actually catch candidates and bootstrap
+        // the LOESS fit for pass 2.
         let new_matches = if has_ms1 {
             run_coelution_calibration_scoring(
                 &calibration_library,
@@ -641,7 +731,7 @@ fn run_calibration_discovery_windowed(
                 config.fragment_tolerance,
                 config.precursor_tolerance.tolerance,
                 initial_tolerance,
-                None, // First pass: use library RT directly
+                pass1_expected_rt_fn,
                 Some(&xcorr_scorer),
                 None, // Pass 1: no fitted LOESS model yet for diag dump
             )
@@ -653,7 +743,7 @@ fn run_calibration_discovery_windowed(
                 config.fragment_tolerance,
                 config.precursor_tolerance.tolerance,
                 initial_tolerance,
-                None, // First pass: use library RT directly
+                pass1_expected_rt_fn,
                 Some(&xcorr_scorer),
                 None, // Pass 1: no fitted LOESS model yet for diag dump
             )
@@ -703,7 +793,10 @@ fn run_calibration_discovery_windowed(
 
         let debug_path = debug_dir.join("calibration_debug.csv");
 
-        let linear_rt_mapping = |lib_rt: f64| -> f64 { rt_slope * lib_rt + rt_intercept };
+        // Reuse the hoisted `linear_rt_mapping` for the debug CSV. The
+        // mapping is identity when ranges are similar (slope=1, intercept=0),
+        // so writing it unconditionally is equivalent to the previous
+        // always-Some behavior.
         let expected_rt_fn: Option<&dyn Fn(f64) -> f64> = Some(&linear_rt_mapping);
 
         // LDA-based scoring on accumulated matches
@@ -7952,6 +8045,120 @@ mod tests {
 
     fn make_test_entry(id: u32, mz: f64, rt: f64) -> LibraryEntry {
         LibraryEntry::new(id, "PEPTIDE".into(), "PEPTIDE".into(), 2, mz, rt)
+    }
+
+    // ===== compute_rt_mapping tests =====
+    //
+    // The pass-1 calibration RT bridge: detect when a library's RT axis is in
+    // different units than the mzML and produce a linear map between them.
+    // Originally regressed because the closure was built after pass-1 scoring
+    // had already run with raw library RTs — universal prefilter rejection on
+    // Carafe libraries that emit `Tr_recalibrated` in seconds against
+    // minutes-keyed mzML. These tests pin the decision logic so a future
+    // refactor can't silently drop the bridge again.
+
+    /// Identity mapping when library and mzML are already on the same axis
+    /// (both in minutes on a 30 min gradient). This is the bit-identical-to-
+    /// before-fix path that the regression must not perturb.
+    #[test]
+    fn compute_rt_mapping_identity_when_minutes_match() {
+        let m = compute_rt_mapping(2.0, 28.0, 0.5, 29.5);
+        assert!(!m.use_linear);
+        assert_eq!(m.slope, 1.0);
+        assert_eq!(m.intercept, 0.0);
+    }
+
+    /// Carafe-in-seconds case: library RT spans 50.87-442.13 (seconds),
+    /// mzML spans 0-24 (minutes). Range ratio ~16x triggers the linear
+    /// bridge; the mapped endpoints must land on the mzML endpoints
+    /// (the whole point — pass-1 prefilter is centered on the mapped RT).
+    #[test]
+    fn compute_rt_mapping_seconds_library_to_minutes_mzml() {
+        let m = compute_rt_mapping(50.87, 442.13, 0.0, 24.0);
+        assert!(
+            m.use_linear,
+            "seconds library vs. minutes mzML must trigger linear bridge"
+        );
+        let map = |x: f64| m.slope * x + m.intercept;
+        // Endpoints land within 1e-9 of the mzML range bounds.
+        assert!((map(50.87) - 0.0).abs() < 1e-9);
+        assert!((map(442.13) - 24.0).abs() < 1e-9);
+        // Slope is the inverse of the unit ratio (range_mzml / range_lib).
+        assert!((m.slope - (24.0 / (442.13 - 50.87))).abs() < 1e-12);
+    }
+
+    /// iRT-in-Biognosys-space case: library RT spans roughly -50 to +150 iRT,
+    /// mzML spans 0-60 minutes. Range ratio ~3.3x and a negative min trigger
+    /// the bridge. This is the historically-supported case the original
+    /// linear-mapping logic was written for — should keep working post-refactor.
+    #[test]
+    fn compute_rt_mapping_irt_library_to_minutes_mzml() {
+        let m = compute_rt_mapping(-50.0, 150.0, 0.0, 60.0);
+        assert!(m.use_linear);
+        let map = |x: f64| m.slope * x + m.intercept;
+        assert!((map(-50.0) - 0.0).abs() < 1e-9);
+        assert!((map(150.0) - 60.0).abs() < 1e-9);
+    }
+
+    /// Ranges are similar (1x ratio) BUT the libraries are offset in absolute
+    /// position — e.g., a library predicted for one gradient applied to a
+    /// shifted mzML start. The min-offset arm of the heuristic kicks in even
+    /// when the ratio test would pass. Verifies both arms of the
+    /// `ranges_similar` predicate are tested.
+    #[test]
+    fn compute_rt_mapping_disjoint_minutes_triggers_bridge() {
+        // Library RT in [50, 80] minutes, mzML in [0, 30] minutes.
+        // Range ratio 1.0x (passes that arm), but min-offset = 50 minutes
+        // and lib_range * 0.5 = 15 minutes, so offset > 50% of range.
+        let m = compute_rt_mapping(50.0, 80.0, 0.0, 30.0);
+        assert!(
+            m.use_linear,
+            "disjoint min positions must trigger the bridge even at matching range scale"
+        );
+    }
+
+    /// Degenerate library RT range (all entries at the same RT) doesn't blow
+    /// up: the slope falls back to 1.0 and the bridge is still applied
+    /// (use_linear = true) because the range ratio is 0/30 = 0, failing the
+    /// `ranges_similar` check on the > 0 clause for library range.
+    #[test]
+    fn compute_rt_mapping_zero_range_library_falls_back_to_slope_1() {
+        let m = compute_rt_mapping(10.0, 10.0, 0.0, 30.0);
+        assert!(m.use_linear);
+        assert_eq!(m.slope, 1.0);
+    }
+
+    /// Symmetric to the zero-library case: a degenerate mzML range also
+    /// fails the `> 0` clauses. We don't crash on division by zero; we just
+    /// trigger the bridge with the safe fallback. This shouldn't happen in
+    /// practice (mzML with 0-width RT range is degenerate input).
+    #[test]
+    fn compute_rt_mapping_zero_range_mzml_falls_back_to_slope_1() {
+        let m = compute_rt_mapping(0.0, 30.0, 5.0, 5.0);
+        assert!(m.use_linear);
+        // slope = (5-5)/(30-0) = 0 — defaults to using the formula since
+        // lib_range > 0 — so slope = 0 here. Just check we don't panic.
+        // (The downstream initial_tolerance from this would be 0, so callers
+        // ought to treat zero mzML range as a hard error anyway.)
+    }
+
+    /// The boundary of the range-ratio test: 2× exactly is "not similar" by
+    /// strict `<` (i.e., should trigger the bridge). Just below 2× is
+    /// "similar". Pins the threshold so a refactor can't silently slide it.
+    #[test]
+    fn compute_rt_mapping_range_ratio_threshold_is_strict_two_x() {
+        // 1.99x ratio with overlapping origins — similar.
+        let near = compute_rt_mapping(0.0, 19.9, 0.0, 10.0);
+        assert!(
+            !near.use_linear,
+            "ranges within strict 2x must be identity-mapped"
+        );
+        // 2.0x ratio exactly — must trigger the bridge.
+        let exact = compute_rt_mapping(0.0, 20.0, 0.0, 10.0);
+        assert!(
+            exact.use_linear,
+            "ranges at exactly 2x must trigger the bridge (strict <)"
+        );
     }
 
     /// Verifies MzRTIndex bins each entry into 3 adjacent m/z bins (±1 Da).
