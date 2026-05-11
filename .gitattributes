@@ -1,2 +1,8 @@
+# Normalize all text files to LF in the index (Git auto-detects text vs binary).
+# Working tree EOL respects each developer's `core.autocrlf` (Windows can keep
+# CRLF locally), but committed content is always LF so diffs and CI stay clean
+# across WSL/Linux/Windows sessions.
+* text=auto
+
 # Mark Jupyter notebooks as generated so they don't skew GitHub language stats
 notebooks/*.ipynb linguist-generated
