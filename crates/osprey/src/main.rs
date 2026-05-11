@@ -134,6 +134,21 @@ struct Args {
     #[arg(long)]
     report: Option<PathBuf>,
 
+    /// Write an FDRBench-compatible input TSV to this path. The level is
+    /// auto-selected from --fdr-level (peptide | precursor | protein; `both`
+    /// emits precursor-level). `protein` requires --protein-fdr. Includes
+    /// every scored target (regardless of q-value) with the raw SVM
+    /// discriminant as `score`, so FDRBench can compute true-FDR via
+    /// entrapment counting without truncation at Osprey's threshold.
+    #[arg(long)]
+    fdrbench: Option<PathBuf>,
+
+    /// With --fdrbench: emit one row per (precursor, run) using run-level
+    /// q-values (adds a `run` column). Default is one row per precursor
+    /// using experiment-level q-values. Ignored for protein-level output.
+    #[arg(long)]
+    fdrbench_per_run: bool,
+
     /// FDR method: percolator (native SVM, default), mokapot (external Python), or simple (no ML)
     #[arg(long, default_value = "percolator")]
     fdr_method: String,
@@ -600,6 +615,8 @@ fn main() -> Result<()> {
         protein_fdr: args.protein_fdr,
         shared_peptides,
         write_pin: args.write_pin,
+        output_fdrbench: args.fdrbench.clone(),
+        fdrbench_per_run: args.fdrbench_per_run,
     };
 
     // Apply CLI overrides

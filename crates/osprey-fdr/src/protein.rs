@@ -688,6 +688,53 @@ pub fn write_protein_report(
     Ok(())
 }
 
+/// Write the FDRBench protein-level input TSV.
+///
+/// Emits one row per target protein group with its picked-protein q-value and
+/// the best peptide's SVM discriminant as `score`. Format:
+///
+/// ```text
+/// protein<TAB>q_value<TAB>score
+/// ```
+///
+/// `protein` is the `;`-joined `accessions` of the group (entrapment markers
+/// like `_p_target` survive unchanged). Every target group in `fdr_result`
+/// is emitted regardless of q-value so FDRBench can see the full ranking.
+/// Decoy winners and missing groups are not included.
+pub fn write_fdrbench_protein_input(
+    path: &std::path::Path,
+    parsimony: &ProteinParsimonyResult,
+    fdr_result: &ProteinFdrResult,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path)?;
+    writeln!(file, "protein\tq_value\tscore")?;
+
+    let mut n_rows: usize = 0;
+    for group in &parsimony.groups {
+        let q = match fdr_result.group_qvalues.get(&group.id) {
+            Some(&q) => q,
+            None => continue, // decoy-winner group or no qvalue computed
+        };
+        let score = fdr_result
+            .group_scores
+            .get(&group.id)
+            .copied()
+            .unwrap_or(0.0);
+        let accessions = group.accessions.join(";");
+        writeln!(file, "{accessions}\t{q:.10e}\t{score:.10e}")?;
+        n_rows += 1;
+    }
+
+    log::info!(
+        "Wrote FDRBench protein input to {}: {} target groups",
+        path.display(),
+        n_rows,
+    );
+    Ok(())
+}
+
 /// Peptide-level data for protein FDR scoring.
 #[derive(Debug, Clone)]
 pub struct PeptideScore {

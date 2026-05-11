@@ -4096,6 +4096,22 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             n_at_1pct,
             config.run_fdr * 100.0,
         );
+
+        // FDRBench protein-level TSV: written from the first-pass picked-protein
+        // result so every target group is included (not just those passing the
+        // user's protein FDR threshold). FDRBench needs the full ranking to
+        // count entrapment hits.
+        if let (Some(path), FdrLevel::Protein) = (&config.output_fdrbench, config.fdr_level) {
+            if let Err(e) =
+                protein::write_fdrbench_protein_input(path, &parsimony, &protein_fdr_result)
+            {
+                log::warn!(
+                    "Failed to write FDRBench protein TSV {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
     }
 
     // Persist the 1st-pass fdr_scores.bin sidecar AFTER first-pass
@@ -4123,6 +4139,24 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 failures,
                 per_file_entries.len()
             )));
+        }
+    }
+
+    // FDRBench peptide/precursor TSV: emit BEFORE compaction so every scored
+    // target is included, with its first-pass q-values (run + experiment) and
+    // raw SVM discriminant. Protein-level output is handled inside the
+    // first-pass protein FDR block above where `protein_fdr_result` exists.
+    if let Some(path) = &config.output_fdrbench {
+        if !matches!(config.fdr_level, FdrLevel::Protein) {
+            if let Err(e) = osprey_io::output::write_fdrbench_peptide_input(
+                path,
+                &per_file_entries,
+                &library,
+                config.fdr_level,
+                config.fdrbench_per_run,
+            ) {
+                log::warn!("Failed to write FDRBench TSV {}: {}", path.display(), e);
+            }
         }
     }
 

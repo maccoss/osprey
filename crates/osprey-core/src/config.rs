@@ -23,6 +23,17 @@ pub struct OspreyConfig {
     pub output_blib: PathBuf,
     /// Optional: TSV report
     pub output_report: Option<PathBuf>,
+    /// Optional: FDRBench-compatible input TSV. Emitted from the
+    /// pre-compaction first-pass FDR pool so every scored target is
+    /// included, with raw SVM discriminant as `score` and a level chosen
+    /// from `fdr_level` (Both -> precursor; Protein requires `protein_fdr`).
+    #[serde(default)]
+    pub output_fdrbench: Option<PathBuf>,
+    /// When true, emit one row per (precursor, run) using run-level
+    /// q-values; otherwise emit one row per precursor using
+    /// experiment-level q-values. Ignored for protein-level output.
+    #[serde(default)]
+    pub fdrbench_per_run: bool,
 
     // Resolution settings
     /// Resolution mode for binning
@@ -150,6 +161,8 @@ impl Default for OspreyConfig {
             library_source: LibrarySource::DiannTsv(PathBuf::new()),
             output_blib: PathBuf::from("results.blib"),
             output_report: None,
+            output_fdrbench: None,
+            fdrbench_per_run: false,
             resolution_mode: ResolutionMode::Auto,
             fragment_tolerance: FragmentToleranceConfig::default(), // 10 ppm for HRAM
             precursor_tolerance: FragmentToleranceConfig::hram(10.0), // 10 ppm for precursor
@@ -375,6 +388,12 @@ n_threads: 0  # 0 = auto-detect
         if let Some(mode) = args.shared_peptides {
             self.shared_peptides = mode;
         }
+        if let Some(ref path) = args.output_fdrbench {
+            self.output_fdrbench = Some(path.clone());
+        }
+        if args.fdrbench_per_run {
+            self.fdrbench_per_run = true;
+        }
     }
 
     /// Compute SHA-256 hash of parameters that affect first-pass scoring.
@@ -553,6 +572,8 @@ pub struct ConfigOverrides {
     pub protein_fdr: Option<f64>,
     pub shared_peptides: Option<SharedPeptideMode>,
     pub write_pin: bool,
+    pub output_fdrbench: Option<PathBuf>,
+    pub fdrbench_per_run: bool,
 }
 
 /// RT Calibration configuration
