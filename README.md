@@ -196,6 +196,18 @@ osprey -i *.mzML -l library.tsv -o results.blib --fdr-level protein
 # Trace a specific peptide's journey through the pipeline (zero overhead when unset)
 OSPREY_TRACE_PEPTIDE=PEPTIDEK osprey -i *.mzML -l library.tsv -o results.blib --verbose 2>&1 | tee trace.log
 grep '\[trace\]' trace.log
+
+# Use decoys already present in the library (DIA-NN / EncyclopeDIA / Carafe
+# output) instead of generating them. Default prefixes recognised on protein
+# accessions: DECOY_, rev_, decoy_ (case-insensitive); customise via the
+# `decoy_prefixes` list in YAML.
+osprey -i *.mzML -l library_with_decoys.tsv -o results.blib --decoys-in-library
+
+# Emit an FDRBench-compatible input TSV alongside the blib for FDR-quality
+# evaluation via entrapment counting. Includes every scored target with its
+# raw SVM discriminant (not just FDR-passing entries). The output's level
+# matches --fdr-level. Run FDRBench with `-score 'score:1'`.
+osprey -i *.mzML -l library.tsv -o results.blib --fdrbench fdp_input.tsv
 ```
 
 ### Using configuration files
@@ -238,12 +250,20 @@ rt_calibration:
 run_fdr: 0.01
 experiment_fdr: 0.01
 decoy_method: Reverse  # Options: Reverse, Shuffle, FromLibrary
-decoys_in_library: false
+decoys_in_library: false  # Set true (or decoy_method: FromLibrary) to trust library decoys
+decoy_prefixes:           # Protein-accession prefixes that mark library decoys
+  - DECOY_                # (case-insensitive). Used only when decoys_in_library is true.
+  - rev_
+  - decoy_
 fdr_level: Precursor    # Output filtering level: Precursor (default), Peptide, Protein, or Both
 
 # Protein-level FDR (always runs)
 protein_fdr: 0.01         # Protein-level FDR threshold (default 0.01)
 shared_peptides: All       # How to handle shared peptides: All (default), Razor, or Unique
+
+# Optional FDRBench-compatible input TSV for FDR-quality evaluation
+output_fdrbench: ~        # Path to write FDRBench input TSV (null = disabled)
+fdrbench_per_run: false   # Emit one row per (precursor, run) instead of per precursor
 ```
 
 ## Command-line Options
@@ -321,6 +341,28 @@ Options:
           - all: shared peptides contribute to all their protein groups
           - razor: shared peptides assigned to the group with most unique peptides
           - unique: only unique peptides used; shared peptides excluded
+
+      --decoys-in-library
+          Trust decoys already present in the spectral library instead of
+          generating them. Library entries whose protein accession matches one
+          of the configured `decoy_prefixes` (default: DECOY_, rev_, decoy_,
+          case-insensitive) are flagged as decoys; the DecoyGenerator step is
+          skipped. Customise the prefix list via `decoy_prefixes` in YAML.
+          Bails out with a clear error if no entries match any prefix.
+
+      --fdrbench <PATH>
+          Write an FDRBench-compatible input TSV. Emits every scored target
+          (not just FDR-passing entries) with raw SVM discriminant as `score`,
+          so FDRBench can compute true-FDR via entrapment counting without
+          truncation at Osprey's threshold. Level is auto-selected from
+          --fdr-level (`both` emits precursor-level; `protein` requires
+          --protein-fdr and writes the picked-protein TSV). Invoke FDRBench
+          with `-score 'score:1'`.
+
+      --fdrbench-per-run
+          With --fdrbench: emit one row per (precursor, run) using run-level
+          q-values (adds a `run` column). Default is one row per precursor
+          using experiment-level q-values. Ignored for protein-level output.
 
       --write-pin
           Write PIN files for external tools
