@@ -27,9 +27,19 @@ use std::path::{Path, PathBuf};
 /// helper sorts when an inversion is detected so downstream consumers see a
 /// well-defined ordering. The leading O(n) sortedness check is the
 /// common-case fast path; the actual sort only runs on inversions.
-fn ensure_sorted(mzs: Vec<f64>, intensities: Vec<f32>, scan_number: u32) -> (Vec<f64>, Vec<f32>) {
+///
+/// Returns `(mzs, intensities, did_sort)`. `did_sort = true` when an
+/// inversion was found and the arrays were reordered; the bulk loaders
+/// aggregate this into a single per-file end-of-load info log so the
+/// default-verbosity log stays uncluttered while `--verbose` still gets
+/// the per-scan trace via the `log::debug!` below.
+fn ensure_sorted(
+    mzs: Vec<f64>,
+    intensities: Vec<f32>,
+    scan_number: u32,
+) -> (Vec<f64>, Vec<f32>, bool) {
     if mzs.len() < 2 || mzs.windows(2).all(|w| w[0] <= w[1]) {
-        return (mzs, intensities);
+        return (mzs, intensities, false);
     }
     // Defensive guard: a malformed mzML where the m/z and intensity arrays
     // are not the same length would panic on `intensities[i]` during the
@@ -42,9 +52,12 @@ fn ensure_sorted(mzs: Vec<f64>, intensities: Vec<f32>, scan_number: u32) -> (Vec
             mzs.len(),
             intensities.len()
         );
-        return (mzs, intensities);
+        return (mzs, intensities, false);
     }
-    log::info!(
+    // Per-scan trace is `debug` (visible with `--verbose`) so a typical
+    // run with ~10 inversions across 200K spectra doesn't spam the default
+    // log. The bulk loaders emit a one-line aggregate summary at info level.
+    log::debug!(
         "[unsorted-spectrum] scan_number={} n_peaks={}",
         scan_number,
         mzs.len()
@@ -53,7 +66,7 @@ fn ensure_sorted(mzs: Vec<f64>, intensities: Vec<f32>, scan_number: u32) -> (Vec
     idx.sort_by(|&a, &b| mzs[a].total_cmp(&mzs[b]));
     let sorted_mzs: Vec<f64> = idx.iter().map(|&i| mzs[i]).collect();
     let sorted_int: Vec<f32> = idx.iter().map(|&i| intensities[i]).collect();
-    (sorted_mzs, sorted_int)
+    (sorted_mzs, sorted_int, true)
 }
 
 /// Reader for mzML files
@@ -163,7 +176,10 @@ impl MzmlReader {
             }
         };
 
-        let (mzs, intensities) = ensure_sorted(mzs, intensities, scan_number);
+        // Iterator path: per-spectrum sort, no aggregation. The `did_sort`
+        // bool is discarded here; the bulk loaders below aggregate it
+        // across the file instead.
+        let (mzs, intensities, _did_sort) = ensure_sorted(mzs, intensities, scan_number);
 
         Ok(Some(Spectrum {
             scan_number,
@@ -325,6 +341,12 @@ pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1In
 
     let mut ms2_spectra = Vec::new();
     let mut ms1_spectra = Vec::new();
+    // Per-file count of spectra that had non-monotonic centroid pairs and
+    // were sorted by `ensure_sorted`. Reported once at end-of-load (info)
+    // so the default-verbosity log shows "Sorted N spectra" instead of one
+    // line per scan. Per-scan detail is available with `--verbose` via the
+    // `log::debug!` inside `ensure_sorted`.
+    let mut n_unsorted = 0usize;
 
     for mz_spectrum in mzml_reader {
         let desc = mz_spectrum.description();
@@ -365,7 +387,10 @@ pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1In
                     }
                 };
 
-                let (mzs, intensities) = ensure_sorted(mzs, intensities, scan_number);
+                let (mzs, intensities, did_sort) = ensure_sorted(mzs, intensities, scan_number);
+                if did_sort {
+                    n_unsorted += 1;
+                }
 
                 ms1_spectra.push(MS1Spectrum {
                     scan_number,
@@ -433,7 +458,10 @@ pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1In
                 // See `convert_spectrum` for the rationale; some mzML
                 // producers emit peaks not strictly ascending in m/z, and
                 // downstream binary-search consumers need a sorted spectrum.
-                let (mzs, intensities) = ensure_sorted(mzs, intensities, scan_number);
+                let (mzs, intensities, did_sort) = ensure_sorted(mzs, intensities, scan_number);
+                if did_sort {
+                    n_unsorted += 1;
+                }
 
                 ms2_spectra.push(Spectrum {
                     scan_number,
@@ -457,6 +485,13 @@ pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1In
         ms1_spectra.len(),
         path.display()
     );
+    if n_unsorted > 0 {
+        // Aggregate summary; per-scan detail is at `debug` level.
+        log::info!(
+            "Sorted {} spectra with non-monotonic centroids (run with --verbose to list scan_numbers)",
+            n_unsorted
+        );
+    }
 
     Ok((ms2_spectra, MS1Index::new(ms1_spectra)))
 }
@@ -477,6 +512,7 @@ pub fn load_ms1_spectra<P: AsRef<Path>>(path: P) -> Result<MS1Index> {
     let mzml_reader = MzMLReader::new(reader);
 
     let mut ms1_spectra = Vec::new();
+    let mut n_unsorted = 0usize;
 
     for mz_spectrum in mzml_reader {
         // Only process MS1 spectra
@@ -519,7 +555,10 @@ pub fn load_ms1_spectra<P: AsRef<Path>>(path: P) -> Result<MS1Index> {
             }
         };
 
-        let (mzs, intensities) = ensure_sorted(mzs, intensities, scan_number);
+        let (mzs, intensities, did_sort) = ensure_sorted(mzs, intensities, scan_number);
+        if did_sort {
+            n_unsorted += 1;
+        }
 
         ms1_spectra.push(MS1Spectrum {
             scan_number,
@@ -534,6 +573,12 @@ pub fn load_ms1_spectra<P: AsRef<Path>>(path: P) -> Result<MS1Index> {
         ms1_spectra.len(),
         path.display()
     );
+    if n_unsorted > 0 {
+        log::info!(
+            "Sorted {} spectra with non-monotonic centroids (run with --verbose to list scan_numbers)",
+            n_unsorted
+        );
+    }
 
     Ok(MS1Index::new(ms1_spectra))
 }
@@ -551,25 +596,30 @@ mod tests {
     }
 
     /// Already-sorted input: ensure_sorted returns the inputs unchanged
-    /// (fast path; no permutation, no extra allocations).
+    /// (fast path; no permutation, no extra allocations). `did_sort` must
+    /// be false so the bulk loaders don't credit this spectrum to the
+    /// "sorted N spectra" summary log line.
     #[test]
     fn ensure_sorted_already_sorted_fast_path() {
         let mzs = vec![100.0, 200.0, 300.0];
         let intensities = vec![1.0_f32, 2.0, 3.0];
-        let (sorted_mzs, sorted_int) = ensure_sorted(mzs.clone(), intensities.clone(), 1);
+        let (sorted_mzs, sorted_int, did_sort) = ensure_sorted(mzs.clone(), intensities.clone(), 1);
         assert_eq!(sorted_mzs, mzs);
         assert_eq!(sorted_int, intensities);
+        assert!(!did_sort, "fast path must report did_sort = false");
     }
 
     /// Single inversion: both arrays reorder consistently so each
-    /// intensity stays paired with its original m/z value.
+    /// intensity stays paired with its original m/z value. `did_sort`
+    /// must be true so the bulk loaders increment their summary counter.
     #[test]
     fn ensure_sorted_inversion_reorders_both_arrays() {
         let mzs = vec![100.0, 300.0, 200.0];
         let intensities = vec![1.0_f32, 3.0, 2.0];
-        let (sorted_mzs, sorted_int) = ensure_sorted(mzs, intensities, 1);
+        let (sorted_mzs, sorted_int, did_sort) = ensure_sorted(mzs, intensities, 1);
         assert_eq!(sorted_mzs, vec![100.0, 200.0, 300.0]);
         assert_eq!(sorted_int, vec![1.0_f32, 2.0, 3.0]);
+        assert!(did_sort, "inversion-path must report did_sort = true");
     }
 
     /// Stable sort: equal m/z values keep their original relative order
@@ -581,20 +631,26 @@ mod tests {
     fn ensure_sorted_equal_mz_preserves_order() {
         let mzs = vec![100.0, 100.0, 200.0, 100.0];
         let intensities = vec![1.0_f32, 2.0, 3.0, 4.0];
-        let (sorted_mzs, sorted_int) = ensure_sorted(mzs, intensities, 1);
+        let (sorted_mzs, sorted_int, did_sort) = ensure_sorted(mzs, intensities, 1);
         assert_eq!(sorted_mzs, vec![100.0, 100.0, 100.0, 200.0]);
         assert_eq!(sorted_int, vec![1.0_f32, 2.0, 4.0, 3.0]);
+        assert!(did_sort);
     }
 
     /// Length mismatch (malformed mzML): skip sorting and return the
     /// inputs untouched so downstream length checks can act on the
     /// malformed spectrum without panicking on out-of-bounds indexing.
+    /// `did_sort` is false because we did not actually sort (we bailed).
     #[test]
     fn ensure_sorted_length_mismatch_skips() {
         let mzs = vec![300.0, 100.0, 200.0];
         let intensities = vec![1.0_f32, 2.0]; // shorter than mzs
-        let (out_mzs, out_int) = ensure_sorted(mzs.clone(), intensities.clone(), 1);
+        let (out_mzs, out_int, did_sort) = ensure_sorted(mzs.clone(), intensities.clone(), 1);
         assert_eq!(out_mzs, mzs);
         assert_eq!(out_int, intensities);
+        assert!(
+            !did_sort,
+            "length mismatch skips the sort, so did_sort = false"
+        );
     }
 }
