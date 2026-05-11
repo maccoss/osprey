@@ -134,6 +134,16 @@ struct Args {
     #[arg(long)]
     report: Option<PathBuf>,
 
+    /// Trust decoys already present in the spectral library instead of
+    /// generating them. Library entries whose protein accession starts with
+    /// a configured `decoy_prefixes` value (default: `DECOY_`, `rev_`,
+    /// `decoy_`, case-insensitive) are flagged as decoys and the
+    /// DecoyGenerator step is skipped. Bails out with a clear error if no
+    /// entries match. Configure custom prefixes via `decoy_prefixes` in the
+    /// YAML config.
+    #[arg(long)]
+    decoys_in_library: bool,
+
     /// Write an FDRBench-compatible input TSV to this path. The level is
     /// auto-selected from --fdr-level (peptide | precursor | protein; `both`
     /// emits precursor-level). `protein` requires --protein-fdr. Includes
@@ -621,6 +631,13 @@ fn main() -> Result<()> {
 
     // Apply CLI overrides
     config.merge_with_args(&overrides);
+
+    // --decoys-in-library is a flat boolean override: only flip true,
+    // never override a YAML `true` back to false (matches --write-pin /
+    // --fdrbench-per-run semantics).
+    if args.decoys_in_library {
+        config.decoys_in_library = true;
+    }
 
     // HPC scoring split: set the new config fields after merge_with_args.
     // These don't go through ConfigOverrides because they're CLI-only and

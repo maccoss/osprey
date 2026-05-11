@@ -61,6 +61,67 @@ impl LibraryEntry {
             is_decoy: false,
         }
     }
+
+    /// Test whether this entry should be treated as a decoy based on a
+    /// configured prefix list. Returns true if ANY protein accession starts
+    /// (case-insensitively) with any of the prefixes.
+    ///
+    /// Used only when the user has set `decoys_in_library = true` (or
+    /// `decoy_method = FromLibrary`). For Osprey-generated decoys, `is_decoy`
+    /// is set directly by `DecoyGenerator` and this function is not called.
+    ///
+    /// Returns false if the prefix list or the entry's protein list is empty.
+    pub fn looks_like_library_decoy(&self, prefixes: &[String]) -> bool {
+        if prefixes.is_empty() || self.protein_ids.is_empty() {
+            return false;
+        }
+        self.protein_ids.iter().any(|acc| {
+            prefixes.iter().any(|p| {
+                !p.is_empty() && acc.len() >= p.len() && acc[..p.len()].eq_ignore_ascii_case(p)
+            })
+        })
+    }
+}
+
+/// High bit of `entry_id` / library `id` marking a decoy entry.
+///
+/// The `base_id = id & 0x7FFF_FFFF` convention pairs a target with its
+/// decoy. Generated decoys (`DecoyGenerator`) inherit this from the target;
+/// library-supplied decoys get the bit set when they match a configured
+/// prefix during post-load marking.
+pub const DECOY_ID_BIT: u32 = 0x8000_0000;
+
+/// Scan a library and flag entries matching `prefixes` as decoys.
+///
+/// For each matching entry, sets `is_decoy = true` and ORs `DECOY_ID_BIT`
+/// into `id`. Returns the number of entries marked. The function is
+/// idempotent: entries already flagged as decoys are left unchanged
+/// (no double-OR of the high bit, no double-count in the return value).
+///
+/// This is the post-load companion to `DecoyGenerator`: when the user
+/// supplies a library that already contains decoys (e.g., DIA-NN or
+/// EncyclopeDIA output with `rev_`/`DECOY_` prefixes on protein
+/// accessions), this marking step sets the same metadata that
+/// DecoyGenerator would, so downstream FDR sees decoys as decoys.
+///
+/// Library-supplied decoys are NOT paired with specific targets via
+/// matching base_ids; the cross-validation grouping invariant (target
+/// and paired decoy in the same fold) is therefore not enforceable for
+/// these entries. SVM training and TDC competition still work at the
+/// population level.
+pub fn apply_library_decoy_marking(library: &mut [LibraryEntry], prefixes: &[String]) -> usize {
+    let mut n_marked = 0;
+    for entry in library.iter_mut() {
+        if entry.is_decoy {
+            continue;
+        }
+        if entry.looks_like_library_decoy(prefixes) {
+            entry.is_decoy = true;
+            entry.id |= DECOY_ID_BIT;
+            n_marked += 1;
+        }
+    }
+    n_marked
 }
 
 /// Fragment ion from library
@@ -941,5 +1002,85 @@ mod tests {
 
         // M+0 should still be detected
         assert!(envelope.has_m0());
+    }
+
+    fn make_lib_entry(id: u32, protein_ids: &[&str]) -> LibraryEntry {
+        let mut e = LibraryEntry::new(id, "PEPTIDE".into(), "PEPTIDE".into(), 2, 500.0, 10.0);
+        e.protein_ids = protein_ids.iter().map(|s| s.to_string()).collect();
+        e
+    }
+
+    #[test]
+    fn looks_like_library_decoy_matches_protein_prefix() {
+        let e = make_lib_entry(1, &["DECOY_P12345", "P67890"]);
+        assert!(e.looks_like_library_decoy(&["DECOY_".into()]));
+    }
+
+    #[test]
+    fn looks_like_library_decoy_is_case_insensitive() {
+        let e = make_lib_entry(1, &["Rev_P12345"]);
+        assert!(e.looks_like_library_decoy(&["rev_".into()]));
+        let e2 = make_lib_entry(2, &["DECOY_P1"]);
+        assert!(e2.looks_like_library_decoy(&["decoy_".into()]));
+    }
+
+    #[test]
+    fn looks_like_library_decoy_requires_prefix_position() {
+        // A protein with `rev_` in the middle should NOT match — it's a prefix test.
+        let e = make_lib_entry(1, &["P12345_rev_suffix"]);
+        assert!(!e.looks_like_library_decoy(&["rev_".into()]));
+    }
+
+    #[test]
+    fn looks_like_library_decoy_empty_inputs_return_false() {
+        let e = make_lib_entry(1, &["P12345"]);
+        assert!(!e.looks_like_library_decoy(&[]));
+        let empty = make_lib_entry(2, &[]);
+        assert!(!empty.looks_like_library_decoy(&["rev_".into()]));
+    }
+
+    #[test]
+    fn looks_like_library_decoy_matches_any_protein() {
+        // A shared peptide: one accession is a target, the other a decoy.
+        // Any-match policy means this is treated as a decoy.
+        let e = make_lib_entry(1, &["P12345", "DECOY_P12345"]);
+        assert!(e.looks_like_library_decoy(&["DECOY_".into()]));
+    }
+
+    #[test]
+    fn apply_library_decoy_marking_sets_flag_and_high_bit() {
+        let mut lib = vec![
+            make_lib_entry(1, &["P12345"]),       // target
+            make_lib_entry(2, &["DECOY_P12345"]), // decoy
+            make_lib_entry(3, &["rev_P67890"]),   // decoy via rev_
+            make_lib_entry(4, &["P67890"]),       // target
+        ];
+        let prefixes = vec!["DECOY_".into(), "rev_".into()];
+        let n = apply_library_decoy_marking(&mut lib, &prefixes);
+        assert_eq!(n, 2);
+        assert!(!lib[0].is_decoy);
+        assert!(lib[1].is_decoy);
+        assert!(lib[2].is_decoy);
+        assert!(!lib[3].is_decoy);
+        // Decoy IDs have the high bit set; targets do not.
+        assert_eq!(lib[0].id & DECOY_ID_BIT, 0);
+        assert_ne!(lib[1].id & DECOY_ID_BIT, 0);
+        assert_ne!(lib[2].id & DECOY_ID_BIT, 0);
+        assert_eq!(lib[3].id & DECOY_ID_BIT, 0);
+        // base_id (low 31 bits) is preserved.
+        assert_eq!(lib[1].id & 0x7FFF_FFFF, 2);
+        assert_eq!(lib[2].id & 0x7FFF_FFFF, 3);
+    }
+
+    #[test]
+    fn apply_library_decoy_marking_is_idempotent() {
+        let mut lib = vec![make_lib_entry(1, &["DECOY_P12345"])];
+        let prefixes = vec!["DECOY_".into()];
+        let n1 = apply_library_decoy_marking(&mut lib, &prefixes);
+        let id_after_first = lib[0].id;
+        let n2 = apply_library_decoy_marking(&mut lib, &prefixes);
+        assert_eq!(n1, 1);
+        assert_eq!(n2, 0); // second pass marks nothing new
+        assert_eq!(lib[0].id, id_after_first); // no double-OR of high bit
     }
 }

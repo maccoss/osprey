@@ -5,7 +5,8 @@
       "Bash(git pull *)",
       "Bash(git cherry-pick *)",
       "Bash(git ls-tree *)",
-      "Bash(git stash *)"
+      "Bash(git stash *)",
+      "Bash(awk '$1 == \"i/-text\" {print $4}')"
     ]
   }
 }

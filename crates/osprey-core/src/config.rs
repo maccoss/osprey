@@ -54,8 +54,18 @@ pub struct OspreyConfig {
     pub experiment_fdr: f64,
     /// Decoy generation method
     pub decoy_method: DecoyMethod,
-    /// Whether library already contains decoys
+    /// Whether library already contains decoys. When true (or when
+    /// `decoy_method == FromLibrary`), DecoyGenerator is skipped and
+    /// existing entries are scanned for `decoy_prefixes` matches on their
+    /// protein accessions; matching entries get `is_decoy = true` and the
+    /// high bit of their `id` set.
     pub decoys_in_library: bool,
+    /// Protein-accession prefixes that identify decoys when the library
+    /// already contains them (case-insensitive). Default covers the three
+    /// common conventions: Osprey's own `DECOY_`, plus `rev_` / `decoy_`
+    /// used by tools like DIA-NN, EncyclopeDIA, and Carafe.
+    #[serde(default = "default_decoy_prefixes")]
+    pub decoy_prefixes: Vec<String>,
 
     // FDR method
     /// FDR method: native Percolator (default), external mokapot, or simple target-decoy
@@ -173,6 +183,7 @@ impl Default for OspreyConfig {
             experiment_fdr: 0.01,
             decoy_method: DecoyMethod::Reverse,
             decoys_in_library: false,
+            decoy_prefixes: default_decoy_prefixes(),
             reconciliation: ReconciliationConfig::default(),
             prefilter_enabled: true,
             protein_fdr: default_protein_fdr(),
@@ -199,6 +210,14 @@ fn default_compaction_fdr() -> f64 {
 
 fn default_protein_fdr() -> f64 {
     0.01
+}
+
+fn default_decoy_prefixes() -> Vec<String> {
+    vec![
+        "DECOY_".to_string(),
+        "rev_".to_string(),
+        "decoy_".to_string(),
+    ]
 }
 
 /// Get the number of CPUs available
@@ -418,6 +437,15 @@ n_threads: 0  # 0 = auto-detect
         hasher.update(format!("prefilter_enabled:{}\n", self.prefilter_enabled).as_bytes());
         hasher.update(format!("decoy_method:{:?}\n", self.decoy_method).as_bytes());
         hasher.update(format!("decoys_in_library:{}\n", self.decoys_in_library).as_bytes());
+        // Sort prefixes so ordering changes don't churn the hash. Lower-case
+        // to make case-only edits no-ops (matching the runtime comparison).
+        let mut prefixes: Vec<String> = self
+            .decoy_prefixes
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        prefixes.sort();
+        hasher.update(format!("decoy_prefixes:{:?}\n", prefixes).as_bytes());
         hasher.update(format!("rt_cal.enabled:{}\n", self.rt_calibration.enabled).as_bytes());
         hasher.update(
             format!(
