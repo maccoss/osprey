@@ -7,12 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Transitional: run pinned v4 GitHub Actions (checkout, upload/download-artifact)
-  # under Node 24 instead of the deprecated Node 20 bundle they ship with. GitHub
-  # forces Node 24 for all JS actions on 2026-06-02; this opts in early to silence the
-  # deprecation warnings without bumping each action's version tag. Remove once we
-  # bump to action versions that natively ship Node 24.
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build-release:
@@ -47,7 +41,7 @@ jobs:
             cross: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -62,8 +56,10 @@ jobs:
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
+        # cmake and openssl@3 are pre-installed on the macos-latest runner image;
+        # only openblas needs explicit install.
         run: |
-          brew install openblas openssl cmake
+          brew install openblas
           BREW_PREFIX=$(brew --prefix openblas)
           echo "LDFLAGS=-L${BREW_PREFIX}/lib" >> $GITHUB_ENV
           echo "CPPFLAGS=-I${BREW_PREFIX}/include" >> $GITHUB_ENV
@@ -90,7 +86,7 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" -DestinationPath "osprey-${{ matrix.name }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: osprey-${{ matrix.name }}
           path: osprey-${{ matrix.name }}.*
@@ -103,10 +99,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
