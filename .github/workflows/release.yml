@@ -7,6 +7,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Transitional: run pinned v4 GitHub Actions (checkout, upload/download-artifact)
+  # under Node 24 instead of the deprecated Node 20 bundle they ship with. GitHub
+  # forces Node 24 for all JS actions on 2026-06-02; this opts in early to silence the
+  # deprecation warnings without bumping each action's version tag. Remove once we
+  # bump to action versions that natively ship Node 24.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build-release:
