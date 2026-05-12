@@ -125,15 +125,20 @@ pub fn apply_library_decoy_marking(library: &mut [LibraryEntry], prefixes: &[Str
     n_marked
 }
 
-/// Statistics from a target-decoy pairing pass.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Statistics from a target-decoy pairing pass (or sequence of passes).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PairingStats {
     /// Number of target entries seen
     pub n_targets: usize,
     /// Number of decoy entries seen
     pub n_decoys: usize,
-    /// Number of decoys successfully paired with a target (decoy.id rewritten)
+    /// Number of decoys successfully paired with a target (decoy.id rewritten).
+    /// Equals `n_paired_via_manifest + n_paired_via_composition`.
     pub n_paired: usize,
+    /// Of the paired decoys, how many were resolved via the manifest path.
+    pub n_paired_via_manifest: usize,
+    /// Of the paired decoys, how many were resolved via the composition fallback.
+    pub n_paired_via_composition: usize,
     /// Number of decoys for which no target match was found
     pub n_unpaired_decoys: usize,
     /// Number of targets that no decoy claimed as its pair
@@ -149,6 +154,26 @@ impl PairingStats {
         } else {
             self.n_paired as f64 / self.n_decoys as f64
         }
+    }
+}
+
+/// Shared bookkeeping state for multi-pass library-decoy pairing.
+///
+/// The manifest path may pair some decoys; the composition fallback then
+/// needs to know which targets are already claimed (so it doesn't reassign
+/// them) and which decoys are already paired (so it doesn't reconsider
+/// them). This struct carries that state between passes.
+#[derive(Debug, Default)]
+pub struct PairingState {
+    /// Library indices of targets already claimed by a paired decoy.
+    pub claimed_targets: std::collections::HashSet<usize>,
+    /// Library indices of decoys already paired with a target.
+    pub paired_decoys: std::collections::HashSet<usize>,
+}
+
+impl PairingState {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -179,8 +204,8 @@ fn strip_decoy_prefix(acc: &str, prefixes: &[String]) -> String {
 /// Pair library-supplied decoys with their targets via amino-acid composition.
 ///
 /// Run this AFTER `apply_library_decoy_marking` (which sets `is_decoy` on the
-/// decoy entries). For each decoy, this function locates the target entry that
-/// shares:
+/// decoy entries). For each decoy not already in `state.paired_decoys`, this
+/// function locates the target entry that shares:
 ///
 /// 1. The same protein accession (after stripping any of `decoy_prefixes` from
 ///    the decoy's accession to recover the target accession), and
@@ -202,26 +227,25 @@ fn strip_decoy_prefix(acc: &str, prefixes: &[String]) -> String {
 /// and the first one that yields an un-paired target match is used. Subsequent
 /// decoys can still claim the targets reachable through other accessions.
 ///
-/// Returns `PairingStats` so the caller can enforce a minimum success rate
-/// (a library that fails to pair a clear majority of decoys is misconfigured
-/// and reported FDR would be unreliable).
+/// `state` carries already-claimed targets and already-paired decoys (e.g.
+/// from a previous manifest-based pass). This function adds its new pairings
+/// to `state` and returns the count of decoys it paired on this call.
 pub fn pair_library_decoys_by_composition(
     library: &mut [LibraryEntry],
     decoy_prefixes: &[String],
-) -> PairingStats {
-    use std::collections::{HashMap, HashSet};
+    state: &mut PairingState,
+) -> usize {
+    use std::collections::HashMap;
 
     // Phase 1: build target index keyed by (accession, charge, sorted_aa)
     //          → list of target library indices, sorted deterministically.
+    // Targets already claimed by an earlier pass are excluded entirely
+    // (they cannot be paired with another decoy).
     let mut target_index: HashMap<(String, u8, String), Vec<usize>> = HashMap::new();
-    let mut n_targets: usize = 0;
-    let mut n_decoys: usize = 0;
     for (idx, entry) in library.iter().enumerate() {
-        if entry.is_decoy {
-            n_decoys += 1;
+        if entry.is_decoy || state.claimed_targets.contains(&idx) {
             continue;
         }
-        n_targets += 1;
         let aa = sorted_aa(&entry.sequence);
         for acc in &entry.protein_ids {
             target_index
@@ -240,9 +264,10 @@ pub fn pair_library_decoys_by_composition(
     }
 
     // Phase 2: scan decoys deterministically (sorted by sequence then id) and
-    //          claim a target slot from the index.
+    //          claim a target slot from the index. Skip decoys already paired
+    //          by an earlier pass.
     let mut decoy_order: Vec<usize> = (0..library.len())
-        .filter(|&i| library[i].is_decoy)
+        .filter(|i| library[*i].is_decoy && !state.paired_decoys.contains(i))
         .collect();
     decoy_order.sort_by(|&a, &b| {
         library[a]
@@ -251,10 +276,6 @@ pub fn pair_library_decoys_by_composition(
             .then(library[a].id.cmp(&library[b].id))
     });
 
-    // claimed[idx] = true means the target at that index is already paired.
-    // Using a HashSet keeps memory proportional to paired count rather than
-    // O(library.len()) bool vec; libraries can be ~6M entries.
-    let mut claimed: HashSet<usize> = HashSet::new();
     // Pairings collected during the immutable-borrow scan, applied in phase 3.
     let mut pairings: Vec<(usize, usize)> = Vec::new();
 
@@ -273,7 +294,7 @@ pub fn pair_library_decoys_by_composition(
             let target_acc = strip_decoy_prefix(acc, decoy_prefixes);
             if let Some(target_indices) = target_index.get(&(target_acc, charge, aa.clone())) {
                 for &t_idx in target_indices {
-                    if !claimed.contains(&t_idx) {
+                    if !state.claimed_targets.contains(&t_idx) {
                         matched = Some(t_idx);
                         break 'protein_loop;
                     }
@@ -282,7 +303,8 @@ pub fn pair_library_decoys_by_composition(
         }
 
         if let Some(t_idx) = matched {
-            claimed.insert(t_idx);
+            state.claimed_targets.insert(t_idx);
+            state.paired_decoys.insert(decoy_idx);
             pairings.push((decoy_idx, t_idx));
         }
     }
@@ -293,14 +315,7 @@ pub fn pair_library_decoys_by_composition(
         let target_id = library[target_idx].id;
         library[decoy_idx].id = target_id | DECOY_ID_BIT;
     }
-
-    PairingStats {
-        n_targets,
-        n_decoys,
-        n_paired,
-        n_unpaired_decoys: n_decoys - n_paired,
-        n_unpaired_targets: n_targets.saturating_sub(claimed.len()),
-    }
+    n_paired
 }
 
 /// Fragment ion from library
@@ -1278,6 +1293,25 @@ mod tests {
         e
     }
 
+    // Convenience wrapper for tests: composition-only pairing returning a
+    // self-contained PairingStats (the real API now uses incremental
+    // PairingState so multi-pass orchestration can be done by the caller).
+    fn run_composition_only(lib: &mut [LibraryEntry], prefixes: &[String]) -> PairingStats {
+        let n_targets = lib.iter().filter(|e| !e.is_decoy).count();
+        let n_decoys = lib.len() - n_targets;
+        let mut state = PairingState::new();
+        let n_paired = pair_library_decoys_by_composition(lib, prefixes, &mut state);
+        PairingStats {
+            n_targets,
+            n_decoys,
+            n_paired,
+            n_paired_via_manifest: 0,
+            n_paired_via_composition: n_paired,
+            n_unpaired_decoys: n_decoys - n_paired,
+            n_unpaired_targets: n_targets.saturating_sub(state.claimed_targets.len()),
+        }
+    }
+
     #[test]
     fn pair_by_composition_simple_permutation() {
         // Target PEPK in protein P1; decoy KPEP (permutation) in DECOY_P1.
@@ -1286,7 +1320,7 @@ mod tests {
             make_paired_entry(1, "PEPK", 2, &["P1"], false),
             make_paired_entry(2 | DECOY_ID_BIT, "KPEP", 2, &["DECOY_P1"], true),
         ];
-        let stats = pair_library_decoys_by_composition(&mut lib, &["DECOY_".into()]);
+        let stats = run_composition_only(&mut lib, &["DECOY_".into()]);
         assert_eq!(stats.n_paired, 1);
         assert_eq!(stats.n_unpaired_decoys, 0);
         assert_eq!(stats.n_unpaired_targets, 0);
@@ -1302,7 +1336,7 @@ mod tests {
             make_paired_entry(1, "PEPK", 2, &["P1"], false),
             make_paired_entry(2 | DECOY_ID_BIT, "KPEP", 2, &["DECOY_P2"], true),
         ];
-        let stats = pair_library_decoys_by_composition(&mut lib, &["DECOY_".into()]);
+        let stats = run_composition_only(&mut lib, &["DECOY_".into()]);
         assert_eq!(stats.n_paired, 0);
         assert_eq!(stats.n_unpaired_decoys, 1);
     }
@@ -1314,7 +1348,7 @@ mod tests {
             make_paired_entry(1, "PEPK", 2, &["P1"], false),
             make_paired_entry(2 | DECOY_ID_BIT, "KPEP", 3, &["DECOY_P1"], true),
         ];
-        let stats = pair_library_decoys_by_composition(&mut lib, &["DECOY_".into()]);
+        let stats = run_composition_only(&mut lib, &["DECOY_".into()]);
         assert_eq!(stats.n_paired, 0);
     }
 
@@ -1329,7 +1363,7 @@ mod tests {
             make_paired_entry(3 | DECOY_ID_BIT, "KPEP", 2, &["DECOY_P1"], true),
             make_paired_entry(4 | DECOY_ID_BIT, "PKPE", 2, &["DECOY_P1"], true),
         ];
-        let stats = pair_library_decoys_by_composition(&mut lib, &["DECOY_".into()]);
+        let stats = run_composition_only(&mut lib, &["DECOY_".into()]);
         assert_eq!(stats.n_paired, 2);
         assert_eq!(stats.n_unpaired_decoys, 0);
         assert_eq!(stats.n_unpaired_targets, 0);
@@ -1360,8 +1394,8 @@ mod tests {
         ];
         let mut lib_a = entries_a.clone();
         let mut lib_b = entries_b.clone();
-        pair_library_decoys_by_composition(&mut lib_a, &prefixes);
-        pair_library_decoys_by_composition(&mut lib_b, &prefixes);
+        run_composition_only(&mut lib_a, &prefixes);
+        run_composition_only(&mut lib_b, &prefixes);
 
         // Find each entry by its original sequence in both runs and confirm
         // the same target gets paired with the same decoy.
@@ -1385,7 +1419,7 @@ mod tests {
             make_paired_entry(1, "PEPK", 2, &["P1", "P2"], false), // shared target
             make_paired_entry(2 | DECOY_ID_BIT, "KPEP", 2, &["DECOY_P2"], true),
         ];
-        let stats = pair_library_decoys_by_composition(&mut lib, &["DECOY_".into()]);
+        let stats = run_composition_only(&mut lib, &["DECOY_".into()]);
         assert_eq!(stats.n_paired, 1);
         assert_eq!(lib[1].id & 0x7FFF_FFFF, 1);
     }
@@ -1399,7 +1433,7 @@ mod tests {
             make_paired_entry(3 | DECOY_ID_BIT, "KPEP", 2, &["DECOY_P1"], true), // pairs to id=1
             make_paired_entry(4 | DECOY_ID_BIT, "XYZK", 2, &["DECOY_P9"], true), // no target
         ];
-        let stats = pair_library_decoys_by_composition(&mut lib, &["DECOY_".into()]);
+        let stats = run_composition_only(&mut lib, &["DECOY_".into()]);
         assert_eq!(stats.n_targets, 2);
         assert_eq!(stats.n_decoys, 2);
         assert_eq!(stats.n_paired, 1);
@@ -1412,7 +1446,7 @@ mod tests {
     fn pair_by_composition_no_decoys_is_full_pair_fraction() {
         // No decoys → paired_fraction returns 1.0 (no failure to report).
         let mut lib = vec![make_paired_entry(1, "PEPK", 2, &["P1"], false)];
-        let stats = pair_library_decoys_by_composition(&mut lib, &["DECOY_".into()]);
+        let stats = run_composition_only(&mut lib, &["DECOY_".into()]);
         assert_eq!(stats.n_decoys, 0);
         assert_eq!(stats.paired_fraction(), 1.0);
     }

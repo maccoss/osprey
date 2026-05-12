@@ -3395,10 +3395,13 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
 
         // Pair each decoy with its target so their base_ids match — required
         // for SVM target-decoy competition, LDA calibration, and CV fold
-        // grouping. Prefer an explicit FDRBench manifest when supplied;
-        // otherwise fall back to composition-based pairing (decoys are
-        // permutations of their targets within the matched protein pair).
-        let pairing_stats = if let Some(manifest_path) = &config.decoy_pairing_manifest {
+        // grouping. Hybrid: manifest first (when supplied), then composition
+        // fallback for decoys the manifest didn't cover. Manifests generated
+        // alongside a library (e.g. by FDRBench) commonly miss a fraction of
+        // the library's peptides because the library generator may use
+        // different digestion rules; composition pairing recovers those.
+        let mut pairing_state = osprey_core::PairingState::new();
+        let n_paired_manifest = if let Some(manifest_path) = &config.decoy_pairing_manifest {
             log::info!(
                 "Loading decoy pairing manifest from {}",
                 manifest_path.display()
@@ -3411,20 +3414,35 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                         e
                     ))
                 })?;
-            manifest.apply_to_library(&mut library)
+            manifest.apply_to_library(&mut library, &mut pairing_state)
         } else {
-            log::info!(
-                "Pairing library decoys to targets by amino-acid composition (no manifest \
-                 provided). For best results with FDRBench-generated libraries, supply \
-                 --decoy-pairing-manifest."
-            );
-            osprey_core::pair_library_decoys_by_composition(&mut library, &config.decoy_prefixes)
+            0
+        };
+        let n_paired_composition = osprey_core::pair_library_decoys_by_composition(
+            &mut library,
+            &config.decoy_prefixes,
+            &mut pairing_state,
+        );
+
+        let n_targets = library.iter().filter(|e| !e.is_decoy).count();
+        let n_decoys = library.len() - n_targets;
+        let n_paired = n_paired_manifest + n_paired_composition;
+        let pairing_stats = osprey_core::PairingStats {
+            n_targets,
+            n_decoys,
+            n_paired,
+            n_paired_via_manifest: n_paired_manifest,
+            n_paired_via_composition: n_paired_composition,
+            n_unpaired_decoys: n_decoys - n_paired,
+            n_unpaired_targets: n_targets.saturating_sub(pairing_state.claimed_targets.len()),
         };
         log::info!(
-            "Library-decoy pairing: paired {}/{} decoys ({:.1}%); {} unpaired decoys, {} unpaired targets",
+            "Library-decoy pairing: paired {}/{} decoys ({:.1}%) - {} via manifest, {} via composition; {} unpaired decoys, {} unpaired targets",
             pairing_stats.n_paired,
             pairing_stats.n_decoys,
             pairing_stats.paired_fraction() * 100.0,
+            pairing_stats.n_paired_via_manifest,
+            pairing_stats.n_paired_via_composition,
             pairing_stats.n_unpaired_decoys,
             pairing_stats.n_unpaired_targets,
         );

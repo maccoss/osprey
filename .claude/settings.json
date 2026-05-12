@@ -7,7 +7,11 @@
       "Bash(git ls-tree *)",
       "Bash(git stash *)",
       "Bash(awk '$1 == \"i/-text\" {print $4}')",
-      "Bash(awk '-F\\\\t' '{print \"columns: \"NF; for\\(i=1;i<=NF;i++\\) print i\": \"$i}')"
+      "Bash(awk '-F\\\\t' '{print \"columns: \"NF; for\\(i=1;i<=NF;i++\\) print i\": \"$i}')",
+      "Bash(awk -F'\\\\t' 'NR>1 {print $4}' uniprot_human_jan2025_yeastENO1_contam_ADpeps_entrapment_pep.txt)",
+      "Bash(awk -F'\\\\t' 'NR>1 && $6 ~ /^rev_/ {print $2\"\\\\t\"$6\"\\\\t\"$4}' human-entrapment-carafe_spectral_library_decoy.tsv)",
+      "Bash(awk -F'\\\\t' 'NR>1 && $6 !~ /^rev_/ {print $2\"\\\\t\"$6\"\\\\t\"$4}' human-entrapment-carafe_spectral_library_decoy.tsv)",
+      "Bash(awk -F'\\\\t' 'NR>1 {if\\($6 ~ /^rev_/\\) print \"DECOY\\\\t\"$2\"\\\\t\"$6\"\\\\t\"$4; else print \"TARGET\\\\t\"$2\"\\\\t\"$6\"\\\\t\"$4}')"
     ]
   }
 }

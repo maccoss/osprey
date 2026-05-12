@@ -282,20 +282,20 @@ each decoy sharing a `base_id` with its target (linked by
 `base_id = entry_id & 0x7FFFFFFF`). Without pairing,
 `compete_from_indices` treats every entry as an "unpaired winner" and the
 SVM trains on the full target population without quality filtering,
-producing FDR estimates that are too optimistic. Osprey runs one of two
-pairing strategies after marking:
+producing FDR estimates that are too optimistic. Osprey runs pairing in
+two stages, hybrid by design:
 
-- **Manifest-based** (preferred): if `decoy_pairing_manifest` points to
-  a FDRBench-style 5-column TSV (`sequence`, `decoy`, `proteins`,
-  `peptide_type`, `peptide_pair_index`), Osprey uses each row's
+- **Stage 1: manifest-based** (when supplied via `decoy_pairing_manifest`):
+  reads a FDRBench-style 5-column TSV (`sequence`, `decoy`, `proteins`,
+  `peptide_type`, `peptide_pair_index`) and uses each row's
   `peptide_pair_index` to group entries into target/decoy pairs.
   Two pairs come from each group: `(target, decoy)` and
   `(p_target, p_decoy)`. Lookup is by unmodified peptide sequence;
-  charge is honored so charge-2 decoys pair with charge-2 targets, etc.
-- **Composition-based fallback**: with no manifest, Osprey infers the
-  pairing from the library itself. For each decoy, it strips a
-  configured prefix from each protein accession to recover the target
-  accession, then looks for a target peptide with the same
+  charge is honored so charge-2 decoys pair with charge-2 targets.
+- **Stage 2: composition-based fallback** (always runs): for each decoy
+  not paired by the manifest, Osprey strips a configured prefix from
+  each protein accession to recover the target accession, then looks
+  for a target peptide with the same
   `(stripped_accession, charge, sorted_amino_acid_composition)`. Within
   a composition group on a single protein, target and decoy entries are
   sorted by `(sequence, id)` and zipped 1:1, so pairings are
@@ -303,13 +303,25 @@ pairing strategies after marking:
   decoy strategy that preserves AA composition (Carafe's randomized
   decoys, sequence-reversal decoys).
 
-Both strategies write decoy IDs as `target_id | DECOY_ID_BIT`. Osprey
-reports a pairing summary (paired / unpaired decoys / unpaired
-targets) at INFO level and **bails with a hard error if fewer than
-`decoy_pair_min_fraction` (default 80%) of decoys pair successfully**.
-Below that threshold, FDR estimates would be unreliable; the user must
-either supply a manifest, fix the library's accession conventions, or
-unset `decoys_in_library` and let Osprey generate decoys.
+Why hybrid? In practice, a manifest generated alongside a library can
+still miss most of the library's peptides if the library generator
+(e.g. Carafe) uses different digestion rules than FDRBench. The
+composition fallback recovers those misses. When both stages run on
+real data, the breakdown looks something like:
+
+```text
+Library-decoy pairing: paired 10103456/10175597 decoys (99.3%) -
+3027526 via manifest, 7075930 via composition; 72141 unpaired decoys,
+72141 unpaired targets
+```
+
+Both stages write decoy IDs as `target_id | DECOY_ID_BIT`. Osprey
+reports the pairing breakdown at INFO level and **bails with a hard
+error if fewer than `decoy_pair_min_fraction` (default 80%) of decoys
+pair successfully overall**. Below that threshold, FDR estimates would
+be unreliable; the user must either supply a more complete manifest,
+fix the library's accession conventions, or unset `decoys_in_library`
+and let Osprey generate decoys.
 
 Prior to this support, `decoys_in_library: true` skipped DecoyGenerator
 but no code set `is_decoy` and no pairing was performed, so real decoys

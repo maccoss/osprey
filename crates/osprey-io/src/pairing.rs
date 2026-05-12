@@ -20,7 +20,7 @@
 //! library decoy ids so each decoy shares a `base_id` with its target — what
 //! the SVM/LDA target-decoy competition relies on.
 
-use osprey_core::{LibraryEntry, PairingStats, DECOY_ID_BIT};
+use osprey_core::{LibraryEntry, PairingState, DECOY_ID_BIT};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -169,25 +169,33 @@ impl DecoyPairingManifest {
 
     /// Apply the manifest to a library: for each pair_index/partition/charge
     /// group, identify target-side and decoy-side entries and rewrite each
-    /// decoy's `id` so its `base_id` matches a target's `id`. Returns
-    /// `PairingStats` reflecting how many decoys were successfully paired.
+    /// decoy's `id` so its `base_id` matches a target's `id`. Returns the
+    /// number of decoys paired on this call.
     ///
     /// Library entries whose sequence is not in the manifest are left
-    /// untouched (and counted as unpaired if they have `is_decoy = true`).
-    /// Within a single (pair_index, partition, charge) bucket, multiple
-    /// target/decoy entries (e.g. modification variants) are sorted by
-    /// `(sequence, id)` and zipped 1:1 deterministically.
-    pub fn apply_to_library(&self, library: &mut [LibraryEntry]) -> PairingStats {
+    /// untouched. Within a single (pair_index, partition, charge) bucket,
+    /// multiple target/decoy entries (e.g. modification variants) are sorted
+    /// by `(sequence, id)` and zipped 1:1 deterministically.
+    ///
+    /// `state` carries already-claimed targets and already-paired decoys so
+    /// this function can be chained with a composition-based fallback pass
+    /// without claiming the same target twice. New pairings made here are
+    /// added to `state`.
+    pub fn apply_to_library(
+        &self,
+        library: &mut [LibraryEntry],
+        state: &mut PairingState,
+    ) -> usize {
         // Group library entries by (pair_index, partition, charge, is_target_side).
-        // Each bucket holds Vec<library_index>.
+        // Each bucket holds Vec<library_index>. Skip entries already paired
+        // (decoys) or claimed (targets) by an earlier pass.
         let mut buckets: HashMap<(u32, u8, u8, bool), Vec<usize>> = HashMap::new();
-        let mut n_targets: usize = 0;
-        let mut n_decoys: usize = 0;
         for (idx, entry) in library.iter().enumerate() {
-            if entry.is_decoy {
-                n_decoys += 1;
-            } else {
-                n_targets += 1;
+            if entry.is_decoy && state.paired_decoys.contains(&idx) {
+                continue;
+            }
+            if !entry.is_decoy && state.claimed_targets.contains(&idx) {
+                continue;
             }
             if let Some(&(kind, pair_index)) = self.seq_to_info.get(&entry.sequence) {
                 buckets
@@ -205,7 +213,6 @@ impl DecoyPairingManifest {
         // Walk every target-side bucket; find its decoy-side counterpart and
         // zip them 1:1 in deterministic order.
         let mut pairings: Vec<(usize, usize)> = Vec::new();
-        let mut claimed_targets = std::collections::HashSet::new();
         // Collect target-side keys first so we can iterate deterministically.
         let mut target_keys: Vec<&(u32, u8, u8, bool)> = buckets.keys().filter(|k| k.3).collect();
         target_keys.sort();
@@ -233,7 +240,8 @@ impl DecoyPairingManifest {
             });
             for (t_idx, d_idx) in t_sorted.iter().zip(d_sorted.iter()) {
                 pairings.push((*d_idx, *t_idx));
-                claimed_targets.insert(*t_idx);
+                state.claimed_targets.insert(*t_idx);
+                state.paired_decoys.insert(*d_idx);
             }
         }
 
@@ -243,14 +251,7 @@ impl DecoyPairingManifest {
             let target_id = library[target_idx].id;
             library[decoy_idx].id = target_id | DECOY_ID_BIT;
         }
-
-        PairingStats {
-            n_targets,
-            n_decoys,
-            n_paired,
-            n_unpaired_decoys: n_decoys - n_paired,
-            n_unpaired_targets: n_targets.saturating_sub(claimed_targets.len()),
-        }
+        n_paired
     }
 }
 
@@ -330,9 +331,9 @@ mod tests {
             make_entry(3, "AEPTPIDE", 2, true), // decoy of PEPTIDEA
             make_entry(4, "BPETPIDE", 2, true), // p_decoy of PEPTIDEB
         ];
-        let stats = m.apply_to_library(&mut lib);
-        assert_eq!(stats.n_paired, 2);
-        assert_eq!(stats.n_unpaired_decoys, 0);
+        let mut state = PairingState::new();
+        let n_paired = m.apply_to_library(&mut lib, &mut state);
+        assert_eq!(n_paired, 2);
         // The decoy of PEPTIDEA should base_id-match target id 1.
         let aeptpide = lib.iter().find(|e| e.sequence == "AEPTPIDE").unwrap();
         let bpetpide = lib.iter().find(|e| e.sequence == "BPETPIDE").unwrap();
@@ -353,8 +354,9 @@ mod tests {
             make_entry(3, "AEPTPIDE", 2, true),
             make_entry(4, "AEPTPIDE", 3, true),
         ];
-        let stats = m.apply_to_library(&mut lib);
-        assert_eq!(stats.n_paired, 2);
+        let mut state = PairingState::new();
+        let n_paired = m.apply_to_library(&mut lib, &mut state);
+        assert_eq!(n_paired, 2);
         // Charge 2 decoy pairs to charge 2 target; charge 3 to charge 3.
         let d_c2 = lib
             .iter()
@@ -385,8 +387,59 @@ mod tests {
             make_entry(1, "PEPTIDEA", 2, false),
             make_entry(2, "UNKNOWNK", 2, true), // not in manifest
         ];
-        let stats = m.apply_to_library(&mut lib);
-        assert_eq!(stats.n_paired, 0);
-        assert_eq!(stats.n_unpaired_decoys, 1);
+        let mut state = PairingState::new();
+        let n_paired = m.apply_to_library(&mut lib, &mut state);
+        assert_eq!(n_paired, 0);
+        // The unpaired decoy is not in state.paired_decoys.
+        assert!(!state.paired_decoys.contains(&1));
+    }
+
+    #[test]
+    fn manifest_then_composition_pairs_unmatched_decoys() {
+        // Hybrid mode: manifest covers PEPTIDEA's pair; composition covers
+        // PEPTIDEB↔EPBPTIDE (a permutation pair not in the manifest).
+        use osprey_core::pair_library_decoys_by_composition;
+        let f = write_manifest(&[
+            "PEPTIDEA\tNo\tprotA\ttarget\t0",
+            "AEPTPIDE\tYes\trev_protA\tdecoy\t0",
+        ]);
+        let m = DecoyPairingManifest::from_tsv(f.path()).unwrap();
+        let mut lib = vec![
+            // Pair 0: in the manifest.
+            {
+                let mut e = make_entry(1, "PEPTIDEA", 2, false);
+                e.protein_ids = vec!["protA".into()];
+                e
+            },
+            {
+                let mut e = make_entry(2, "AEPTPIDE", 2, true);
+                e.protein_ids = vec!["rev_protA".into()];
+                e
+            },
+            // Pair 1: NOT in the manifest but composition-pairable
+            // (PEPTIDEB and EPBPTIDE share AA composition; same protein pair).
+            {
+                let mut e = make_entry(3, "PEPTIDEB", 2, false);
+                e.protein_ids = vec!["protB".into()];
+                e
+            },
+            {
+                let mut e = make_entry(4, "EPBPTIDE", 2, true);
+                e.protein_ids = vec!["rev_protB".into()];
+                e
+            },
+        ];
+        let mut state = PairingState::new();
+        let n_manifest = m.apply_to_library(&mut lib, &mut state);
+        assert_eq!(n_manifest, 1);
+        // Run composition fallback. Should pair the remaining (PEPTIDEB, EPBPTIDE).
+        let n_composition =
+            pair_library_decoys_by_composition(&mut lib, &["rev_".to_string()], &mut state);
+        assert_eq!(n_composition, 1);
+        // Verify both pairs have matching base_ids.
+        let dec_a = lib.iter().find(|e| e.sequence == "AEPTPIDE").unwrap();
+        let dec_b = lib.iter().find(|e| e.sequence == "EPBPTIDE").unwrap();
+        assert_eq!(dec_a.id & 0x7FFF_FFFF, 1);
+        assert_eq!(dec_b.id & 0x7FFF_FFFF, 3);
     }
 }
