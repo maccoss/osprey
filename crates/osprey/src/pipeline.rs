@@ -3370,25 +3370,24 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     let library_supplies_decoys =
         config.decoys_in_library || matches!(config.decoy_method, CoreDecoyMethod::FromLibrary);
     if library_supplies_decoys {
-        let n_marked =
+        let marking_stats =
             osprey_core::apply_library_decoy_marking(&mut library, &config.decoy_prefixes);
         let n_targets = library.iter().filter(|e| !e.is_decoy).count();
         let n_decoys = library.len() - n_targets;
         log::info!(
-            "Library-decoy mode: matched prefixes {:?}",
-            config.decoy_prefixes
-        );
-        log::info!(
-            "Library-decoy mode: {} entries flagged this pass; {} targets, {} decoys total",
-            n_marked,
+            "Library-decoy mode: prefixes {:?}; decoys flagged via TSV Decoy column = {}, via prefix scan = {}; {} targets, {} decoys total",
+            config.decoy_prefixes,
+            marking_stats.n_marked_by_column,
+            marking_stats.n_marked_by_prefix,
             n_targets,
             n_decoys
         );
         if n_decoys == 0 {
             return Err(OspreyError::config(format!(
-                "decoys_in_library mode requested but no library entries match prefixes {:?}. \
-                 Check that the library actually contains decoys with one of these prefixes on \
-                 a protein accession, or unset decoys_in_library so Osprey generates decoys.",
+                "decoys_in_library mode requested but no library entries match prefixes {:?} \
+                 and no rows have a populated Decoy column. Check that the library actually \
+                 contains decoys (decoy_/rev_ protein-accession prefix OR Decoy=1 in the TSV), \
+                 or unset decoys_in_library so Osprey generates decoys.",
                 config.decoy_prefixes
             )));
         }

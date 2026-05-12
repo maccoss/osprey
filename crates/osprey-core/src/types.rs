@@ -91,18 +91,24 @@ impl LibraryEntry {
 /// prefix during post-load marking.
 pub const DECOY_ID_BIT: u32 = 0x8000_0000;
 
-/// Scan a library and flag entries matching `prefixes` as decoys.
+/// Scan a library and flag entries matching `prefixes` as decoys, and also
+/// canonicalise entries already flagged by the loader (e.g. from a `Decoy`
+/// column in the DIA-NN TSV).
 ///
-/// For each matching entry, sets `is_decoy = true` and ORs `DECOY_ID_BIT`
-/// into `id`. Returns the number of entries marked. The function is
-/// idempotent: entries already flagged as decoys are left unchanged
-/// (no double-OR of the high bit, no double-count in the return value).
+/// For every entry that ends up flagged as a decoy (either because it
+/// already had `is_decoy = true` from the loader, or because one of its
+/// protein accessions starts with one of `prefixes`), the function ORs
+/// `DECOY_ID_BIT` into its `id`. Idempotent: a second call is a no-op.
+///
+/// Returns `MarkingStats` so the caller can log how many decoys came from
+/// each source (the `Decoy` column vs the prefix scan).
 ///
 /// This is the post-load companion to `DecoyGenerator`: when the user
-/// supplies a library that already contains decoys (e.g., DIA-NN or
-/// EncyclopeDIA output with `rev_`/`DECOY_` prefixes on protein
-/// accessions), this marking step sets the same metadata that
-/// DecoyGenerator would, so downstream FDR sees decoys as decoys.
+/// supplies a library that already contains decoys (DIA-NN / EncyclopeDIA
+/// / Carafe output with `decoy_` / `rev_` / `DECOY_` prefixes on protein
+/// accessions, or with a populated `Decoy` column), this marking step sets
+/// the same metadata that `DecoyGenerator` would, so downstream FDR sees
+/// decoys as decoys.
 ///
 /// **Note**: marking alone does NOT establish the target-decoy pairing
 /// (matching base_ids) that the SVM and LDA rely on for proper
@@ -110,19 +116,46 @@ pub const DECOY_ID_BIT: u32 = 0x8000_0000;
 /// `pair_library_decoys_by_composition` (uses peptide AA composition
 /// within matched target/decoy protein pairs) or an explicit pairing
 /// manifest reader.
-pub fn apply_library_decoy_marking(library: &mut [LibraryEntry], prefixes: &[String]) -> usize {
-    let mut n_marked = 0;
+pub fn apply_library_decoy_marking(
+    library: &mut [LibraryEntry],
+    prefixes: &[String],
+) -> MarkingStats {
+    let mut stats = MarkingStats::default();
     for entry in library.iter_mut() {
         if entry.is_decoy {
+            // Loader (Decoy column) already flagged this one; just make sure
+            // the high bit on `id` is set so base_id pairing works.
+            if entry.id & DECOY_ID_BIT == 0 {
+                entry.id |= DECOY_ID_BIT;
+                stats.n_marked_by_column += 1;
+            }
             continue;
         }
         if entry.looks_like_library_decoy(prefixes) {
             entry.is_decoy = true;
             entry.id |= DECOY_ID_BIT;
-            n_marked += 1;
+            stats.n_marked_by_prefix += 1;
         }
     }
-    n_marked
+    stats
+}
+
+/// Breakdown of how decoys were detected in `apply_library_decoy_marking`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarkingStats {
+    /// Entries whose `is_decoy` was already true (set by the loader from a
+    /// `Decoy` column in the TSV) and whose `id` got the high bit set here.
+    pub n_marked_by_column: usize,
+    /// Entries newly flagged as decoy on this pass via the protein-prefix
+    /// scan.
+    pub n_marked_by_prefix: usize,
+}
+
+impl MarkingStats {
+    /// Total decoys flagged across both detection paths.
+    pub fn total(&self) -> usize {
+        self.n_marked_by_column + self.n_marked_by_prefix
+    }
 }
 
 /// Statistics from a target-decoy pairing pass (or sequence of passes).
@@ -1245,13 +1278,15 @@ mod tests {
     fn apply_library_decoy_marking_sets_flag_and_high_bit() {
         let mut lib = vec![
             make_lib_entry(1, &["P12345"]),       // target
-            make_lib_entry(2, &["DECOY_P12345"]), // decoy
+            make_lib_entry(2, &["DECOY_P12345"]), // decoy via prefix
             make_lib_entry(3, &["rev_P67890"]),   // decoy via rev_
             make_lib_entry(4, &["P67890"]),       // target
         ];
         let prefixes = vec!["DECOY_".into(), "rev_".into()];
-        let n = apply_library_decoy_marking(&mut lib, &prefixes);
-        assert_eq!(n, 2);
+        let stats = apply_library_decoy_marking(&mut lib, &prefixes);
+        assert_eq!(stats.n_marked_by_prefix, 2);
+        assert_eq!(stats.n_marked_by_column, 0);
+        assert_eq!(stats.total(), 2);
         assert!(!lib[0].is_decoy);
         assert!(lib[1].is_decoy);
         assert!(lib[2].is_decoy);
@@ -1270,12 +1305,38 @@ mod tests {
     fn apply_library_decoy_marking_is_idempotent() {
         let mut lib = vec![make_lib_entry(1, &["DECOY_P12345"])];
         let prefixes = vec!["DECOY_".into()];
-        let n1 = apply_library_decoy_marking(&mut lib, &prefixes);
+        let stats1 = apply_library_decoy_marking(&mut lib, &prefixes);
         let id_after_first = lib[0].id;
-        let n2 = apply_library_decoy_marking(&mut lib, &prefixes);
-        assert_eq!(n1, 1);
-        assert_eq!(n2, 0); // second pass marks nothing new
+        let stats2 = apply_library_decoy_marking(&mut lib, &prefixes);
+        assert_eq!(stats1.n_marked_by_prefix, 1);
+        // Second pass: nothing new by prefix; high bit already set so no
+        // column-canonicalisation needed either.
+        assert_eq!(stats2.n_marked_by_prefix, 0);
+        assert_eq!(stats2.n_marked_by_column, 0);
         assert_eq!(lib[0].id, id_after_first); // no double-OR of high bit
+    }
+
+    #[test]
+    fn apply_library_decoy_marking_canonicalises_loader_flagged_decoys() {
+        // Simulate: the DIA-NN loader read a Decoy=1 column and set
+        // entry.is_decoy = true, but did NOT set DECOY_ID_BIT on the id.
+        // The marking pass should fix that.
+        let mut lib = vec![
+            make_lib_entry(7, &["SomeProtein"]), // target (untouched by loader)
+            {
+                let mut e = make_lib_entry(8, &["SomeOtherProtein"]); // loader-flagged
+                e.is_decoy = true;
+                e
+            },
+        ];
+        let stats = apply_library_decoy_marking(&mut lib, &["DECOY_".into()]);
+        // The loader-flagged entry got its high bit set; the prefix scan
+        // contributed nothing.
+        assert_eq!(stats.n_marked_by_column, 1);
+        assert_eq!(stats.n_marked_by_prefix, 0);
+        assert_eq!(lib[0].id & DECOY_ID_BIT, 0);
+        assert_ne!(lib[1].id & DECOY_ID_BIT, 0);
+        assert_eq!(lib[1].id & 0x7FFF_FFFF, 8);
     }
 
     // Helper: like make_lib_entry but lets the test set sequence, charge,

@@ -83,8 +83,15 @@ impl DiannTsvLoader {
                 retention_time: row_data.retention_time,
                 protein_ids: row_data.protein_ids.clone(),
                 gene_names: row_data.gene_names.clone(),
+                is_decoy: row_data.is_decoy,
                 fragments: Vec::new(),
             });
+            // If any fragment row in this precursor is flagged as a decoy, the
+            // whole precursor is a decoy. (DIA-NN writes the same Decoy value
+            // on every row of a given precursor, so this OR is defensive.)
+            if row_data.is_decoy {
+                precursor.is_decoy = true;
+            }
 
             // Add fragment
             precursor.fragments.push(LibraryFragment {
@@ -120,6 +127,7 @@ impl DiannTsvLoader {
             entry.fragments = data.fragments;
             entry.protein_ids = data.protein_ids;
             entry.gene_names = data.gene_names;
+            entry.is_decoy = data.is_decoy;
 
             entries.push(entry);
             id += 1;
@@ -249,6 +257,16 @@ impl DiannTsvLoader {
             .map(split_list)
             .unwrap_or_default();
 
+        // Optional Decoy column. Accept any truthy spelling (1 / true / yes /
+        // y / t, case-insensitive); anything else is treated as target. Empty
+        // / missing column → false. We intentionally do NOT error on
+        // unparseable values so a malformed cell doesn't fail an entire load.
+        let is_decoy = cols
+            .decoy
+            .and_then(|i| record.get(i))
+            .map(parse_decoy_flag)
+            .unwrap_or(false);
+
         Ok(RowData {
             precursor_mz,
             charge,
@@ -260,8 +278,24 @@ impl DiannTsvLoader {
             annotation,
             protein_ids,
             gene_names,
+            is_decoy,
         })
     }
+}
+
+/// Parse the optional Decoy column. Accepts ``1``, ``true``, ``yes``, ``y``,
+/// ``t`` (case-insensitive) as decoy. Everything else (including ``0``,
+/// empty, garbage) is treated as target. Returning false on unknown values
+/// matches the "default to target if unsure" convention DIA-NN itself uses.
+fn parse_decoy_flag(s: &str) -> bool {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "t"
+    )
 }
 
 impl Default for DiannTsvLoader {
@@ -301,6 +335,13 @@ struct ColumnIndices {
     normalized_rt: Option<usize>,
     protein_id: Option<usize>,
     gene_name: Option<usize>,
+    /// Optional Decoy column (DIA-NN convention: 0=target, 1=decoy). When
+    /// present, rows with `1` / `true` / `yes` are flagged as decoys at load
+    /// time. Combined with `decoys_in_library` mode in the pipeline, this
+    /// catches decoys that lack the `decoy_` / `rev_` protein-accession
+    /// prefix and vice-versa — useful since some library generators set the
+    /// column but not the prefix or vice versa.
+    decoy: Option<usize>,
 }
 
 impl ColumnIndices {
@@ -335,6 +376,7 @@ impl ColumnIndices {
             normalized_rt: find(&["NormalizedRetentionTime", "Tr_recalibrated", "RT"]),
             protein_id: find(&["ProteinId", "Protein.Id", "ProteinName", "Protein"]),
             gene_name: find(&["GeneName", "Gene.Name", "Genes"]),
+            decoy: find(&["Decoy", "IsDecoy", "Is.Decoy"]),
         };
 
         // Validate required columns exist
@@ -380,6 +422,9 @@ struct RowData {
     annotation: FragmentAnnotation,
     protein_ids: Vec<String>,
     gene_names: Vec<String>,
+    /// Parsed value of the optional Decoy column (true = decoy). Defaults to
+    /// false when the column is absent or the row has an unrecognised value.
+    is_decoy: bool,
 }
 
 /// Intermediate precursor data for grouping fragments
@@ -391,6 +436,7 @@ struct PrecursorData {
     retention_time: f64,
     protein_ids: Vec<String>,
     gene_names: Vec<String>,
+    is_decoy: bool,
     fragments: Vec<LibraryFragment>,
 }
 
@@ -588,5 +634,70 @@ mod tests {
         assert!((parse_mod_mass("+15.9949").unwrap() - 15.9949).abs() < 1e-4);
         assert!((parse_mod_mass("-17.026").unwrap() + 17.026).abs() < 1e-3);
         assert!((parse_mod_mass("Oxidation").unwrap() - 15.9949).abs() < 1e-4);
+    }
+
+    /// `parse_decoy_flag` accepts common truthy spellings and treats everything
+    /// else (including blank, garbage) as target.
+    #[test]
+    fn test_parse_decoy_flag() {
+        assert!(parse_decoy_flag("1"));
+        assert!(parse_decoy_flag("true"));
+        assert!(parse_decoy_flag("TRUE"));
+        assert!(parse_decoy_flag("Yes"));
+        assert!(parse_decoy_flag("y"));
+        assert!(parse_decoy_flag("t"));
+        assert!(parse_decoy_flag(" 1 ")); // leading/trailing whitespace
+        assert!(!parse_decoy_flag("0"));
+        assert!(!parse_decoy_flag(""));
+        assert!(!parse_decoy_flag("false"));
+        assert!(!parse_decoy_flag("garbage"));
+    }
+
+    /// End-to-end: parser sets `is_decoy = true` on entries whose `Decoy`
+    /// column is 1, leaves it false on 0 / missing values.
+    #[test]
+    fn test_loader_reads_decoy_column() {
+        use std::io::Cursor;
+
+        // Minimal DIA-NN TSV: 4 rows = 2 precursors × 2 fragments each.
+        // First precursor has Decoy=0, second has Decoy=1. min_fragments=2
+        // so both survive the threshold.
+        let tsv = "\
+ModifiedPeptide\tStrippedPeptide\tPrecursorMz\tPrecursorCharge\tTr_recalibrated\tProteinID\tDecoy\tFragmentMz\tRelativeIntensity\tFragmentType\tFragmentNumber\tFragmentCharge\tFragmentLossType
+_PEPTIDEK_\tPEPTIDEK\t400.0\t2\t10.5\tsp|P00001|TEST_HUMAN\t0\t100.0\t1.0\ty\t1\t1\tnoloss
+_PEPTIDEK_\tPEPTIDEK\t400.0\t2\t10.5\tsp|P00001|TEST_HUMAN\t0\t200.0\t0.8\ty\t2\t1\tnoloss
+_KEDITPEP_\tKEDITPEP\t400.0\t2\t10.5\tdecoy_sp|P00001|TEST_HUMAN\t1\t100.0\t1.0\ty\t1\t1\tnoloss
+_KEDITPEP_\tKEDITPEP\t400.0\t2\t10.5\tdecoy_sp|P00001|TEST_HUMAN\t1\t200.0\t0.8\ty\t2\t1\tnoloss
+";
+        let loader = DiannTsvLoader::new().with_min_fragments(2);
+        let entries = loader
+            .parse_reader(Cursor::new(tsv), std::path::Path::new("test.tsv"))
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        let target = entries.iter().find(|e| e.sequence == "PEPTIDEK").unwrap();
+        let decoy = entries.iter().find(|e| e.sequence == "KEDITPEP").unwrap();
+        assert!(!target.is_decoy, "target row should have is_decoy=false");
+        assert!(decoy.is_decoy, "decoy row should have is_decoy=true");
+    }
+
+    /// When the TSV has no Decoy column at all, all entries default to
+    /// `is_decoy = false`. The `apply_library_decoy_marking` pass is what
+    /// handles prefix-only libraries.
+    #[test]
+    fn test_loader_no_decoy_column_defaults_to_target() {
+        use std::io::Cursor;
+        let tsv = "\
+ModifiedPeptide\tStrippedPeptide\tPrecursorMz\tPrecursorCharge\tTr_recalibrated\tProteinID\tFragmentMz\tRelativeIntensity\tFragmentType\tFragmentNumber\tFragmentCharge\tFragmentLossType
+_PEPTIDEK_\tPEPTIDEK\t400.0\t2\t10.5\tdecoy_sp|P00001|TEST_HUMAN\t100.0\t1.0\ty\t1\t1\tnoloss
+_PEPTIDEK_\tPEPTIDEK\t400.0\t2\t10.5\tdecoy_sp|P00001|TEST_HUMAN\t200.0\t0.8\ty\t2\t1\tnoloss
+";
+        let loader = DiannTsvLoader::new().with_min_fragments(2);
+        let entries = loader
+            .parse_reader(Cursor::new(tsv), std::path::Path::new("test.tsv"))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        // No Decoy column → loader sets false. Prefix-based marking happens
+        // later in apply_library_decoy_marking.
+        assert!(!entries[0].is_decoy);
     }
 }
