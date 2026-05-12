@@ -13,6 +13,7 @@
 pub mod library;
 pub mod mzml;
 pub mod output;
+pub mod pairing;
 
 pub use library::{load_library, BlibLoader, DiannTsvLoader, ElibLoader};
 pub use mzml::{
@@ -20,3 +21,4 @@ pub use mzml::{
     MS1Index, MzmlReader,
 };
 pub use output::BlibWriter;
+pub use pairing::{DecoyPairingManifest, PeptideKind};

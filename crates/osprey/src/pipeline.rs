@@ -3392,6 +3392,55 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 config.decoy_prefixes
             )));
         }
+
+        // Pair each decoy with its target so their base_ids match — required
+        // for SVM target-decoy competition, LDA calibration, and CV fold
+        // grouping. Prefer an explicit FDRBench manifest when supplied;
+        // otherwise fall back to composition-based pairing (decoys are
+        // permutations of their targets within the matched protein pair).
+        let pairing_stats = if let Some(manifest_path) = &config.decoy_pairing_manifest {
+            log::info!(
+                "Loading decoy pairing manifest from {}",
+                manifest_path.display()
+            );
+            let manifest =
+                osprey_io::DecoyPairingManifest::from_tsv(manifest_path).map_err(|e| {
+                    OspreyError::config(format!(
+                        "Failed to read decoy pairing manifest {}: {}",
+                        manifest_path.display(),
+                        e
+                    ))
+                })?;
+            manifest.apply_to_library(&mut library)
+        } else {
+            log::info!(
+                "Pairing library decoys to targets by amino-acid composition (no manifest \
+                 provided). For best results with FDRBench-generated libraries, supply \
+                 --decoy-pairing-manifest."
+            );
+            osprey_core::pair_library_decoys_by_composition(&mut library, &config.decoy_prefixes)
+        };
+        log::info!(
+            "Library-decoy pairing: paired {}/{} decoys ({:.1}%); {} unpaired decoys, {} unpaired targets",
+            pairing_stats.n_paired,
+            pairing_stats.n_decoys,
+            pairing_stats.paired_fraction() * 100.0,
+            pairing_stats.n_unpaired_decoys,
+            pairing_stats.n_unpaired_targets,
+        );
+        if pairing_stats.paired_fraction() < config.decoy_pair_min_fraction {
+            return Err(OspreyError::config(format!(
+                "Library-decoy pairing failed: only {:.1}% of decoys paired with a target \
+                 (threshold: {:.0}%). FDR estimates would be unreliable without proper \
+                 target-decoy competition. Either supply a pairing manifest via \
+                 --decoy-pairing-manifest, ensure the library uses matching protein \
+                 accessions with one of `decoy_prefixes` ({:?}), or unset \
+                 `decoys_in_library` so Osprey generates its own decoys.",
+                pairing_stats.paired_fraction() * 100.0,
+                config.decoy_pair_min_fraction * 100.0,
+                config.decoy_prefixes
+            )));
+        }
     } else {
         log::info!("Generating decoys using {:?} method", config.decoy_method);
         let decoy_method = match config.decoy_method {

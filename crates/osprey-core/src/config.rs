@@ -66,6 +66,20 @@ pub struct OspreyConfig {
     /// used by tools like DIA-NN, EncyclopeDIA, and Carafe.
     #[serde(default = "default_decoy_prefixes")]
     pub decoy_prefixes: Vec<String>,
+    /// Path to a FDRBench-style pairing manifest (5-column TSV with columns
+    /// `sequence, decoy, proteins, peptide_type, peptide_pair_index`). When
+    /// set together with `decoys_in_library`, this overrides the default
+    /// composition-based pairing and instead uses the manifest's explicit
+    /// `peptide_pair_index` groups to match each decoy to its target.
+    /// Recommended path when FDRBench generated the entrapment library.
+    #[serde(default)]
+    pub decoy_pairing_manifest: Option<PathBuf>,
+    /// Minimum fraction of decoys that must pair successfully when
+    /// `decoys_in_library` is set. Below this, Osprey bails out with a
+    /// clear error rather than running with broken target-decoy
+    /// competition.
+    #[serde(default = "default_decoy_pair_threshold")]
+    pub decoy_pair_min_fraction: f64,
 
     // FDR method
     /// FDR method: native Percolator (default), external mokapot, or simple target-decoy
@@ -184,6 +198,8 @@ impl Default for OspreyConfig {
             decoy_method: DecoyMethod::Reverse,
             decoys_in_library: false,
             decoy_prefixes: default_decoy_prefixes(),
+            decoy_pairing_manifest: None,
+            decoy_pair_min_fraction: default_decoy_pair_threshold(),
             reconciliation: ReconciliationConfig::default(),
             prefilter_enabled: true,
             protein_fdr: default_protein_fdr(),
@@ -218,6 +234,10 @@ fn default_decoy_prefixes() -> Vec<String> {
         "rev_".to_string(),
         "decoy_".to_string(),
     ]
+}
+
+fn default_decoy_pair_threshold() -> f64 {
+    0.80
 }
 
 /// Get the number of CPUs available
@@ -446,6 +466,18 @@ n_threads: 0  # 0 = auto-detect
             .collect();
         prefixes.sort();
         hasher.update(format!("decoy_prefixes:{:?}\n", prefixes).as_bytes());
+        hasher.update(
+            format!(
+                "decoy_pairing_manifest:{:?}\n",
+                self.decoy_pairing_manifest
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+            )
+            .as_bytes(),
+        );
+        hasher.update(
+            format!("decoy_pair_min_fraction:{}\n", self.decoy_pair_min_fraction).as_bytes(),
+        );
         hasher.update(format!("rt_cal.enabled:{}\n", self.rt_calibration.enabled).as_bytes());
         hasher.update(
             format!(

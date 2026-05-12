@@ -266,24 +266,53 @@ by prefix.
 
 ## Library-supplied decoys
 
-When `decoys_in_library` is enabled, Osprey scans each entry's
-`protein_ids` after load. Any entry whose protein accession begins
-(case-insensitively) with one of the configured `decoy_prefixes` is
-flagged: `is_decoy = true` and `id |= DECOY_ID_BIT`. The marking step is
-idempotent (running it twice doesn't double-OR the bit).
+When `decoys_in_library` is enabled, Osprey processes the library in two
+post-load steps:
 
-If the mode is enabled but no entries match any prefix, Osprey bails out
-with a clear error rather than silently producing zero-decoy FDR (which
-is meaningless). Prior to this support, the flag skipped DecoyGenerator
-but no code set `is_decoy`, so real decoys were silently treated as
-targets and FDR estimates were corrupted; see
-`release-notes/RELEASE_NOTES_v26.5.4.md` (or current draft).
+The first step is **decoy marking**: each entry's `protein_ids` are
+scanned, and any entry whose protein accession begins (case-insensitively)
+with one of the configured `decoy_prefixes` is flagged with
+`is_decoy = true` and `id |= DECOY_ID_BIT`. The marking step is idempotent.
 
-Unlike Osprey-generated decoys, library-supplied decoys are not paired
-1:1 with specific targets by base_id. The cross-validation grouping
-invariant (target + paired decoy in the same fold) is therefore enforced
-only at the population level for these entries; SVM training and TDC
-competition still work correctly.
+The second step is **target-decoy pairing**. Marking alone is not enough —
+the SVM, LDA calibration, and cross-validation fold splitting all rely on
+each decoy sharing a `base_id` with its target (linked by
+`base_id = entry_id & 0x7FFFFFFF`). Without pairing,
+`compete_from_indices` treats every entry as an "unpaired winner" and the
+SVM trains on the full target population without quality filtering,
+producing FDR estimates that are too optimistic. Osprey runs one of two
+pairing strategies after marking:
+
+- **Manifest-based** (preferred): if `decoy_pairing_manifest` points to
+  a FDRBench-style 5-column TSV (`sequence`, `decoy`, `proteins`,
+  `peptide_type`, `peptide_pair_index`), Osprey uses each row's
+  `peptide_pair_index` to group entries into target/decoy pairs.
+  Two pairs come from each group: `(target, decoy)` and
+  `(p_target, p_decoy)`. Lookup is by unmodified peptide sequence;
+  charge is honored so charge-2 decoys pair with charge-2 targets, etc.
+- **Composition-based fallback**: with no manifest, Osprey infers the
+  pairing from the library itself. For each decoy, it strips a
+  configured prefix from each protein accession to recover the target
+  accession, then looks for a target peptide with the same
+  `(stripped_accession, charge, sorted_amino_acid_composition)`. Within
+  a composition group on a single protein, target and decoy entries are
+  sorted by `(sequence, id)` and zipped 1:1, so pairings are
+  deterministic regardless of input order. The fallback works for any
+  decoy strategy that preserves AA composition (Carafe's randomized
+  decoys, sequence-reversal decoys).
+
+Both strategies write decoy IDs as `target_id | DECOY_ID_BIT`. Osprey
+reports a pairing summary (paired / unpaired decoys / unpaired
+targets) at INFO level and **bails with a hard error if fewer than
+`decoy_pair_min_fraction` (default 80%) of decoys pair successfully**.
+Below that threshold, FDR estimates would be unreliable; the user must
+either supply a manifest, fix the library's accession conventions, or
+unset `decoys_in_library` and let Osprey generate decoys.
+
+Prior to this support, `decoys_in_library: true` skipped DecoyGenerator
+but no code set `is_decoy` and no pairing was performed, so real decoys
+were silently treated as targets and FDR estimates were corrupted; see
+`release-notes/RELEASE_NOTES_next.md` (or current draft).
 
 ## Implementation
 

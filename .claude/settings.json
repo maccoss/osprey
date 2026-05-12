@@ -6,7 +6,8 @@
       "Bash(git cherry-pick *)",
       "Bash(git ls-tree *)",
       "Bash(git stash *)",
-      "Bash(awk '$1 == \"i/-text\" {print $4}')"
+      "Bash(awk '$1 == \"i/-text\" {print $4}')",
+      "Bash(awk '-F\\\\t' '{print \"columns: \"NF; for\\(i=1;i<=NF;i++\\) print i\": \"$i}')"
     ]
   }
 }

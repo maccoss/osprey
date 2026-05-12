@@ -144,6 +144,17 @@ struct Args {
     #[arg(long)]
     decoys_in_library: bool,
 
+    /// Path to a FDRBench pairing manifest (5-column TSV: sequence, decoy,
+    /// proteins, peptide_type, peptide_pair_index) that links each library
+    /// decoy to its target. Used only with --decoys-in-library. Without a
+    /// manifest, Osprey falls back to composition-based pairing (each decoy
+    /// is a permutation of its target within the matched target/decoy
+    /// protein pair). Either way, pairing is required for SVM target-decoy
+    /// competition, LDA calibration, and CV fold grouping; Osprey bails if
+    /// fewer than 80% of decoys pair successfully.
+    #[arg(long)]
+    decoy_pairing_manifest: Option<PathBuf>,
+
     /// Write an FDRBench-compatible input TSV to this path. The level is
     /// auto-selected from --fdr-level (peptide | precursor | protein; `both`
     /// emits precursor-level). `protein` requires --protein-fdr. Includes
@@ -637,6 +648,9 @@ fn main() -> Result<()> {
     // --fdrbench-per-run semantics).
     if args.decoys_in_library {
         config.decoys_in_library = true;
+    }
+    if let Some(ref path) = args.decoy_pairing_manifest {
+        config.decoy_pairing_manifest = Some(path.clone());
     }
 
     // HPC scoring split: set the new config fields after merge_with_args.
