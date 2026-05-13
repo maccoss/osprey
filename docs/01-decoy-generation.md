@@ -365,12 +365,17 @@ This solves two problems at once:
   contrast, carries the original clean accession; substituting it
   back at load time restores correct protein parsimony / picked-protein
   FDR rollup.
-- **Shared peptides**. The FASTA only carries the primary
-  (alphabetically-first) source protein for any given peptide. The
-  manifest's `proteins` column is the only place the full multi-protein
-  list survives intact; the substitution makes
-  `entry.protein_ids = ["sp|A|...", "sp|B|...", ...]` for every shared
-  peptide in the manifest, restoring full inference downstream.
+- **Shared peptides**. The FASTA emits the joined source-protein list
+  in each header (e.g.
+  `>sp|P12345_pep00001|GENE_A;sp|Q67890_pep00001|GENE_B`), matching the
+  semicolon convention DIA-NN / Carafe already use in their library
+  `ProteinID` column for shared peptides. The library predictor
+  typically propagates this joined string verbatim into `ProteinID`,
+  so the multi-protein attribution survives even before the manifest
+  substitution. When the predictor doesn't preserve the joined header,
+  the manifest's `proteins` column carries the same information and
+  the substitution restores `entry.protein_ids = ["sp|A|...", "sp|B|..."]`
+  at load time.
 
 The substitution is a no-op when the manifest's `proteins` column is
 empty or `-`. Library entries whose sequence isn't in the manifest are

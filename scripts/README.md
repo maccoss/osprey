@@ -139,9 +139,14 @@ Any synthetic peptide that happens to collide with a real target somewhere in th
 
 **FASTA emission semantics:**
 
-- **One entry per peptide** (deduplicated by sequence). Peptides shared across multiple proteins appear once; the **primary** (alphabetically first) source protein supplies the FASTA-header accession.
-- **Unique accession per FASTA entry** via a per-source-protein peptide counter `_pep00001`, `_pep00002`, … (controlled by `--unique-accessions`, default ON). Necessary because library predictors like Carafe deduplicate by FASTA accession; without the counter, ~99% of library rows would have `ProteinID = "-"`.
-- **Manifest carries the full multi-source protein list** in its `proteins` column (clean accessions, no counter, sources joined with `;`). Osprey's `--decoy-pairing-manifest` reads this and replaces each library entry's `ProteinID` with the clean list at load time, so protein parsimony and picked-protein FDR work as on any normal library even though Carafe wrote a suffixed primary into the library.
+- **One entry per peptide** (deduplicated by sequence). A peptide that appears in N source proteins still produces exactly one FASTA entry.
+- **Multi-protein peptides get all sources joined by `;` in the FASTA header**, matching the convention DIA-NN / Carafe already use in their library `ProteinID` column for shared peptides:
+  ```
+  >sp|P12345_pep00001|GENE_A;sp|Q67890_pep00001|GENE_B
+  ```
+  Carafe propagates the joined string straight into the library's `ProteinID`, so the resulting library carries the same multi-protein attribution it would have produced from a regular FASTA where each protein was its own entry.
+- **Unique accession per FASTA entry** via a per-source-protein peptide counter `_pep00001`, `_pep00002`, … (controlled by `--unique-accessions`, default ON). Necessary because library predictors like Carafe deduplicate by FASTA accession; without the counter, ~99% of library rows would have `ProteinID = "-"`. For shared peptides, ALL sources' counters increment in lockstep so the joined header has matching `_pepNNNN` suffixes across all listed accessions.
+- **Manifest also carries the full multi-source protein list** in its `proteins` column (clean accessions, no counter, sources joined with `;`). Osprey's `--decoy-pairing-manifest` reads this and replaces each library entry's `ProteinID` with the clean list at load time, so protein parsimony and picked-protein FDR work even if Carafe didn't preserve the joined header. The manifest is the authoritative fallback.
 
 ```bash
 # Targets + entrapment + decoys with all defaults (len 7-35, m/z 400-900,

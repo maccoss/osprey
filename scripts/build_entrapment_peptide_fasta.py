@@ -484,72 +484,85 @@ def main(argv: list[str] | None = None) -> int:
     n_ptarget_entries = 0
     n_decoy_entries = 0
     n_pdecoy_entries = 0
-    # Per-(primary-source-accession) peptide counter. Each peptide gets one
-    # counter value; that same counter is reused across the four kinds
+    n_shared_entries = 0
+    # Per-source-protein peptide counter. Each source protein has its OWN
+    # counter that increments for every peptide that protein contains. For
+    # shared peptides (in multiple proteins), each source's counter
+    # increments by 1 in lockstep so the joined header carries a coherent
+    # per-source suffix. Counter values are reused across the four kinds
     # (target / p_target / decoy / p_decoy) so they remain visibly linked
-    # while their distinct prefix/suffix decoration keeps the accessions
-    # globally unique.
+    # while their distinct prefix/suffix decoration keeps the joined
+    # accession globally unique.
     protein_pep_counter: dict[str, int] = {}
-    with args.output.open("w") as fo:
-        for q in kept:
-            primary = q.sources[0]
-            counter: int | None
-            if args.unique_accessions:
-                protein_pep_counter[primary.accession] = (
-                    protein_pep_counter.get(primary.accession, 0) + 1
-                )
-                counter = protein_pep_counter[primary.accession]
-            else:
-                counter = None
-            # target
-            label = build_full_protein_label(
-                primary, p_target=False, decoy=False,
+
+    def joined_label(sources_with_counters, p_target: bool, decoy: bool) -> str:
+        """Build a semicolon-joined label for all sources of a shared peptide.
+
+        Each per-source label is decorated with the same prefix/suffix +
+        per-source counter. Carafe propagates the whole joined string into
+        the library's `ProteinID` column for shared peptides, mirroring
+        how a regular FASTA digestion would join accessions in DIA-NN /
+        Carafe output.
+        """
+        return ";".join(
+            build_full_protein_label(
+                src,
+                p_target=p_target,
+                decoy=decoy,
                 entrap_suffix=args.entrapment_suffix,
                 decoy_prefix=args.decoy_prefix,
-                pep_counter=counter,
+                pep_counter=cnt,
                 pep_suffix_fmt=args.pep_suffix_format,
             )
+            for src, cnt in sources_with_counters
+        )
+
+    with args.output.open("w") as fo:
+        for q in kept:
+            # Get a counter value for each source of this peptide. For
+            # shared peptides, all sources' counters increment together so
+            # the joined header has matching `_pepNNNN` suffixes across
+            # all listed accessions.
+            sources_with_counters: list[tuple[ProteinRecord, int | None]]
+            if args.unique_accessions:
+                sources_with_counters = []
+                for src in q.sources:
+                    protein_pep_counter[src.accession] = (
+                        protein_pep_counter.get(src.accession, 0) + 1
+                    )
+                    sources_with_counters.append((src, protein_pep_counter[src.accession]))
+            else:
+                sources_with_counters = [(src, None) for src in q.sources]
+
+            if len(q.sources) > 1:
+                n_shared_entries += 1
+
+            # target
+            label = joined_label(sources_with_counters, p_target=False, decoy=False)
             fo.write(f">{label}\n{q.target}\n")
             n_target_entries += 1
             # p_target (entrapment)
             if q.p_target is not None:
-                label = build_full_protein_label(
-                    primary, p_target=True, decoy=False,
-                    entrap_suffix=args.entrapment_suffix,
-                    decoy_prefix=args.decoy_prefix,
-                    pep_counter=counter,
-                    pep_suffix_fmt=args.pep_suffix_format,
-                )
+                label = joined_label(sources_with_counters, p_target=True, decoy=False)
                 fo.write(f">{label}\n{q.p_target}\n")
                 n_ptarget_entries += 1
             # decoy
             if q.decoy is not None:
-                label = build_full_protein_label(
-                    primary, p_target=False, decoy=True,
-                    entrap_suffix=args.entrapment_suffix,
-                    decoy_prefix=args.decoy_prefix,
-                    pep_counter=counter,
-                    pep_suffix_fmt=args.pep_suffix_format,
-                )
+                label = joined_label(sources_with_counters, p_target=False, decoy=True)
                 fo.write(f">{label}\n{q.decoy}\n")
                 n_decoy_entries += 1
             # p_decoy
             if q.p_decoy is not None:
-                label = build_full_protein_label(
-                    primary, p_target=True, decoy=True,
-                    entrap_suffix=args.entrapment_suffix,
-                    decoy_prefix=args.decoy_prefix,
-                    pep_counter=counter,
-                    pep_suffix_fmt=args.pep_suffix_format,
-                )
+                label = joined_label(sources_with_counters, p_target=True, decoy=True)
                 fo.write(f">{label}\n{q.p_decoy}\n")
                 n_pdecoy_entries += 1
     logger.info(
-        "Wrote FASTA: %d target, %d p_target, %d decoy, %d p_decoy entries (one per peptide)",
+        "Wrote FASTA: %d target, %d p_target, %d decoy, %d p_decoy entries (one per peptide; %d shared across multiple source proteins)",
         n_target_entries,
         n_ptarget_entries,
         n_decoy_entries,
         n_pdecoy_entries,
+        n_shared_entries,
     )
 
     # Step 5: optional manifest. The manifest's `proteins` column captures
