@@ -15,6 +15,21 @@ If any synthetic peptide (p_target, decoy, p_decoy) happens to match a real
 target peptide somewhere in the input, the whole quartet (target, p_target,
 decoy, p_decoy) is dropped — matches FDRBench's collision-drop policy.
 
+Peptides are filtered at digest time by length, precursor m/z (at any of the
+allowed charge states), missed cleavage count, and residue alphabet (peptides
+containing B / Z / J / X / U / O are dropped silently with a count).
+
+Defaults (all CLI-configurable):
+
+- ``--missed-cleavages 1`` (allowed 0..5; a value of N includes peptides with
+  0..N missed cleavages)
+- ``--min-length 7`` / ``--max-length 35``
+- ``--min-mz 400`` / ``--max-mz 900``
+- ``--charges 2 3`` (kept iff at least one allowed charge produces an m/z
+  inside the window)
+- ``--entrapment-seed 42`` / ``--decoy-seed 24``
+- ``--decoy-prefix decoy_`` / ``--entrapment-suffix _p_target``
+
 Output FASTA layout: each peptide gets its own FASTA entry whose accession is
 the **source protein accession** (no per-peptide suffix). Multiple peptides
 from the same source protein produce multiple FASTA entries that share the
@@ -23,24 +38,36 @@ tryptic peptide already), so the resulting library has the source protein
 accession in its ProteinID column — Osprey's protein parsimony and
 picked-protein FDR work as on any normal library.
 
-Header conventions::
+Header conventions (with default prefix/suffix)::
 
     target:    >sp|<acc>|<entry>
     p_target:  >sp|<acc>_p_target|<entry>_p_target
-    decoy:     >rev_sp|<acc>|<entry>
-    p_decoy:   >rev_sp|<acc>_p_target|<entry>_p_target
+    decoy:     >decoy_sp|<acc>|<entry>
+    p_decoy:   >decoy_sp|<acc>_p_target|<entry>_p_target
 
 The manifest is the standard FDRBench 5-column TSV
 (sequence, decoy, proteins, peptide_type, peptide_pair_index) that Osprey's
 ``--decoy-pairing-manifest`` reads.
 
-Usage::
+Usage (all defaults — len 7-35, m/z 400-900, charges 2/3, mc=1)::
 
     python build_entrapment_peptide_fasta.py \\
         --input uniprot_human.fasta \\
         --output peptide_lib.fasta \\
         --manifest pairing.tsv \\
         --add-entrapment --add-decoys
+
+Usage (explicit filters, e.g. for an Astral run with 4+ charges)::
+
+    python build_entrapment_peptide_fasta.py \\
+        --input uniprot_human.fasta \\
+        --output peptide_lib.fasta \\
+        --manifest pairing.tsv \\
+        --add-entrapment --add-decoys \\
+        --missed-cleavages 2 \\
+        --min-length 7 --max-length 35 \\
+        --min-mz 400 --max-mz 900 \\
+        --charges 2 3 4
 """
 
 from __future__ import annotations
