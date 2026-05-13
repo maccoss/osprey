@@ -202,6 +202,16 @@ python scripts/build_entrapment_peptide_fasta.py \
 
 # 2. Run Carafe (or any library predictor) on entrapment_peptides.fasta
 #    -> spectral_library.tsv
+#
+#    IMPORTANT Carafe settings for this workflow:
+#      * Enzyme: "NoCut" (each FASTA entry is already one tryptic peptide;
+#        we don't want Carafe re-digesting).
+#      * `-clip_n_m` (GUI: "clip N-terminal Met"): UNCHECK / set to FALSE.
+#        When enabled, Carafe applies biological N-terminal Met removal
+#        to any FASTA "protein" whose sequence starts with M. Since each
+#        FASTA entry here is a single peptide (not a real protein), this
+#        produces a Met-stripped library entry whose sequence is not in
+#        the manifest, leaving ~2-3% of peptides unpaired in Osprey.
 
 # 3. Run Osprey with the manifest; the manifest fixes both decoy
 #    classification and protein-ID rollup transparently.
