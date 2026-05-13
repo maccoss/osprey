@@ -22,7 +22,14 @@
       "Bash(awk -F'\\\\t' 'NR>1 && $7==\"1\" {print \"  \" $2 \"\\\\t\" $4 \"\\\\t\" $6 \"\\\\t\" $7; if\\(++c>=3\\) exit}' /tmp/fixtest/after.tsv)",
       "Read(//mnt/UNAS-DataAnalysis/osprey-test-data/astral/Entrapment-Decoy-Database/**)",
       "Read(//mnt/UNAS-DataAnalysis/osprey-test-data/astral/Carafe-Entrapment-Decoy-Library/carafe_library/**)",
-      "Bash(awk -F'\\\\t' 'NR>1 && $4==\"target\" {print; if\\(++c>=5\\) exit}' /tmp/eptest5/manifest.tsv)"
+      "Bash(awk -F'\\\\t' 'NR>1 && $4==\"target\" {print; if\\(++c>=5\\) exit}' /tmp/eptest5/manifest.tsv)",
+      "Read(//mnt/UNAS-DataAnalysis/osprey-test-data/astral/**)",
+      "Bash(awk -F'\\\\t' '{print \"  ModifiedPeptide=\"$1, \"StrippedPeptide=\"$2, \"PrecursorCharge=\"$4, \"ProteinID=\"$6, \"Decoy=\"$7}')",
+      "Bash(grep -c \"^TQPLVER$\" Entrapment-Decoy-Database/uniprot_human_jan2025_yeastENO1_contam_ADpeps_entrapment_pep_decoy.fasta)",
+      "Bash(grep -B 1 \"^TQPLVER$\" Entrapment-Decoy-Database/uniprot_human_jan2025_yeastENO1_contam_ADpeps_entrapment_pep_decoy.fasta)",
+      "Bash(awk -F'\\\\t' '$1==\"TQPLVER\"' Entrapment-Decoy-Database/uniprot_human_jan2025_yeastENO1_contam_ADpeps_pairing_manifest.tsv)",
+      "Bash(grep -A 1 \"^>decoy_sp|Q9H568_pep00029|ACTL8_HUMAN$\" Entrapment-Decoy-Database/uniprot_human_jan2025_yeastENO1_contam_ADpeps_entrapment_pep_decoy.fasta)",
+      "Bash(awk -F: '{s+=$2} END {print s}')"
     ]
   }
 }

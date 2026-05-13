@@ -34,29 +34,28 @@ Stellar with coelution and Percolator (4/11/2026)
 
 
 
-Coelution with Astral data and Percolator
+Coelution with Astral data and Percolator (05/13/2026)
 
-[1:01:02] Percolator: 240325 entries (147694 targets, 92631 decoys), 21 features, 3-fold CV
-[1:07:03] WARN:   Fold 1: median decoy score (-1.5646) >= FDR threshold score (-5.7865), skipping calibration
-[1:07:03] WARN:   Fold 2: median decoy score (-1.5078) >= FDR threshold score (-5.6713), skipping calibration
-[1:07:03] WARN:   Fold 3: median decoy score (-1.5465) >= FDR threshold score (-5.2785), skipping calibration
-[1:07:13]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_49: 138842 precursors, 122367 peptides
-[1:07:13]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_55: 139074 precursors, 122544 peptides
-[1:07:14]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_60: 137609 precursors, 121260 peptides
-[1:07:16]
-[1:07:16] === Experiment-level results (1% FDR) ===
-[1:07:16]   Experiment: 147562 precursors, 130616 peptides (from 673965 total entries)
-[1:07:19]
-[1:07:19] Protein-level FDR
-[1:07:34] Protein parsimony: 14619 proteins, 130747 peptides in bipartite graph
-[1:07:34] Protein parsimony: 14230 protein groups after identical-set merging
-[1:08:37] Protein parsimony: 13724 protein groups after subset elimination
-[1:08:37] Protein parsimony: 126758 unique peptides, 3989 shared peptides
-[1:08:38] Peptide scores for protein FDR: 130747 target peptides, 89203 decoy peptides
-[1:08:38] Composite scores: 13724 targets (median=1.22, max=50.04), 3647 decoys (median=0.00, max=1.43)
-[1:08:38] Best quality scores: 13724 targets (median=0.8990, max=1.0000), 3647 decoys (median=0.3745, max=0.8611)
-[1:08:39] Protein FDR: 13724 protein groups scored, 13724 at 1% FDR
-[1:08:39] Protein FDR: 13724 protein groups at 1% FDR (from 13724 total groups)
+[27:46] Second-pass FDR
+[27:50] Percolator: 255344 entries (134963 targets, 120381 decoys), 21 features, 3-fold CV
+[31:06]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_49: 115617 precursors, 91493 peptides
+[31:06]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_55: 115657 precursors, 91555 peptides
+[31:06]   Ast-2024-12-05_HeLa_3mzDIA_6mIIT_400-900_60: 114960 precursors, 91225 peptides
+[31:08]
+[31:08] === Experiment-level results at 1% FDR (from 724104 total entries) ===
+[31:08]   122376 precursors passing precursor-level FDR
+[31:08]   93714 peptides passing peptide-level FDR
+[31:09]
+[31:09] Protein parsimony
+[31:10] Protein parsimony: 10471 proteins, 93714 peptides in bipartite graph (peptides from precursor-level FDR)
+[31:10] Protein parsimony: 10165 protein groups after identical-set merging
+[31:27] Protein parsimony: 9506 protein groups after subset elimination
+[31:27] Protein parsimony: 91291 unique peptides, 2423 shared peptides
+[31:27] Second-pass protein FDR
+[31:27] Peptide scores for protein FDR: 93915 target peptides, 87609 decoy peptides
+[31:27] Picked-protein FDR: 9506 winners (9506 target, 0 decoy); 9506 target groups at 1% FDR
+[31:27] Second-pass protein FDR: 9506 protein groups at 1% FDR (from 9506 total groups)
+
 
 
 

@@ -36,6 +36,8 @@ Working draft for the next release. Append entries here as features and fixes la
 
 - **Repository line endings normalized.** The repo had a 51/73 CRLF/LF split with no enforcement, causing spurious whole-file diffs whenever a file was edited from the "wrong" platform. Added `* text=auto` to `.gitattributes` so Git stores all text files with LF in the index, and ran `git add --renormalize .` to flip the 51 CRLF files. Working-tree EOL still respects each developer's `core.autocrlf` setting — Windows sessions can keep CRLF locally if they prefer. No content changes from this normalization.
 
+- **FDRBench TSV: protein column capped at 4000 bytes to avoid Univocity parser crash.** FDRBench's bundled Tablesaw/Univocity CSV parser hardcodes `maxCharsPerColumn = 4096` and aborts with `ArrayIndexOutOfBoundsException` on any wider field. Peptides shared across large paralog families (zinc fingers, olfactory receptors, keratins, HLA, immunoglobulin variable regions) routinely accumulate 100+ source-protein IDs joined with `;`, which crosses the cap. `write_fdrbench_peptide_input` (in `crates/osprey-io/src/output/fdrbench.rs`) now truncates the joined protein-ID list at 4000 bytes, keeping whole IDs and appending a `;...+N_more` marker that records how many were dropped. The canonical blib and CSV reports still carry the full protein-ID list; only the `--fdrbench` / `--fdrbench-per-run` TSV is affected. A bug report describing the upstream parser limit (with a one-line `CsvReadOptions.maxCharsPerColumn(-1)` fix on FDRBench's side) is in `release-notes/`-adjacent docs.
+
 ## Performance
 
 <!-- none yet -->

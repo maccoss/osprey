@@ -19,6 +19,13 @@
 //! `score` is the raw SVM discriminant from [`FdrEntry::score`], i.e. the
 //! upstream score that drives the q-value. Invoke FDRBench with
 //! `-score 'score:1'` (higher is better).
+//!
+//! The `protein` column is capped at [`MAX_PROTEIN_FIELD_BYTES`] (under the
+//! 4096-char per-column limit in FDRBench's Univocity CSV parser). Lists
+//! that exceed the cap, e.g. peptides shared across large paralog families
+//! such as zinc fingers, are truncated with a trailing `;...+N_more` marker
+//! indicating how many IDs were dropped. The canonical blib and CSV outputs
+//! still carry the full protein-ID list.
 
 use osprey_core::config::FdrLevel;
 use osprey_core::types::{FdrEntry, LibraryEntry};
@@ -31,6 +38,56 @@ use std::path::Path;
 /// The high bit is set for decoys; clearing it yields the library entry id
 /// shared by a target and its paired decoy.
 const BASE_ID_MASK: u32 = 0x7FFF_FFFF;
+
+/// Maximum width of the `protein` column in the FDRBench TSV, in bytes.
+///
+/// FDRBench's bundled Univocity CSV parser caps each column at 4096
+/// characters and aborts the run with an `ArrayIndexOutOfBoundsException`
+/// when that limit is exceeded. Shared peptides (e.g. ZNF / olfactory
+/// receptor families) can legitimately map to hundreds of protein IDs
+/// joined with `;`, which trips the cap. We keep a margin under 4096 so
+/// the surrounding tabs and a truncation marker fit comfortably.
+const MAX_PROTEIN_FIELD_BYTES: usize = 4000;
+
+/// Format a protein-ID list for the FDRBench TSV, truncating when the joined
+/// string would exceed [`MAX_PROTEIN_FIELD_BYTES`].
+///
+/// On truncation, returns `<kept_ids_joined_with_';'>;...+N_more` where `N`
+/// is the number of IDs dropped. Returns `(field, true)` when truncation
+/// occurred. If even the first ID is longer than the budget (pathological),
+/// it is hard-truncated to the budget and the marker is appended.
+fn format_protein_field(ids: &[String]) -> (String, bool) {
+    let joined = ids.join(";");
+    if joined.len() <= MAX_PROTEIN_FIELD_BYTES {
+        return (joined, false);
+    }
+    // Reserve worst-case marker width (uses the initial dropped count, which
+    // shrinks monotonically as we keep more IDs).
+    let marker_reserve = format!(";...+{}_more", ids.len()).len();
+    let budget = MAX_PROTEIN_FIELD_BYTES.saturating_sub(marker_reserve);
+
+    let mut kept = 0usize;
+    let mut len = 0usize;
+    for (i, id) in ids.iter().enumerate() {
+        let sep_len = if i == 0 { 0 } else { 1 };
+        if len + sep_len + id.len() > budget {
+            break;
+        }
+        len += sep_len + id.len();
+        kept = i + 1;
+    }
+
+    if kept == 0 {
+        // First ID alone exceeds the budget. Hard-truncate it (byte-safe via
+        // chars().take()) and append the marker.
+        let truncated: String = ids[0].chars().take(budget).collect();
+        return (format!("{}...+{}_more", truncated, ids.len()), true);
+    }
+    let dropped = ids.len() - kept;
+    let mut s = ids[..kept].join(";");
+    s.push_str(&format!(";...+{}_more", dropped));
+    (s, true)
+}
 
 /// Write the FDRBench peptide / precursor-level input TSV.
 ///
@@ -93,6 +150,7 @@ pub fn write_fdrbench_peptide_input(
 
     let mut n_rows: usize = 0;
     let mut n_missing_lib: usize = 0;
+    let mut n_truncated_protein: usize = 0;
 
     if per_run {
         for (run_name, entries) in per_file_entries {
@@ -102,7 +160,13 @@ pub fn write_fdrbench_peptide_input(
                 }
                 let base_id = entry.entry_id & BASE_ID_MASK;
                 let (peptide, protein) = match library_by_id.get(&base_id) {
-                    Some(lib) => (lib.sequence.as_str(), lib.protein_ids.join(";")),
+                    Some(lib) => {
+                        let (field, truncated) = format_protein_field(&lib.protein_ids);
+                        if truncated {
+                            n_truncated_protein += 1;
+                        }
+                        (lib.sequence.as_str(), field)
+                    }
                     None => {
                         n_missing_lib += 1;
                         ("", String::new())
@@ -155,7 +219,13 @@ pub fn write_fdrbench_peptide_input(
         for row in best.into_values() {
             let base_id = row.entry.entry_id & BASE_ID_MASK;
             let (peptide, protein) = match library_by_id.get(&base_id) {
-                Some(lib) => (lib.sequence.as_str(), lib.protein_ids.join(";")),
+                Some(lib) => {
+                    let (field, truncated) = format_protein_field(&lib.protein_ids);
+                    if truncated {
+                        n_truncated_protein += 1;
+                    }
+                    (lib.sequence.as_str(), field)
+                }
                 None => {
                     n_missing_lib += 1;
                     ("", String::new())
@@ -186,6 +256,16 @@ pub fn write_fdrbench_peptide_input(
         log::warn!(
             "{} FDRBench rows had no library entry for entry_id; protein column left blank",
             n_missing_lib
+        );
+    }
+    if n_truncated_protein > 0 {
+        // FDRBench's CSV parser caps each column at 4096 chars; we truncate
+        // longer protein-ID lists (e.g. ZNF families) to keep the run alive.
+        // The `;...+N_more` marker preserves the dropped-ID count.
+        log::warn!(
+            "{} FDRBench rows had protein-ID lists exceeding {} bytes; truncated with ';...+N_more' marker",
+            n_truncated_protein,
+            MAX_PROTEIN_FIELD_BYTES,
         );
     }
     Ok(())
@@ -376,6 +456,47 @@ mod tests {
         assert!(lines[0].ends_with("run"));
         assert!(lines.iter().any(|l| l.ends_with("\trun_a")));
         assert!(lines.iter().any(|l| l.ends_with("\trun_b")));
+    }
+
+    #[test]
+    fn format_protein_field_passes_short_lists_through() {
+        let ids = vec!["P1".to_string(), "P2".to_string(), "P3".to_string()];
+        let (field, truncated) = format_protein_field(&ids);
+        assert_eq!(field, "P1;P2;P3");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn format_protein_field_truncates_oversize_list() {
+        // 200 IDs of ~30 chars each = ~6000 bytes joined, well over 4000.
+        let ids: Vec<String> = (0..200)
+            .map(|i| format!("sp|A{:08}|PROT_{:04}", i, i))
+            .collect();
+        let (field, truncated) = format_protein_field(&ids);
+        assert!(truncated, "expected truncation for oversize list");
+        assert!(
+            field.len() <= MAX_PROTEIN_FIELD_BYTES,
+            "field len {} exceeds budget {}",
+            field.len(),
+            MAX_PROTEIN_FIELD_BYTES
+        );
+        assert!(
+            field.contains(";...+") && field.ends_with("_more"),
+            "expected ';...+N_more' marker; got tail: {}",
+            &field[field.len().saturating_sub(40)..]
+        );
+        // First ID must survive intact.
+        assert!(field.starts_with("sp|A00000000|PROT_0000"));
+    }
+
+    #[test]
+    fn format_protein_field_handles_oversize_single_id() {
+        // One pathological ID longer than the budget on its own.
+        let ids = vec!["X".repeat(MAX_PROTEIN_FIELD_BYTES + 500)];
+        let (field, truncated) = format_protein_field(&ids);
+        assert!(truncated);
+        assert!(field.len() <= MAX_PROTEIN_FIELD_BYTES);
+        assert!(field.ends_with("...+1_more"));
     }
 
     #[test]
