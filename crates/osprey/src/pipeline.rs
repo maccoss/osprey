@@ -3400,7 +3400,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // the library's peptides because the library generator may use
         // different digestion rules; composition pairing recovers those.
         let mut pairing_state = osprey_core::PairingState::new();
-        let (n_paired_manifest, n_newly_marked_by_manifest) =
+        let (n_paired_manifest, n_newly_marked_by_manifest, n_proteins_replaced) =
             if let Some(manifest_path) = &config.decoy_pairing_manifest {
                 log::info!(
                     "Loading decoy pairing manifest from {}",
@@ -3415,15 +3415,26 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                         ))
                     })?;
                 let stats = manifest.apply_to_library(&mut library, &mut pairing_state);
-                (stats.n_paired, stats.n_newly_marked_decoy)
+                (
+                    stats.n_paired,
+                    stats.n_newly_marked_decoy,
+                    stats.n_proteins_replaced,
+                )
             } else {
-                (0, 0)
+                (0, 0, 0)
             };
         if n_newly_marked_by_manifest > 0 {
             log::info!(
                 "Library-decoy mode: manifest classified {} additional library entries as decoys \
                  (their protein accessions lacked a decoy prefix)",
                 n_newly_marked_by_manifest
+            );
+        }
+        if n_proteins_replaced > 0 {
+            log::info!(
+                "Library-decoy mode: manifest replaced protein_ids on {} library entries \
+                 (clean source-protein accessions from the manifest's `proteins` column)",
+                n_proteins_replaced
             );
         }
         let n_paired_composition = osprey_core::pair_library_decoys_by_composition(

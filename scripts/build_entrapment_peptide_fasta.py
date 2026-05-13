@@ -252,9 +252,26 @@ def shuffle_preserving_cterm(seq: str, master_seed: int) -> str:
     return "".join(body) + last
 
 
-def build_full_protein_label(rec: ProteinRecord, p_target: bool, decoy: bool, entrap_suffix: str, decoy_prefix: str) -> str:
-    """Build the ``db|accession|entry_name`` label for a peptide kind."""
+def build_full_protein_label(
+    rec: ProteinRecord,
+    p_target: bool,
+    decoy: bool,
+    entrap_suffix: str,
+    decoy_prefix: str,
+    pep_counter: int | None = None,
+    pep_suffix_fmt: str = "_pep{:05d}",
+) -> str:
+    """Build the ``db|accession|entry_name`` label for a peptide kind.
+
+    When `pep_counter` is given, append `pep_suffix_fmt.format(pep_counter)`
+    to the accession field so each FASTA entry has a unique header (required
+    when a library predictor — e.g. Carafe — deduplicates by FASTA
+    accession). The matching strip regex on the Osprey side is
+    ``_pep\\d+`` by default.
+    """
     acc = rec.accession + entrap_suffix if p_target else rec.accession
+    if pep_counter is not None:
+        acc = acc + pep_suffix_fmt.format(pep_counter)
     entry = rec.entry_name + entrap_suffix if p_target else rec.entry_name
     label = f"{rec.db}|{acc}|{entry}"
     if decoy:
@@ -314,6 +331,31 @@ def main(argv: list[str] | None = None) -> int:
         type=str,
         default=DEFAULT_DECOY_PREFIX,
         help=f"Prefix prepended to db|accession|entry for decoy headers [default: {DEFAULT_DECOY_PREFIX!r}].",
+    )
+    parser.add_argument(
+        "--unique-accessions",
+        dest="unique_accessions",
+        action="store_true",
+        default=True,
+        help=(
+            "Append a per-source-protein peptide counter (_pep00001, _pep00002, ...) "
+            "to each FASTA accession so library predictors that dedupe by accession "
+            "(e.g. Carafe) accept every entry. Default: enabled. The counter is NOT "
+            "written into the manifest's `proteins` column, so the manifest stays the "
+            "authoritative source of clean protein accessions for downstream tools."
+        ),
+    )
+    parser.add_argument(
+        "--no-unique-accessions",
+        dest="unique_accessions",
+        action="store_false",
+        help="Disable the per-peptide counter suffix; output FASTA may have duplicate accessions.",
+    )
+    parser.add_argument(
+        "--pep-suffix-format",
+        type=str,
+        default="_pep{:05d}",
+        help="Python format string for the per-peptide counter suffix [default: '_pep{:05d}']. The matching Osprey strip regex is `_pep\\d+`.",
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging.")
 
@@ -422,81 +464,116 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("%d quartets retained", len(kept))
 
     # Stable pair_index assignment by sorted target sequence so the manifest
-    # is reproducible regardless of dict iteration order.
+    # is reproducible regardless of dict iteration order. Within each quartet,
+    # also sort the source proteins deterministically — the FIRST one becomes
+    # the "primary" used for the FASTA header accession; the rest live only
+    # in the manifest's `proteins` column.
     kept.sort(key=lambda q: q.target)
+    for q in kept:
+        q.sources.sort(key=lambda r: (r.accession, r.entry_name))
 
-    # Step 4: write FASTA. Each peptide gets one entry per source protein
-    # (shared peptides produce multiple entries with different accessions
-    # but the same peptide sequence). DIA-NN / Carafe will merge by sequence.
+    # Step 4: write FASTA. One entry per peptide (not per peptide-source pair),
+    # using the primary (alphabetically-first) source protein for the accession
+    # and an optional per-source peptide counter so library predictors that
+    # dedupe by accession (e.g. Carafe) still see every entry as distinct.
+    # Shared peptides appear ONCE in the FASTA; their multi-protein info is
+    # preserved in the manifest's `proteins` column.
     logger.info("Writing FASTA: %s", args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     n_target_entries = 0
     n_ptarget_entries = 0
     n_decoy_entries = 0
     n_pdecoy_entries = 0
+    # Per-(primary-source-accession) peptide counter. Each peptide gets one
+    # counter value; that same counter is reused across the four kinds
+    # (target / p_target / decoy / p_decoy) so they remain visibly linked
+    # while their distinct prefix/suffix decoration keeps the accessions
+    # globally unique.
+    protein_pep_counter: dict[str, int] = {}
     with args.output.open("w") as fo:
         for q in kept:
-            for src in q.sources:
-                # target
+            primary = q.sources[0]
+            counter: int | None
+            if args.unique_accessions:
+                protein_pep_counter[primary.accession] = (
+                    protein_pep_counter.get(primary.accession, 0) + 1
+                )
+                counter = protein_pep_counter[primary.accession]
+            else:
+                counter = None
+            # target
+            label = build_full_protein_label(
+                primary, p_target=False, decoy=False,
+                entrap_suffix=args.entrapment_suffix,
+                decoy_prefix=args.decoy_prefix,
+                pep_counter=counter,
+                pep_suffix_fmt=args.pep_suffix_format,
+            )
+            fo.write(f">{label}\n{q.target}\n")
+            n_target_entries += 1
+            # p_target (entrapment)
+            if q.p_target is not None:
                 label = build_full_protein_label(
-                    src, p_target=False, decoy=False,
+                    primary, p_target=True, decoy=False,
                     entrap_suffix=args.entrapment_suffix,
                     decoy_prefix=args.decoy_prefix,
+                    pep_counter=counter,
+                    pep_suffix_fmt=args.pep_suffix_format,
                 )
-                fo.write(f">{label}\n{q.target}\n")
-                n_target_entries += 1
-                # p_target (entrapment)
-                if q.p_target is not None:
-                    label = build_full_protein_label(
-                        src, p_target=True, decoy=False,
-                        entrap_suffix=args.entrapment_suffix,
-                        decoy_prefix=args.decoy_prefix,
-                    )
-                    fo.write(f">{label}\n{q.p_target}\n")
-                    n_ptarget_entries += 1
-                # decoy
-                if q.decoy is not None:
-                    label = build_full_protein_label(
-                        src, p_target=False, decoy=True,
-                        entrap_suffix=args.entrapment_suffix,
-                        decoy_prefix=args.decoy_prefix,
-                    )
-                    fo.write(f">{label}\n{q.decoy}\n")
-                    n_decoy_entries += 1
-                # p_decoy
-                if q.p_decoy is not None:
-                    label = build_full_protein_label(
-                        src, p_target=True, decoy=True,
-                        entrap_suffix=args.entrapment_suffix,
-                        decoy_prefix=args.decoy_prefix,
-                    )
-                    fo.write(f">{label}\n{q.p_decoy}\n")
-                    n_pdecoy_entries += 1
+                fo.write(f">{label}\n{q.p_target}\n")
+                n_ptarget_entries += 1
+            # decoy
+            if q.decoy is not None:
+                label = build_full_protein_label(
+                    primary, p_target=False, decoy=True,
+                    entrap_suffix=args.entrapment_suffix,
+                    decoy_prefix=args.decoy_prefix,
+                    pep_counter=counter,
+                    pep_suffix_fmt=args.pep_suffix_format,
+                )
+                fo.write(f">{label}\n{q.decoy}\n")
+                n_decoy_entries += 1
+            # p_decoy
+            if q.p_decoy is not None:
+                label = build_full_protein_label(
+                    primary, p_target=True, decoy=True,
+                    entrap_suffix=args.entrapment_suffix,
+                    decoy_prefix=args.decoy_prefix,
+                    pep_counter=counter,
+                    pep_suffix_fmt=args.pep_suffix_format,
+                )
+                fo.write(f">{label}\n{q.p_decoy}\n")
+                n_pdecoy_entries += 1
     logger.info(
-        "Wrote FASTA: %d target, %d p_target, %d decoy, %d p_decoy entries (one per peptide-source pair)",
+        "Wrote FASTA: %d target, %d p_target, %d decoy, %d p_decoy entries (one per peptide)",
         n_target_entries,
         n_ptarget_entries,
         n_decoy_entries,
         n_pdecoy_entries,
     )
 
-    # Step 5: optional manifest.
+    # Step 5: optional manifest. The manifest's `proteins` column captures
+    # ALL source proteins for each peptide (joined by `;`) using the clean,
+    # un-suffixed accessions — even when the FASTA uses per-peptide
+    # counters. Osprey reads the manifest as the authoritative source for
+    # both decoy classification AND protein-FDR rollup, so the suffixed
+    # FASTA accessions only need to be unique enough for the library
+    # predictor; Osprey replaces them at load time.
     if args.manifest is not None:
         logger.info("Writing manifest: %s", args.manifest)
         args.manifest.parent.mkdir(parents=True, exist_ok=True)
         with args.manifest.open("w") as fm:
             fm.write("sequence\tdecoy\tproteins\tpeptide_type\tpeptide_pair_index\n")
             for pair_idx, q in enumerate(kept):
-                # The "proteins" column joins all source proteins with ";"
-                # following FDRBench/DIA-NN convention. Each peptide_type
-                # in the same pair_index lists the SAME set of source
-                # proteins (with the appropriate p_target/rev_ wrapping).
                 def proteins_for(p_target: bool, decoy: bool) -> str:
                     return ";".join(
                         build_full_protein_label(
-                            src, p_target=p_target, decoy=decoy,
+                            src,
+                            p_target=p_target,
+                            decoy=decoy,
                             entrap_suffix=args.entrapment_suffix,
                             decoy_prefix=args.decoy_prefix,
+                            pep_counter=None,
                         )
                         for src in q.sources
                     )

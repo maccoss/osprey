@@ -78,14 +78,34 @@ pub struct ManifestApplyStats {
     /// predictor strips the decoy prefix from protein accessions; the
     /// manifest's sequence-based classification is authoritative.
     pub n_newly_marked_decoy: usize,
+    /// Number of library entries whose `protein_ids` were replaced by the
+    /// manifest's `proteins` column (e.g. a Carafe library stamped a
+    /// per-peptide suffix into ProteinID; the manifest carries the clean,
+    /// un-suffixed source-protein accessions so protein parsimony /
+    /// picked-protein FDR work correctly).
+    pub n_proteins_replaced: usize,
+}
+
+/// One entry of manifest metadata for a given peptide sequence.
+#[derive(Debug, Clone)]
+struct ManifestEntryInfo {
+    kind: PeptideKind,
+    pair_index: u32,
+    /// All source proteins for this peptide, as parsed from the manifest's
+    /// `proteins` column (semicolon-separated, no per-peptide suffix). When
+    /// present and non-empty, `apply_to_library` replaces matching library
+    /// entries' `protein_ids` with this list — the manifest is the
+    /// authoritative source of protein info because predictors (Carafe) may
+    /// stamp synthetic per-peptide accessions into the library's ProteinID
+    /// column.
+    proteins: Vec<String>,
 }
 
 /// In-memory representation of a FDRBench pairing manifest.
 pub struct DecoyPairingManifest {
-    /// Lookup by peptide sequence: gives `(kind, pair_index)`.
-    ///
-    /// Each sequence appears in exactly one manifest row, so this is a 1:1 map.
-    seq_to_info: HashMap<String, (PeptideKind, u32)>,
+    /// Lookup by peptide sequence: gives kind, pair_index, and clean source
+    /// proteins. Each sequence appears in exactly one manifest row.
+    seq_to_info: HashMap<String, ManifestEntryInfo>,
 }
 
 impl DecoyPairingManifest {
@@ -109,6 +129,10 @@ impl DecoyPairingManifest {
         let i_seq = cols.iter().position(|c| *c == "sequence");
         let i_type = cols.iter().position(|c| *c == "peptide_type");
         let i_pair = cols.iter().position(|c| *c == "peptide_pair_index");
+        // `proteins` is optional — only used to override library protein_ids.
+        // Older manifests without it still parse fine; apply_to_library
+        // simply won't replace protein_ids when this column is absent.
+        let i_proteins = cols.iter().position(|c| *c == "proteins");
         let (i_seq, i_type, i_pair) = match (i_seq, i_type, i_pair) {
             (Some(a), Some(b), Some(c)) => (a, b, c),
             _ => {
@@ -123,7 +147,7 @@ impl DecoyPairingManifest {
             }
         };
 
-        let mut map: HashMap<String, (PeptideKind, u32)> = HashMap::new();
+        let mut map: HashMap<String, ManifestEntryInfo> = HashMap::new();
         let mut n_skipped: usize = 0;
         for (line_no, line) in reader.lines().enumerate() {
             let line = line?;
@@ -131,7 +155,8 @@ impl DecoyPairingManifest {
                 continue;
             }
             let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() <= i_pair.max(i_type).max(i_seq) {
+            let max_needed = i_proteins.unwrap_or(0).max(i_pair).max(i_type).max(i_seq);
+            if fields.len() <= max_needed {
                 n_skipped += 1;
                 continue;
             }
@@ -156,7 +181,31 @@ impl DecoyPairingManifest {
                     continue;
                 }
             };
-            map.insert(fields[i_seq].to_string(), (kind, pair_index));
+            // Parse semicolon-separated proteins column. Empty / "-" / single
+            // dash → empty Vec, signalling "don't override library proteins".
+            let proteins: Vec<String> = i_proteins
+                .and_then(|i| fields.get(i))
+                .map(|s| {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() || trimmed == "-" {
+                        Vec::new()
+                    } else {
+                        trimmed
+                            .split(';')
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty())
+                            .collect()
+                    }
+                })
+                .unwrap_or_default();
+            map.insert(
+                fields[i_seq].to_string(),
+                ManifestEntryInfo {
+                    kind,
+                    pair_index,
+                    proteins,
+                },
+            );
         }
         if n_skipped > 0 {
             log::info!(
@@ -220,6 +269,10 @@ impl DecoyPairingManifest {
         // protein-accession prefix from decoy entries).
         let mut buckets: HashMap<(u32, u8, u8, bool), Vec<usize>> = HashMap::new();
         let mut decoy_side_indices: Vec<usize> = Vec::new();
+        // Library indices whose `protein_ids` should be replaced from the
+        // manifest's `proteins` column (collected here so we can apply the
+        // replacement after the read-only scan).
+        let mut protein_override: Vec<(usize, Vec<String>)> = Vec::new();
         for (idx, entry) in library.iter().enumerate() {
             if entry.is_decoy && state.paired_decoys.contains(&idx) {
                 continue;
@@ -227,14 +280,29 @@ impl DecoyPairingManifest {
             if !entry.is_decoy && state.claimed_targets.contains(&idx) {
                 continue;
             }
-            if let Some(&(kind, pair_index)) = self.seq_to_info.get(&entry.sequence) {
-                let is_target_side = kind.is_target_side();
+            if let Some(info) = self.seq_to_info.get(&entry.sequence) {
+                let is_target_side = info.kind.is_target_side();
                 buckets
-                    .entry((pair_index, kind.partition(), entry.charge, is_target_side))
+                    .entry((
+                        info.pair_index,
+                        info.kind.partition(),
+                        entry.charge,
+                        is_target_side,
+                    ))
                     .or_default()
                     .push(idx);
                 if !is_target_side {
                     decoy_side_indices.push(idx);
+                }
+                // Override library protein_ids when the manifest carries the
+                // clean accessions for this sequence. This matters for
+                // libraries whose predictor stamped a per-peptide suffix
+                // into ProteinID (Carafe + unique-accession FASTAs):
+                // protein parsimony groups by full ProteinID string, so
+                // unsuffixed accessions from the manifest let multiple
+                // peptides from the same source protein roll up.
+                if !info.proteins.is_empty() && entry.protein_ids != info.proteins {
+                    protein_override.push((idx, info.proteins.clone()));
                 }
             }
         }
@@ -252,6 +320,13 @@ impl DecoyPairingManifest {
             if library[idx].id & DECOY_ID_BIT == 0 {
                 library[idx].id |= DECOY_ID_BIT;
             }
+        }
+
+        // Replace library protein_ids with the manifest's clean accessions
+        // for every sequence the manifest covers.
+        let n_proteins_replaced = protein_override.len();
+        for (idx, new_proteins) in protein_override {
+            library[idx].protein_ids = new_proteins;
         }
 
         // Walk every target-side bucket; find its decoy-side counterpart and
@@ -299,6 +374,7 @@ impl DecoyPairingManifest {
         ManifestApplyStats {
             n_paired,
             n_newly_marked_decoy,
+            n_proteins_replaced,
         }
     }
 }
@@ -474,6 +550,95 @@ mod tests {
         assert_ne!(decoy.id & DECOY_ID_BIT, 0, "decoy id should have high bit");
         // Paired: base_id matches the target.
         assert_eq!(decoy.id & 0x7FFF_FFFF, 1);
+    }
+
+    /// Manifest's `proteins` column overrides the library's protein_ids.
+    /// This catches the case where a predictor (Carafe) stamped a
+    /// per-peptide suffix into ProteinID (e.g. `sp|P12345_pep00001|...`),
+    /// breaking protein parsimony unless we substitute the clean source
+    /// accessions from the manifest.
+    #[test]
+    fn manifest_replaces_protein_ids_with_clean_accessions() {
+        // Manifest has multi-protein "proteins" column (shared peptide).
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "sequence\tdecoy\tproteins\tpeptide_type\tpeptide_pair_index"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "PEPTIDE\tNo\tsp|P12345|GENE_A;sp|Q67890|GENE_B\ttarget\t0"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "AEPTPID\tYes\tdecoy_sp|P12345|GENE_A;decoy_sp|Q67890|GENE_B\tdecoy\t0"
+        )
+        .unwrap();
+        let m = DecoyPairingManifest::from_tsv(f.path()).unwrap();
+
+        // Library has Carafe-style suffixed protein_ids (only one source kept).
+        let mut lib = vec![
+            {
+                let mut e = make_entry(1, "PEPTIDE", 2, false);
+                e.protein_ids = vec!["sp|P12345_pep00001|GENE_A".into()];
+                e
+            },
+            {
+                let mut e = make_entry(2, "AEPTPID", 2, false);
+                e.protein_ids = vec!["decoy_sp|P12345_pep00001|GENE_A".into()];
+                e
+            },
+        ];
+
+        let mut state = PairingState::new();
+        let stats = m.apply_to_library(&mut lib, &mut state);
+
+        assert_eq!(stats.n_paired, 1);
+        assert_eq!(stats.n_proteins_replaced, 2);
+        // Library protein_ids now match the manifest's clean accessions
+        // (multiple sources, no per-peptide suffix).
+        assert_eq!(
+            lib[0].protein_ids,
+            vec!["sp|P12345|GENE_A", "sp|Q67890|GENE_B"]
+        );
+        assert_eq!(
+            lib[1].protein_ids,
+            vec!["decoy_sp|P12345|GENE_A", "decoy_sp|Q67890|GENE_B"]
+        );
+    }
+
+    /// If a manifest row's `proteins` column is empty or "-", don't touch
+    /// the library's protein_ids — the library's value wins.
+    #[test]
+    fn manifest_skips_replacement_when_proteins_column_empty() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            "sequence\tdecoy\tproteins\tpeptide_type\tpeptide_pair_index"
+        )
+        .unwrap();
+        writeln!(f, "PEPTIDE\tNo\t-\ttarget\t0").unwrap();
+        writeln!(f, "AEPTPID\tYes\t\tdecoy\t0").unwrap();
+        let m = DecoyPairingManifest::from_tsv(f.path()).unwrap();
+        let mut lib = vec![
+            {
+                let mut e = make_entry(1, "PEPTIDE", 2, false);
+                e.protein_ids = vec!["sp|original|FROM_LIB".into()];
+                e
+            },
+            {
+                let mut e = make_entry(2, "AEPTPID", 2, false);
+                e.protein_ids = vec!["sp|orig_decoy|FROM_LIB".into()];
+                e
+            },
+        ];
+        let mut state = PairingState::new();
+        let stats = m.apply_to_library(&mut lib, &mut state);
+        assert_eq!(stats.n_proteins_replaced, 0);
+        assert_eq!(lib[0].protein_ids, vec!["sp|original|FROM_LIB"]);
+        assert_eq!(lib[1].protein_ids, vec!["sp|orig_decoy|FROM_LIB"]);
     }
 
     /// An unpaired manifest-flagged decoy (no target-side counterpart in the

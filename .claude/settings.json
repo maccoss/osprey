@@ -19,7 +19,10 @@
       "Bash(grep -c '^1$')",
       "Bash(awk -F'\\\\t' 'NR>1{print $7}' /tmp/fixtest/after.tsv)",
       "Bash(awk -F'\\\\t' 'NR>1{print $6}' /tmp/fixtest/after.tsv)",
-      "Bash(awk -F'\\\\t' 'NR>1 && $7==\"1\" {print \"  \" $2 \"\\\\t\" $4 \"\\\\t\" $6 \"\\\\t\" $7; if\\(++c>=3\\) exit}' /tmp/fixtest/after.tsv)"
+      "Bash(awk -F'\\\\t' 'NR>1 && $7==\"1\" {print \"  \" $2 \"\\\\t\" $4 \"\\\\t\" $6 \"\\\\t\" $7; if\\(++c>=3\\) exit}' /tmp/fixtest/after.tsv)",
+      "Read(//mnt/UNAS-DataAnalysis/osprey-test-data/astral/Entrapment-Decoy-Database/**)",
+      "Read(//mnt/UNAS-DataAnalysis/osprey-test-data/astral/Carafe-Entrapment-Decoy-Library/carafe_library/**)",
+      "Bash(awk -F'\\\\t' 'NR>1 && $4==\"target\" {print; if\\(++c>=5\\) exit}' /tmp/eptest5/manifest.tsv)"
     ]
   }
 }
