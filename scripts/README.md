@@ -137,11 +137,16 @@ For each tryptic peptide:
 
 Any synthetic peptide that happens to collide with a real target somewhere in the input drops the whole quartet (matches FDRBench's policy).
 
-Each FASTA entry carries the **source protein accession** (no per-peptide ID in the accession), so multiple peptides from one protein share the same `ProteinID` in the downstream library and Osprey's protein parsimony / picked-protein FDR work as on any normal library.
+**FASTA emission semantics:**
+
+- **One entry per peptide** (deduplicated by sequence). Peptides shared across multiple proteins appear once; the **primary** (alphabetically first) source protein supplies the FASTA-header accession.
+- **Unique accession per FASTA entry** via a per-source-protein peptide counter `_pep00001`, `_pep00002`, … (controlled by `--unique-accessions`, default ON). Necessary because library predictors like Carafe deduplicate by FASTA accession; without the counter, ~99% of library rows would have `ProteinID = "-"`.
+- **Manifest carries the full multi-source protein list** in its `proteins` column (clean accessions, no counter, sources joined with `;`). Osprey's `--decoy-pairing-manifest` reads this and replaces each library entry's `ProteinID` with the clean list at load time, so protein parsimony and picked-protein FDR work as on any normal library even though Carafe wrote a suffixed primary into the library.
 
 ```bash
 # Targets + entrapment + decoys with all defaults (len 7-35, m/z 400-900,
-# charges 2 and 3, 1 missed cleavage, decoy_ / _p_target conventions)
+# charges 2 and 3, 1 missed cleavage, decoy_ / _p_target conventions,
+# unique per-peptide accessions for Carafe compatibility)
 python scripts/build_entrapment_peptide_fasta.py \
     --input uniprot_human.fasta \
     --output entrapment_peptides.fasta \
@@ -154,6 +159,12 @@ python scripts/build_entrapment_peptide_fasta.py \
     --add-entrapment --add-decoys \
     --min-mz 400 --max-mz 900 --charges 2 3 4 \
     --min-length 7 --max-length 35 --missed-cleavages 2
+
+# For a predictor that handles duplicate FASTA accessions correctly,
+# disable the counter (one peptide can produce identical headers).
+python scripts/build_entrapment_peptide_fasta.py \
+    --input uniprot_human.fasta --output peptides.fasta --manifest manifest.tsv \
+    --add-entrapment --add-decoys --no-unique-accessions
 ```
 
 | Argument | Description |
@@ -171,6 +182,28 @@ python scripts/build_entrapment_peptide_fasta.py \
 | `--decoy-seed` | Master RNG seed for decoy shuffling [default: 24] |
 | `--entrapment-suffix` | Suffix appended to accession/entry-name for entrapment proteins [default: `_p_target`] |
 | `--decoy-prefix` | Prefix prepended to db\|accession\|entry for decoy headers [default: `decoy_`] |
+| `--unique-accessions` / `--no-unique-accessions` | Append a per-source-protein peptide counter to each FASTA accession so the predictor doesn't dedupe [default: enabled]. The counter is NOT written to the manifest. |
+| `--pep-suffix-format` | Python format string for the peptide counter [default: `_pep{:05d}`]. The matching Osprey strip regex is `_pep\d+`. |
+
+**Workflow with Carafe + Osprey:**
+
+```bash
+# 1. Generate the FASTA + manifest
+python scripts/build_entrapment_peptide_fasta.py \
+    --input uniprot_human.fasta \
+    --output entrapment_peptides.fasta \
+    --manifest pairing_manifest.tsv \
+    --add-entrapment --add-decoys
+
+# 2. Run Carafe (or any library predictor) on entrapment_peptides.fasta
+#    -> spectral_library.tsv
+
+# 3. Run Osprey with the manifest; the manifest fixes both decoy
+#    classification and protein-ID rollup transparently.
+osprey -i *.mzML -l spectral_library.tsv -o results.blib \
+       --decoys-in-library \
+       --decoy-pairing-manifest pairing_manifest.tsv
+```
 
 The manifest output uses FDRBench's 5-column format (`sequence`, `decoy`, `proteins`, `peptide_type`, `peptide_pair_index`) and can be passed directly to Osprey via `--decoy-pairing-manifest`.
 

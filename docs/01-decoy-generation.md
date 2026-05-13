@@ -268,40 +268,62 @@ by prefix.
 
 ## Library-supplied decoys
 
-When `decoys_in_library` is enabled, Osprey processes the library in two
-post-load steps:
+When `decoys_in_library` is enabled, Osprey processes the library in
+three post-load steps: decoy marking, target-decoy pairing, and
+(when a pairing manifest is supplied) authoritative protein-ID
+substitution.
 
-The first step is **decoy marking**: each entry's `protein_ids` are
-scanned, and any entry whose protein accession begins (case-insensitively)
-with one of the configured `decoy_prefixes` is flagged with
-`is_decoy = true` and `id |= DECOY_ID_BIT`. The marking step is idempotent.
+### Step 1: decoy marking
 
-The second step is **target-decoy pairing**. Marking alone is not enough —
-the SVM, LDA calibration, and cross-validation fold splitting all rely on
-each decoy sharing a `base_id` with its target (linked by
+Decoys are detected via two complementary signals, OR'd together:
+
+- **TSV `Decoy` column** (DIA-NN convention, `0` / `1` / case-insensitive
+  `true`/`yes`/`y`/`t`). The DIA-NN TSV loader reads it at load time
+  and sets `is_decoy = true` accordingly.
+- **Protein-accession prefix scan**: each entry's `protein_ids` are
+  scanned, and any entry whose protein accession begins
+  (case-insensitively) with one of the configured `decoy_prefixes` is
+  flagged. Marking is idempotent; entries already flagged by the
+  loader just get `DECOY_ID_BIT` canonicalised on their `id`.
+
+The pipeline log breaks the count down: `decoys flagged via TSV Decoy
+column = N, via prefix scan = M`. Libraries that set ONLY the column,
+ONLY the prefix, or BOTH all work.
+
+### Step 2: target-decoy pairing (hybrid manifest + composition fallback)
+
+Marking alone is not enough — the SVM, LDA calibration, and
+cross-validation fold splitting all rely on each decoy sharing a
+`base_id` with its target (linked by
 `base_id = entry_id & 0x7FFFFFFF`). Without pairing,
-`compete_from_indices` treats every entry as an "unpaired winner" and the
-SVM trains on the full target population without quality filtering,
-producing FDR estimates that are too optimistic. Osprey runs pairing in
-two stages, hybrid by design:
+`compete_from_indices` treats every entry as an "unpaired winner" and
+the SVM trains on the full target population without quality
+filtering, producing FDR estimates that are too optimistic. Osprey
+runs pairing in two stages, hybrid by design:
 
-- **Stage 1: manifest-based** (when supplied via `decoy_pairing_manifest`):
-  reads a FDRBench-style 5-column TSV (`sequence`, `decoy`, `proteins`,
-  `peptide_type`, `peptide_pair_index`) and uses each row's
-  `peptide_pair_index` to group entries into target/decoy pairs.
-  Two pairs come from each group: `(target, decoy)` and
-  `(p_target, p_decoy)`. Lookup is by unmodified peptide sequence;
-  charge is honored so charge-2 decoys pair with charge-2 targets.
-- **Stage 2: composition-based fallback** (always runs): for each decoy
-  not paired by the manifest, Osprey strips a configured prefix from
-  each protein accession to recover the target accession, then looks
-  for a target peptide with the same
-  `(stripped_accession, charge, sorted_amino_acid_composition)`. Within
-  a composition group on a single protein, target and decoy entries are
-  sorted by `(sequence, id)` and zipped 1:1, so pairings are
-  deterministic regardless of input order. The fallback works for any
-  decoy strategy that preserves AA composition (Carafe's randomized
-  decoys, sequence-reversal decoys).
+- **Stage 2a: manifest-based** (when supplied via
+  `decoy_pairing_manifest`): reads a FDRBench-style 5-column TSV
+  (`sequence`, `decoy`, `proteins`, `peptide_type`,
+  `peptide_pair_index`) and uses each row's `peptide_pair_index` to
+  group entries into target/decoy pairs. Two pairs come from each
+  group: `(target, decoy)` and `(p_target, p_decoy)`. Lookup is by
+  unmodified peptide sequence; charge is honored so charge-2 decoys
+  pair with charge-2 targets. **The manifest is authoritative for
+  decoy classification too**: any library entry whose sequence is in
+  the manifest as `decoy` or `p_decoy` is flagged `is_decoy = true`
+  even if the prefix scan missed it (which happens when a library
+  predictor strips the `decoy_` / `rev_` prefix from protein
+  accessions during processing — the Carafe failure mode).
+- **Stage 2b: composition-based fallback** (always runs): for each
+  decoy not paired by the manifest, Osprey strips a configured prefix
+  from each protein accession to recover the target accession, then
+  looks for a target peptide with the same
+  `(stripped_accession, charge, sorted_amino_acid_composition)`.
+  Within a composition group on a single protein, target and decoy
+  entries are sorted by `(sequence, id)` and zipped 1:1, so pairings
+  are deterministic regardless of input order. The fallback works for
+  any decoy strategy that preserves AA composition (Carafe's
+  randomized decoys, sequence-reversal decoys).
 
 Why hybrid? In practice, a manifest generated alongside a library can
 still miss most of the library's peptides if the library generator
@@ -322,6 +344,37 @@ pair successfully overall**. Below that threshold, FDR estimates would
 be unreliable; the user must either supply a more complete manifest,
 fix the library's accession conventions, or unset `decoys_in_library`
 and let Osprey generate decoys.
+
+### Step 3: protein-ID substitution from the manifest (when supplied)
+
+When the manifest's `proteins` column is non-empty for a matched
+library entry, `DecoyPairingManifest::apply_to_library` REPLACES the
+library entry's `protein_ids` with the manifest's clean source-protein
+list. The pipeline logs `manifest replaced protein_ids on N library
+entries`.
+
+This solves two problems at once:
+
+- **Library predictors that deduplicate by FASTA accession**. When
+  generating an entrapment FASTA via
+  `scripts/build_entrapment_peptide_fasta.py` for a predictor like
+  Carafe, the script appends a per-peptide counter
+  (`_pep00001`, `_pep00002`, …) to each accession so every FASTA entry
+  is unique to the predictor. Carafe then writes that suffixed
+  accession into the library's `ProteinID` column. The manifest, by
+  contrast, carries the original clean accession; substituting it
+  back at load time restores correct protein parsimony / picked-protein
+  FDR rollup.
+- **Shared peptides**. The FASTA only carries the primary
+  (alphabetically-first) source protein for any given peptide. The
+  manifest's `proteins` column is the only place the full multi-protein
+  list survives intact; the substitution makes
+  `entry.protein_ids = ["sp|A|...", "sp|B|...", ...]` for every shared
+  peptide in the manifest, restoring full inference downstream.
+
+The substitution is a no-op when the manifest's `proteins` column is
+empty or `-`. Library entries whose sequence isn't in the manifest are
+left untouched.
 
 Prior to this support, `decoys_in_library: true` skipped DecoyGenerator
 but no code set `is_decoy` and no pairing was performed, so real decoys
