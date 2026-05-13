@@ -68,6 +68,40 @@ DEFAULT_ENTRAPMENT_SUFFIX = "_p_target"
 # patches the column based on protein-accession prefix detection.
 DEFAULT_DECOY_PREFIX = "decoy_"
 
+# Monoisotopic residue masses (Da). U/O selenocysteine/pyrrolysine left out; B,
+# Z, J, X are ambiguity codes — peptides containing them are skipped silently.
+AA_MONO_MASS: dict[str, float] = {
+    "G": 57.02146, "A": 71.03711, "S": 87.03203, "P": 97.05276, "V": 99.06841,
+    "T": 101.04768, "C": 103.00919, "L": 113.08406, "I": 113.08406,
+    "N": 114.04293, "D": 115.02694, "Q": 128.05858, "K": 128.09496,
+    "E": 129.04259, "M": 131.04049, "H": 137.05891, "F": 147.06841,
+    "R": 156.10111, "Y": 163.06333, "W": 186.07931,
+}
+H2O_MONO = 18.01056
+PROTON_MONO = 1.007276
+
+
+def peptide_neutral_mass(seq: str) -> float | None:
+    """Monoisotopic neutral mass of a peptide, or `None` if any residue is not
+    in `AA_MONO_MASS` (e.g. contains B, Z, J, X, U, O)."""
+    total = H2O_MONO
+    for aa in seq:
+        m = AA_MONO_MASS.get(aa)
+        if m is None:
+            return None
+        total += m
+    return total
+
+
+def fits_mz_range(neutral_mass: float, charges: list[int], min_mz: float, max_mz: float) -> bool:
+    """True iff at least one of the allowed charge states produces an m/z
+    inside `[min_mz, max_mz]`."""
+    for z in charges:
+        mz = (neutral_mass + z * PROTON_MONO) / z
+        if min_mz <= mz <= max_mz:
+            return True
+    return False
+
 
 @dataclass
 class ProteinRecord:
@@ -211,9 +245,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", type=Path, default=None, help="Output FDRBench-style pairing manifest TSV (optional).")
     parser.add_argument("--add-entrapment", action="store_true", help="Include p_target entrapment peptides.")
     parser.add_argument("--add-decoys", action="store_true", help="Include decoy peptides (and p_decoys when entrapment is also enabled).")
-    parser.add_argument("--missed-cleavages", type=int, default=1, help="Max missed cleavages [default: 1].")
-    parser.add_argument("--min-length", type=int, default=6, help="Minimum peptide length [default: 6].")
-    parser.add_argument("--max-length", type=int, default=50, help="Maximum peptide length [default: 50].")
+    parser.add_argument(
+        "--missed-cleavages",
+        type=int,
+        default=1,
+        choices=range(0, 6),
+        metavar="{0..5}",
+        help="Max missed cleavages [default: 1]. A value of N includes peptides with 0..N missed cleavages.",
+    )
+    parser.add_argument("--min-length", type=int, default=7, help="Minimum peptide length [default: 7].")
+    parser.add_argument("--max-length", type=int, default=35, help="Maximum peptide length [default: 35].")
+    parser.add_argument(
+        "--min-mz",
+        type=float,
+        default=400.0,
+        help="Minimum precursor m/z for at least one allowed charge state [default: 400].",
+    )
+    parser.add_argument(
+        "--max-mz",
+        type=float,
+        default=900.0,
+        help="Maximum precursor m/z for at least one allowed charge state [default: 900].",
+    )
+    parser.add_argument(
+        "--charges",
+        type=int,
+        nargs="+",
+        default=[2, 3],
+        help="Allowed precursor charge states; a peptide is kept if any of these charges produces an m/z in [min_mz, max_mz] [default: 2 3].",
+    )
     parser.add_argument("--entrapment-seed", type=int, default=42, help="Master RNG seed for entrapment shuffling [default: 42].")
     parser.add_argument("--decoy-seed", type=int, default=24, help="Master RNG seed for decoy shuffling [default: 24].")
     parser.add_argument(
@@ -238,9 +298,24 @@ def main(argv: list[str] | None = None) -> int:
 
     # Step 1: parse the FASTA and tryptic-digest every protein. Collect all
     # unique target peptides, each with a list of source ProteinRecord refs.
+    # Apply length, residue (skip unknown AAs), and precursor m/z filters
+    # at digest time so we don't carry unusable peptides through the
+    # shuffle and collision-check stages.
     logger.info("Reading FASTA: %s", args.input)
+    if args.min_length < 1 or args.max_length < args.min_length:
+        logger.error("invalid length range: %d-%d", args.min_length, args.max_length)
+        return 1
+    if args.min_mz >= args.max_mz:
+        logger.error("invalid m/z range: %.3f-%.3f", args.min_mz, args.max_mz)
+        return 1
+    if any(z < 1 or z > 10 for z in args.charges):
+        logger.error("invalid charge state in %s (allowed: 1..10)", args.charges)
+        return 1
+
     target_to_sources: dict[str, list[ProteinRecord]] = {}
     n_proteins = 0
+    n_dropped_unknown_aa = 0
+    n_dropped_out_of_mz = 0
     for rec in parse_fasta(args.input):
         n_proteins += 1
         for pep in tryptic_digest(
@@ -249,14 +324,30 @@ def main(argv: list[str] | None = None) -> int:
             min_len=args.min_length,
             max_len=args.max_length,
         ):
-            target_to_sources.setdefault(pep, []).append(rec)
+            if pep in target_to_sources:
+                target_to_sources[pep].append(rec)
+                continue
+            neutral_mass = peptide_neutral_mass(pep)
+            if neutral_mass is None:
+                n_dropped_unknown_aa += 1
+                continue
+            if not fits_mz_range(neutral_mass, args.charges, args.min_mz, args.max_mz):
+                n_dropped_out_of_mz += 1
+                continue
+            target_to_sources[pep] = [rec]
     logger.info(
-        "Digested %d proteins into %d unique target peptides (mc=%d, len=%d-%d)",
+        "Digested %d proteins (mc=%d, len=%d-%d, charges=%s, m/z=%.1f-%.1f): "
+        "%d unique target peptides retained, %d dropped (unknown AA), %d dropped (out of m/z range)",
         n_proteins,
-        len(target_to_sources),
         args.missed_cleavages,
         args.min_length,
         args.max_length,
+        args.charges,
+        args.min_mz,
+        args.max_mz,
+        len(target_to_sources),
+        n_dropped_unknown_aa,
+        n_dropped_out_of_mz,
     )
 
     # Step 2: build quartets. p_target/decoy/p_decoy are deterministic
