@@ -3400,29 +3400,40 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // the library's peptides because the library generator may use
         // different digestion rules; composition pairing recovers those.
         let mut pairing_state = osprey_core::PairingState::new();
-        let n_paired_manifest = if let Some(manifest_path) = &config.decoy_pairing_manifest {
+        let (n_paired_manifest, n_newly_marked_by_manifest) =
+            if let Some(manifest_path) = &config.decoy_pairing_manifest {
+                log::info!(
+                    "Loading decoy pairing manifest from {}",
+                    manifest_path.display()
+                );
+                let manifest =
+                    osprey_io::DecoyPairingManifest::from_tsv(manifest_path).map_err(|e| {
+                        OspreyError::config(format!(
+                            "Failed to read decoy pairing manifest {}: {}",
+                            manifest_path.display(),
+                            e
+                        ))
+                    })?;
+                let stats = manifest.apply_to_library(&mut library, &mut pairing_state);
+                (stats.n_paired, stats.n_newly_marked_decoy)
+            } else {
+                (0, 0)
+            };
+        if n_newly_marked_by_manifest > 0 {
             log::info!(
-                "Loading decoy pairing manifest from {}",
-                manifest_path.display()
+                "Library-decoy mode: manifest classified {} additional library entries as decoys \
+                 (their protein accessions lacked a decoy prefix)",
+                n_newly_marked_by_manifest
             );
-            let manifest =
-                osprey_io::DecoyPairingManifest::from_tsv(manifest_path).map_err(|e| {
-                    OspreyError::config(format!(
-                        "Failed to read decoy pairing manifest {}: {}",
-                        manifest_path.display(),
-                        e
-                    ))
-                })?;
-            manifest.apply_to_library(&mut library, &mut pairing_state)
-        } else {
-            0
-        };
+        }
         let n_paired_composition = osprey_core::pair_library_decoys_by_composition(
             &mut library,
             &config.decoy_prefixes,
             &mut pairing_state,
         );
 
+        // Recount AFTER all marking + pairing has finished — the manifest may
+        // have flipped is_decoy on entries the prefix scan missed.
         let n_targets = library.iter().filter(|e| !e.is_decoy).count();
         let n_decoys = library.len() - n_targets;
         let n_paired = n_paired_manifest + n_paired_composition;
@@ -3432,7 +3443,9 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             n_paired,
             n_paired_via_manifest: n_paired_manifest,
             n_paired_via_composition: n_paired_composition,
-            n_unpaired_decoys: n_decoys - n_paired,
+            // saturating_sub: defensive against double-counting bugs that
+            // could otherwise yield a u64 underflow.
+            n_unpaired_decoys: n_decoys.saturating_sub(n_paired),
             n_unpaired_targets: n_targets.saturating_sub(pairing_state.claimed_targets.len()),
         };
         log::info!(

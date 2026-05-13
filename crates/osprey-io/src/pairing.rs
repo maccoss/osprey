@@ -65,6 +65,21 @@ impl PeptideKind {
     }
 }
 
+/// Stats returned by `DecoyPairingManifest::apply_to_library`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ManifestApplyStats {
+    /// Number of decoys paired with a target on this call (decoy.id rewritten
+    /// so its `base_id` matches the target's `id`).
+    pub n_paired: usize,
+    /// Number of library entries whose `is_decoy` was flipped from `false`
+    /// to `true` because the manifest classified them as `decoy` or
+    /// `p_decoy`. The protein-prefix scan in
+    /// `apply_library_decoy_marking` misses these when the library
+    /// predictor strips the decoy prefix from protein accessions; the
+    /// manifest's sequence-based classification is authoritative.
+    pub n_newly_marked_decoy: usize,
+}
+
 /// In-memory representation of a FDRBench pairing manifest.
 pub struct DecoyPairingManifest {
     /// Lookup by peptide sequence: gives `(kind, pair_index)`.
@@ -181,15 +196,30 @@ impl DecoyPairingManifest {
     /// this function can be chained with a composition-based fallback pass
     /// without claiming the same target twice. New pairings made here are
     /// added to `state`.
+    ///
+    /// **Authoritative classification by manifest.** Any library entry whose
+    /// sequence appears in the manifest as `decoy` or `p_decoy` gets
+    /// `is_decoy = true` and `DECOY_ID_BIT` set on its `id`, even if it
+    /// doesn't pair. This catches the common case where a library predictor
+    /// (e.g. Carafe) stripped the protein-accession decoy prefix during
+    /// processing, leaving Osprey's prefix scan unable to recognise the
+    /// decoys. The manifest's `peptide_type` column is taken as the source
+    /// of truth.
     pub fn apply_to_library(
         &self,
         library: &mut [LibraryEntry],
         state: &mut PairingState,
-    ) -> usize {
+    ) -> ManifestApplyStats {
         // Group library entries by (pair_index, partition, charge, is_target_side).
         // Each bucket holds Vec<library_index>. Skip entries already paired
         // (decoys) or claimed (targets) by an earlier pass.
+        //
+        // Also collect the list of decoy-side library indices identified by
+        // the manifest, so we can stamp `is_decoy = true` + `DECOY_ID_BIT`
+        // on them afterwards (catches predictors that stripped the
+        // protein-accession prefix from decoy entries).
         let mut buckets: HashMap<(u32, u8, u8, bool), Vec<usize>> = HashMap::new();
+        let mut decoy_side_indices: Vec<usize> = Vec::new();
         for (idx, entry) in library.iter().enumerate() {
             if entry.is_decoy && state.paired_decoys.contains(&idx) {
                 continue;
@@ -198,15 +228,29 @@ impl DecoyPairingManifest {
                 continue;
             }
             if let Some(&(kind, pair_index)) = self.seq_to_info.get(&entry.sequence) {
+                let is_target_side = kind.is_target_side();
                 buckets
-                    .entry((
-                        pair_index,
-                        kind.partition(),
-                        entry.charge,
-                        kind.is_target_side(),
-                    ))
+                    .entry((pair_index, kind.partition(), entry.charge, is_target_side))
                     .or_default()
                     .push(idx);
+                if !is_target_side {
+                    decoy_side_indices.push(idx);
+                }
+            }
+        }
+
+        // Mark manifest-identified decoys BEFORE pairing. Idempotent: entries
+        // already flagged keep their flag and high bit. Pairing will overwrite
+        // the low 31 bits to the target's base_id for paired decoys; unpaired
+        // decoys keep their original id with just the high bit set.
+        let mut n_newly_marked_decoy: usize = 0;
+        for &idx in &decoy_side_indices {
+            if !library[idx].is_decoy {
+                library[idx].is_decoy = true;
+                n_newly_marked_decoy += 1;
+            }
+            if library[idx].id & DECOY_ID_BIT == 0 {
+                library[idx].id |= DECOY_ID_BIT;
             }
         }
 
@@ -245,13 +289,17 @@ impl DecoyPairingManifest {
             }
         }
 
-        // Apply rewrites.
+        // Apply pairing rewrites. For each paired decoy, set its id so that
+        // base_id matches the target.
         let n_paired = pairings.len();
         for (decoy_idx, target_idx) in pairings {
             let target_id = library[target_idx].id;
             library[decoy_idx].id = target_id | DECOY_ID_BIT;
         }
-        n_paired
+        ManifestApplyStats {
+            n_paired,
+            n_newly_marked_decoy,
+        }
     }
 }
 
@@ -332,8 +380,8 @@ mod tests {
             make_entry(4, "BPETPIDE", 2, true), // p_decoy of PEPTIDEB
         ];
         let mut state = PairingState::new();
-        let n_paired = m.apply_to_library(&mut lib, &mut state);
-        assert_eq!(n_paired, 2);
+        let stats = m.apply_to_library(&mut lib, &mut state);
+        assert_eq!(stats.n_paired, 2);
         // The decoy of PEPTIDEA should base_id-match target id 1.
         let aeptpide = lib.iter().find(|e| e.sequence == "AEPTPIDE").unwrap();
         let bpetpide = lib.iter().find(|e| e.sequence == "BPETPIDE").unwrap();
@@ -355,8 +403,8 @@ mod tests {
             make_entry(4, "AEPTPIDE", 3, true),
         ];
         let mut state = PairingState::new();
-        let n_paired = m.apply_to_library(&mut lib, &mut state);
-        assert_eq!(n_paired, 2);
+        let stats = m.apply_to_library(&mut lib, &mut state);
+        assert_eq!(stats.n_paired, 2);
         // Charge 2 decoy pairs to charge 2 target; charge 3 to charge 3.
         let d_c2 = lib
             .iter()
@@ -388,10 +436,70 @@ mod tests {
             make_entry(2, "UNKNOWNK", 2, true), // not in manifest
         ];
         let mut state = PairingState::new();
-        let n_paired = m.apply_to_library(&mut lib, &mut state);
-        assert_eq!(n_paired, 0);
+        let stats = m.apply_to_library(&mut lib, &mut state);
+        assert_eq!(stats.n_paired, 0);
         // The unpaired decoy is not in state.paired_decoys.
         assert!(!state.paired_decoys.contains(&1));
+    }
+
+    /// Real-world failure mode: a library predictor (Carafe) strips the
+    /// `decoy_` / `rev_` prefix from protein accessions, so the library
+    /// loads with every decoy looking like a target (`is_decoy = false`).
+    /// The manifest's sequence-based classification is authoritative and
+    /// must flip those entries to `is_decoy = true`.
+    #[test]
+    fn manifest_flips_unflagged_decoys_to_is_decoy() {
+        let f = write_manifest(&[
+            "PEPTIDEA\tNo\tprotA\ttarget\t0",
+            "AEPTPIDE\tYes\trev_protA\tdecoy\t0",
+        ]);
+        let m = DecoyPairingManifest::from_tsv(f.path()).unwrap();
+        // Library has the decoy peptide but with is_decoy=false (predictor
+        // stripped the rev_ prefix). Both entries look like targets to Osprey.
+        let mut lib = vec![
+            make_entry(1, "PEPTIDEA", 2, false),
+            make_entry(2, "AEPTPIDE", 2, false), // <-- looked like target
+        ];
+        assert!(!lib[1].is_decoy);
+        assert_eq!(lib[1].id & DECOY_ID_BIT, 0);
+
+        let mut state = PairingState::new();
+        let stats = m.apply_to_library(&mut lib, &mut state);
+
+        assert_eq!(stats.n_paired, 1);
+        assert_eq!(stats.n_newly_marked_decoy, 1);
+        // The manifest flipped the AEPTPIDE entry.
+        let decoy = lib.iter().find(|e| e.sequence == "AEPTPIDE").unwrap();
+        assert!(decoy.is_decoy, "manifest should flip is_decoy=true");
+        assert_ne!(decoy.id & DECOY_ID_BIT, 0, "decoy id should have high bit");
+        // Paired: base_id matches the target.
+        assert_eq!(decoy.id & 0x7FFF_FFFF, 1);
+    }
+
+    /// An unpaired manifest-flagged decoy (no target-side counterpart in the
+    /// library) still gets `is_decoy = true` and the high bit on its `id`,
+    /// even though pairing skips it.
+    #[test]
+    fn manifest_marks_unpaired_decoy_without_pairing_it() {
+        let f = write_manifest(&[
+            // Target-side counterpart missing from the library entirely.
+            "PEPTIDEA\tNo\tprotA\ttarget\t0",
+            "AEPTPIDE\tYes\trev_protA\tdecoy\t0",
+        ]);
+        let m = DecoyPairingManifest::from_tsv(f.path()).unwrap();
+        let mut lib = vec![
+            // Only the decoy peptide is in the library; its target sibling
+            // PEPTIDEA isn't.
+            make_entry(7, "AEPTPIDE", 2, false),
+        ];
+        let mut state = PairingState::new();
+        let stats = m.apply_to_library(&mut lib, &mut state);
+        assert_eq!(stats.n_paired, 0); // no target -> no pair
+        assert_eq!(stats.n_newly_marked_decoy, 1);
+        assert!(lib[0].is_decoy);
+        assert_ne!(lib[0].id & DECOY_ID_BIT, 0);
+        // Unpaired: low 31 bits keep the original id.
+        assert_eq!(lib[0].id & 0x7FFF_FFFF, 7);
     }
 
     #[test]
@@ -431,7 +539,7 @@ mod tests {
         ];
         let mut state = PairingState::new();
         let n_manifest = m.apply_to_library(&mut lib, &mut state);
-        assert_eq!(n_manifest, 1);
+        assert_eq!(n_manifest.n_paired, 1);
         // Run composition fallback. Should pair the remaining (PEPTIDEB, EPBPTIDE).
         let n_composition =
             pair_library_decoys_by_composition(&mut lib, &["rev_".to_string()], &mut state);
