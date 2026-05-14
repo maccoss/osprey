@@ -527,9 +527,18 @@ osprey/
 
 ```text
 scripts/
-+-- evaluate_calibration.py      # Generate HTML report from calibration JSON
-+-- inspect_mokapot_weights.py   # Display Mokapot feature weights/importance
++-- evaluate_calibration.py            # HTML report from calibration JSON
++-- inspect_mokapot_weights.py         # Display Mokapot feature weights/importance
++-- visualize_pin_features.py          # Histograms of PIN features (target vs decoy)
++-- compare_library_rt.py              # Compare library RTs between two libraries
++-- compare_scan_numbers.py            # Compare scan numbers between two blibs
++-- verify_blib_rt_consistency.py      # Sanity-check RT fields in a blib
++-- build_fdrbench_input.py            # FDRBench input TSV from DIA-NN parquet or Osprey blib
++-- build_entrapment_peptide_fasta.py  # Entrapment FASTA + pairing manifest for FDRBench workflows
++-- fix_library_decoy_column.py        # Patch DIA-NN library Decoy column from protein prefix
 ```
+
+See [scripts/README.md](../scripts/README.md) for full usage, options, and the end-to-end Carafe + Osprey + FDRBench workflow. A brief tour follows.
 
 ### evaluate_calibration.py
 
@@ -550,6 +559,16 @@ Displays feature weights from trained Mokapot models to identify important featu
 ```bash
 python scripts/inspect_mokapot_weights.py mokapot.model.pkl
 ```
+
+### FDRBench-area utilities and native flags
+
+For FDR-quality evaluation via entrapment counting, Osprey ships both Python utilities and two native CLI flags:
+
+- `--fdrbench <path>`: writes an FDRBench-compatible input TSV directly from the pre-compaction first-pass FDR pool. Emits **every scored target** (not just FDR-passing entries) with the raw SVM discriminant as `score`, so FDRBench can compute true-FDR via entrapment counting without truncation at Osprey's threshold. Output level follows `--fdr-level` (`both` emits precursor-level; `protein` requires `--protein-fdr` and writes the picked-protein TSV). Add `--fdrbench-per-run` to emit one row per (precursor, run) using run-level q-values. Invoke FDRBench with `-score 'score:1'`.
+- `--decoy-pairing-manifest <PATH>`: links each library decoy to its target via a FDRBench-style 5-column TSV (`sequence`, `decoy`, `proteins`, `peptide_type`, `peptide_pair_index`). Used together with `--decoys-in-library`; the manifest is authoritative for both decoy classification AND protein-ID rollup (the manifest's `proteins` column REPLACES the library's `ProteinID` so `_pep00001`-style unique accessions survive round-tripping through Carafe). Without a manifest, Osprey falls back to amino-acid composition pairing. See [01-decoy-generation.md](01-decoy-generation.md).
+- `build_entrapment_peptide_fasta.py`: generates a peptide-level FASTA + the matching pairing manifest from a target-only uniprot FASTA, with per-peptide entrapment / decoy / p_decoy sequences (deterministic seeded shuffle, C-terminal residue preserved, configurable length / m/z / charge / missed-cleavage filters). Used to build entrapment libraries for Carafe-style predictors.
+- `build_fdrbench_input.py`: emits an FDRBench-compatible TSV from a DIA-NN `report.parquet` or an Osprey `.blib` (+ `proteins.csv`). For Osprey results, prefer the native `--fdrbench` flag — the blib only contains FDR-passing entries; the script is the right choice for DIA-NN parquets and for after-the-fact analysis of existing blibs.
+- `fix_library_decoy_column.py`: stream-patches the `Decoy` column of a DIA-NN-style library TSV based on protein-accession prefix detection. Not needed for Osprey workflows now that the loader reads both signals, but useful for DIA-NN-only consumers of the library.
 
 ---
 
