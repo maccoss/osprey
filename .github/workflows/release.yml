@@ -114,10 +114,21 @@ jobs:
           done
           ls -la release/
 
+      - name: Verify curated release notes exist
+        run: |
+          notes_path="release-notes/RELEASE_NOTES_${GITHUB_REF_NAME}.md"
+          if [ ! -f "$notes_path" ]; then
+            echo "ERROR: curated release notes not found at $notes_path"
+            echo "Expected file matching tag ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+          echo "Using curated release notes from $notes_path"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
+          body_path: release-notes/RELEASE_NOTES_${{ github.ref_name }}.md
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
