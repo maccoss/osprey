@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "osprey"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "osprey-chromatography"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "approx",
  "chrono",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "osprey-core"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "approx",
  "log",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "osprey-fdr"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "approx",
  "indicatif",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "osprey-io"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "base64",
  "csv",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "osprey-ml"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "log",
  "rayon",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "osprey-scoring"
-version = "26.6.0"
+version = "26.6.1"
 dependencies = [
  "approx",
  "blas-src",
