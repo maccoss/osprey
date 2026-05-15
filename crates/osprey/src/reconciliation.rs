@@ -87,12 +87,21 @@ pub fn compute_consensus_rts(
             || (protein_fdr_threshold > 0.0 && entry.run_protein_qvalue <= protein_fdr_threshold)
     };
 
-    // 1. Collect target peptides passing run-level FDR (or rescued by protein FDR)
+    // 1. Collect target peptides passing run-level FDR (or rescued by protein FDR).
+    //    We also record the set of qualifying target *base_ids* so that paired
+    //    decoys can be identified by base_id linkage (entry_id & 0x7FFFFFFF)
+    //    rather than by stripping a "DECOY_" prefix from modified_sequence.
+    //    The prefix-strip approach only works for Osprey-generated decoys; it
+    //    silently misses library-supplied decoys (Carafe etc.) whose modified
+    //    sequence carries no prefix. Pairing was already established by the
+    //    FDRBench manifest or composition fallback during library load.
     let mut target_peptides: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
+    let mut target_base_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
             if qualifies(entry) {
                 target_peptides.insert(entry.modified_sequence.clone());
+                target_base_ids.insert(entry.entry_id & 0x7FFF_FFFF);
             }
         }
     }
@@ -116,21 +125,16 @@ pub fn compute_consensus_rts(
     type DetectionVec = Vec<(String, f64, f64, f64, f64)>;
     let mut detections: HashMap<(String, bool), DetectionVec> = HashMap::new();
 
-    // Identify decoy modified_sequences paired to target peptides
-    // Decoys have DECOY_ prefix on modified_sequence
+    // Identify decoy modified_sequences paired to target peptides via base_id
+    // linkage. This is authoritative for both Osprey-generated decoys (which
+    // also carry a DECOY_ prefix on modified_sequence) and library-supplied
+    // decoys (whose modified_sequence has no prefix — the decoy mark lives on
+    // protein_ids and on the high bit of entry_id).
     let mut decoy_peptides: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
-            if entry.is_decoy {
-                // Check if the paired target is in our consensus set
-                // Decoy modified_sequence has DECOY_ prefix
-                let target_seq = entry
-                    .modified_sequence
-                    .strip_prefix("DECOY_")
-                    .unwrap_or(&entry.modified_sequence);
-                if target_peptides.contains(target_seq) {
-                    decoy_peptides.insert(entry.modified_sequence.clone());
-                }
+            if entry.is_decoy && target_base_ids.contains(&(entry.entry_id & 0x7FFF_FFFF)) {
+                decoy_peptides.insert(entry.modified_sequence.clone());
             }
         }
     }
@@ -553,20 +557,24 @@ pub fn plan_reconciliation(
         }
     };
 
-    // Build set of precursors (base_sequence, charge) that will appear in
-    // the blib output. Every such precursor needs reconciliation in ALL
-    // files so its per-file boundaries agree with the consensus. We use the
-    // MINIMUM of (run_precursor, run_peptide, experiment_precursor,
-    // experiment_peptide) q-values — most permissive — because the blib
-    // admits a precursor if ANY of those levels passes at the configured
-    // FDR gate. Using the strict max (e.g., `FdrLevel::Both`) would leave
-    // out precursors that clear peptide-level FDR but just barely fail
-    // precursor-level; those precursors still ship in the blib and must be
-    // reconciled so sibling charges don't end up at inconsistent RTs within
-    // the same run. Decoys are included through the paired-decoy logic
-    // below, not this gate. "base_sequence" strips the DECOY_ prefix so
-    // targets and decoys share the same key.
-    let mut passing_precursors: std::collections::HashSet<(&str, u8)> =
+    // Build set of precursors (base_id, charge) that will appear in the blib
+    // output. Every such precursor needs reconciliation in ALL files so its
+    // per-file boundaries agree with the consensus. We use the MINIMUM of
+    // (run_precursor, run_peptide, experiment_precursor, experiment_peptide)
+    // q-values — most permissive — because the blib admits a precursor if
+    // ANY of those levels passes at the configured FDR gate. Using the
+    // strict max (e.g., `FdrLevel::Both`) would leave out precursors that
+    // clear peptide-level FDR but just barely fail precursor-level; those
+    // precursors still ship in the blib and must be reconciled so sibling
+    // charges don't end up at inconsistent RTs within the same run.
+    //
+    // We key on `base_id = entry_id & 0x7FFFFFFF` (plus charge) rather than
+    // on modified_sequence so that paired decoys are recognised regardless
+    // of whether their modified_sequence carries a DECOY_ prefix. Targets
+    // and decoys share the same base_id by construction (Osprey-generated
+    // pairing) or via the FDRBench manifest / composition fallback (library-
+    // supplied decoys).
+    let mut passing_base_ids: std::collections::HashSet<(u32, u8)> =
         std::collections::HashSet::new();
     for (_, entries) in per_file_entries {
         for entry in entries {
@@ -579,7 +587,7 @@ pub fn plan_reconciliation(
                 .min(entry.experiment_precursor_qvalue)
                 .min(entry.experiment_peptide_qvalue);
             if best_q <= experiment_fdr {
-                passing_precursors.insert((&entry.modified_sequence, entry.charge));
+                passing_base_ids.insert((entry.entry_id & 0x7FFF_FFFF, entry.charge));
             }
         }
     }
@@ -659,12 +667,11 @@ pub fn plan_reconciliation(
 
                 // Only reconcile precursors (peptide+charge) that passed experiment FDR,
                 // or their paired decoys. This avoids wasting time on charge states that
-                // weren't detected and won't appear in output.
-                let base_seq = entry
-                    .modified_sequence
-                    .strip_prefix("DECOY_")
-                    .unwrap_or(&entry.modified_sequence);
-                if !passing_precursors.contains(&(base_seq, entry.charge)) {
+                // weren't detected and won't appear in output. We key on base_id so
+                // library-supplied decoys (whose modified_sequence lacks a DECOY_
+                // prefix) still match their paired target.
+                let base_id = entry.entry_id & 0x7FFF_FFFF;
+                if !passing_base_ids.contains(&(base_id, entry.charge)) {
                     continue;
                 }
 
@@ -794,7 +801,7 @@ pub fn plan_reconciliation(
     let n_forced = n_forced_t + n_forced_d;
     let n_evaluated = n_keep + n_cwt + n_forced;
     let n_rescore = n_cwt + n_forced;
-    let n_precursors = passing_precursors.len();
+    let n_precursors = passing_base_ids.len();
     let n_files = per_file_entries.len();
     log::info!(
         "Reconciliation: {} passing precursors × {} files = {} entries evaluated (across {} consensus peptides)",
@@ -1659,6 +1666,174 @@ mod tests {
             (target.consensus_library_rt - 15.0).abs() < 0.5,
             "Consensus RT {} should be near 15.0",
             target.consensus_library_rt
+        );
+    }
+
+    #[test]
+    fn test_consensus_rts_pairs_library_decoy_by_base_id() {
+        // Regression for the library-supplied-decoy bug:
+        // before the fix, `compute_consensus_rts` identified paired decoys by
+        // stripping a "DECOY_" prefix from the decoy's modified_sequence and
+        // checking whether the stripped form matched a target peptide. That
+        // works for Osprey-generated decoys ("DECOY_PEPTIDEK" -> "PEPTIDEK"
+        // hits "PEPTIDEK") but silently misses library-supplied decoys
+        // (Carafe-predicted, FDRBench manifest-paired) whose
+        // modified_sequence is the raw scrambled sequence with no prefix.
+        // After the fix, pairing is done by base_id (entry_id & 0x7FFFFFFF)
+        // which is the authoritative target-decoy link Osprey establishes at
+        // library load.
+        let cal = make_identity_calibration();
+        let per_file_calibrations: HashMap<String, RTCalibration> = vec![
+            ("file1".to_string(), cal.clone()),
+            ("file2".to_string(), cal),
+        ]
+        .into_iter()
+        .collect();
+
+        // Library-style decoy: paired via base_id 1, but modified_sequence
+        // does NOT carry a DECOY_ prefix. This is what Carafe-predicted
+        // libraries look like after the FDRBench manifest sets `is_decoy`.
+        let per_file_entries = vec![
+            (
+                "file1".to_string(),
+                vec![
+                    make_fdr_entry(1, "PEPTIDEK", 2, false, 15.0, 14.5, 15.5, 8.0, 0.005),
+                    make_fdr_entry(
+                        1 | 0x80000000,
+                        "EDITPEPK", // raw decoy sequence, no DECOY_ prefix
+                        2,
+                        true,
+                        15.2,
+                        14.7,
+                        15.7,
+                        3.0,
+                        1.0,
+                    ),
+                ],
+            ),
+            (
+                "file2".to_string(),
+                vec![
+                    make_fdr_entry(1, "PEPTIDEK", 2, false, 15.1, 14.6, 15.6, 7.5, 0.008),
+                    make_fdr_entry(
+                        1 | 0x80000000,
+                        "EDITPEPK",
+                        2,
+                        true,
+                        15.3,
+                        14.8,
+                        15.8,
+                        2.5,
+                        1.0,
+                    ),
+                ],
+            ),
+        ];
+
+        let consensus = compute_consensus_rts(&per_file_entries, &per_file_calibrations, 0.01, 0.0);
+
+        // Before the fix: only the target consensus would appear (1 entry).
+        // After the fix: both target and library-style decoy are paired by
+        // base_id and both consensus entries appear (2 entries).
+        assert_eq!(
+            consensus.len(),
+            2,
+            "Library-supplied decoy must be paired with its target via base_id, \
+             producing consensus entries for both target and decoy"
+        );
+
+        let decoy = consensus
+            .iter()
+            .find(|c| c.is_decoy)
+            .expect("paired decoy must appear in consensus");
+        assert_eq!(decoy.modified_sequence, "EDITPEPK");
+        assert_eq!(decoy.n_runs_detected, 2);
+    }
+
+    #[test]
+    fn test_plan_reconciliation_includes_library_decoy_via_base_id() {
+        // Companion to test_consensus_rts_pairs_library_decoy_by_base_id:
+        // even with consensus correctly built, plan_reconciliation must look
+        // up "passing" status by base_id (not by stripping DECOY_) so that
+        // library-supplied decoys whose target passed experiment FDR get
+        // their boundaries reconciled along with their target.
+        let cal = make_identity_calibration();
+        let refined_cal: HashMap<String, RTCalibration> = vec![("file1".to_string(), cal.clone())]
+            .into_iter()
+            .collect();
+        let original_cal: HashMap<String, RTCalibration> =
+            vec![("file1".to_string(), cal)].into_iter().collect();
+
+        let consensus = vec![
+            PeptideConsensusRT {
+                modified_sequence: "PEPTIDEK".to_string(),
+                is_decoy: false,
+                consensus_library_rt: 15.0,
+                median_peak_width: 1.0,
+                n_runs_detected: 2,
+                apex_library_rt_mad: None,
+            },
+            PeptideConsensusRT {
+                modified_sequence: "EDITPEPK".to_string(),
+                is_decoy: true,
+                consensus_library_rt: 15.0,
+                median_peak_width: 1.0,
+                n_runs_detected: 2,
+                apex_library_rt_mad: None,
+            },
+        ];
+
+        // Target passes experiment FDR; library-style decoy is paired via
+        // base_id 1 but has no DECOY_ prefix on its modified_sequence. Both
+        // apexes are placed far enough from the consensus that the
+        // reconciliation plan picks a non-Keep action (only non-Keep actions
+        // are stored, so this is what we can assert on).
+        let per_file_entries = vec![(
+            "file1".to_string(),
+            vec![
+                make_fdr_entry(1, "PEPTIDEK", 2, false, 18.0, 17.5, 18.5, 8.0, 0.005),
+                make_fdr_entry(
+                    1 | 0x80000000,
+                    "EDITPEPK",
+                    2,
+                    true,
+                    18.2,
+                    17.7,
+                    18.7,
+                    3.0,
+                    1.0,
+                ),
+            ],
+        )];
+
+        let cwt: HashMap<String, Vec<Vec<CwtCandidate>>> =
+            vec![("file1".to_string(), vec![vec![], vec![]])]
+                .into_iter()
+                .collect();
+
+        let actions = plan_reconciliation(
+            &consensus,
+            &per_file_entries,
+            &cwt,
+            &refined_cal,
+            &original_cal,
+            0.01,
+        );
+
+        // Before the fix: passing_precursors only held ("PEPTIDEK", 2). The
+        // decoy lookup stripped DECOY_ from "EDITPEPK" (no-op), got
+        // ("EDITPEPK", 2), missed the set, and the decoy was skipped — no
+        // action generated for index 1.
+        // After the fix: passing_base_ids holds (1, 2), and the decoy at
+        // entry_id 0x80000001 maps to base_id 1, so an action is generated.
+        assert!(
+            actions.contains_key(&("file1".to_string(), 0)),
+            "Target action should be present"
+        );
+        assert!(
+            actions.contains_key(&("file1".to_string(), 1)),
+            "Library-supplied decoy must be reconciled when its paired target \
+             passes experiment FDR (base_id linkage, not DECOY_ prefix)"
         );
     }
 
