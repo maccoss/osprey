@@ -3382,15 +3382,13 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             n_targets,
             n_decoys
         );
-        if n_decoys == 0 {
-            return Err(OspreyError::config(format!(
-                "decoys_in_library mode requested but no library entries match prefixes {:?} \
-                 and no rows have a populated Decoy column. Check that the library actually \
-                 contains decoys (decoy_/rev_ protein-accession prefix OR Decoy=1 in the TSV), \
-                 or unset decoys_in_library so Osprey generates decoys.",
-                config.decoy_prefixes
-            )));
-        }
+        // The "no decoys detected" hard error is deferred until after the
+        // manifest pass below, because the manifest can flip is_decoy on
+        // library entries whose decoy_/rev_ protein-accession prefix the
+        // predictor stripped during library generation (the Carafe failure
+        // mode that motivated d23d496). Bailing here, before the manifest
+        // runs, would defeat that recovery path for libraries that depend
+        // on it. See the post-pairing check below.
 
         // Pair each decoy with its target so their base_ids match — required
         // for SVM target-decoy competition, LDA calibration, and CV fold
@@ -3447,6 +3445,20 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // have flipped is_decoy on entries the prefix scan missed.
         let n_targets = library.iter().filter(|e| !e.is_decoy).count();
         let n_decoys = library.len() - n_targets;
+        // Deferred "no decoys at all" check (moved here from before the
+        // manifest pass). Bailing earlier would defeat the manifest-
+        // authoritative recovery path for predictor-stripped libraries.
+        if n_decoys == 0 {
+            return Err(OspreyError::config(format!(
+                "decoys_in_library mode requested but no library entries match prefixes {:?}, \
+                 no rows have a populated Decoy column, and no manifest entry classified any \
+                 library sequence as a decoy. Check that the library actually contains decoys \
+                 (decoy_/rev_ protein-accession prefix, Decoy=1 in the TSV, or a pairing \
+                 manifest with peptide_type=decoy/p_decoy rows), or unset decoys_in_library so \
+                 Osprey generates decoys.",
+                config.decoy_prefixes
+            )));
+        }
         let n_paired = n_paired_manifest + n_paired_composition;
         let pairing_stats = osprey_core::PairingStats {
             n_targets,
