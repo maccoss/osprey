@@ -809,7 +809,13 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
     }
 
     let path = "rust_stage5_percolator.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Without this the ~74 MB TSV took ~14 minutes to write on WSL
+    // drvfs/9P (one syscall per row); buffering completes in seconds.
+    // Diagnostic-only output; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -853,6 +859,10 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
         n_written
     );
 
+    // Flush BufWriter before exit_if_only -- process::exit(0) skips
+    // destructors so the 8 MB buffer would otherwise truncate the file.
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_PERCOLATOR_ONLY", "Stage 5 Percolator dump");
 }
 
@@ -877,7 +887,12 @@ pub fn dump_stage6_rescored(per_file_entries: &[(String, Vec<osprey_core::FdrEnt
     }
 
     let path = "rust_stage6_rescored.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Critical on WSL drvfs/9P where unbuffered per-row writes turn
+    // a 1-minute dump into 10+ minutes. Diagnostic-only; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -917,6 +932,8 @@ pub fn dump_stage6_rescored(per_file_entries: &[(String, Vec<osprey_core::FdrEnt
     }
     log::info!("Wrote Stage 6 rescored dump: {} ({} rows)", path, n_written);
 
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_RESCORED_ONLY", "Stage 6 rescored dump");
 }
 
@@ -939,7 +956,12 @@ pub fn dump_stage6_consensus(consensus: &[crate::reconciliation::PeptideConsensu
     }
 
     let path = "rust_stage6_consensus.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Critical on WSL drvfs/9P where unbuffered per-row writes turn
+    // a 1-minute dump into 10+ minutes. Diagnostic-only; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -973,6 +995,8 @@ pub fn dump_stage6_consensus(consensus: &[crate::reconciliation::PeptideConsensu
         consensus.len()
     );
 
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_CONSENSUS_ONLY", "Stage 6 consensus dump");
 }
 
@@ -998,7 +1022,12 @@ pub fn dump_stage6_multicharge(
     }
 
     let path = "rust_stage6_multicharge.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Critical on WSL drvfs/9P where unbuffered per-row writes turn
+    // a 1-minute dump into 10+ minutes. Diagnostic-only; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -1048,6 +1077,8 @@ pub fn dump_stage6_multicharge(
         rows.len()
     );
 
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_MULTICHARGE_ONLY", "Stage 6 multi-charge dump");
 }
 
@@ -1133,7 +1164,12 @@ pub fn dump_stage6_inv_predict(records: &[InvPredictRecord]) {
     }
 
     let path = "rust_stage6_inv_predict.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Critical on WSL drvfs/9P where unbuffered per-row writes turn
+    // a 1-minute dump into 10+ minutes. Diagnostic-only; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -1176,6 +1212,8 @@ pub fn dump_stage6_inv_predict(records: &[InvPredictRecord]) {
         sorted.len()
     );
 
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_INV_PREDICT_ONLY", "Stage 6 inverse-predict dump");
 }
 
@@ -1207,7 +1245,12 @@ pub fn dump_stage6_protein_fdr(
     }
 
     let path = "rust_stage6_protein_fdr.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Critical on WSL drvfs/9P where unbuffered per-row writes turn
+    // a 1-minute dump into 10+ minutes. Diagnostic-only; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -1244,6 +1287,8 @@ pub fn dump_stage6_protein_fdr(
         rows.len()
     );
 
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_PROTEIN_FDR_ONLY", "Stage 6 protein FDR dump");
 }
 
@@ -1279,7 +1324,12 @@ pub fn dump_stage7_protein_fdr(parsimony: &ProteinParsimonyResult, fdr_result: &
     }
 
     let path = "rust_stage7_protein_fdr.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Critical on WSL drvfs/9P where unbuffered per-row writes turn
+    // a 1-minute dump into 10+ minutes. Diagnostic-only; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -1366,6 +1416,8 @@ pub fn dump_stage7_protein_fdr(parsimony: &ProteinParsimonyResult, fdr_result: &
         rows.len()
     );
 
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_STAGE7_PROTEIN_FDR_ONLY", "Stage 7 protein FDR dump");
 }
 
@@ -1392,7 +1444,12 @@ pub fn dump_stage6_loess_fit(
     }
 
     let path = "rust_stage6_loess_fit.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Critical on WSL drvfs/9P where unbuffered per-row writes turn
+    // a 1-minute dump into 10+ minutes. Diagnostic-only; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -1432,6 +1489,8 @@ pub fn dump_stage6_loess_fit(
         file_names.len()
     );
 
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_LOESS_FIT_ONLY", "Stage 6 LOESS fit dump");
 }
 
@@ -1452,7 +1511,12 @@ pub fn dump_stage6_refit(
     }
 
     let path = "rust_stage6_refit.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Critical on WSL drvfs/9P where unbuffered per-row writes turn
+    // a 1-minute dump into 10+ minutes. Diagnostic-only; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -1479,6 +1543,8 @@ pub fn dump_stage6_refit(
     }
     log::info!("Wrote Stage 6 refit dump: {} ({} rows)", path, rows.len());
 
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_REFIT_ONLY", "Stage 6 refit dump");
 }
 
@@ -1502,7 +1568,12 @@ pub fn dump_stage6_reconciliation(
     }
 
     let path = "rust_stage6_reconciliation.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Critical on WSL drvfs/9P where unbuffered per-row writes turn
+    // a 1-minute dump into 10+ minutes. Diagnostic-only; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -1577,6 +1648,8 @@ pub fn dump_stage6_reconciliation(
         rows.len()
     );
 
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_RECONCILIATION_ONLY", "Stage 6 reconciliation dump");
 }
 
