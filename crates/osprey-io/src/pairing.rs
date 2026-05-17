@@ -552,6 +552,69 @@ mod tests {
         assert_eq!(decoy.id & 0x7FFF_FFFF, 1);
     }
 
+    /// Regression for the `run_analysis` ordering bug fixed in
+    /// fix/library-decoy-no-decoys-check-after-manifest: the "no decoys
+    /// detected" hard error must be deferred until AFTER the manifest pass
+    /// has had a chance to flip `is_decoy`. The Carafe failure mode is a
+    /// library where the predictor stripped every `decoy_` / `rev_`
+    /// protein-accession prefix, so `apply_library_decoy_marking` finds
+    /// zero decoys via prefix scan and zero via the `Decoy` column — yet
+    /// the manifest's `peptide_type=decoy` rows still know which library
+    /// entries are decoys. A future refactor that re-introduces the early
+    /// bail (between `apply_library_decoy_marking` and `apply_to_library`)
+    /// will trip this test.
+    #[test]
+    fn manifest_recovers_decoys_when_prefix_scan_finds_none() {
+        // Library: every entry looks like a target. Decoy protein
+        // accessions have NO `decoy_`/`rev_` prefix — the predictor
+        // stripped it during library generation.
+        let mut lib = vec![
+            {
+                let mut e = make_entry(1, "PEPTIDEA", 2, false);
+                e.protein_ids = vec!["protA".into()];
+                e
+            },
+            {
+                let mut e = make_entry(2, "AEPTPIDE", 2, false);
+                e.protein_ids = vec!["protA".into()]; // prefix stripped
+                e
+            },
+        ];
+
+        // Step 1 (mirrors pipeline): prefix scan + Decoy column. With the
+        // prefix stripped and no Decoy column, this finds nothing.
+        let prefixes = vec!["decoy_".to_string(), "rev_".to_string()];
+        let marking = osprey_core::apply_library_decoy_marking(&mut lib, &prefixes);
+        assert_eq!(marking.total(), 0, "prefix scan should find no decoys");
+        let n_decoys_after_prefix_scan = lib.iter().filter(|e| e.is_decoy).count();
+        assert_eq!(
+            n_decoys_after_prefix_scan, 0,
+            "library has zero decoys at this point — pipeline MUST NOT bail here, \
+             the manifest still has a chance to recover them"
+        );
+
+        // Step 2 (mirrors pipeline): apply the manifest. Its
+        // `peptide_type=decoy` row is the authoritative signal.
+        let f = write_manifest(&[
+            "PEPTIDEA\tNo\tprotA\ttarget\t0",
+            "AEPTPIDE\tYes\tprotA\tdecoy\t0",
+        ]);
+        let m = DecoyPairingManifest::from_tsv(f.path()).unwrap();
+        let mut state = PairingState::new();
+        let stats = m.apply_to_library(&mut lib, &mut state);
+
+        // Step 3 (mirrors pipeline): recount AFTER manifest application.
+        let n_decoys_final = lib.iter().filter(|e| e.is_decoy).count();
+        assert_eq!(stats.n_newly_marked_decoy, 1);
+        assert_eq!(stats.n_paired, 1);
+        assert_eq!(
+            n_decoys_final, 1,
+            "manifest must have recovered the predictor-stripped decoy; \
+             the deferred `n_decoys == 0` gate in run_analysis must check \
+             this count, not the pre-manifest one"
+        );
+    }
+
     /// Manifest's `proteins` column overrides the library's protein_ids.
     /// This catches the case where a predictor (Carafe) stamped a
     /// per-peptide suffix into ProteinID (e.g. `sp|P12345_pep00001|...`),
