@@ -1505,7 +1505,13 @@ fn dump_stage5_subsample(
     }
 
     let path = "rust_stage5_subsample.tsv";
-    let Ok(mut f) = std::fs::File::create(path) else {
+    // 8 MB BufWriter so each writeln! is a memcpy, not a syscall.
+    // Without this the ~27 MB TSV took ~9 minutes to write on WSL
+    // drvfs/9P (one syscall per row); buffering completes in seconds.
+    // Diagnostic-only output; bytes unchanged.
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
         log::warn!("Could not create {}", path);
         return;
     };
@@ -1538,6 +1544,11 @@ fn dump_stage5_subsample(
     }
     log::info!("Wrote Stage 5 subsample dump: {} ({} rows)", path, n);
 
+    // exit_if_only calls std::process::exit(0), which skips destructors,
+    // so the BufWriter's in-memory buffer would never flush -- truncating
+    // the file by up to 8 MB. Flush + drop explicitly here.
+    let _ = f.flush();
+    drop(f);
     exit_if_only("OSPREY_SUBSAMPLE_ONLY", "Stage 5 subsample dump");
 }
 
