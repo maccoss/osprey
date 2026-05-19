@@ -141,9 +141,27 @@ impl<'a> Formatter for RoundtripPrettyFormatter<'a> {
 /// Top-level JSON envelope. Field declaration order is alphabetical so
 /// `serde_json::to_writer_pretty` emits keys in alphabetical order and
 /// matches the C# emitter byte-for-byte.
+///
+/// `file_stems` (added 2026-05-19, format_version 2) carries the full
+/// set of file stems that participated in the first-join phase. The
+/// per-file rescore worker (`--join-at-pass=1 --no-join`) consumes only
+/// its own parquet, so its `config.input_files` reflects a single
+/// stem. To produce a reconciled parquet that the downstream
+/// `--join-at-pass=2` merge node can validate (its
+/// `reconciliation_parameter_hash` is computed over all parquets it
+/// receives), the worker uses this list to compute the same multi-stem
+/// hash the original join used. v1 files (no `file_stems`) deserialize
+/// with an empty list; the worker will then fall back to its own
+/// `config.input_files` stems, preserving v1 behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReconciliationFile {
+    /// Sorted list of file stems that participated in the first-join phase.
+    /// `#[serde(default)]` deserializes v1 files (which omit this field) as
+    /// an empty list; the worker code falls back to `config.input_files`
+    /// stems in that case for backward compatibility.
+    #[serde(default)]
+    pub file_stems: Vec<String>,
     pub forced_integration_actions: Vec<ForcedIntegrationEntry>,
     pub format_version: u32,
     pub gap_fill_targets: Vec<GapFillEntry>,
@@ -198,7 +216,16 @@ pub struct RefinedRtCalibrationJson {
 }
 
 /// Current format version. Bump on incompatible schema changes.
-pub const RECONCILIATION_FORMAT_VERSION: u32 = 1;
+///
+/// v1: initial format.
+/// v2: added `file_stems` so per-file rescore workers can compute the
+///     reconciliation parameter hash that the downstream
+///     `--join-at-pass=2` merge node expects (which is computed over
+///     all files participating in the join, not the worker's single
+///     parquet). Old v1 files deserialize with empty `file_stems` via
+///     `#[serde(default)]`; the worker falls back to its
+///     `config.input_files` stems for those (preserving v1 behavior).
+pub const RECONCILIATION_FORMAT_VERSION: u32 = 2;
 
 impl ReconciliationFile {
     /// Build the wire envelope for a single file. Filters
@@ -211,6 +238,7 @@ impl ReconciliationFile {
     /// should prefer [`Self::from_planner_output_pre_grouped`] together
     /// with a single up-front grouping to keep the total cost
     /// O(num_actions) rather than O(num_files * num_actions).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_planner_output(
         file_name: &str,
         file_entries: &[FdrEntry],
@@ -219,6 +247,7 @@ impl ReconciliationFile {
         refined_calibration: Option<&RTCalibration>,
         search_hash: &str,
         library_hash: &str,
+        file_stems: &[String],
     ) -> Self {
         let file_actions: Vec<(usize, &ReconcileAction)> = reconciliation_actions
             .iter()
@@ -237,6 +266,7 @@ impl ReconciliationFile {
             refined_calibration,
             search_hash,
             library_hash,
+            file_stems,
         )
     }
 
@@ -246,6 +276,7 @@ impl ReconciliationFile {
     /// included or not — they are filtered here either way). Use this
     /// when emitting envelopes for many files so the per-file cost stays
     /// O(actions_for_this_file) rather than O(total_actions).
+    #[allow(clippy::too_many_arguments)]
     pub fn from_planner_output_pre_grouped(
         file_entries: &[FdrEntry],
         file_actions: &[(usize, &ReconcileAction)],
@@ -253,7 +284,14 @@ impl ReconciliationFile {
         refined_calibration: Option<&RTCalibration>,
         search_hash: &str,
         library_hash: &str,
+        file_stems: &[String],
     ) -> Self {
+        // Sort and deduplicate the file_stems for deterministic output
+        // — matches the sort+dedup used by reconciliation_parameter_hash
+        // on the read side, so the worker hash matches the merge node hash.
+        let mut stems: Vec<String> = file_stems.to_vec();
+        stems.sort();
+        stems.dedup();
         let mut use_cwt: Vec<UseCwtPeakEntry> = Vec::new();
         let mut forced: Vec<ForcedIntegrationEntry> = Vec::new();
         for (vec_idx, action) in file_actions {
@@ -317,6 +355,7 @@ impl ReconciliationFile {
         });
 
         Self {
+            file_stems: stems,
             forced_integration_actions: forced,
             format_version: RECONCILIATION_FORMAT_VERSION,
             gap_fill_targets: gap,
@@ -423,6 +462,7 @@ mod tests {
 
     fn sample_file() -> ReconciliationFile {
         ReconciliationFile {
+            file_stems: vec!["fileA".to_string(), "fileB".to_string()],
             forced_integration_actions: vec![
                 ForcedIntegrationEntry {
                     entry_id: 200,
