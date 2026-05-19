@@ -342,7 +342,24 @@ fn build_scores_metadata(config: &OspreyConfig) -> Vec<parquet::file::metadata::
 }
 
 /// Build Parquet key-value metadata for a reconciled scores cache.
-fn build_reconciled_metadata(config: &OspreyConfig) -> Vec<parquet::file::metadata::KeyValue> {
+/// Build the reconciled-parquet metadata block.
+///
+/// `file_stems_override`: when present, used to compute the
+/// reconciliation hash via
+/// [`OspreyConfig::reconciliation_parameter_hash_for_stems`]. The
+/// per-file rescore worker (`--join-at-pass=1 --no-join`) passes the
+/// file_stems list from reconciliation.json here so the hash it writes
+/// matches the multi-file hash the downstream `--join-at-pass=2` merge
+/// node will compute. Pass `None` from the in-process pipeline path —
+/// `config.input_files` already reflects the full set.
+fn build_reconciled_metadata(
+    config: &OspreyConfig,
+    file_stems_override: Option<&[String]>,
+) -> Vec<parquet::file::metadata::KeyValue> {
+    let recon_hash = match file_stems_override {
+        Some(stems) if !stems.is_empty() => config.reconciliation_parameter_hash_for_stems(stems),
+        _ => config.reconciliation_parameter_hash(),
+    };
     vec![
         parquet::file::metadata::KeyValue {
             key: META_OSPREY_VERSION.to_string(),
@@ -362,7 +379,7 @@ fn build_reconciled_metadata(config: &OspreyConfig) -> Vec<parquet::file::metada
         },
         parquet::file::metadata::KeyValue {
             key: META_RECONCILIATION_HASH.to_string(),
-            value: Some(config.reconciliation_parameter_hash()),
+            value: Some(recon_hash),
         },
     ]
 }
@@ -2838,6 +2855,13 @@ pub(crate) fn rescore_per_file_loop(
     file_name_to_idx: &HashMap<String, usize>,
     config: &OspreyConfig,
     seq_interner: &mut HashSet<Arc<str>>,
+    // Full set of file stems that participated in the first-join phase
+    // (the join that produced the reconciliation actions this loop applies).
+    // Used to compute the reconciliation hash written into the reconciled
+    // parquet's metadata so the downstream `--join-at-pass=2` merge node
+    // accepts it. When empty, falls back to `config.input_files` stems
+    // (the in-process pipeline path always has the full set there).
+    join_file_stems: &[String],
 ) -> Result<RescoreStats> {
     use crate::reconciliation::ReconcileAction;
     let total_reconciliation: usize = reconciliation_actions
@@ -3023,14 +3047,41 @@ pub(crate) fn rescore_per_file_loop(
             );
         }
 
-        let cal_params: Option<CalibrationParams> = input_file.parent().and_then(|input_dir| {
+        // Hard-error on missing or unreadable calibration JSON. The
+        // calibration sidecar is required by Stage 6 for MS1/MS2 mass
+        // calibration of the rescore search; silently proceeding with
+        // uncalibrated MS scoring would produce wrong scores without
+        // surfacing the cause. In-process this should always exist
+        // (Stage 2 just wrote it); workers already gate on it in
+        // `run_rescore` so this catch is belt-and-suspenders for both
+        // paths.
+        let cal_params: CalibrationParams = {
+            let input_dir = input_file.parent().ok_or_else(|| {
+                OspreyError::config(format!(
+                    "rescore_per_file_loop: cannot derive parent directory from input path `{}`. \
+                     Stage 6 needs to locate the Stage 1-4 calibration sidecar next to the mzML.",
+                    input_file.display()
+                ))
+            })?;
             let cal_path = calibration_path_for_input(input_file, input_dir);
-            if cal_path.exists() {
-                load_calibration(&cal_path).ok()
-            } else {
-                None
+            if !cal_path.exists() {
+                return Err(OspreyError::config(format!(
+                    "rescore_per_file_loop: required calibration JSON not found at `{}` (input \
+                     file: `{}`). Stage 6 needs the Stage 1-4 calibration sidecar to rescore.",
+                    cal_path.display(),
+                    input_file.display()
+                )));
             }
-        });
+            load_calibration(&cal_path).map_err(|e| {
+                OspreyError::config(format!(
+                    "rescore_per_file_loop: failed to read calibration JSON `{}`: {}. The file \
+                     exists but could not be parsed -- check that it was written by a matching \
+                     Osprey version.",
+                    cal_path.display(),
+                    e
+                ))
+            })?
+        };
 
         // --- Re-score existing entries (consensus + reconciliation) ---
         let mut overlay: HashMap<usize, CoelutionScoredEntry> = HashMap::new();
@@ -3039,7 +3090,7 @@ pub(crate) fn rescore_per_file_loop(
                 &subset_library,
                 &spectra,
                 &ms1_index,
-                cal_params.as_ref(),
+                Some(&cal_params),
                 rt_cal,
                 config,
                 file_name,
@@ -3066,7 +3117,7 @@ pub(crate) fn rescore_per_file_loop(
                 &gap_fill_library,
                 &spectra,
                 &ms1_index,
-                cal_params.as_ref(),
+                Some(&cal_params),
                 rt_cal,
                 &gap_config,
                 file_name,
@@ -3121,7 +3172,7 @@ pub(crate) fn rescore_per_file_loop(
                     &forced_library,
                     &spectra,
                     &ms1_index,
-                    cal_params.as_ref(),
+                    Some(&cal_params),
                     rt_cal,
                     config,
                     file_name,
@@ -3237,7 +3288,7 @@ pub(crate) fn rescore_per_file_loop(
                         }
                     }
                     // Write back to Parquet with reconciliation metadata
-                    let recon_metadata = build_reconciled_metadata(config);
+                    let recon_metadata = build_reconciled_metadata(config, Some(join_file_stems));
                     let codec = parquet_compression_codec(config.parquet_compression);
                     if let Err(e) = write_scores_parquet_with_metadata(
                         cache_path,
@@ -3257,7 +3308,7 @@ pub(crate) fn rescore_per_file_loop(
             let scores_path = per_file_cache_paths.get(file_name.as_str());
             if let Some(cache_path) = scores_path {
                 if let Ok(full_entries) = load_scores_parquet(cache_path) {
-                    let recon_metadata = build_reconciled_metadata(config);
+                    let recon_metadata = build_reconciled_metadata(config, Some(join_file_stems));
                     let codec = parquet_compression_codec(config.parquet_compression);
                     if let Err(e) = write_scores_parquet_with_metadata(
                         cache_path,
@@ -3285,6 +3336,11 @@ pub(crate) fn rescore_per_file_loop(
 }
 
 pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
+    // Sliding timer for [STAGE-WALL] per-stage perf markers. Reset at
+    // each stage boundary (stage1to4 -> stage5 -> stage6 -> stage7 -> blib).
+    // Parsed by Measure-Pipeline.ps1 for cross-impl perf comparison.
+    let mut stage_marker = std::time::Instant::now();
+
     // Validate config: --join-only feeds per-file state from --input-scores
     // parquets and ignores --input-files; default + --no-join modes both
     // require mzML inputs.
@@ -4110,6 +4166,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             percolator::compute_fdr_from_stubs(&mut per_file_entries, config.run_fdr, None);
         }
     } else {
+        log::info!(
+            "[STAGE-WALL] stage1to4: {:.1}s",
+            stage_marker.elapsed().as_secs_f64()
+        );
+        stage_marker = std::time::Instant::now();
+
         // Dispatch FDR control based on method
         log::info!("");
         log::info!(
@@ -4158,11 +4220,16 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // = 1.0` and silently break protein-rescue parity in the worker.
     }
 
-    // Stage 5 diagnostic dump. Gated by OSPREY_DUMP_PERCOLATOR=1; exits the
-    // process when OSPREY_PERCOLATOR_ONLY=1 is also set. Writes all 4 q-values
-    // plus the SVM score and PEP for every FdrEntry, before compaction drops
-    // any rows, so the cross-impl diff sees both targets and decoys.
+    // Stage 5 diagnostic dump. Gated by OSPREY_DUMP_PERCOLATOR=1. Writes
+    // all 4 q-values plus the SVM score and PEP for every FdrEntry, before
+    // compaction drops any rows, so the cross-impl diff sees both targets
+    // and decoys.
     crate::diagnostics::dump_stage5_percolator(&per_file_entries);
+    // OSPREY_PERCOLATOR_ONLY exits after Stage 5 work completes,
+    // independently of whether the dump ran. Lets us measure production
+    // stage5 wall without paying the dump cost. Matches the C# decoupling
+    // in OspreySharp/Tasks/FirstJoinTask.cs.
+    osprey_core::diagnostics::exit_if_only("OSPREY_PERCOLATOR_ONLY", "Stage 5");
 
     // First-pass protein FDR (picked-protein, Savitski 2015).
     //
@@ -4352,13 +4419,30 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // 1st-pass-derived q-values, swap entry.score over to 2nd-pass scores so
     // the second-pass q-value recompute below sees the right rank ordering.
     // No-op if no 2nd-pass sidecar exists for a given file (best-effort).
+    //
+    // When NO 2nd-pass sidecar is present for ANY file (the HPC
+    // distribution case — the per-file rescore worker writes reconciled
+    // parquets but does NOT write 2nd-pass sidecars, since 2nd-pass
+    // Percolator is a cross-file join step that the per-file worker
+    // can't perform), we run 2nd-pass Percolator here so the merge
+    // node's output matches the straight-through pipeline. Without this,
+    // --join-at-pass=2 would use stale first-pass scores for rescored
+    // entries (which had their scores reset to 0 during reconciliation
+    // and never re-scored), and the final blib would silently lose
+    // ~25% of the precursors a straight-through run produces.
     if config.expect_reconciled_input {
         let mut reloaded = 0usize;
+        let mut missing_sidecars = 0usize;
         for (file_name, entries) in per_file_entries.iter_mut() {
-            if let Some(p2) = pass2_sidecar_paths.get(file_name) {
+            let p2 = pass2_sidecar_paths.get(file_name);
+            if let Some(p2) = p2 {
                 if load_fdr_scores_sidecar(p2, entries, 2) {
                     reloaded += 1;
+                } else {
+                    missing_sidecars += 1;
                 }
+            } else {
+                missing_sidecars += 1;
             }
         }
         log::debug!(
@@ -4366,6 +4450,61 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             reloaded,
             per_file_entries.len()
         );
+        if missing_sidecars > 0 {
+            log::info!(
+                "--join-at-pass=2: {}/{} file(s) lack a 2nd-pass sidecar — running second-pass FDR \
+                 to compute scores from reconciled features (HPC distribution path).",
+                missing_sidecars,
+                per_file_entries.len()
+            );
+            log::info!("");
+            log::info!("Second-pass FDR");
+            let empty_overlay: RescoreOverlay = HashMap::new();
+            match config.fdr_method {
+                FdrMethod::Percolator => {
+                    run_percolator_fdr(
+                        &mut per_file_entries,
+                        &per_file_cache_paths,
+                        &config,
+                        &empty_overlay,
+                        Some(&first_pass_base_ids),
+                    )?;
+                }
+                FdrMethod::Mokapot => {
+                    run_mokapot_fdr(
+                        &mut per_file_entries,
+                        &per_file_cache_paths,
+                        &mokapot,
+                        &pin_files,
+                        &mokapot_dir,
+                        &config,
+                    )?;
+                }
+                FdrMethod::Simple => {
+                    for (_, entries) in per_file_entries.iter_mut() {
+                        apply_simple_fdr(entries, config.run_fdr)?;
+                    }
+                }
+            }
+            crate::trace::log_fdr_qvalues(&per_file_entries, "second-pass");
+
+            // Persist the 2nd-pass scores we just computed as a resume
+            // cache for future --join-at-pass=2 invocations against the
+            // same reconciled parquets. Mirrors the persist call inside
+            // the in-process reconciliation block below; gated by
+            // multi-file because reconciliation only fires there.
+            let has_reconciliation = config.reconciliation.enabled && per_file_entries.len() > 1;
+            if has_reconciliation {
+                log::debug!("Persisting 2nd-pass FDR scores as resume cache...");
+                let _ = persist_fdr_scores(
+                    &per_file_entries,
+                    &config,
+                    fdr_scores_path_pass2,
+                    "2nd-pass",
+                    2,
+                );
+            }
+        }
     }
 
     // Post-FDR re-scoring: multi-charge consensus + inter-replicate reconciliation.
@@ -4456,6 +4595,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                     }
                 }
             });
+
+        log::info!(
+            "[STAGE-WALL] stage5: {:.1}s",
+            stage_marker.elapsed().as_secs_f64()
+        );
+        stage_marker = std::time::Instant::now();
 
         // 1. Multi-charge consensus: compute per-file rescore targets
         //    Groups by (peptide, file). If at least one charge state passes FDR,
@@ -4632,6 +4777,18 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // joined work above.
         let search_hash = config.search_parameter_hash();
         let library_hash = config.library_identity_hash();
+        // The full set of file stems that participated in this first-join
+        // phase. Embedded in every per-file reconciliation.json so the
+        // downstream per-file rescore worker can compute the same
+        // reconciliation hash the `--join-at-pass=2` merge node will
+        // validate against (which is computed over all parquets at the
+        // 2nd-join node, not the worker's single input). Without this
+        // the worker writes a single-stem hash and `--join-at-pass=2`
+        // rejects the reconciled parquet.
+        let join_file_stems: Vec<String> = per_file_entries
+            .iter()
+            .map(|(fname, _)| fname.clone())
+            .collect();
         // Pre-group reconciliation actions by file name to avoid the
         // O(num_files * num_actions) walk that the previous
         // implementation performed inside `from_planner_output` (one
@@ -4669,6 +4826,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                     refined_calibrations.get(file_name),
                     &search_hash,
                     &library_hash,
+                    &join_file_stems,
                 );
             if let Err(e) =
                 crate::reconciliation_io::write_reconciliation_file(&recon_path, &recon_file)
@@ -4733,6 +4891,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             &file_name_to_idx,
             &config,
             &mut seq_interner,
+            // In-process pipeline: config.input_files already has the
+            // full set, so the empty-slice override makes
+            // build_reconciled_metadata fall back to
+            // config.reconciliation_parameter_hash().
+            &[],
         )?;
 
         // Cross-impl bisection seam: dump the per-precursor q-values
@@ -4752,6 +4915,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 total_gap_cwt,
                 total_gap_forced,
             );
+            log::info!(
+                "[STAGE-WALL] stage6: {:.1}s",
+                stage_marker.elapsed().as_secs_f64()
+            );
+            stage_marker = std::time::Instant::now();
+
             log::info!("");
             log::info!("Second-pass FDR");
             match config.fdr_method {
@@ -5119,6 +5288,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // to the final destination. This avoids SQLite locking issues on network
     // filesystems.
     if !plan_entries.is_empty() {
+        log::info!(
+            "[STAGE-WALL] stage7: {:.1}s",
+            stage_marker.elapsed().as_secs_f64()
+        );
+        stage_marker = std::time::Instant::now();
+
         log::info!("Writing blib to {}", config.output_blib.display());
 
         let final_path = &config.output_blib;
@@ -5131,6 +5306,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
 
         // Move to final destination (safe copy for network filesystems)
         osprey_core::copy_and_verify(&temp_path, final_path)?;
+
+        log::info!(
+            "[STAGE-WALL] blib: {:.1}s",
+            stage_marker.elapsed().as_secs_f64()
+        );
     } else {
         log::warn!("No peptides passed FDR threshold, skipping blib output");
     }

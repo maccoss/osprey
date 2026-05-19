@@ -580,8 +580,35 @@ n_threads: 0  # 0 = auto-detect
     }
 
     /// Compute SHA-256 hash of parameters that affect reconciliation.
-    /// Includes the search hash (if search changed, reconciliation is also invalid).
+    /// Includes the search hash (if search changed, reconciliation is also
+    /// invalid). The file set affects the consensus RTs that drive
+    /// reconciliation actions, so it is part of the hash. Uses
+    /// `self.input_files` stems by default; the per-file rescore worker
+    /// (`--join-at-pass=1 --no-join`) has only one input parquet in
+    /// `input_files` but participated in a multi-file join, so it must
+    /// instead compute the hash with the full file_stems list from its
+    /// reconciliation.json via [`Self::reconciliation_parameter_hash_for_stems`].
     pub fn reconciliation_parameter_hash(&self) -> String {
+        let stems: Vec<String> = self
+            .input_files
+            .iter()
+            .filter_map(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        self.reconciliation_parameter_hash_for_stems(&stems)
+    }
+
+    /// Variant of [`Self::reconciliation_parameter_hash`] that accepts the
+    /// file_stems list explicitly. The per-file rescore worker uses this
+    /// with the file_stems carried in `reconciliation.json` so the hash
+    /// it writes into the reconciled parquet matches the hash the
+    /// downstream `--join-at-pass=2` merge node will compute (which is
+    /// based on the full set of `--input-scores` it receives, not the
+    /// single parquet the worker rescored).
+    pub fn reconciliation_parameter_hash_for_stems(&self, file_stems: &[String]) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.search_parameter_hash().as_bytes());
         hasher
@@ -594,17 +621,11 @@ n_threads: 0  # 0 = auto-detect
             .as_bytes(),
         );
         hasher.update(format!("run_fdr:{}\n", self.run_fdr).as_bytes());
-        // File set affects consensus RTs
-        let mut stems: Vec<String> = self
-            .input_files
-            .iter()
-            .filter_map(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
+        // File set affects consensus RTs. Sort + dedup so the same logical
+        // set produces the same hash regardless of caller iteration order.
+        let mut stems = file_stems.to_vec();
         stems.sort();
+        stems.dedup();
         hasher.update(format!("file_stems:{:?}\n", stems).as_bytes());
         format!("{:x}", hasher.finalize())
     }
