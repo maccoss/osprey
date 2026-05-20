@@ -62,6 +62,22 @@ use osprey_scoring::{
     DecoyGenerator, DecoyMethod, Enzyme, SpectralScorer,
 };
 
+/// Resolve the precursor tolerance to a ppm value usable for MS1 isotope
+/// envelope extraction. If the configured precursor tolerance is already
+/// in ppm, return it as-is. If it's a Da/Mz tolerance (typical for unit-
+/// resolution data like Stellar), treating it as ppm would produce an
+/// absurdly tight window (e.g. 1 Da -> 0.0005 mDa at 500 m/z), making
+/// `envelope.has_m0()` fail on ~99.8% of matches. Fall back to a 10 ppm
+/// default in that case, matching C# OspreySharp's PerFileScoringTask
+/// ScoreCalibrationEntry behavior:
+/// `unit == Ppm ? tolerance : 10.0`.
+fn ms1_envelope_tolerance_ppm(precursor_tolerance: &osprey_core::FragmentToleranceConfig) -> f64 {
+    match precursor_tolerance.unit {
+        osprey_core::ToleranceUnit::Ppm => precursor_tolerance.tolerance,
+        osprey_core::ToleranceUnit::Mz => 10.0,
+    }
+}
+
 /// Wrapper to implement MS1SpectrumLookup for MS1Index
 struct MS1IndexWrapper<'a>(&'a MS1Index);
 
@@ -746,7 +762,7 @@ fn run_calibration_discovery_windowed(
                 spectra,
                 Some(&MS1IndexWrapper(ms1_index)),
                 config.fragment_tolerance,
-                config.precursor_tolerance.tolerance,
+                ms1_envelope_tolerance_ppm(&config.precursor_tolerance),
                 initial_tolerance,
                 pass1_expected_rt_fn,
                 Some(&xcorr_scorer),
@@ -758,7 +774,7 @@ fn run_calibration_discovery_windowed(
                 spectra,
                 None,
                 config.fragment_tolerance,
-                config.precursor_tolerance.tolerance,
+                ms1_envelope_tolerance_ppm(&config.precursor_tolerance),
                 initial_tolerance,
                 pass1_expected_rt_fn,
                 Some(&xcorr_scorer),
@@ -1037,7 +1053,7 @@ fn run_calibration_discovery_windowed(
                     spectra,
                     Some(&MS1IndexWrapper(ms1_index)),
                     config.fragment_tolerance,
-                    config.precursor_tolerance.tolerance,
+                    ms1_envelope_tolerance_ppm(&config.precursor_tolerance),
                     pass1_tolerance,
                     Some(&predict_fn),
                     Some(&xcorr_scorer),
@@ -1049,7 +1065,7 @@ fn run_calibration_discovery_windowed(
                     spectra,
                     None,
                     config.fragment_tolerance,
-                    config.precursor_tolerance.tolerance,
+                    ms1_envelope_tolerance_ppm(&config.precursor_tolerance),
                     pass1_tolerance,
                     Some(&predict_fn),
                     Some(&xcorr_scorer),
