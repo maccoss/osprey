@@ -53,11 +53,16 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
 
         for entry in entries {
             if let Some(m) = by_id.get(&entry.id) {
-                // Use :.10 everywhere so we don't hit banker's vs round-
-                // half-up rounding differences between Rust and C#.
+                // Use :.17 (17 fractional digits) so f64 values round-trip
+                // exactly. Earlier :.10 was chosen "to avoid banker's vs
+                // round-half-up rounding differences between Rust and C#",
+                // but evidence shows the formatters still disagree at the
+                // 10th decimal when f64 values land near a rounding
+                // boundary. :.17 sidesteps the disagreement entirely:
+                // the underlying f64 bits are reproduced exactly.
                 writeln!(
                     f,
-                    "{}\t{}\t{}\t1\t{}\t{:.10}\t{:.10}\t{:.10}\t{}\t{:.10}\t{:.10}",
+                    "{}\t{}\t{}\t1\t{}\t{:.17}\t{:.17}\t{:.17}\t{}\t{:.17}\t{:.17}",
                     entry.id,
                     if entry.is_decoy { 1 } else { 0 },
                     entry.charge,
