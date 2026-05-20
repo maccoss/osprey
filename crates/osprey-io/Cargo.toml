@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 osprey-core = { workspace = true }
 mzdata = { workspace = true }
+quick-xml = { workspace = true }
 rusqlite = { workspace = true }
 csv = { workspace = true }
 flate2 = { workspace = true }
