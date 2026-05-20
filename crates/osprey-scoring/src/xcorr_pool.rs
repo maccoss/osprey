@@ -1,16 +1,22 @@
 //! Buffer pool for XCorr preprocessing scratch space.
 //!
-//! XCorr preprocessing allocates three `NBins`-sized `f32` buffers per call
-//! (binned accumulator, windowed result, sliding-window prefix sum). On
-//! HRAM binning (NBins ~= 100K) each buffer is ~400 KB, so per-window
-//! scoring across ~1000 spectra churns through ~1.2 GB of transient
-//! `Vec<f32>` allocations plus the ~400 MB per-window preprocessed cache
-//! itself. All of this memory is dropped at the end of each window and
-//! re-allocated by the next window -- pure churn.
+//! XCorr preprocessing allocates three `NBins`-sized `f64` scratch buffers
+//! per call (binned accumulator, windowed result, sliding-window prefix
+//! sum) and writes the final preprocessed values into a per-spectrum `f32`
+//! cache. The f64 scratch is dual-purpose: it keeps the windowing /
+//! sliding-window cascade math in f64 precision (avoiding the ~1e-5
+//! prefix-sum error f32 would accumulate over ~100K bins), and only the
+//! final write to the cache narrows to f32. The per-spectrum cache stays
+//! f32 to keep HRAM memory budget at ~400 KB per spectrum.
 //!
-//! This pool hands out reusable scratch bundles and single output buffers
-//! so that after the first few windows reach the high-water mark the hot
-//! path never allocates. Mirrors the C# OspreySharp `XcorrScratchPool` in
+//! On HRAM binning (NBins ~= 100K) each scratch buffer is ~800 KB, so per-
+//! window scoring across ~1000 spectra would otherwise churn through
+//! ~2.4 GB of transient `Vec<f64>` allocations plus the ~400 MB per-window
+//! preprocessed cache. This pool hands out reusable scratch bundles and
+//! single output buffers so that after the first few windows reach the
+//! high-water mark the hot path never allocates.
+//!
+//! Mirrors the C# OspreySharp `XcorrScratchPool` in
 //! `pwiz_tools/OspreySharp/OspreySharp.Scoring/XcorrScratchPool.cs`.
 //!
 //! Thread-safety: the pool uses `Mutex<Vec<_>>` bags. Contention is low
@@ -24,16 +30,16 @@ use std::sync::Mutex;
 /// Rented by value, returned by value via [`XcorrScratchPool::recycle`].
 pub struct XcorrScratch {
     /// `NBins` accumulator for binned-and-sqrt-transformed spectrum
-    /// intensities. Written via `+=` so must start zeroed; zeroed on
-    /// recycle.
-    pub binned: Vec<f32>,
-    /// `NBins` windowing-normalization output. Filled by
+    /// intensities, in f64 so the windowing pipeline preserves precision.
+    /// Written via `+=` so must start zeroed; zeroed on recycle.
+    pub binned: Vec<f64>,
+    /// `NBins` windowing-normalization output, f64. Filled by
     /// `apply_windowing_normalization_into`; zeroed on recycle so
     /// below-threshold positions retain 0.
-    pub windowed: Vec<f32>,
-    /// `NBins + 1` sliding-window prefix sum. `prefix[0]` is always 0;
+    pub windowed: Vec<f64>,
+    /// `NBins + 1` sliding-window prefix sum, f64. `prefix[0]` is always 0;
     /// positions `1..=NBins` are fully overwritten each call.
-    pub prefix: Vec<f32>,
+    pub prefix: Vec<f64>,
 }
 
 impl XcorrScratch {
