@@ -2081,43 +2081,95 @@ impl SpectralScorer {
         // First get LibCosine for additional metrics
         let lib_cosine_score = self.lib_cosine(observed, library);
 
-        // Bin observed spectrum using Comet BIN macro
-        let mut obs_binned = vec![0.0f32; self.bin_config.n_bins];
+        // CALIBRATION PARITY: this path is f64 throughout to bit-equal C#'s
+        // OspreySharp.Scoring.SpectralScorer.XcorrAtScan, which is the
+        // calibration entry point on the C# side. The HRAM main-search hot
+        // path (preprocess_spectrum_for_xcorr_into) stays on the f32 cache
+        // for memory; only the scratch-internal math + this inline path go
+        // f64. Mismatching even one step (e.g. f32::sqrt vs widen-then-sqrt)
+        // amplifies through the windowing/sliding-window cascade to f32
+        // magnitude (~1e-6).
+        let n_bins = self.bin_config.n_bins;
+
+        // (1) Bin observed spectrum. Widen intensity to f64 BEFORE sqrt to
+        // match C#'s `Math.Sqrt((double)float)` bit-for-bit -- f32::sqrt and
+        // f64::sqrt(f32 as f64) can differ by 1 ULP at f32 magnitude.
+        let mut binned = vec![0.0f64; n_bins];
         for (&mz, &intensity) in observed.mzs.iter().zip(observed.intensities.iter()) {
             if let Some(bin) = self.bin_config.mz_to_bin(mz) {
-                // Apply sqrt transformation to experimental spectrum
-                obs_binned[bin] += intensity.sqrt();
+                binned[bin] += (intensity as f64).sqrt();
             }
         }
 
-        // Apply windowing normalization (Comet's MakeCorrData)
-        let windowed = self.apply_windowing_normalization(&obs_binned);
+        // (2) Windowing normalization (Comet MakeCorrData): 10 windows,
+        // normalize each window to max=50.0, zero values below 5% of global.
+        let mut windowed = vec![0.0f64; n_bins];
+        {
+            let num_windows = 10;
+            let window_size = (n_bins / num_windows) + 1;
+            let global_max = binned.iter().cloned().fold(0.0f64, f64::max);
+            let threshold = global_max * 0.05;
+            for window_idx in 0..num_windows {
+                let start = window_idx * window_size;
+                let end = ((window_idx + 1) * window_size).min(n_bins);
+                let mut window_max = 0.0f64;
+                for &val in &binned[start..end] {
+                    if val > window_max {
+                        window_max = val;
+                    }
+                }
+                if window_max > 0.0 {
+                    let norm_factor = 50.0 / window_max;
+                    for i in start..end {
+                        if binned[i] > threshold {
+                            windowed[i] = binned[i] * norm_factor;
+                        }
+                    }
+                }
+            }
+        }
 
-        // Apply sliding window subtraction (fast XCorr preprocessing)
-        let xcorr_preprocessed = self.apply_sliding_window(&windowed);
+        // (3) Sliding window subtraction (Comet fast XCorr): prefix-sum for
+        // O(n) window sums, divisor 2*offset = 150 regardless of boundary.
+        let mut xcorr_preprocessed = vec![0.0f64; n_bins];
+        {
+            let offset: usize = 75;
+            let norm_factor = 1.0f64 / (2 * offset) as f64;
+            let mut prefix = vec![0.0f64; n_bins + 1];
+            for i in 0..n_bins {
+                prefix[i + 1] = prefix[i] + windowed[i];
+            }
+            for i in 0..n_bins {
+                let left = i.saturating_sub(offset);
+                let right = if i + offset < n_bins {
+                    i + offset + 1
+                } else {
+                    n_bins
+                };
+                let window_sum = prefix[right] - prefix[left];
+                let sum_excluding_center = window_sum - windowed[i];
+                xcorr_preprocessed[i] = windowed[i] - sum_excluding_center * norm_factor;
+            }
+        }
 
-        // XCorr = sum of preprocessed experimental values at UNIQUE fragment
-        // bin positions. When two library fragments fall into the same bin,
-        // the bin's contribution must count once, not twice -- the Comet
-        // theoretical spectrum uses unit intensity per bin (see
-        // preprocess_library_for_xcorr, which sets binned[bin] = 1.0 per
-        // unique bin). Summing preprocessed[bin] once per fragment instead
-        // of once per unique bin double-counts collisions and over-scores
-        // dense fragment lists.
-        let n_bins = xcorr_preprocessed.len();
+        // (4) Sum preprocessed values at UNIQUE library fragment bin
+        // positions. Comet theoretical spectrum uses unit intensity per
+        // bin, so collisions must count once (matches
+        // preprocess_library_for_xcorr which sets binned[bin] = 1.0).
         let mut visited = vec![false; n_bins];
         let mut xcorr_raw: f64 = 0.0;
         for frag in &library.fragments {
             if let Some(bin) = self.bin_config.mz_to_bin(frag.mz) {
                 if !visited[bin] {
                     visited[bin] = true;
-                    xcorr_raw += xcorr_preprocessed[bin] as f64;
+                    xcorr_raw += xcorr_preprocessed[bin];
                 }
             }
         }
 
-        // Scale XCorr (pyXcorrDIA uses 0.005 for spectrum-centric)
-        let xcorr_scaled = xcorr_raw * 0.005;
+        // (5) Scale (pyXcorrDIA spectrum-centric). Explicit f64 literal
+        // matches C# `xcorrRaw * XCORR_SCALING` exactly.
+        let xcorr_scaled = xcorr_raw * 0.005_f64;
 
         SpectralScore {
             xcorr: xcorr_scaled,
@@ -2281,19 +2333,12 @@ impl SpectralScorer {
         matches
     }
 
-    /// Apply Comet-style windowing normalization
-    ///
-    /// Divides spectrum into 10 windows and normalizes each to max=50.0
-    fn apply_windowing_normalization(&self, spectrum: &[f32]) -> Vec<f32> {
-        let mut result = vec![0.0f32; spectrum.len()];
-        self.apply_windowing_normalization_into(spectrum, &mut result);
-        result
-    }
-
-    /// In-place variant of [`apply_windowing_normalization`] that writes
-    /// into a caller-provided buffer. The buffer must be zero on entry
-    /// because below-threshold and empty-window positions retain their
-    /// initial value.
+    /// In-place Comet-style windowing normalization (f32, used by the HRAM
+    /// per-window cache path). The buffer must be zero on entry because
+    /// below-threshold and empty-window positions retain their initial
+    /// value. The f64 calibration path inlines an equivalent computation
+    /// in [`SpectralScorer::xcorr`] for bit-exact alignment with the C#
+    /// OspreySharp port.
     fn apply_windowing_normalization_into(&self, spectrum: &[f32], result: &mut [f32]) {
         debug_assert_eq!(
             spectrum.len(),
@@ -2331,23 +2376,12 @@ impl SpectralScorer {
         }
     }
 
-    /// Apply sliding window subtraction for fast XCorr (Comet-style)
-    ///
-    /// Uses prefix sum for O(n) performance instead of O(n × window).
-    /// Comet divides by (2*offset) = 150 regardless of boundary effects.
-    /// offset=75, matching Comet's iXcorrProcessingOffset default.
-    fn apply_sliding_window(&self, spectrum: &[f32]) -> Vec<f32> {
-        let n = spectrum.len();
-        let mut prefix = vec![0.0f32; n + 1];
-        let mut result = vec![0.0f32; n];
-        self.apply_sliding_window_into(spectrum, &mut prefix, &mut result);
-        result
-    }
-
-    /// In-place variant of [`apply_sliding_window`] that writes into
-    /// caller-provided prefix and result buffers. Every position of
-    /// `result` is overwritten; `prefix[0]` is assumed to be 0 on entry
-    /// and positions 1..=n are overwritten.
+    /// In-place sliding-window subtraction (Comet fast XCorr, f32, used by
+    /// the HRAM per-window cache path). Writes into caller-provided prefix
+    /// and result buffers. Every position of `result` is overwritten;
+    /// `prefix[0]` is assumed to be 0 on entry and positions 1..=n are
+    /// overwritten. The f64 calibration path inlines an equivalent
+    /// computation in [`SpectralScorer::xcorr`].
     fn apply_sliding_window_into(&self, spectrum: &[f32], prefix: &mut [f32], result: &mut [f32]) {
         let n = spectrum.len();
         let offset: usize = 75;
