@@ -2333,13 +2333,12 @@ impl SpectralScorer {
         matches
     }
 
-    /// In-place Comet-style windowing normalization (f32, used by the HRAM
-    /// per-window cache path). The buffer must be zero on entry because
+    /// In-place Comet-style windowing normalization (f64 internal,
+    /// dual-purpose helper for both calibration and the HRAM per-window
+    /// cache path). The buffer must be zero on entry because
     /// below-threshold and empty-window positions retain their initial
-    /// value. The f64 calibration path inlines an equivalent computation
-    /// in [`SpectralScorer::xcorr`] for bit-exact alignment with the C#
-    /// OspreySharp port.
-    fn apply_windowing_normalization_into(&self, spectrum: &[f32], result: &mut [f32]) {
+    /// value. Matches C# `ApplyWindowingNormalizationD` bit-for-bit.
+    fn apply_windowing_normalization_into(&self, spectrum: &[f64], result: &mut [f64]) {
         debug_assert_eq!(
             spectrum.len(),
             result.len(),
@@ -2348,23 +2347,20 @@ impl SpectralScorer {
         let num_windows = 10;
         let window_size = (spectrum.len() / num_windows) + 1;
 
-        // Find global max for threshold
-        let global_max = spectrum.iter().cloned().fold(0.0f32, f32::max);
+        let global_max = spectrum.iter().cloned().fold(0.0f64, f64::max);
         let threshold = global_max * 0.05;
 
         for window_idx in 0..num_windows {
             let start = window_idx * window_size;
             let end = ((window_idx + 1) * window_size).min(spectrum.len());
 
-            // Find max in this window
-            let mut window_max = 0.0f32;
+            let mut window_max = 0.0f64;
             for &val in &spectrum[start..end] {
                 if val > window_max {
                     window_max = val;
                 }
             }
 
-            // Normalize this window to 50.0
             if window_max > 0.0 {
                 let norm_factor = 50.0 / window_max;
                 for i in start..end {
@@ -2376,23 +2372,24 @@ impl SpectralScorer {
         }
     }
 
-    /// In-place sliding-window subtraction (Comet fast XCorr, f32, used by
-    /// the HRAM per-window cache path). Writes into caller-provided prefix
-    /// and result buffers. Every position of `result` is overwritten;
-    /// `prefix[0]` is assumed to be 0 on entry and positions 1..=n are
-    /// overwritten. The f64 calibration path inlines an equivalent
-    /// computation in [`SpectralScorer::xcorr`].
-    fn apply_sliding_window_into(&self, spectrum: &[f32], prefix: &mut [f32], result: &mut [f32]) {
+    /// In-place sliding-window subtraction (Comet fast XCorr) with f64
+    /// internal math narrowing to an f32 result buffer at the final store.
+    /// `spectrum` and `prefix` are f64 scratch; `result` is the per-spectrum
+    /// f32 cache. Every position of `result` is overwritten; `prefix[0]` is
+    /// assumed to be 0 on entry and positions 1..=n are overwritten.
+    /// Matches C# `ApplySlidingWindowD` for the f64 cascade, with a single
+    /// final cast to f32 on store. Used by the HRAM per-window cache path.
+    fn apply_sliding_window_into(&self, spectrum: &[f64], prefix: &mut [f64], result: &mut [f32]) {
         let n = spectrum.len();
         let offset: usize = 75;
-        // Comet uses (window_size - 1) = 2*offset = 150 as divisor
-        let norm_factor = 1.0f32 / (2 * offset) as f32;
+        // Comet uses (window_size - 1) = 2*offset = 150 as divisor.
+        // f64 literal so the final subtraction stays in f64.
+        let norm_factor = 1.0f64 / (2 * offset) as f64;
 
         debug_assert_eq!(prefix.len(), n + 1, "prefix buffer must be n+1");
         debug_assert_eq!(result.len(), n, "result buffer must be n");
         debug_assert_eq!(prefix[0], 0.0, "prefix[0] must be 0 on entry");
 
-        // Build prefix sum for O(n) window sums
         for i in 0..n {
             prefix[i + 1] = prefix[i] + spectrum[i];
         }
@@ -2400,12 +2397,12 @@ impl SpectralScorer {
         for i in 0..n {
             let left = i.saturating_sub(offset);
             let right = if i + offset < n { i + offset + 1 } else { n };
-            // Window sum including center
             let window_sum = prefix[right] - prefix[left];
-            // Subtract center to get sum excluding center
             let sum_excluding_center = window_sum - spectrum[i];
-            // Subtract local average from center value
-            result[i] = spectrum[i] - sum_excluding_center * norm_factor;
+            let centered = spectrum[i] - sum_excluding_center * norm_factor;
+            // f64 -> f32 narrowing at the final store: single deterministic
+            // rounding, identical bits cross-impl when the f64 inputs agree.
+            result[i] = centered as f32;
         }
     }
 
@@ -2427,11 +2424,17 @@ impl SpectralScorer {
     }
 
     /// In-place XCorr preprocess using a pool-rented scratch and a
-    /// caller-provided output buffer. The output buffer is fully
-    /// overwritten. The scratch's accumulator fields (`binned`,
-    /// `windowed`) are zeroed at the start of the call, so callers can
-    /// reuse a single rented scratch across many preprocess calls
-    /// without interleaving recycle/rent.
+    /// caller-provided f32 output buffer (the per-spectrum HRAM cache).
+    /// The scratch fields are f64 so the windowing / sliding-window
+    /// cascade runs in f64 precision; only the final cache write narrows
+    /// to f32. Matches C# OspreySharp's PreprocessSpectrumForXcorrF32 with
+    /// f64-internal math: same f32 cache size, but values carry single-
+    /// cast precision rather than f32-cascade noise.
+    ///
+    /// The scratch's accumulator fields (`binned`, `windowed`) are zeroed
+    /// at the start of the call, so callers can reuse a single rented
+    /// scratch across many preprocess calls without interleaving
+    /// recycle/rent.
     pub fn preprocess_spectrum_for_xcorr_into(
         &self,
         spectrum: &Spectrum,
@@ -2451,10 +2454,13 @@ impl SpectralScorer {
         scratch.binned.fill(0.0);
         scratch.windowed.fill(0.0);
 
-        // Bin observed spectrum with sqrt transformation using Comet BIN macro
+        // Bin observed spectrum with sqrt transformation using Comet BIN
+        // macro. Widen f32 intensity to f64 BEFORE sqrt to match C#'s
+        // `Math.Sqrt((double)float)` bit-for-bit; f32::sqrt and
+        // f64::sqrt(f32 as f64) can differ by 1 ULP at f32 magnitude.
         for (&mz, &intensity) in spectrum.mzs.iter().zip(spectrum.intensities.iter()) {
             if let Some(bin) = self.bin_config.mz_to_bin(mz) {
-                scratch.binned[bin] += intensity.sqrt();
+                scratch.binned[bin] += (intensity as f64).sqrt();
             }
         }
 
