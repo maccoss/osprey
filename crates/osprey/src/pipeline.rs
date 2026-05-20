@@ -879,7 +879,7 @@ fn run_calibration_discovery_windowed(
             }
         }
 
-        let num_confident_peptides = library_rts_detected.len();
+        let mut num_confident_peptides = library_rts_detected.len();
 
         // Compute median peak width from confident matches for adaptive co-elution window
         // Log median peak width from calibration matches (diagnostic)
@@ -1088,6 +1088,17 @@ fn run_calibration_discovery_windowed(
                 if rt_stats_refined.r_squared >= rt_stats.r_squared * 0.99 {
                     rt_calibration = rt_cal_refined;
                     rt_stats = rt_stats_refined;
+                    // Update metadata to reflect the refined fit that's
+                    // actually being used (was pass 1's count). C# parity:
+                    // PerFileScoringTask.cs reports n_refined when pass 2 is
+                    // accepted.
+                    num_confident_peptides = n_refined;
+                    // Overwrite the LOESS input dump with pass 2's points
+                    // so the diagnostic reflects the calibration actually
+                    // used. C# overwrites unconditionally on pass 2; Rust
+                    // previously only wrote pass 1 (line 1000), leaving
+                    // ~960 entries unreported here on Stellar Single.
+                    crate::diagnostics::dump_loess_input(&refined_lib_rts, &refined_meas_rts);
 
                     // Re-collect mass errors from refined matches
                     mz_qc_data = MzQCData::new(config.fragment_tolerance.unit);
