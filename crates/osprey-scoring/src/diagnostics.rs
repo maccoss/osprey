@@ -102,8 +102,11 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
 /// Dump per-entry LDA discriminant + q-value to `rust_lda_scores.txt`,
 /// sorted by entry_id for a stable diff against `cs_lda_scores.txt`.
 ///
-/// Uses `{:.10}` formatting to avoid banker's-vs-half-up text rounding
-/// mismatches with C#.
+/// Uses `{:.17}` formatting so the underlying f64 round-trips exactly.
+/// Earlier `{:.10}` was chosen "to avoid banker's vs half-up rounding
+/// mismatches with C#"; in practice Rust `{:.10}` (RHE) and .NET
+/// Framework `F10` (HAFZ) still disagree by 1 in the last digit on
+/// boundary-case f64s. See the cal_match dump for the same fix.
 ///
 /// Gated by `OSPREY_DUMP_LDA_SCORES=1`. When `OSPREY_LDA_SCORES_ONLY=1`
 /// is also set, exits the process after writing.
@@ -120,7 +123,7 @@ pub fn dump_lda_scores(matches: &[CalibrationMatch]) {
             let m = &matches[i];
             writeln!(
                 f,
-                "{}\t{}\t{:.10}\t{:.10}",
+                "{}\t{}\t{:.17}\t{:.17}",
                 m.entry_id,
                 if m.is_decoy { 1 } else { 0 },
                 m.discriminant_score,
