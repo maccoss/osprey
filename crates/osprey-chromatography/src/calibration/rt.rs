@@ -114,13 +114,18 @@ impl RTCalibrator {
             )));
         }
 
-        // Sort by library RT
+        // Sort by library RT, breaking ties on measured RT so the order is
+        // deterministic for duplicate-x inputs. Without the secondary key,
+        // pairs with equal library_rt land in input-order on Rust (stable
+        // sort_by) but may land in a different order cross-impl, producing
+        // cosmetic swaps in abs_residuals[i] downstream that the cross-impl
+        // calibration.json diff catches.
         let mut pairs: Vec<(f64, f64)> = library_rts
             .iter()
             .zip(measured_rts.iter())
             .map(|(&x, &y)| (x, y))
             .collect();
-        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
 
         let x: Vec<f64> = pairs.iter().map(|(x, _)| *x).collect();
         let y: Vec<f64> = pairs.iter().map(|(_, y)| *y).collect();
