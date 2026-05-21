@@ -5467,6 +5467,19 @@ fn run_percolator_fdr(
 
     log::debug!("Running native Percolator FDR on coelution entries");
 
+    // Sort each file's entries by entry_id so the SVM working-set selection
+    // sees a canonical order regardless of upstream operation history. The
+    // 1st-pass input is already entry_id-sorted via deduplicate_pairs
+    // (pipeline.rs:6123), but the post-rescore pool that feeds 2nd-pass
+    // Percolator can have gap-fill entries appended after the sorted
+    // pre-existing rows. Re-sorting here guarantees identical iteration
+    // order across Rust and OspreySharp; without it, gap-fill ordering
+    // diverges and the cross-impl 2nd-pass scores drift on multi-file
+    // datasets even when feature columns are bit-equal.
+    for (_, entries) in per_file_entries.iter_mut() {
+        entries.sort_by_key(|e| e.entry_id);
+    }
+
     let total_entries: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();
     let n_files = per_file_entries.len();
     let perc_config = percolator::PercolatorConfig {
