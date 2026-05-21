@@ -3312,23 +3312,84 @@ pub(crate) fn rescore_per_file_loop(
                         }
                     }
                     // Append gap-fill entries (remaining overlay entries beyond parquet range).
-                    // Update the corresponding fdr_entries stubs' parquet_index to point to
-                    // the actual Parquet row they will occupy after write-back. Without this,
-                    // gap-fill stubs keep parquet_index = u32::MAX and Phase 2 of the next
-                    // Percolator run can't load their features.
+                    // The vec_idx in the overlay matches the position in fdr_entries
+                    // (gap-fill entries were appended to fdr_entries in order).
+                    // Track the (vec_idx, pre-sort row) pair so we can remap each
+                    // FdrEntry stub's parquet_index to the post-canonical-sort row.
                     let gap_start_pq_row = full_entries.len();
                     let mut gap_entries: Vec<(usize, CoelutionScoredEntry)> =
                         overlay.into_iter().collect();
                     gap_entries.sort_by_key(|(idx, _)| *idx);
+                    let mut gap_vec_idx_for_pre_sort_row: Vec<usize> =
+                        Vec::with_capacity(gap_entries.len());
                     for (gap_offset, (vec_idx, entry)) in gap_entries.into_iter().enumerate() {
-                        let new_pq_row = (gap_start_pq_row + gap_offset) as u32;
+                        let pre_sort_row = gap_start_pq_row + gap_offset;
                         full_entries.push(entry);
-                        // The vec_idx in the overlay matches the position in fdr_entries
-                        // (gap-fill entries were appended to fdr_entries in order)
-                        if vec_idx < fdr_entries.len() {
-                            fdr_entries[vec_idx].parquet_index = new_pq_row;
+                        // Track gap-fill mapping by pre-sort row position.
+                        // Length pads with `usize::MAX` for the upstream rows
+                        // (which already have a real parquet_index pointing to
+                        // the pre-sort row).
+                        while gap_vec_idx_for_pre_sort_row.len() + gap_start_pq_row < pre_sort_row {
+                            gap_vec_idx_for_pre_sort_row.push(usize::MAX);
+                        }
+                        gap_vec_idx_for_pre_sort_row.push(vec_idx);
+                    }
+
+                    // Canonical (entry_id, charge, scan_number) sort permutation.
+                    // Must match write_scores_parquet_with_metadata's internal
+                    // sort key exactly; the writer then iterates in this same
+                    // order, producing a parquet whose physical row layout is
+                    // identical regardless of caller order.
+                    //
+                    // CRITICAL: every FdrEntry stub whose parquet_index points
+                    // into this rewritten parquet must be remapped to its post
+                    // -sort row. Upstream rows held a parquet_index equal to
+                    // their pre-sort row position; the sort moves them, so the
+                    // stale pre-sort index would silently fetch a different
+                    // entry's features in the next Percolator pass.
+                    let mut perm: Vec<usize> = (0..full_entries.len()).collect();
+                    perm.sort_by(|&a, &b| {
+                        full_entries[a]
+                            .entry_id
+                            .cmp(&full_entries[b].entry_id)
+                            .then_with(|| full_entries[a].charge.cmp(&full_entries[b].charge))
+                            .then_with(|| {
+                                full_entries[a]
+                                    .scan_number
+                                    .cmp(&full_entries[b].scan_number)
+                            })
+                    });
+                    // Inverse permutation: pre_sort_row -> post_sort_row.
+                    let mut pre_to_post: Vec<u32> = vec![0u32; full_entries.len()];
+                    for (post, &pre) in perm.iter().enumerate() {
+                        pre_to_post[pre] = post as u32;
+                    }
+                    // Remap every FdrEntry stub for this file. Upstream stubs
+                    // already had parquet_index pointing to their pre-sort row.
+                    // Gap-fill stubs still have parquet_index = u32::MAX; for
+                    // them we look up the pre-sort row via the vec_idx mapping
+                    // built above (vec_idx -> pre_sort_row inverse).
+                    let mut vec_idx_to_gap_pre_sort: HashMap<usize, usize> = HashMap::new();
+                    for (offset, &vec_idx) in gap_vec_idx_for_pre_sort_row.iter().enumerate() {
+                        if vec_idx != usize::MAX {
+                            vec_idx_to_gap_pre_sort.insert(vec_idx, gap_start_pq_row + offset);
                         }
                     }
+                    for (vec_idx, fdr_entry) in fdr_entries.iter_mut().enumerate() {
+                        let pre_sort_row = if fdr_entry.parquet_index == u32::MAX {
+                            // Gap-fill stub: look up pre-sort row by vec_idx.
+                            match vec_idx_to_gap_pre_sort.get(&vec_idx) {
+                                Some(&row) => row,
+                                None => continue, // gap-fill stub without an overlay entry?
+                            }
+                        } else {
+                            fdr_entry.parquet_index as usize
+                        };
+                        if pre_sort_row < pre_to_post.len() {
+                            fdr_entry.parquet_index = pre_to_post[pre_sort_row];
+                        }
+                    }
+
                     // Write back to Parquet with reconciliation metadata
                     let recon_metadata = build_reconciled_metadata(config, Some(join_file_stems));
                     let codec = parquet_compression_codec(config.parquet_compression);
@@ -5450,17 +5511,36 @@ fn run_percolator_fdr(
 
     log::debug!("Running native Percolator FDR on coelution entries");
 
-    // Sort each file's entries by entry_id so the SVM working-set selection
-    // sees a canonical order regardless of upstream operation history. The
+    // Sort each file's entries by the parquet canonical key (entry_id,
+    // charge, scan_number, parquet_index) so the SVM working-set
+    // selection sees the same order regardless of upstream operation
+    // history *and* matches the parquet's physical row layout. The
     // 1st-pass input is already entry_id-sorted via deduplicate_pairs
     // (pipeline.rs:6123), but the post-rescore pool that feeds 2nd-pass
     // Percolator can have gap-fill entries appended after the sorted
-    // pre-existing rows. Re-sorting here guarantees identical iteration
-    // order across Rust and OspreySharp; without it, gap-fill ordering
-    // diverges and the cross-impl 2nd-pass scores drift on multi-file
-    // datasets even when feature columns are bit-equal.
+    // pre-existing rows. The parquet writer uses (entry_id, charge,
+    // scan_number) as its sort key, but on Stellar 3-file the post-
+    // reconciliation pool has 94 per-file groups of 2 entries sharing
+    // ALL THREE of (entry_id, charge, scan_number) (gap-fill rescore
+    // landing on the same scan as an original row with a *different*
+    // rt_deviation). With only those three keys, ties leave a stable
+    // sort taking input order on each side -- but C# `List<T>.Sort` is
+    // unstable, so the same input produced a swapped order at every
+    // tied group, drifting the 2nd-pass standardizer mean by 1 ULP on
+    // rt_deviation and cascading through all downstream SVM weights.
+    // Including `parquet_index` as a final tie-break gives the same
+    // total order on both sides regardless of underlying sort
+    // stability, since the parquets are byte-identical cross-impl and
+    // each entry's parquet_index points to its row in that shared
+    // canonical layout.
     for (_, entries) in per_file_entries.iter_mut() {
-        entries.sort_by_key(|e| e.entry_id);
+        entries.sort_by(|a, b| {
+            a.entry_id
+                .cmp(&b.entry_id)
+                .then_with(|| a.charge.cmp(&b.charge))
+                .then_with(|| a.scan_number.cmp(&b.scan_number))
+                .then_with(|| a.parquet_index.cmp(&b.parquet_index))
+        });
     }
 
     let total_entries: usize = per_file_entries.iter().map(|(_, e)| e.len()).sum();

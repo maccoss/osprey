@@ -199,6 +199,12 @@ pub fn run_percolator(
     // two sides, cascading through every downstream computation.
     dump_stage5_standardizer(&standardizer, config.feature_names.as_deref());
 
+    // One-shot diagnostic for 2nd-pass divergence localization. Dumps
+    // per-entry raw feature vectors so the cross-impl compare can see
+    // exactly which rows differ. Sorted by (entry_id, native_position)
+    // to align with the C# dump.
+    dump_stage5_perc_input(entries, config.feature_names.as_deref());
+
     // 3a. Best-per-precursor: pick the single best-scoring observation per
     //     (base_id, is_decoy) tuple across all files. With N files per peptide,
     //     this avoids the SVM seeing the same precursor's target/decoy pair
@@ -1360,7 +1366,21 @@ fn compute_per_run_peptide_qvalues(
     qvalues
 }
 
-/// Compute experiment-level precursor q-values (across all files)
+/// Compute experiment-level precursor q-values (across all files).
+///
+/// Propagates the winner's q-value to every observation sharing the
+/// same `base_id` (target and decoy). The streaming path
+/// (`run_percolator_fdr_streaming` in `crates/osprey/src/pipeline.rs`)
+/// already does this via its `base_id_exp_prec_q` map; the direct
+/// path used to assign the q-value only to the single winner,
+/// leaving every non-winning per-file observation at q=1.0. That
+/// undercount silently broke downstream stages that gate on
+/// `experiment_precursor_qvalue` (Stage 6 consensus selection /
+/// calibration refit, Stage 7 protein FDR) on multi-file inputs
+/// using the direct path (Stellar 3-file, ~393K entries below the
+/// 600K streaming threshold). The OspreySharp port matched the
+/// streaming path's "propagate to all base_id observations"
+/// semantics, so the direct path was the divergent side.
 fn compute_experiment_precursor_qvalues(
     scores: &[f64],
     labels: &[bool],
@@ -1375,8 +1395,20 @@ fn compute_experiment_precursor_qvalues(
     let ws: Vec<f64> = winner_indices.iter().map(|&i| scores[i]).collect();
     compute_conservative_qvalues(&ws, &winner_is_decoy, &mut q);
 
+    // Build base_id -> winner q-value map (one entry per base_id, since
+    // compete_all picks a single winner per base_id).
+    let mut base_id_q: HashMap<u32, f64> = HashMap::with_capacity(winner_indices.len());
     for (rank, &idx) in winner_indices.iter().enumerate() {
-        qvalues[idx] = q[rank];
+        let base_id = entry_ids[idx] & 0x7FFF_FFFF;
+        base_id_q.insert(base_id, q[rank]);
+    }
+
+    // Propagate winner's q-value to every observation of that base_id.
+    for i in 0..n {
+        let base_id = entry_ids[i] & 0x7FFF_FFFF;
+        if let Some(&qv) = base_id_q.get(&base_id) {
+            qvalues[i] = qv;
+        }
     }
 
     qvalues
@@ -1725,6 +1757,68 @@ fn dump_stage5_standardizer(standardizer: &FeatureStandardizer, feature_names: O
     );
 
     exit_if_only("OSPREY_STANDARDIZER_ONLY", "Stage 5 standardizer dump");
+}
+
+/// One-shot diagnostic dump of the per-entry raw feature vectors that
+/// feed `FeatureStandardizer::fit_transform`. Gated by
+/// `OSPREY_DUMP_PERC_INPUT=1`. Writes `rust_stage5_perc_input.tsv` with
+/// columns `native_position, entry_id, is_decoy, <feature_name_0>..<feature_name_N>`
+/// sorted by (entry_id, native_position) for stable cross-impl compare.
+///
+/// This is a localizer for cross-impl standardizer divergence: when
+/// `rust_stage5_standardizer.tsv` differs but `2nd-pass entries[]`
+/// positions match, the divergence is in feature values themselves.
+fn dump_stage5_perc_input(entries: &[PercolatorEntry], feature_names: Option<&[String]>) {
+    if !is_dump_enabled("OSPREY_DUMP_PERC_INPUT") {
+        return;
+    }
+    let path = "rust_stage5_perc_input.tsv";
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+    write!(f, "native_position\tentry_id\tis_decoy").ok();
+    let n_features = if entries.is_empty() {
+        0
+    } else {
+        entries[0].features.len()
+    };
+    for i in 0..n_features {
+        let name = feature_names
+            .and_then(|n| n.get(i))
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        write!(f, "\t{}", name).ok();
+    }
+    writeln!(f).ok();
+
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| (entries[i].entry_id, i));
+    for i in order {
+        let e = &entries[i];
+        write!(
+            f,
+            "{}\t{}\t{}",
+            i,
+            e.entry_id,
+            if e.is_decoy { "true" } else { "false" }
+        )
+        .ok();
+        for v in &e.features {
+            write!(f, "\t{}", format_f64_roundtrip(*v)).ok();
+        }
+        writeln!(f).ok();
+    }
+    let _ = f.flush();
+    drop(f);
+    log::info!(
+        "Wrote Stage 5 Percolator input dump: {} ({} rows)",
+        path,
+        entries.len()
+    );
+    exit_if_only("OSPREY_PERC_INPUT_ONLY", "Stage 5 Percolator input dump");
 }
 
 /// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.
