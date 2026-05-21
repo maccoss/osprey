@@ -5054,6 +5054,21 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             .map(|e| e.modified_sequence.to_string())
             .collect();
 
+        // Cross-impl bisection: dump sorted detected_peptides for diff against
+        // the C# port. Gated by env var; zero overhead when unset.
+        if std::env::var("OSPREY_DUMP_DETECTED_PEPTIDES").as_deref() == Ok("1") {
+            let mut sorted: Vec<String> = detected_peptides.iter().cloned().collect();
+            sorted.sort();
+            let _ = std::fs::write(
+                "rust_stage7_detected_peptides.txt",
+                sorted.join("\n") + "\n",
+            );
+            log::info!(
+                "[DIAG] Wrote rust_stage7_detected_peptides.txt ({} entries)",
+                sorted.len()
+            );
+        }
+
         let parsimony = protein::build_protein_parsimony(
             &library,
             config.shared_peptides,
