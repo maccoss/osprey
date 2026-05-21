@@ -4993,22 +4993,27 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         }
     }
 
-    // Persist second-pass SVM scores to sidecar files (after reconciliation block closes)
+    // Persist second-pass SVM scores to sidecar files (after reconciliation block closes).
+    // Always written when FDR ran, regardless of reconciliation. In single-file
+    // mode there is no rescore step, so the persisted scores equal the 1st-pass
+    // scores; this is fine semantically (per_file_entries already carry the
+    // authoritative final-pass scores) and required for cross-impl parity with
+    // the C# port, whose Stage 7 (--join-at-pass=2) reads the 2nd-pass sidecar
+    // unconditionally. Without an unconditional write here, single-file per-side
+    // cross-impl runs hit a load-cached-vs-retrain asymmetry in Stage 7 protein
+    // FDR even when every upstream stage is bit-equal.
     if !can_skip_fdr {
-        let has_reconciliation = config.reconciliation.enabled && config.input_files.len() > 1;
-        if has_reconciliation {
-            log::debug!("Persisting 2nd-pass FDR scores...");
-            // 2nd-pass is a resume-only optimization (skip-Percolator on
-            // reruns); the return value is logged via per-file warnings
-            // already, so no need to escalate here.
-            let _ = persist_fdr_scores(
-                &per_file_entries,
-                &config,
-                fdr_scores_path_pass2,
-                "2nd-pass",
-                2,
-            );
-        }
+        log::debug!("Persisting 2nd-pass FDR scores...");
+        // 2nd-pass is a resume-only optimization (skip-Percolator on
+        // reruns); the return value is logged via per-file warnings
+        // already, so no need to escalate here.
+        let _ = persist_fdr_scores(
+            &per_file_entries,
+            &config,
+            fdr_scores_path_pass2,
+            "2nd-pass",
+            2,
+        );
     }
 
     // Protein parsimony (always runs) + optional second-pass picked-protein FDR.
