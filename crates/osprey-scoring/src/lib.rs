@@ -430,20 +430,25 @@ pub fn compute_cosine_at_scan(
         return 0.0;
     }
 
-    // L2 normalize
-    let lib_norm = lib_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let obs_norm = obs_preprocessed.iter().map(|x| x * x).sum::<f64>().sqrt();
+    // Single-pass accumulation of squared norms + dot product, then divide once
+    // at the end. Matches `cosine_angle` in this crate and the C# port's
+    // ComputeCosineAtScan, ensuring cross-impl bit-equality for sg_weighted_cosine.
+    let mut lib_sq = 0.0;
+    let mut obs_sq = 0.0;
+    let mut dot = 0.0;
+    for (a, b) in lib_preprocessed.iter().zip(obs_preprocessed.iter()) {
+        lib_sq += a * a;
+        obs_sq += b * b;
+        dot += a * b;
+    }
+    let lib_norm = lib_sq.sqrt();
+    let obs_norm = obs_sq.sqrt();
 
     if lib_norm < 1e-10 || obs_norm < 1e-10 {
         return 0.0;
     }
 
-    // Cosine = dot(lib_norm, obs_norm)
-    lib_preprocessed
-        .iter()
-        .zip(obs_preprocessed.iter())
-        .map(|(a, b)| (a / lib_norm) * (b / obs_norm))
-        .sum()
+    dot / (lib_norm * obs_norm)
 }
 
 /// Compute per-fragment mass accuracy statistics at the apex scan.
