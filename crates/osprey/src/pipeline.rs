@@ -1763,7 +1763,22 @@ fn write_scores_parquet_with_metadata(
         .map(|_| Float64Builder::with_capacity(n))
         .collect();
 
-    for entry in entries {
+    // Iterate in canonical sorted order (entry_id, charge, scan_number) so
+    // per-side parquets have identical physical row layout across Rust and C#
+    // impls. Order-sensitive consumers downstream (Stage 5 standardizer,
+    // SVM training) then see the same row sequence regardless of which side
+    // wrote the parquet, making per-side cross-tool stages bit-equal.
+    let mut sorted_indices: Vec<usize> = (0..entries.len()).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        entries[a]
+            .entry_id
+            .cmp(&entries[b].entry_id)
+            .then_with(|| entries[a].charge.cmp(&entries[b].charge))
+            .then_with(|| entries[a].scan_number.cmp(&entries[b].scan_number))
+    });
+
+    for &idx in &sorted_indices {
+        let entry = &entries[idx];
         entry_id_b.append_value(entry.entry_id);
         decoy_b.append_value(entry.is_decoy);
         seq_b.append_value(&entry.sequence);
