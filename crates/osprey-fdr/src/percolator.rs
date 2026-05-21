@@ -199,22 +199,77 @@ pub fn run_percolator(
     // two sides, cascading through every downstream computation.
     dump_stage5_standardizer(&standardizer, config.feature_names.as_deref());
 
-    // 3. Subsample by peptide groups if needed (before fold splitting, per PMC5059416)
-    //    Keeps target-decoy pairs and charge states together.
-    //    The subsampled set is used for fold assignment + SVM training.
-    //    ALL entries are scored with the trained model.
-    let train_subset: Option<Vec<usize>> = if config.max_train_size > 0 && n > config.max_train_size
-    {
-        Some(subsample_by_peptide_group(
-            &labels,
-            &entry_ids,
-            &peptides,
-            config.max_train_size,
-            config.seed,
-        ))
-    } else {
-        None
-    };
+    // 3a. Best-per-precursor: pick the single best-scoring observation per
+    //     (base_id, is_decoy) tuple across all files. With N files per peptide,
+    //     this avoids the SVM seeing the same precursor's target/decoy pair
+    //     N times, which would inflate apparent target/decoy separation and
+    //     cause the SVM to learn file-specific noise rather than peptide
+    //     discriminating features. The streaming path applies this dedup
+    //     inline (pipeline.rs::run_percolator_fdr); applying it here makes
+    //     the direct path statistically consistent. Without this, on multi-
+    //     file inputs below the streaming threshold (Stellar 3-file at 393K
+    //     entries) the SVM trained on N-times-redundant precursor pairs and
+    //     produced inflated target/decoy separation diverging from the
+    //     deduped C# port.
+    //
+    //     Dedup key is features[0] (fragment_coelution_sum, the first PIN
+    //     feature) which matches the streaming path's `coelution_sum`
+    //     dedup field exactly — same per-entry value.
+    let mut best_target: HashMap<u32, usize> = HashMap::new();
+    let mut best_decoy: HashMap<u32, usize> = HashMap::new();
+    for i in 0..n {
+        let base_id = entries[i].entry_id & 0x7FFF_FFFF;
+        let score = entries[i].features[0];
+        let map = if labels[i] {
+            &mut best_decoy
+        } else {
+            &mut best_target
+        };
+        match map.get(&base_id) {
+            Some(&existing) if entries[existing].features[0] >= score => {}
+            _ => {
+                map.insert(base_id, i);
+            }
+        }
+    }
+    let mut dedup_indices: Vec<usize> = best_target
+        .values()
+        .chain(best_decoy.values())
+        .copied()
+        .collect();
+    dedup_indices.sort();
+    log::debug!(
+        "  Best-per-precursor: {} entries ({} targets, {} decoys) from {} total",
+        dedup_indices.len(),
+        best_target.len(),
+        best_decoy.len(),
+        n
+    );
+
+    // 3b. Subsample by peptide groups if dedup'd count still exceeds the
+    //     training cap (before fold splitting, per PMC5059416). Keeps target-
+    //     decoy pairs and charge states together. The subsampled set is used
+    //     for fold assignment + SVM training; ALL entries are scored with
+    //     the trained model regardless.
+    let train_subset: Option<Vec<usize>> =
+        if config.max_train_size > 0 && dedup_indices.len() > config.max_train_size {
+            // Build dedup-local arrays for the subsample call.
+            let dedup_labels: Vec<bool> = dedup_indices.iter().map(|&i| labels[i]).collect();
+            let dedup_entry_ids: Vec<u32> = dedup_indices.iter().map(|&i| entry_ids[i]).collect();
+            let dedup_peptides: Vec<String> =
+                dedup_indices.iter().map(|&i| peptides[i].clone()).collect();
+            let local = subsample_by_peptide_group(
+                &dedup_labels,
+                &dedup_entry_ids,
+                &dedup_peptides,
+                config.max_train_size,
+                config.seed,
+            );
+            // Remap local indices back into the original entry index space.
+            Some(local.into_iter().map(|li| dedup_indices[li]).collect())
+        } else {
+            Some(dedup_indices)
+        };
 
     let sub_n = train_subset.as_ref().map_or(n, |s| s.len());
 
