@@ -101,6 +101,79 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
     exit_if_only("OSPREY_CAL_MATCH_ONLY", "match dump");
 }
 
+/// Dump the per-fragment MS2 mass errors that feed the MS2 mass
+/// calibration mean / sd computation, to `rust_ms2_cal_errors.txt`.
+///
+/// One row per (entry_id, fragment_order_index, error) triple, sorted
+/// by (entry_id, fragment_order_index). Mirrors `cs_ms2_cal_errors.txt`
+/// emitted by OspreySharp. Use to bisect a 1-ULP MS2 calibration mean
+/// divergence cross-impl: if the dumps are identical, the divergence is
+/// in the calibration sum/mean computation; if not, divergence is in
+/// per-match top-N fragment selection or per-fragment error arithmetic.
+///
+/// `matches` should be the iterable of `CalibrationMatch` whose
+/// `ms2_mass_errors` arrays feed the global calibration accumulator
+/// (i.e., post-LDA passing targets with `q_value <= calibration_fdr`
+/// and `signal_to_noise >= MIN_SNR_FOR_RT_CAL`; the caller is
+/// responsible for that filtering — the dump just reads
+/// `ms2_mass_errors` from whatever matches are passed).
+///
+/// Error values formatted with G17 / `{:.17e}` so f64 bits round-trip
+/// exactly.
+///
+/// Gated by `OSPREY_DUMP_MS2_CAL_ERRORS=1`. When
+/// `OSPREY_MS2_CAL_ERRORS_ONLY=1` is also set, the process exits after
+/// writing for fast cycle-time during calibration bisection.
+pub fn dump_ms2_cal_errors(matches: &[&CalibrationMatch]) {
+    if !is_dump_enabled("OSPREY_DUMP_MS2_CAL_ERRORS") {
+        return;
+    }
+
+    let dump_path = "rust_ms2_cal_errors.txt";
+    let Ok(mut f) = std::fs::File::create(dump_path) else {
+        log::warn!("Could not create {}", dump_path);
+        return;
+    };
+
+    // entry_id ascending; within each entry, error position in the
+    // mass_errors vec (i.e., the order in which errors are appended
+    // to the global calibration accumulator).
+    let mut sorted_matches: Vec<&&CalibrationMatch> = matches.iter().collect();
+    sorted_matches.sort_by_key(|m| m.entry_id);
+
+    writeln!(f, "entry_id\tfrag_order_idx\terror").ok();
+
+    let mut n_rows = 0usize;
+    let mut n_matches = 0usize;
+    for m in sorted_matches {
+        n_matches += 1;
+        for (i, err) in m.ms2_mass_errors.iter().enumerate() {
+            // Round-trip-safe; same primitive used by other cross-impl
+            // dumps (`format_f64_roundtrip` from osprey-core). Strings
+            // are stable across language formatters because both go
+            // through Rust ↔ Python ↔ C# via this canonical
+            // representation (shortest decimal that round-trips).
+            writeln!(
+                f,
+                "{}\t{}\t{}",
+                m.entry_id,
+                i,
+                osprey_core::diagnostics::format_f64_roundtrip(*err)
+            )
+            .ok();
+            n_rows += 1;
+        }
+    }
+    log::info!(
+        "Wrote MS2 calibration errors dump: {} ({} rows across {} matches)",
+        dump_path,
+        n_rows,
+        n_matches
+    );
+
+    exit_if_only("OSPREY_MS2_CAL_ERRORS_ONLY", "MS2 cal errors dump");
+}
+
 /// Dump per-entry LDA discriminant + q-value to `rust_lda_scores.txt`,
 /// sorted by entry_id for a stable diff against `cs_lda_scores.txt`.
 ///

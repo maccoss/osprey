@@ -887,7 +887,17 @@ fn run_calibration_discovery_windowed(
         let mut measured_rts_detected: Vec<f64> = Vec::new();
         let mut mz_qc_data = MzQCData::new(config.fragment_tolerance.unit);
 
-        for m in &passing_targets {
+        // Sort by (base_id, entry_id) before accumulating mass errors into
+        // the calibration so the running Welford sum sees them in the same
+        // deterministic order C#'s OspreySharp uses (its `matchArray` is
+        // sorted (base_id, entry_id) and never re-sorted; Rust's
+        // `train_and_score_calibration` sorts `all_matches` by
+        // discriminant_score-descending as a side effect of LDA, which
+        // would otherwise feed Welford a different order cross-impl and
+        // leave a 1-ULP MS2 calibration mean drift.
+        let mut passing_sorted: Vec<&CalibrationMatch> = passing_targets.clone();
+        passing_sorted.sort_by_key(|m| (m.entry_id & 0x7FFFFFFF, m.entry_id));
+        for m in &passing_sorted {
             library_rts_detected.push(m.library_rt);
             measured_rts_detected.push(m.measured_rt);
 
@@ -899,6 +909,13 @@ fn run_calibration_discovery_windowed(
             }
         }
 
+        // Cross-impl bisection dump for the MS2 calibration accumulator
+        // (gated by OSPREY_DUMP_MS2_CAL_ERRORS=1). One row per per-fragment
+        // error in the same order the calibration mean sees them.
+        osprey_scoring::diagnostics::dump_ms2_cal_errors(&passing_sorted);
+
+        // `mut` because PR #42 (Calibration pass 2 LOESS+metadata refresh)
+        // reassigns this to `n_refined` when pass 2 is accepted.
         let mut num_confident_peptides = library_rts_detected.len();
 
         // Compute median peak width from confident matches for adaptive co-elution window
@@ -1080,6 +1097,22 @@ fn run_calibration_discovery_windowed(
             let n_refined = refined_passing.len();
 
             if n_refined >= ABSOLUTE_MIN_CALIBRATION_POINTS {
+                // Sort refined_passing by (base_id, entry_id) BEFORE
+                // building lib/measured RT pairs and the mass-error
+                // accumulator: Rust's LDA pass leaves refined_all sorted by
+                // score-descending (matches.sort_by score_desc in
+                // calibration_ml.rs:89), but C# leaves matchArray in
+                // (base_id, entry_id) order. Without this re-sort the
+                // accumulated Welford running sum (and the LOESS input
+                // sequence) sees fragments in a different order cross-
+                // impl, leaving a 1-ULP residual in MS2 calibration mean
+                // even when the input set is bit-identical.
+                let refined_passing: Vec<&CalibrationMatch> = {
+                    let mut v = refined_passing.clone();
+                    v.sort_by_key(|m| (m.entry_id & 0x7FFFFFFF, m.entry_id));
+                    v
+                };
+
                 // Refit LOESS on refined points
                 let refined_lib_rts: Vec<f64> =
                     refined_passing.iter().map(|m| m.library_rt).collect();
@@ -1122,6 +1155,10 @@ fn run_calibration_discovery_windowed(
                     // Single.
                     crate::diagnostics::dump_loess_input(&refined_lib_rts, &refined_meas_rts);
 
+                    // refined_passing is already sorted (base_id, entry_id)
+                    // by the shadowing rebind above, matching C# matchArray
+                    // order so Welford sees fragments in identical order.
+
                     // Re-collect mass errors from refined matches
                     mz_qc_data = MzQCData::new(config.fragment_tolerance.unit);
                     for m in &refined_passing {
@@ -1132,6 +1169,13 @@ fn run_calibration_discovery_windowed(
                             mz_qc_data.add_ms2_error(ms2_error);
                         }
                     }
+
+                    // Cross-impl bisection dump for the PASS 2 MS2
+                    // calibration accumulator. Overwrites the PASS 1
+                    // dump so the final file mirrors what C#'s per-pass
+                    // dump produces (its `RunCalibrationPass` fires the
+                    // dump every pass, last pass wins).
+                    osprey_scoring::diagnostics::dump_ms2_cal_errors(&refined_passing);
                 } else {
                     log::debug!(
                         "Refined calibration not better (R² {:.4} vs {:.4}), keeping original",
