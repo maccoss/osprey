@@ -442,10 +442,22 @@ pub fn compute_protein_fdr(
 
     // Step 2: Pair picking. Each protein group produces exactly one winner.
     // Target wins if target_score >= decoy_score (ties go to target).
-    #[derive(Clone, Copy)]
+    //
+    // Carry the sorted-accessions string on each winner so the sort tie-
+    // break in Step 3 can use a cross-impl-deterministic key. The
+    // numeric group_id is HashMap-iteration-order-derived in
+    // build_protein_parsimony and so is NOT a stable tiebreak — when
+    // two winners have identical scores (common once upstream
+    // arithmetic is bit-equal cross-impl), group_id picks different
+    // sort positions on the two sides, shifting adjacent target/decoy
+    // pairs in the cumulative-FDR sweep and producing
+    // bit-different group_qvalues. Sorted accessions are a stable,
+    // input-deterministic key.
+    #[derive(Clone)]
     struct Winner {
         group_id: ProteinGroupId,
-        score: f64, // best peptide SVM score for this winner
+        sort_key: String, // sorted-accessions string, used as deterministic tie-break
+        score: f64,       // best peptide SVM score for this winner
         is_decoy: bool,
     }
     let mut winners: Vec<Winner> = Vec::new();
@@ -455,17 +467,24 @@ pub fn compute_protein_fdr(
             Some(x) => *x,
             None => continue, // no peptides passed the gate for this group
         };
+        // Build sort_key once per group: accessions sorted then joined
+        // with semicolons (matches the diagnostic dump and the C# port).
+        let mut sorted_accs = group.accessions.clone();
+        sorted_accs.sort();
+        let sort_key = sorted_accs.join(";");
         match (gs.target_score, gs.decoy_score) {
             (Some(t), Some(d)) => {
                 if t >= d {
                     winners.push(Winner {
                         group_id: group.id,
+                        sort_key,
                         score: t,
                         is_decoy: false,
                     });
                 } else {
                     winners.push(Winner {
                         group_id: group.id,
+                        sort_key,
                         score: d,
                         is_decoy: true,
                     });
@@ -473,11 +492,13 @@ pub fn compute_protein_fdr(
             }
             (Some(t), None) => winners.push(Winner {
                 group_id: group.id,
+                sort_key,
                 score: t,
                 is_decoy: false,
             }),
             (None, Some(d)) => winners.push(Winner {
                 group_id: group.id,
+                sort_key,
                 score: d,
                 is_decoy: true,
             }),
@@ -486,12 +507,14 @@ pub fn compute_protein_fdr(
     }
 
     // Step 3: Classical cumulative FDR on winners, sorted by SVM score
-    // DESCENDING (highest = strongest = first). Tiebreak by group_id
-    // ascending for determinism.
+    // DESCENDING (highest = strongest = first). Tiebreak by sorted
+    // accessions ASCENDING — cross-impl-deterministic and run-stable,
+    // unlike group_id which is HashMap-iteration-order from
+    // build_protein_parsimony.
     winners.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
-            .then(a.group_id.cmp(&b.group_id))
+            .then_with(|| a.sort_key.cmp(&b.sort_key))
     });
 
     let mut raw_qvalues: Vec<f64> = Vec::with_capacity(winners.len());
