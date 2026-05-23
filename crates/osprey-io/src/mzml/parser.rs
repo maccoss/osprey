@@ -154,41 +154,72 @@ fn make_isolation_window(
     precursor: &mzdata::spectrum::Precursor,
     scan_number: u32,
     iso_cv_params: Option<&HashMap<u32, IsolationCvParams>>,
-) -> Option<IsolationWindow> {
-    let ion = precursor.ion()?;
-    let center_fallback = ion.mz;
+) -> Result<Option<IsolationWindow>> {
+    let Some(ion) = precursor.ion() else {
+        // Genuinely no selected ion on this precursor (e.g. an MS1
+        // spectrum slipping through MS2 conversion). Skip without
+        // error.
+        return Ok(None);
+    };
 
-    // Compute mzdata-derived (f32 → f64 widened) values up front; they
-    // are the per-field fallback for any cvParam our quick-xml pre-pass
-    // did not capture. Without this, a partial-cvParam mzML (e.g.
-    // MS:1000827 present but MS:1000828/9 missing) would silently use
-    // the hard-coded 12.5 default instead of the perfectly-good
-    // mzdata-derived offsets.
+    // Per-field resolution: f64 cvParam preferred, mzdata-derived
+    // (f32 → f64 widened) value as fallback, error if neither is
+    // available. The previous 12.5 hardcoded default silently
+    // produced bogus isolation windows for mzMLs missing both
+    // MS:1000828/9 cvParams and mzdata-readable lower/upper bounds —
+    // DIA processing cannot proceed without true isolation windows,
+    // and a silent default produces results that are very hard to
+    // diagnose downstream. Better to fail fast with the scan number
+    // and a clear message.
+    let cv = iso_cv_params.and_then(|m| m.get(&scan_number));
     let isolation = &precursor.isolation_window;
-    let mzdata_lower_offset = if isolation.lower_bound > 0.0 {
-        center_fallback - isolation.lower_bound as f64
-    } else {
-        12.5
-    };
-    let mzdata_upper_offset = if isolation.upper_bound > 0.0 {
-        isolation.upper_bound as f64 - center_fallback
-    } else {
-        12.5
-    };
 
-    // Per-field, prefer the f64 cvParam value from our pre-pass; fall
-    // back to the mzdata (f32-widened) value otherwise.
-    let (center, lower_offset, upper_offset) =
-        if let Some(cv) = iso_cv_params.and_then(|m| m.get(&scan_number)) {
-            (
-                cv.target_mz.unwrap_or(center_fallback),
-                cv.lower_offset.unwrap_or(mzdata_lower_offset),
-                cv.upper_offset.unwrap_or(mzdata_upper_offset),
-            )
+    let center = cv
+        .and_then(|c| c.target_mz.filter(|&v| v > 0.0))
+        .or(if ion.mz > 0.0 { Some(ion.mz) } else { None })
+        .ok_or_else(|| {
+            OspreyError::MzmlParseError(format!(
+                "scan {}: no valid isolation-window center m/z (cvParam MS:1000827 \
+                 missing or non-positive, and mzdata ion.mz is non-positive)",
+                scan_number
+            ))
+        })?;
+
+    let lower_offset = cv
+        .and_then(|c| c.lower_offset)
+        .or(if isolation.lower_bound > 0.0 {
+            Some(center - isolation.lower_bound as f64)
         } else {
-            (center_fallback, mzdata_lower_offset, mzdata_upper_offset)
-        };
-    Some(IsolationWindow::new(center, lower_offset, upper_offset))
+            None
+        })
+        .ok_or_else(|| {
+            OspreyError::MzmlParseError(format!(
+                "scan {}: no valid isolation-window lower offset (cvParam MS:1000828 \
+                 missing and mzdata lower_bound is 0)",
+                scan_number
+            ))
+        })?;
+
+    let upper_offset = cv
+        .and_then(|c| c.upper_offset)
+        .or(if isolation.upper_bound > 0.0 {
+            Some(isolation.upper_bound as f64 - center)
+        } else {
+            None
+        })
+        .ok_or_else(|| {
+            OspreyError::MzmlParseError(format!(
+                "scan {}: no valid isolation-window upper offset (cvParam MS:1000829 \
+                 missing and mzdata upper_bound is 0)",
+                scan_number
+            ))
+        })?;
+
+    Ok(Some(IsolationWindow::new(
+        center,
+        lower_offset,
+        upper_offset,
+    )))
 }
 
 /// Some mzML producers emit peaks that are not strictly ascending in m/z
@@ -304,7 +335,7 @@ impl MzmlReader {
         // quantization. See `read_isolation_cvparams_f64`.
         let isolation_window = match desc.precursor.first() {
             Some(precursor) => {
-                match make_isolation_window(precursor, scan_number, Some(&self.iso_cv_params)) {
+                match make_isolation_window(precursor, scan_number, Some(&self.iso_cv_params))? {
                     Some(w) => w,
                     None => return Ok(None), // No selected ion
                 }
@@ -577,7 +608,7 @@ pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1In
                 // `read_isolation_cvparams_f64` for the rationale.
                 let isolation_window = match desc.precursor.first() {
                     Some(precursor) => {
-                        match make_isolation_window(precursor, scan_number, Some(&iso_cv_params)) {
+                        match make_isolation_window(precursor, scan_number, Some(&iso_cv_params))? {
                             Some(w) => w,
                             None => continue, // No selected ion
                         }

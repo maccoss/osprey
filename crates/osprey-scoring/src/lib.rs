@@ -2435,37 +2435,26 @@ impl SpectralScorer {
     /// and accumulated in f64; final scale uses an f64 literal. Matches
     /// C# `SpectralScorer.XcorrFromPreprocessed(float[], LibraryEntry)`
     /// which sums `xcorrRaw += preprocessed[bin]` into a `double` accumulator
-    /// (implicit float-to-double promotion on read). The iteration order
-    /// differs (Rust sorts bins ascending; C# iterates fragments in input
-    /// order with a visited[bin] dedup) but at f64 precision the resulting
-    /// sum-order difference is bounded by ~f64_eps × intermediate magnitude
-    /// (~1e-13 for typical xcorr) — well below f64 epsilon noise.
+    /// (implicit float-to-double promotion on read). Iteration order also
+    /// matches C#: fragments in input order with a per-call dedup against
+    /// already-seen bins. Identical sum order ⇒ bit-equal f64 result.
     #[inline]
     pub fn xcorr_sparse(&self, spectrum_preprocessed: &[f32], entry: &LibraryEntry) -> f64 {
-        // Small stack-friendly accumulator for unique fragment bins. At HRAM
-        // NBins=~100K, the dense path would alloc 400 KB per call; here we
-        // alloc one usize per fragment (~80-240 bytes per call, served by
-        // the allocator's thread-local cache).
-        let mut bins: Vec<usize> = Vec::with_capacity(entry.fragments.len());
+        // Dedup-by-linear-scan rather than the dense Vec<bool> visited[]
+        // approach: typical library entries have ~10-30 fragments, so an
+        // O(n²) `seen.contains` is ~100-900 compares per spectrum vs an
+        // ~100 KB allocation per call for the visited bitmap.
+        let n_bins = spectrum_preprocessed.len();
+        let mut seen: Vec<usize> = Vec::with_capacity(entry.fragments.len());
+        let mut sum: f64 = 0.0;
         for frag in &entry.fragments {
             if let Some(bin) = self.bin_config.mz_to_bin(frag.mz) {
-                bins.push(bin);
+                if bin < n_bins && !seen.contains(&bin) {
+                    seen.push(bin);
+                    sum += spectrum_preprocessed[bin] as f64;
+                }
             }
         }
-        bins.sort_unstable();
-        bins.dedup();
-
-        let n_bins = spectrum_preprocessed.len();
-        let sum: f64 = bins
-            .iter()
-            .filter_map(|&b| {
-                if b < n_bins {
-                    Some(spectrum_preprocessed[b] as f64)
-                } else {
-                    None
-                }
-            })
-            .sum();
         sum * 0.005_f64
     }
 

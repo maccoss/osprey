@@ -1733,6 +1733,30 @@ fn write_scores_parquet_with_metadata(
             .then_with(|| entries[a].scan_number.cmp(&entries[b].scan_number))
     });
 
+    // The canonical sort key (entry_id, charge, scan_number) is expected
+    // to be unique per row: each row represents one peptide-charge
+    // observation at one apex scan, and the post-dedup output of
+    // deduplicate_pairs guarantees at most one entry per (base_id,
+    // is_decoy) and downstream stages don't reintroduce duplicates at
+    // the same scan. If two rows ever share all three keys, the stable
+    // sort's tiebreak is implementation-defined, so row order would no
+    // longer be cross-impl-deterministic — silently breaking the bit-
+    // parity story. Catch that in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        for w in sorted_indices.windows(2) {
+            let a = &entries[w[0]];
+            let b = &entries[w[1]];
+            debug_assert!(
+                (a.entry_id, a.charge, a.scan_number) != (b.entry_id, b.charge, b.scan_number),
+                "duplicate canonical sort key (entry_id={}, charge={}, scan_number={}) breaks cross-impl row-order determinism",
+                a.entry_id,
+                a.charge,
+                a.scan_number,
+            );
+        }
+    }
+
     for &idx in &sorted_indices {
         let entry = &entries[idx];
         entry_id_b.append_value(entry.entry_id);
