@@ -515,14 +515,30 @@ pub fn compute_protein_fdr(
     // target winners only.
     let mut group_qvalues: HashMap<ProteinGroupId, f64> = HashMap::new();
     let mut group_scores: HashMap<ProteinGroupId, f64> = HashMap::new();
+    let mut monotonic_qvalues: Vec<f64> = vec![1.0; winners.len()];
     let mut min_q = 1.0f64;
     for i in (0..winners.len()).rev() {
         min_q = min_q.min(raw_qvalues[i]);
+        monotonic_qvalues[i] = min_q;
         let w = &winners[i];
         if !w.is_decoy {
             group_qvalues.insert(w.group_id, min_q);
             group_scores.insert(w.group_id, w.score);
         }
+    }
+
+    // Cross-impl bisection dump (env-var-gated, no-op in production).
+    // The flag check short-circuits the slice extraction below; in the
+    // disabled-dump path this whole block is one env-var lookup.
+    if crate::diagnostics::stage7_winners_enabled() {
+        let winner_scores: Vec<f64> = winners.iter().map(|w| w.score).collect();
+        let winner_is_decoys: Vec<bool> = winners.iter().map(|w| w.is_decoy).collect();
+        crate::diagnostics::dump_stage7_winners(
+            &winner_scores,
+            &winner_is_decoys,
+            &raw_qvalues,
+            &monotonic_qvalues,
+        );
     }
 
     // Step 5: Propagate to peptides. Each peptide's protein q-value is the best
@@ -797,6 +813,10 @@ pub fn collect_best_peptide_scores(
         n_target,
         n_decoy,
     );
+
+    // Cross-impl bisection dump (env-var-gated, no-op in production).
+    // See crate::diagnostics::dump_best_peptide_scores for context.
+    crate::diagnostics::dump_best_peptide_scores(&best);
 
     best
 }
