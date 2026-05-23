@@ -341,17 +341,20 @@ fn build_scores_metadata(config: &OspreyConfig) -> Vec<parquet::file::metadata::
     ]
 }
 
-/// Build Parquet key-value metadata for a reconciled scores cache.
-/// Build the reconciled-parquet metadata block.
+/// Build the reconciled-parquet metadata key-value block.
 ///
-/// `file_stems_override`: when present, used to compute the
-/// reconciliation hash via
-/// [`OspreyConfig::reconciliation_parameter_hash_for_stems`]. The
-/// per-file rescore worker (`--join-at-pass=1 --no-join`) passes the
-/// file_stems list from reconciliation.json here so the hash it writes
-/// matches the multi-file hash the downstream `--join-at-pass=2` merge
-/// node will compute. Pass `None` from the in-process pipeline path —
-/// `config.input_files` already reflects the full set.
+/// `file_stems_override`: the source of truth for the reconciliation
+/// hash. Passing `Some(non_empty_slice)` uses
+/// [`OspreyConfig::reconciliation_parameter_hash_for_stems`] with the
+/// given stems; passing `None` OR `Some(&[])` falls back to
+/// `config.input_files`-derived stems via
+/// [`OspreyConfig::reconciliation_parameter_hash`]. The per-file
+/// rescore worker (`--join-at-pass=1 --no-join`) passes the
+/// file_stems list from reconciliation.json so the hash it writes
+/// matches the multi-file hash the downstream `--join-at-pass=2`
+/// merge node will compute. The in-process pipeline path may pass
+/// either `None` or `Some(&[])` — both fall back to
+/// `config.input_files`, which already reflects the full set.
 fn build_reconciled_metadata(
     config: &OspreyConfig,
     file_stems_override: Option<&[String]>,
@@ -4529,20 +4532,23 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
 
             // Persist the 2nd-pass scores we just computed as a resume
             // cache for future --join-at-pass=2 invocations against the
-            // same reconciled parquets. Mirrors the persist call inside
-            // the in-process reconciliation block below; gated by
-            // multi-file because reconciliation only fires there.
-            let has_reconciliation = config.reconciliation.enabled && per_file_entries.len() > 1;
-            if has_reconciliation {
-                log::debug!("Persisting 2nd-pass FDR scores as resume cache...");
-                let _ = persist_fdr_scores(
-                    &per_file_entries,
-                    &config,
-                    fdr_scores_path_pass2,
-                    "2nd-pass",
-                    2,
-                );
-            }
+            // same reconciled parquets. Always persist when this branch
+            // runs 2nd-pass FDR; the previous reconciliation-enabled
+            // multi-file gate left single-file or reconciliation-
+            // disabled --join-at-pass=2 invocations re-running 2nd-pass
+            // Percolator on every call instead of short-circuiting via
+            // the sidecar. The unconditional 2nd-pass sidecar persist
+            // block further down covers the in-process path; here we
+            // mirror that intent for the missing-sidecar HPC-chain
+            // path.
+            log::debug!("Persisting 2nd-pass FDR scores as resume cache...");
+            let _ = persist_fdr_scores(
+                &per_file_entries,
+                &config,
+                fdr_scores_path_pass2,
+                "2nd-pass",
+                2,
+            );
         }
     }
 
