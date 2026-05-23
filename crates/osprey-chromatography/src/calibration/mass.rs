@@ -109,10 +109,31 @@ fn calculate_single_calibration(errors: &[f64], unit: ToleranceUnit) -> MzCalibr
         };
     }
 
-    // Calculate mean
-    let mean = errors.iter().sum::<f64>() / errors.len() as f64;
+    // Welford-Knuth online mean + variance.
+    //
+    // The naive `sum / n` formulation lets the running sum drift up to
+    // magnitude ~|n * mean|; for the MS2 calibration on Astral 3-file
+    // that reaches ~4000 (18,245 errors × ~-0.22 ppm), where f64 ULP is
+    // ~5e-13 — enough to produce a 1-ULP cross-impl drift in the
+    // computed mean and cascade through the calibration into
+    // `mass_accuracy_deviation_mean` features and the SVM training that
+    // depends on them. Welford's running mean keeps the accumulator
+    // bounded near the true mean (~0.22 magnitude, ULP ~2e-17), giving
+    // ~10,000× more headroom; the variance accumulator `m2` uses the
+    // companion `(x - mean_prev) * (x - mean_new)` formulation to stay
+    // bit-deterministic for a given input sequence. Mirrors Skyline's
+    // running-mean pattern (e.g. `NextGenFeatureCalc.MassErrorCalc`).
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+    for (i, &x) in errors.iter().enumerate() {
+        let n_f = (i + 1) as f64;
+        let delta = x - mean;
+        mean += delta / n_f;
+        let delta2 = x - mean;
+        m2 += delta * delta2;
+    }
 
-    // Calculate median
+    // Calculate median (sort-based, unaffected by the Welford change)
     let mut sorted = errors.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let median = if sorted.len() % 2 == 0 {
@@ -121,9 +142,9 @@ fn calculate_single_calibration(errors: &[f64], unit: ToleranceUnit) -> MzCalibr
         sorted[sorted.len() / 2]
     };
 
-    // Calculate standard deviation
+    // Sample standard deviation: sqrt(M2 / (n-1)).
     let variance = if errors.len() > 1 {
-        errors.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (errors.len() - 1) as f64
+        m2 / (errors.len() - 1) as f64
     } else {
         0.0
     };

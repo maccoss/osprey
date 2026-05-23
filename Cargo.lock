@@ -1516,6 +1516,7 @@ dependencies = [
  "log",
  "mzdata",
  "osprey-core",
+ "quick-xml",
  "rusqlite",
  "serde",
  "tempfile",

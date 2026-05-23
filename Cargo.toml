@@ -38,6 +38,12 @@ parquet = "58"
 
 # File I/O
 mzdata = "0.63"
+# Used by osprey-io::mzml to pre-parse isolation-window cvParams as
+# f64, bypassing mzdata 0.63's `param.to_f32()` quantization which
+# produces ~3e-5 m/z drift on isolation bounds that land between two
+# f32-representable values. mzdata transitively pins quick-xml 0.30,
+# so this version matches and does not bloat the dep graph.
+quick-xml = "0.30"
 rusqlite = { version = "0.39", features = ["bundled"] }
 csv = "1.3"
 # Use flate2's `zlib-default` feature (vendored stock zlib via libz-sys)

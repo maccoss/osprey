@@ -14,9 +14,213 @@ use mzdata::io::mzml::MzMLReader;
 use mzdata::prelude::*;
 use mzdata::spectrum::RefPeakDataLevel;
 use osprey_core::{IsolationWindow, MS1Spectrum, OspreyError, Result, Spectrum, SpectrumSource};
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+
+/// Raw f64 isolation window cvParam values lifted directly from the
+/// mzML XML, indexed by spectrum index (matching mzdata's
+/// `MultiLayerSpectrum.description().index`). Used to override
+/// mzdata 0.63's f32-quantized `IsolationWindow.lower_bound` /
+/// `upper_bound` values; see [`read_isolation_cvparams_f64`] for the
+/// rationale.
+#[derive(Default, Clone, Debug)]
+struct IsolationCvParams {
+    /// MS:1000827 isolation window target m/z (f64 from XML text).
+    target_mz: Option<f64>,
+    /// MS:1000828 isolation window lower offset (positive magnitude).
+    lower_offset: Option<f64>,
+    /// MS:1000829 isolation window upper offset (positive magnitude).
+    upper_offset: Option<f64>,
+}
+
+/// One-pass streaming scan of an mzML file to extract every
+/// `<isolationWindow>` block's cvParam values at f64 precision,
+/// directly from the XML text. mzdata 0.63's reader pipes these
+/// values through `param.to_f32()` (see mzdata-0.63
+/// `src/io/mzml/reader.rs:281`), which quantizes through f32 and
+/// produces ~3e-5 m/z drift on isolation-window edges that land
+/// between two f32-representable values. The C# port
+/// (OspreySharp) parses the same cvParams at f64, so the f32
+/// quantization on the Rust side is the sole source of a 1,732-row
+/// cross-impl `iso_upper` mismatch on Stellar 3-file. This
+/// function reads the same XML text mzdata sees but preserves full
+/// f64 precision.
+///
+/// The override is wired in via [`make_isolation_window`] at the two
+/// MS2 parsing sites in this module. When upstream mzdata moves to
+/// f64 storage for `IsolationWindow` bounds, this pre-pass + override
+/// can be deleted in one commit. See workspace `Cargo.toml`
+/// `quick-xml = "0.30"` line for the lifetime expectation.
+fn read_isolation_cvparams_f64(path: &Path) -> Result<HashMap<u32, IsolationCvParams>> {
+    let mut reader = Reader::from_file(path).map_err(|e| {
+        OspreyError::MzmlParseError(format!("quick-xml open '{}': {}", path.display(), e))
+    })?;
+    let mut buf = Vec::new();
+    let mut result: HashMap<u32, IsolationCvParams> = HashMap::new();
+    let mut current_index: Option<u32> = None;
+    let mut depth_in_isolation_window: i32 = 0;
+    let mut current_params = IsolationCvParams::default();
+
+    loop {
+        let event = reader.read_event_into(&mut buf).map_err(|e| {
+            OspreyError::MzmlParseError(format!(
+                "quick-xml read at pos {}: {}",
+                reader.buffer_position(),
+                e
+            ))
+        })?;
+        match event {
+            Event::Start(ref e) if e.name().as_ref() == b"spectrum" => {
+                current_index = None;
+                for attr in e.attributes().flatten() {
+                    if attr.key.as_ref() == b"index" {
+                        if let Ok(s) = std::str::from_utf8(attr.value.as_ref()) {
+                            current_index = s.parse().ok();
+                        }
+                    }
+                }
+                current_params = IsolationCvParams::default();
+            }
+            Event::Start(ref e) if e.name().as_ref() == b"isolationWindow" => {
+                depth_in_isolation_window += 1;
+            }
+            Event::End(ref e) if e.name().as_ref() == b"isolationWindow" => {
+                depth_in_isolation_window -= 1;
+                if depth_in_isolation_window == 0 {
+                    if let Some(idx) = current_index {
+                        result.insert(idx, current_params.clone());
+                    }
+                }
+            }
+            // cvParam elements inside isolationWindow are typically
+            // self-closing (`Event::Empty`); handle the start variant
+            // too for defensive parsing. Attributes are iterated
+            // directly (no per-cvParam Vec allocation); accession is
+            // matched against the byte-literal once and the value is
+            // parsed to f64 inline. Both are captured because attribute
+            // order is not guaranteed by the mzML producer; dispatch
+            // happens after the inner loop.
+            Event::Empty(ref e) | Event::Start(ref e)
+                if depth_in_isolation_window > 0 && e.name().as_ref() == b"cvParam" =>
+            {
+                let mut accession: Option<&'static str> = None;
+                let mut value_f64: Option<f64> = None;
+                for attr in e.attributes().flatten() {
+                    match attr.key.as_ref() {
+                        b"accession" => {
+                            accession = match attr.value.as_ref() {
+                                b"MS:1000827" => Some("MS:1000827"),
+                                b"MS:1000828" => Some("MS:1000828"),
+                                b"MS:1000829" => Some("MS:1000829"),
+                                _ => None,
+                            };
+                        }
+                        b"value" => {
+                            value_f64 = std::str::from_utf8(attr.value.as_ref())
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok());
+                        }
+                        _ => {}
+                    }
+                }
+                if let (Some(acc), Some(f)) = (accession, value_f64) {
+                    match acc {
+                        "MS:1000827" => current_params.target_mz = Some(f),
+                        "MS:1000828" => current_params.lower_offset = Some(f),
+                        "MS:1000829" => current_params.upper_offset = Some(f),
+                        _ => {}
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(result)
+}
+
+/// Build an [`IsolationWindow`] for a spectrum, preferring f64 cvParam
+/// values from the pre-parsed map if available. Falls back to
+/// mzdata's f32-quantized bounds when (a) no map is provided, (b) the
+/// map has no entry for this scan index, or (c) the entry is missing
+/// the requested cvParams (e.g., older mzML converters that omit
+/// MS:1000827 / 828 / 829).
+fn make_isolation_window(
+    precursor: &mzdata::spectrum::Precursor,
+    scan_number: u32,
+    iso_cv_params: Option<&HashMap<u32, IsolationCvParams>>,
+) -> Result<Option<IsolationWindow>> {
+    let Some(ion) = precursor.ion() else {
+        // Genuinely no selected ion on this precursor (e.g. an MS1
+        // spectrum slipping through MS2 conversion). Skip without
+        // error.
+        return Ok(None);
+    };
+
+    // Per-field resolution: f64 cvParam preferred, mzdata-derived
+    // (f32 → f64 widened) value as fallback, error if neither is
+    // available. The previous 12.5 hardcoded default silently
+    // produced bogus isolation windows for mzMLs missing both
+    // MS:1000828/9 cvParams and mzdata-readable lower/upper bounds —
+    // DIA processing cannot proceed without true isolation windows,
+    // and a silent default produces results that are very hard to
+    // diagnose downstream. Better to fail fast with the scan number
+    // and a clear message.
+    let cv = iso_cv_params.and_then(|m| m.get(&scan_number));
+    let isolation = &precursor.isolation_window;
+
+    let center = cv
+        .and_then(|c| c.target_mz.filter(|&v| v > 0.0))
+        .or(if ion.mz > 0.0 { Some(ion.mz) } else { None })
+        .ok_or_else(|| {
+            OspreyError::MzmlParseError(format!(
+                "scan {}: no valid isolation-window center m/z (cvParam MS:1000827 \
+                 missing or non-positive, and mzdata ion.mz is non-positive)",
+                scan_number
+            ))
+        })?;
+
+    let lower_offset = cv
+        .and_then(|c| c.lower_offset)
+        .or(if isolation.lower_bound > 0.0 {
+            Some(center - isolation.lower_bound as f64)
+        } else {
+            None
+        })
+        .ok_or_else(|| {
+            OspreyError::MzmlParseError(format!(
+                "scan {}: no valid isolation-window lower offset (cvParam MS:1000828 \
+                 missing and mzdata lower_bound is 0)",
+                scan_number
+            ))
+        })?;
+
+    let upper_offset = cv
+        .and_then(|c| c.upper_offset)
+        .or(if isolation.upper_bound > 0.0 {
+            Some(isolation.upper_bound as f64 - center)
+        } else {
+            None
+        })
+        .ok_or_else(|| {
+            OspreyError::MzmlParseError(format!(
+                "scan {}: no valid isolation-window upper offset (cvParam MS:1000829 \
+                 missing and mzdata upper_bound is 0)",
+                scan_number
+            ))
+        })?;
+
+    Ok(Some(IsolationWindow::new(
+        center,
+        lower_offset,
+        upper_offset,
+    )))
+}
 
 /// Some mzML producers emit peaks that are not strictly ascending in m/z
 /// (observed in a HeLa Astral 3 mz DIA file: ~1 row in 1.7M had a single
@@ -75,12 +279,20 @@ pub struct MzmlReader {
     reader: MzMLReader<BufReader<File>>,
     total_spectra: Option<usize>,
     current_index: usize,
+    /// Pre-parsed f64 isolation window cvParams, keyed by spectrum
+    /// index. Overrides mzdata 0.63's f32-quantized bounds in
+    /// `convert_spectrum`. See [`read_isolation_cvparams_f64`].
+    iso_cv_params: HashMap<u32, IsolationCvParams>,
 }
 
 impl MzmlReader {
     /// Open an mzML file for reading
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        // First pass: scan the XML for isolation-window cvParams as
+        // f64. Cheap streaming pass (~5% of bytes parsed) that lets us
+        // override mzdata 0.63's f32 quantization downstream.
+        let iso_cv_params = read_isolation_cvparams_f64(&path)?;
         let file = File::open(&path).map_err(|e| {
             OspreyError::MzmlParseError(format!("Failed to open file '{}': {}", path.display(), e))
         })?;
@@ -93,6 +305,7 @@ impl MzmlReader {
             reader: mzml_reader,
             total_spectra: None, // Will be determined on first iteration
             current_index: 0,
+            iso_cv_params,
         })
     }
 
@@ -116,31 +329,18 @@ impl MzmlReader {
             scan.start_time // mzdata returns time in minutes
         });
 
-        // Get isolation window from precursor (now a Vec in mzdata 0.63)
-        let isolation_window = if let Some(precursor) = desc.precursor.first() {
-            let ion = match precursor.ion() {
-                Some(i) => i,
-                None => return Ok(None),
-            };
-            let isolation = &precursor.isolation_window;
-
-            let center = ion.mz;
-            // In mzdata 0.63, bounds are f32 directly
-            let lower_offset = if isolation.lower_bound > 0.0 {
-                center - isolation.lower_bound as f64
-            } else {
-                12.5
-            };
-            let upper_offset = if isolation.upper_bound > 0.0 {
-                isolation.upper_bound as f64 - center
-            } else {
-                12.5
-            };
-
-            IsolationWindow::new(center, lower_offset, upper_offset)
-        } else {
-            // No precursor info - skip this spectrum
-            return Ok(None);
+        // Get isolation window from precursor (now a Vec in mzdata 0.63).
+        // Routes through `make_isolation_window` so we use f64 cvParam
+        // values from the pre-parsed XML, bypassing mzdata 0.63's f32
+        // quantization. See `read_isolation_cvparams_f64`.
+        let isolation_window = match desc.precursor.first() {
+            Some(precursor) => {
+                match make_isolation_window(precursor, scan_number, Some(&self.iso_cv_params))? {
+                    Some(w) => w,
+                    None => return Ok(None), // No selected ion
+                }
+            }
+            None => return Ok(None), // No precursor info
         };
 
         // Get peaks - use the peaks() method which returns RefPeakDataLevel
@@ -333,6 +533,8 @@ impl MS1Index {
 /// Returns: (MS2 spectra, MS1 index)
 pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1Index)> {
     let path = path.as_ref();
+    // First pass: f64 isolation-window cvParams from raw XML.
+    let iso_cv_params = read_isolation_cvparams_f64(path)?;
     let file = File::open(path).map_err(|e| {
         OspreyError::MzmlParseError(format!("Failed to open file '{}': {}", path.display(), e))
     })?;
@@ -400,30 +602,18 @@ pub fn load_all_spectra<P: AsRef<Path>>(path: P) -> Result<(Vec<Spectrum>, MS1In
                 });
             }
             2 => {
-                // Process MS2 spectrum
-                // Get isolation window from precursor
-                let isolation_window = if let Some(precursor) = desc.precursor.first() {
-                    let ion = match precursor.ion() {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                    let isolation = &precursor.isolation_window;
-
-                    let center = ion.mz;
-                    let lower_offset = if isolation.lower_bound > 0.0 {
-                        center - isolation.lower_bound as f64
-                    } else {
-                        12.5
-                    };
-                    let upper_offset = if isolation.upper_bound > 0.0 {
-                        isolation.upper_bound as f64 - center
-                    } else {
-                        12.5
-                    };
-
-                    IsolationWindow::new(center, lower_offset, upper_offset)
-                } else {
-                    continue;
+                // Process MS2 spectrum.
+                // Route through `make_isolation_window` for the f64
+                // cvParam override path; see `convert_spectrum` and
+                // `read_isolation_cvparams_f64` for the rationale.
+                let isolation_window = match desc.precursor.first() {
+                    Some(precursor) => {
+                        match make_isolation_window(precursor, scan_number, Some(&iso_cv_params))? {
+                            Some(w) => w,
+                            None => continue, // No selected ion
+                        }
+                    }
+                    None => continue,
                 };
 
                 // Get peaks
@@ -652,5 +842,158 @@ mod tests {
             !did_sort,
             "length mismatch skips the sort, so did_sort = false"
         );
+    }
+
+    /// Helper: write an mzML snippet to a temp file and run the
+    /// quick-xml f64 isolation-window pre-pass on it. Each spectrum's
+    /// `index` attribute becomes the HashMap key.
+    fn parse_iso_cv(xml: &str) -> HashMap<u32, IsolationCvParams> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.mzML");
+        std::fs::write(&path, xml).unwrap();
+        read_isolation_cvparams_f64(&path).unwrap()
+    }
+
+    /// Full set of cvParams (target_mz + both offsets): all three
+    /// fields captured at full f64 precision. The literal values
+    /// chosen exceed f32 precision so a regression to f32 parsing
+    /// would surface as `.abs() < 1e-12` failing.
+    #[test]
+    fn isolation_cv_pre_pass_full_set() {
+        let xml = r#"<?xml version="1.0"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <spectrumList>
+    <spectrum index="0" id="scan=1">
+      <precursorList><precursor><isolationWindow>
+        <cvParam accession="MS:1000827" value="500.50000000012345" />
+        <cvParam accession="MS:1000828" value="12.500000000000123" />
+        <cvParam accession="MS:1000829" value="12.499999999999876" />
+      </isolationWindow></precursor></precursorList>
+    </spectrum>
+  </spectrumList>
+</mzML>"#;
+        let map = parse_iso_cv(xml);
+        let cv = map.get(&0).expect("spectrum index 0 must be present");
+        assert!((cv.target_mz.unwrap() - 500.50000000012345).abs() < 1e-12);
+        assert!((cv.lower_offset.unwrap() - 12.500000000000123).abs() < 1e-12);
+        assert!((cv.upper_offset.unwrap() - 12.499999999999876).abs() < 1e-12);
+    }
+
+    /// Only target_mz present: the other two fields stay `None` so the
+    /// downstream `make_isolation_window` falls back to mzdata's
+    /// f32-derived offsets per-field instead of the hard-coded 12.5
+    /// default.
+    #[test]
+    fn isolation_cv_pre_pass_target_only() {
+        let xml = r#"<?xml version="1.0"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <spectrumList>
+    <spectrum index="3" id="scan=4">
+      <precursorList><precursor><isolationWindow>
+        <cvParam accession="MS:1000827" value="600.25" />
+      </isolationWindow></precursor></precursorList>
+    </spectrum>
+  </spectrumList>
+</mzML>"#;
+        let map = parse_iso_cv(xml);
+        let cv = map.get(&3).expect("spectrum index 3 must be present");
+        assert_eq!(cv.target_mz, Some(600.25));
+        assert_eq!(cv.lower_offset, None);
+        assert_eq!(cv.upper_offset, None);
+    }
+
+    /// Only one offset present: target_mz and the other offset stay
+    /// `None`. Covers the partial-cvParam case that the per-field
+    /// fallback in `make_isolation_window` was added to handle.
+    #[test]
+    fn isolation_cv_pre_pass_lower_offset_only() {
+        let xml = r#"<?xml version="1.0"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <spectrumList>
+    <spectrum index="7" id="scan=8">
+      <precursorList><precursor><isolationWindow>
+        <cvParam accession="MS:1000828" value="10.0" />
+      </isolationWindow></precursor></precursorList>
+    </spectrum>
+  </spectrumList>
+</mzML>"#;
+        let map = parse_iso_cv(xml);
+        let cv = map.get(&7).expect("spectrum index 7 must be present");
+        assert_eq!(cv.target_mz, None);
+        assert_eq!(cv.lower_offset, Some(10.0));
+        assert_eq!(cv.upper_offset, None);
+    }
+
+    /// Multiple spectra in one file: each `spectrum/@index` produces
+    /// its own HashMap entry. The current_params reset on
+    /// `Event::Start(spectrum)` so an earlier spectrum's values do not
+    /// leak into the next.
+    #[test]
+    fn isolation_cv_pre_pass_multiple_spectra() {
+        let xml = r#"<?xml version="1.0"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <spectrumList>
+    <spectrum index="0" id="scan=1">
+      <precursorList><precursor><isolationWindow>
+        <cvParam accession="MS:1000827" value="500.5" />
+        <cvParam accession="MS:1000828" value="12.5" />
+        <cvParam accession="MS:1000829" value="12.5" />
+      </isolationWindow></precursor></precursorList>
+    </spectrum>
+    <spectrum index="1" id="scan=2">
+      <precursorList><precursor><isolationWindow>
+        <cvParam accession="MS:1000827" value="600.5" />
+      </isolationWindow></precursor></precursorList>
+    </spectrum>
+  </spectrumList>
+</mzML>"#;
+        let map = parse_iso_cv(xml);
+        assert_eq!(map.len(), 2);
+        let cv0 = map.get(&0).unwrap();
+        assert_eq!(cv0.target_mz, Some(500.5));
+        assert_eq!(cv0.lower_offset, Some(12.5));
+        let cv1 = map.get(&1).unwrap();
+        assert_eq!(cv1.target_mz, Some(600.5));
+        assert_eq!(cv1.lower_offset, None);
+    }
+
+    /// MS1 spectrum (no precursor / no isolationWindow) produces no
+    /// entry in the map. Verifies the depth tracking does not produce
+    /// a spurious entry when there is no isolationWindow to enter.
+    #[test]
+    fn isolation_cv_pre_pass_no_isolation_window() {
+        let xml = r#"<?xml version="1.0"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <spectrumList>
+    <spectrum index="0" id="scan=1">
+    </spectrum>
+  </spectrumList>
+</mzML>"#;
+        let map = parse_iso_cv(xml);
+        assert!(map.is_empty(), "no isolationWindow → no map entries");
+    }
+
+    /// Unknown cvParam accessions (anything outside the three we care
+    /// about) are silently ignored — they must not error out the pre-
+    /// pass and must not steal the target_mz / lower / upper slots.
+    #[test]
+    fn isolation_cv_pre_pass_ignores_unknown_cv_params() {
+        let xml = r#"<?xml version="1.0"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml">
+  <spectrumList>
+    <spectrum index="0" id="scan=1">
+      <precursorList><precursor><isolationWindow>
+        <cvParam accession="MS:1000511" value="2" />
+        <cvParam accession="MS:1000827" value="500.5" />
+        <cvParam accession="MS:9999999" value="42.0" />
+      </isolationWindow></precursor></precursorList>
+    </spectrum>
+  </spectrumList>
+</mzML>"#;
+        let map = parse_iso_cv(xml);
+        let cv = map.get(&0).unwrap();
+        assert_eq!(cv.target_mz, Some(500.5));
+        assert_eq!(cv.lower_offset, None);
+        assert_eq!(cv.upper_offset, None);
     }
 }
