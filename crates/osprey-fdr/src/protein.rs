@@ -809,8 +809,13 @@ pub fn collect_best_peptide_scores(
     );
 
     // Cross-impl bisection dump (env-var-gated, no-op in production).
-    // See crate::diagnostics::dump_best_peptide_scores for context.
-    crate::diagnostics::dump_best_peptide_scores(&best);
+    // The flag check pattern is symmetric with the stage7_winners dump
+    // callsite above; here there are no pre-dump slices to extract from a
+    // private struct, but keeping the predicate at the callsite makes the
+    // gating uniform and avoids the function call entirely when disabled.
+    if crate::diagnostics::best_peptide_scores_enabled() {
+        crate::diagnostics::dump_best_peptide_scores(&best);
+    }
 
     best
 }

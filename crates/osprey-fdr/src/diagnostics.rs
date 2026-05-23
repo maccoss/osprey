@@ -22,6 +22,13 @@ pub fn stage7_winners_enabled() -> bool {
     is_dump_enabled("OSPREY_DUMP_STAGE7_WINNERS")
 }
 
+/// Cheap predicate symmetric with [`stage7_winners_enabled`] so the
+/// `collect_best_peptide_scores` callsite can gate any pre-dump work
+/// uniformly. Mirrors the env var checked by [`dump_best_peptide_scores`].
+pub fn best_peptide_scores_enabled() -> bool {
+    is_dump_enabled("OSPREY_DUMP_BEST_PEPTIDE_SCORES")
+}
+
 /// Dump the full cumulative-FDR winners list (target + decoy together).
 ///
 /// The existing `dump_stage7_protein_fdr` (in `crates/osprey/src/diagnostics.rs`)
@@ -41,12 +48,17 @@ pub fn dump_stage7_winners(winner_scores: &[f64], winner_is_decoys: &[bool], raw
     if !is_dump_enabled("OSPREY_DUMP_STAGE7_WINNERS") {
         return;
     }
-    debug_assert_eq!(
+    // assert_eq! (not debug_assert_eq!): the dump primarily runs in
+    // release builds, and the comparisons cost nothing relative to the
+    // upcoming N-line write loop. A mismatched slice would still panic
+    // on the first out-of-bounds index, but this catches it before the
+    // file is partially written and with a clearer error.
+    assert_eq!(
         winner_scores.len(),
         winner_is_decoys.len(),
         "winner_scores and winner_is_decoys must be the same length"
     );
-    debug_assert_eq!(
+    assert_eq!(
         winner_scores.len(),
         raw_qvalues.len(),
         "winner_scores and raw_qvalues must be the same length"
@@ -80,7 +92,7 @@ pub fn dump_stage7_winners(winner_scores: &[f64], winner_is_decoys: &[bool], raw
         );
     }
     let _ = f.flush();
-    log::info!("Wrote {} ({} winners)", path, n);
+    log::info!("[DIAG] Wrote {} ({} winners)", path, n);
 }
 
 /// Dump the per-modseq aggregated best-score map from
@@ -117,5 +129,5 @@ pub fn dump_best_peptide_scores(best: &HashMap<Arc<str>, PeptideScore>) {
         );
     }
     let _ = f.flush();
-    log::info!("Wrote {} ({} peptides)", path, best.len());
+    log::info!("[DIAG] Wrote {} ({} peptides)", path, best.len());
 }

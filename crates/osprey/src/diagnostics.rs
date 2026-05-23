@@ -1292,29 +1292,6 @@ pub fn dump_stage6_protein_fdr(
     exit_if_only("OSPREY_PROTEIN_FDR_ONLY", "Stage 6 protein FDR dump");
 }
 
-/// Dump per-protein-group state at the end of second-pass picked-protein
-/// FDR (Stage 7 authoritative protein FDR) to `rust_stage7_protein_fdr.tsv`.
-/// Mirrors what the OspreySharp port of `compute_protein_fdr` emits.
-///
-/// One row per protein group present in the parsimony result. The
-/// `is_target_winner` column captures the pairwise pick outcome:
-/// `true` if the target side scored at or above the decoy side for this
-/// group (or the group has only a target side); `false` otherwise. Groups
-/// with no winner -- both sides absent because no peptide passed the
-/// gate -- are emitted with `group_qvalue = 1.0`, `best_peptide_score = NaN`,
-/// `is_target_winner = false`.
-///
-/// Sort order: `(is_target_winner DESC, group_qvalue ASC, accessions ASC)`.
-/// Targets-first keeps the calibration-relevant rows (target winners) at
-/// the top of the file; secondary keys make the diff stable. The numeric
-/// `group_id` is intentionally NOT a sort key (or a column) -- see below.
-///
-/// Columns: `accessions`, `n_unique`, `n_shared`, `best_peptide_score`,
-/// `group_qvalue`, `is_target_winner`. The numeric `group_id` is omitted
-/// because `build_protein_parsimony` assigns it in HashMap iteration order,
-/// which would inject per-run noise into a cross-impl bisection. Joining on
-/// `accessions` keeps the dump stable.
-///
 /// Dump the sorted set of detected target peptides handed to
 /// `build_protein_parsimony` for Stage 7. Mirrors the OspreySharp
 /// `WriteStage7DetectedPeptidesDump` so the protein-FDR input set can be
@@ -1345,6 +1322,29 @@ pub fn dump_stage7_detected_peptides(detected_peptides: &std::collections::HashS
     log::info!("[DIAG] Wrote {} ({} entries)", path, sorted.len());
 }
 
+/// Dump per-protein-group state at the end of second-pass picked-protein
+/// FDR (Stage 7 authoritative protein FDR) to `rust_stage7_protein_fdr.tsv`.
+/// Mirrors what the OspreySharp port of `compute_protein_fdr` emits.
+///
+/// One row per protein group present in the parsimony result. The
+/// `is_target_winner` column captures the pairwise pick outcome:
+/// `true` if the target side scored at or above the decoy side for this
+/// group (or the group has only a target side); `false` otherwise. Groups
+/// with no winner -- both sides absent because no peptide passed the
+/// gate -- are emitted with `group_qvalue = 1.0`, `best_peptide_score = NaN`,
+/// `is_target_winner = false`.
+///
+/// Sort order: `(is_target_winner DESC, group_qvalue ASC, accessions ASC)`.
+/// Targets-first keeps the calibration-relevant rows (target winners) at
+/// the top of the file; secondary keys make the diff stable. The numeric
+/// `group_id` is intentionally NOT a sort key (or a column) -- see below.
+///
+/// Columns: `accessions`, `n_unique`, `n_shared`, `best_peptide_score`,
+/// `group_qvalue`, `is_target_winner`. The numeric `group_id` is omitted
+/// because `build_protein_parsimony` assigns it in HashMap iteration order,
+/// which would inject per-run noise into a cross-impl bisection. Joining on
+/// `accessions` keeps the dump stable.
+///
 /// Gated by `OSPREY_DUMP_STAGE7_PROTEIN_FDR=1`. When
 /// `OSPREY_STAGE7_PROTEIN_FDR_ONLY=1` is also set, exits the process after
 /// writing for fast bisection cycle.
