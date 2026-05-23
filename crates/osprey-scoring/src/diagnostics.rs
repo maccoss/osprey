@@ -9,7 +9,7 @@
 //! gating convention.
 
 use crate::batch::CalibrationMatch;
-use osprey_core::diagnostics::{exit_if_only, is_dump_enabled};
+use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::LibraryEntry;
 use std::collections::HashMap;
 use std::io::Write;
@@ -53,26 +53,30 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
 
         for entry in entries {
             if let Some(m) = by_id.get(&entry.id) {
-                // Use :.17 (17 fractional digits) so f64 values round-trip
-                // exactly. Earlier :.10 was chosen "to avoid banker's vs
-                // round-half-up rounding differences between Rust and C#",
-                // but evidence shows the formatters still disagree at the
-                // 10th decimal when f64 values land near a rounding
-                // boundary. :.17 sidesteps the disagreement entirely:
-                // the underlying f64 bits are reproduced exactly.
+                // format_f64_roundtrip emits the shortest decimal that round-
+                // trips back to the same f64 bits across all magnitudes
+                // (matches Rust's ryu output and the C# port's
+                // FormatF64Roundtrip). Earlier :.10 was chosen to avoid
+                // banker's vs round-half-up rounding differences between
+                // Rust and C#, but the formatters still disagree at the 10th
+                // decimal when f64 values land near a rounding boundary;
+                // the bumped :.17 fixed-fractional alternative is not safe
+                // for very small magnitudes (1e-30 → "0.00000000000000000"
+                // truncates significant digits). The roundtrip helper is
+                // the project convention used by every other Stage 5+ dump.
                 writeln!(
                     f,
-                    "{}\t{}\t{}\t1\t{}\t{:.17}\t{:.17}\t{:.17}\t{}\t{:.17}\t{:.17}",
+                    "{}\t{}\t{}\t1\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     entry.id,
                     if entry.is_decoy { 1 } else { 0 },
                     entry.charge,
                     m.scan_number,
-                    m.measured_rt,
-                    m.correlation_score,
-                    m.libcosine_apex,
+                    format_f64_roundtrip(m.measured_rt),
+                    format_f64_roundtrip(m.correlation_score),
+                    format_f64_roundtrip(m.libcosine_apex),
                     m.top6_matched_apex,
-                    m.xcorr_score,
-                    m.signal_to_noise
+                    format_f64_roundtrip(m.xcorr_score),
+                    format_f64_roundtrip(m.signal_to_noise),
                 )
                 .ok();
                 n_matched += 1;
@@ -102,11 +106,13 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
 /// Dump per-entry LDA discriminant + q-value to `rust_lda_scores.txt`,
 /// sorted by entry_id for a stable diff against `cs_lda_scores.txt`.
 ///
-/// Uses `{:.17}` formatting so the underlying f64 round-trips exactly.
-/// Earlier `{:.10}` was chosen "to avoid banker's vs half-up rounding
-/// mismatches with C#"; in practice Rust `{:.10}` (RHE) and .NET
-/// Framework `F10` (HAFZ) still disagree by 1 in the last digit on
-/// boundary-case f64s. See the cal_match dump for the same fix.
+/// Uses `format_f64_roundtrip` (shortest decimal that round-trips back to
+/// the same f64 bits across all magnitudes). Earlier `{:.10}` was chosen
+/// "to avoid banker's vs half-up rounding mismatches with C#"; in
+/// practice Rust `{:.10}` (RHE) and .NET Framework `F10` (HAFZ) still
+/// disagree by 1 in the last digit on boundary-case f64s. The roundtrip
+/// helper sidesteps the disagreement entirely and is the project
+/// convention used by every other Stage 5+ dump.
 ///
 /// Gated by `OSPREY_DUMP_LDA_SCORES=1`. When `OSPREY_LDA_SCORES_ONLY=1`
 /// is also set, exits the process after writing.
@@ -123,11 +129,11 @@ pub fn dump_lda_scores(matches: &[CalibrationMatch]) {
             let m = &matches[i];
             writeln!(
                 f,
-                "{}\t{}\t{:.17}\t{:.17}",
+                "{}\t{}\t{}\t{}",
                 m.entry_id,
                 if m.is_decoy { 1 } else { 0 },
-                m.discriminant_score,
-                m.q_value
+                format_f64_roundtrip(m.discriminant_score),
+                format_f64_roundtrip(m.q_value),
             )
             .ok();
         }

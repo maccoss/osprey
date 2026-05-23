@@ -32,16 +32,34 @@ pub fn stage7_winners_enabled() -> bool {
 ///
 /// Gated by `OSPREY_DUMP_STAGE7_WINNERS=1`. Caller passes the per-winner
 /// arrays in sort order so the dump's `rank` column matches the order
-/// driving the sweep. Use [`stage7_winners_enabled`] to short-circuit
-/// the slice construction in the disabled-dump (production) path.
-pub fn dump_stage7_winners(
-    winner_scores: &[f64],
-    winner_is_decoys: &[bool],
-    raw_qvalues: &[f64],
-    monotonic_qvalues: &[f64],
-) {
+/// driving the sweep. Monotonic q-values are recomputed here from
+/// `raw_qvalues` (same backward sweep as `compute_protein_fdr`'s Step 4)
+/// so the algorithm does not need to store them on the disabled-dump
+/// (production) path. Use [`stage7_winners_enabled`] to short-circuit
+/// the per-winner slice construction at the caller.
+pub fn dump_stage7_winners(winner_scores: &[f64], winner_is_decoys: &[bool], raw_qvalues: &[f64]) {
     if !is_dump_enabled("OSPREY_DUMP_STAGE7_WINNERS") {
         return;
+    }
+    debug_assert_eq!(
+        winner_scores.len(),
+        winner_is_decoys.len(),
+        "winner_scores and winner_is_decoys must be the same length"
+    );
+    debug_assert_eq!(
+        winner_scores.len(),
+        raw_qvalues.len(),
+        "winner_scores and raw_qvalues must be the same length"
+    );
+    // Recompute monotonic_qvalues via the same backward sweep used by
+    // compute_protein_fdr's Step 4. Doing it here means the algorithm
+    // does not allocate this vec when the dump is disabled.
+    let n = winner_scores.len();
+    let mut monotonic_qvalues = vec![1.0f64; n];
+    let mut min_q = 1.0f64;
+    for i in (0..n).rev() {
+        min_q = min_q.min(raw_qvalues[i]);
+        monotonic_qvalues[i] = min_q;
     }
     let path = "rust_stage7_winners.tsv";
     let Ok(file) = std::fs::File::create(path) else {
@@ -50,7 +68,7 @@ pub fn dump_stage7_winners(
     };
     let mut f = std::io::BufWriter::with_capacity(8 << 20, file);
     let _ = writeln!(f, "rank\tscore\tis_decoy\traw_qvalue\tmonotonic_qvalue");
-    for i in 0..winner_scores.len() {
+    for i in 0..n {
         let _ = writeln!(
             f,
             "{}\t{}\t{}\t{}\t{}",
@@ -62,7 +80,7 @@ pub fn dump_stage7_winners(
         );
     }
     let _ = f.flush();
-    log::info!("Wrote {} ({} winners)", path, winner_scores.len());
+    log::info!("Wrote {} ({} winners)", path, n);
 }
 
 /// Dump the per-modseq aggregated best-score map from
