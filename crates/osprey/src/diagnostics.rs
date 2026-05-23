@@ -1315,6 +1315,32 @@ pub fn dump_stage6_protein_fdr(
 /// which would inject per-run noise into a cross-impl bisection. Joining on
 /// `accessions` keeps the dump stable.
 ///
+/// Dump the sorted set of detected target peptides handed to
+/// `build_protein_parsimony` for Stage 7. Mirrors the OspreySharp
+/// `WriteStage7DetectedPeptidesDump` so the protein-FDR input set can be
+/// diffed cross-impl before debugging downstream divergence.
+///
+/// Gated by `OSPREY_DUMP_DETECTED_PEPTIDES=1`.
+pub fn dump_stage7_detected_peptides(detected_peptides: &std::collections::HashSet<String>) {
+    if !is_dump_enabled("OSPREY_DUMP_DETECTED_PEPTIDES") {
+        return;
+    }
+    let mut sorted: Vec<&String> = detected_peptides.iter().collect();
+    sorted.sort();
+    let path = "rust_stage7_detected_peptides.txt";
+    let body: String = sorted
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    if std::fs::write(path, body).is_ok() {
+        log::info!("[DIAG] Wrote {} ({} entries)", path, sorted.len());
+    } else {
+        log::warn!("Could not create {}", path);
+    }
+}
+
 /// Gated by `OSPREY_DUMP_STAGE7_PROTEIN_FDR=1`. When
 /// `OSPREY_STAGE7_PROTEIN_FDR_ONLY=1` is also set, exits the process after
 /// writing for fast bisection cycle.
