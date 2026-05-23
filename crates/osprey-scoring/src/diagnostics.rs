@@ -9,7 +9,7 @@
 //! gating convention.
 
 use crate::batch::CalibrationMatch;
-use osprey_core::diagnostics::{exit_if_only, is_dump_enabled};
+use osprey_core::diagnostics::{exit_if_only, format_f64_roundtrip, is_dump_enabled};
 use osprey_core::LibraryEntry;
 use std::collections::HashMap;
 use std::io::Write;
@@ -53,21 +53,28 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
 
         for entry in entries {
             if let Some(m) = by_id.get(&entry.id) {
-                // Use :.10 everywhere so we don't hit banker's vs round-
-                // half-up rounding differences between Rust and C#.
+                // format_f64_roundtrip emits the shortest decimal that
+                // round-trips back to the same f64 bits across all
+                // magnitudes; this matches Rust's ryu output and the C#
+                // port's `Diagnostics.FormatF64Roundtrip` helper. Earlier
+                // `{:.10}` here truncated below f64 precision and the next
+                // attempt of `{:.17}` fixed-fractional loses significant
+                // digits at very small magnitudes (1e-30 →
+                // "0.00000000000000000"). The roundtrip helper is the
+                // project convention used by every other Stage 5+ dump.
                 writeln!(
                     f,
-                    "{}\t{}\t{}\t1\t{}\t{:.10}\t{:.10}\t{:.10}\t{}\t{:.10}\t{:.10}",
+                    "{}\t{}\t{}\t1\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     entry.id,
                     if entry.is_decoy { 1 } else { 0 },
                     entry.charge,
                     m.scan_number,
-                    m.measured_rt,
-                    m.correlation_score,
-                    m.libcosine_apex,
+                    format_f64_roundtrip(m.measured_rt),
+                    format_f64_roundtrip(m.correlation_score),
+                    format_f64_roundtrip(m.libcosine_apex),
                     m.top6_matched_apex,
-                    m.xcorr_score,
-                    m.signal_to_noise
+                    format_f64_roundtrip(m.xcorr_score),
+                    format_f64_roundtrip(m.signal_to_noise),
                 )
                 .ok();
                 n_matched += 1;
@@ -97,8 +104,11 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
 /// Dump per-entry LDA discriminant + q-value to `rust_lda_scores.txt`,
 /// sorted by entry_id for a stable diff against `cs_lda_scores.txt`.
 ///
-/// Uses `{:.10}` formatting to avoid banker's-vs-half-up text rounding
-/// mismatches with C#.
+/// Uses `format_f64_roundtrip` (shortest decimal that round-trips back to
+/// the same f64 bits across all magnitudes; matches Rust's ryu output
+/// and the C# port's `Diagnostics.FormatF64Roundtrip` helper). Earlier
+/// `{:.10}` truncated below f64 precision; the roundtrip helper is the
+/// project convention used by every other Stage 5+ dump.
 ///
 /// Gated by `OSPREY_DUMP_LDA_SCORES=1`. When `OSPREY_LDA_SCORES_ONLY=1`
 /// is also set, exits the process after writing.
@@ -115,11 +125,11 @@ pub fn dump_lda_scores(matches: &[CalibrationMatch]) {
             let m = &matches[i];
             writeln!(
                 f,
-                "{}\t{}\t{:.10}\t{:.10}",
+                "{}\t{}\t{}\t{}",
                 m.entry_id,
                 if m.is_decoy { 1 } else { 0 },
-                m.discriminant_score,
-                m.q_value
+                format_f64_roundtrip(m.discriminant_score),
+                format_f64_roundtrip(m.q_value),
             )
             .ok();
         }

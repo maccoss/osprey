@@ -525,6 +525,16 @@ pub fn compute_protein_fdr(
         }
     }
 
+    // Cross-impl bisection dump (env-var-gated, no-op in production).
+    // The flag check short-circuits both the per-winner slice extraction
+    // and the dump's own monotonic_qvalues recomputation; in the
+    // disabled-dump path this whole block is one env-var lookup.
+    if crate::diagnostics::stage7_winners_enabled() {
+        let winner_scores: Vec<f64> = winners.iter().map(|w| w.score).collect();
+        let winner_is_decoys: Vec<bool> = winners.iter().map(|w| w.is_decoy).collect();
+        crate::diagnostics::dump_stage7_winners(&winner_scores, &winner_is_decoys, &raw_qvalues);
+    }
+
     // Step 5: Propagate to peptides. Each peptide's protein q-value is the best
     // (lowest) across protein groups it belongs to. Peptides belonging only to
     // groups that lost the pair (decoy won, or had no winner) get q = 1.0.
@@ -797,6 +807,15 @@ pub fn collect_best_peptide_scores(
         n_target,
         n_decoy,
     );
+
+    // Cross-impl bisection dump (env-var-gated, no-op in production).
+    // The flag check pattern is symmetric with the stage7_winners dump
+    // callsite above; here there are no pre-dump slices to extract from a
+    // private struct, but keeping the predicate at the callsite makes the
+    // gating uniform and avoids the function call entirely when disabled.
+    if crate::diagnostics::best_peptide_scores_enabled() {
+        crate::diagnostics::dump_best_peptide_scores(&best);
+    }
 
     best
 }

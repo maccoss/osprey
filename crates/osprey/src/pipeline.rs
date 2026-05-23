@@ -4838,6 +4838,8 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             .map(|e| e.modified_sequence.to_string())
             .collect();
 
+        crate::diagnostics::dump_stage7_detected_peptides(&detected_peptides);
+
         let parsimony = protein::build_protein_parsimony(
             &library,
             config.shared_peptides,

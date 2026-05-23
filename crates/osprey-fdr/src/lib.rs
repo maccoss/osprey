@@ -7,6 +7,7 @@
 //! - Run-level and experiment-level FDR
 //! - Integration with mokapot for semi-supervised learning (optional)
 
+pub mod diagnostics;
 pub mod mokapot;
 pub mod percolator;
 pub mod protein;

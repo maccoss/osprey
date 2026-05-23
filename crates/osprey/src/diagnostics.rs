@@ -1292,6 +1292,36 @@ pub fn dump_stage6_protein_fdr(
     exit_if_only("OSPREY_PROTEIN_FDR_ONLY", "Stage 6 protein FDR dump");
 }
 
+/// Dump the sorted set of detected target peptides handed to
+/// `build_protein_parsimony` for Stage 7. Mirrors the OspreySharp
+/// `WriteStage7DetectedPeptidesDump` so the protein-FDR input set can be
+/// diffed cross-impl before debugging downstream divergence.
+///
+/// Gated by `OSPREY_DUMP_DETECTED_PEPTIDES=1`. Streams via `BufWriter` so
+/// peak memory stays bounded on large datasets (the sorted Vec of
+/// references is the only working set beyond the input HashSet).
+pub fn dump_stage7_detected_peptides(detected_peptides: &std::collections::HashSet<String>) {
+    if !is_dump_enabled("OSPREY_DUMP_DETECTED_PEPTIDES") {
+        return;
+    }
+    let mut sorted: Vec<&String> = detected_peptides.iter().collect();
+    sorted.sort();
+    let path = "rust_stage7_detected_peptides.txt";
+    let Ok(file) = std::fs::File::create(path) else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+    let mut f = std::io::BufWriter::with_capacity(8 << 20, file);
+    for s in &sorted {
+        if writeln!(f, "{}", s).is_err() {
+            log::warn!("Failed writing {}", path);
+            return;
+        }
+    }
+    let _ = f.flush();
+    log::info!("[DIAG] Wrote {} ({} entries)", path, sorted.len());
+}
+
 /// Dump per-protein-group state at the end of second-pass picked-protein
 /// FDR (Stage 7 authoritative protein FDR) to `rust_stage7_protein_fdr.tsv`.
 /// Mirrors what the OspreySharp port of `compute_protein_fdr` emits.
