@@ -3004,11 +3004,23 @@ pub(crate) fn rescore_per_file_loop(
             .cloned()
             .collect();
 
-        // Build gap-fill library subset (targets + decoys, separate from re-scoring)
+        // Build gap-fill library subset (targets only, separate from re-scoring).
+        //
+        // Decoys are intentionally excluded from gap-fill: forcing a random
+        // decoy sequence to be scored at the target's consensus RT has no
+        // biological basis (decoys are not expected to co-elute with their
+        // paired target), and the 1st-pass parquet already has a score for
+        // every decoy at its own natural-but-best peak. Gap-filling decoys
+        // also re-scored them at consensus RT and APPENDED a second parquet
+        // row alongside the existing 1st-pass row, producing exact-duplicate
+        // rows (same entry_id + charge + scan_number) in the reconciled
+        // parquet. Those duplicates then cascaded into different max-per-
+        // modseq aggregations cross-impl and a 1.1e-4 group_qvalue drift on
+        // Astral 3-file. Targets are still gap-filled because they were
+        // missing from this file by definition (no pre-existing row).
         let mut gap_fill_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for gf in &gap_fill_targets {
             gap_fill_ids.insert(gf.target_entry_id);
-            gap_fill_ids.insert(gf.decoy_entry_id);
         }
         let gap_fill_library: Vec<LibraryEntry> = if !gap_fill_ids.is_empty() {
             library
@@ -3133,19 +3145,13 @@ pub(crate) fn rescore_per_file_loop(
             let mut forced_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
             let mut forced_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for gf in &gap_fill_targets {
-                // Add target if CWT missed it
+                // Add target if CWT missed it. Decoys are intentionally
+                // excluded from gap-fill (see gap_fill_ids build above).
                 if !cwt_hit_ids.contains(&gf.target_entry_id) {
                     let start = gf.expected_rt - gf.half_width;
                     let end = gf.expected_rt + gf.half_width;
                     forced_overrides.insert(gf.target_entry_id, (gf.expected_rt, start, end));
                     forced_ids.insert(gf.target_entry_id);
-                }
-                // Add decoy if CWT missed it
-                if !cwt_hit_ids.contains(&gf.decoy_entry_id) {
-                    let start = gf.expected_rt - gf.half_width;
-                    let end = gf.expected_rt + gf.half_width;
-                    forced_overrides.insert(gf.decoy_entry_id, (gf.expected_rt, start, end));
-                    forced_ids.insert(gf.decoy_entry_id);
                 }
             }
 
