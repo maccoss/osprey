@@ -150,17 +150,20 @@ impl<'a> Formatter for RoundtripPrettyFormatter<'a> {
 /// `--join-at-pass=2` merge node can validate (its
 /// `reconciliation_parameter_hash` is computed over all parquets it
 /// receives), the worker uses this list to compute the same multi-stem
-/// hash the original join used. v1 files (no `file_stems`) deserialize
-/// with an empty list; the worker will then fall back to its own
-/// `config.input_files` stems, preserving v1 behavior.
+/// hash the original join used. v1 files (no `file_stems` field) are
+/// rejected at deserialization — re-run the first-join phase to
+/// regenerate a v2 envelope. The pipeline is not in active production
+/// use, so backward compat is not maintained; v1 acceptance previously
+/// silently fell back to a single-stem hash that the merge node would
+/// reject anyway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReconciliationFile {
-    /// Sorted list of file stems that participated in the first-join phase.
-    /// `#[serde(default)]` deserializes v1 files (which omit this field) as
-    /// an empty list; the worker code falls back to `config.input_files`
-    /// stems in that case for backward compatibility.
-    #[serde(default)]
+    /// Sorted list of file stems that participated in the first-join
+    /// phase. Required (no `#[serde(default)]`): a missing field
+    /// triggers a serde deserialization error so legacy v1 envelopes
+    /// are rejected at parse time with a clear error rather than
+    /// silently falling back to single-stem hashes.
     pub file_stems: Vec<String>,
     pub forced_integration_actions: Vec<ForcedIntegrationEntry>,
     pub format_version: u32,
@@ -599,8 +602,11 @@ mod tests {
         let path = dir.path().join("bad_version.reconciliation.json");
         // Hand-craft a file with an out-of-range format_version. Field
         // order matches the alphabetical struct declaration so the
-        // reader doesn't trip over deny_unknown_fields.
+        // reader doesn't trip over deny_unknown_fields. file_stems is
+        // present (non-default) so serde parse succeeds and the runtime
+        // format_version check fires.
         let bad = r#"{
+  "file_stems": ["a", "b"],
   "forced_integration_actions": [],
   "format_version": 99,
   "gap_fill_targets": [],
@@ -613,5 +619,32 @@ mod tests {
         std::fs::write(&path, bad).unwrap();
         let err = read_reconciliation_file(&path).unwrap_err().to_string();
         assert!(err.contains("unsupported format_version"), "got: {}", err);
+    }
+
+    /// v1 envelopes (no `file_stems` field) are rejected at parse time:
+    /// the missing-field serde error fires before the runtime
+    /// `format_version` check. This locks in the cross-impl alignment
+    /// with OspreySharp which also hard-rejects v1.
+    #[test]
+    fn reconciliation_file_v1_envelope_rejected_at_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.reconciliation.json");
+        let v1 = r#"{
+  "forced_integration_actions": [],
+  "format_version": 1,
+  "gap_fill_targets": [],
+  "library_hash": "x",
+  "refined_rt_calibration": null,
+  "search_hash": "y",
+  "use_cwt_peak_actions": []
+}
+"#;
+        std::fs::write(&path, v1).unwrap();
+        let err = read_reconciliation_file(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("missing field `file_stems`"),
+            "expected v1 rejection at serde parse, got: {}",
+            err
+        );
     }
 }

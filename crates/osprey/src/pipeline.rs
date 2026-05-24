@@ -344,24 +344,24 @@ fn build_scores_metadata(config: &OspreyConfig) -> Vec<parquet::file::metadata::
 /// Build the reconciled-parquet metadata key-value block.
 ///
 /// `file_stems_override`: the source of truth for the reconciliation
-/// hash. Passing `Some(non_empty_slice)` uses
+/// hash. Pass a non-empty slice to use
 /// [`OspreyConfig::reconciliation_parameter_hash_for_stems`] with the
-/// given stems; passing `None` OR `Some(&[])` falls back to
+/// given stems; pass an empty slice (`&[]`) to fall back to
 /// `config.input_files`-derived stems via
 /// [`OspreyConfig::reconciliation_parameter_hash`]. The per-file
 /// rescore worker (`--join-at-pass=1 --no-join`) passes the
 /// file_stems list from reconciliation.json so the hash it writes
 /// matches the multi-file hash the downstream `--join-at-pass=2`
-/// merge node will compute. The in-process pipeline path may pass
-/// either `None` or `Some(&[])` — both fall back to
-/// `config.input_files`, which already reflects the full set.
+/// merge node will compute. The in-process pipeline path passes
+/// `&[]` because `config.input_files` already reflects the full set.
 fn build_reconciled_metadata(
     config: &OspreyConfig,
-    file_stems_override: Option<&[String]>,
+    file_stems_override: &[String],
 ) -> Vec<parquet::file::metadata::KeyValue> {
-    let recon_hash = match file_stems_override {
-        Some(stems) if !stems.is_empty() => config.reconciliation_parameter_hash_for_stems(stems),
-        _ => config.reconciliation_parameter_hash(),
+    let recon_hash = if !file_stems_override.is_empty() {
+        config.reconciliation_parameter_hash_for_stems(file_stems_override)
+    } else {
+        config.reconciliation_parameter_hash()
     };
     vec![
         parquet::file::metadata::KeyValue {
@@ -3330,7 +3330,7 @@ pub(crate) fn rescore_per_file_loop(
                         }
                     }
                     // Write back to Parquet with reconciliation metadata
-                    let recon_metadata = build_reconciled_metadata(config, Some(join_file_stems));
+                    let recon_metadata = build_reconciled_metadata(config, join_file_stems);
                     let codec = parquet_compression_codec(config.parquet_compression);
                     if let Err(e) = write_scores_parquet_with_metadata(
                         cache_path,
@@ -3350,7 +3350,7 @@ pub(crate) fn rescore_per_file_loop(
             let scores_path = per_file_cache_paths.get(file_name.as_str());
             if let Some(cache_path) = scores_path {
                 if let Ok(full_entries) = load_scores_parquet(cache_path) {
-                    let recon_metadata = build_reconciled_metadata(config, Some(join_file_stems));
+                    let recon_metadata = build_reconciled_metadata(config, join_file_stems);
                     let codec = parquet_compression_codec(config.parquet_compression);
                     if let Err(e) = write_scores_parquet_with_metadata(
                         cache_path,
@@ -4549,6 +4549,18 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 "2nd-pass",
                 2,
             );
+
+            // Record the stage5 wall time for this missing-sidecar path
+            // so perf comparisons see the work done here. The matching
+            // marker in the in-process reconciliation branch fires
+            // unconditionally; without this marker, --join-at-pass=2
+            // runs that hit the missing-sidecar Percolator would
+            // silently omit stage5 from the timing report.
+            log::info!(
+                "[STAGE-WALL] stage5: {:.1}s",
+                stage_marker.elapsed().as_secs_f64()
+            );
+            stage_marker = std::time::Instant::now();
         }
     }
 

@@ -142,14 +142,11 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
     // file's envelope must declare the same join file_stems (all came
     // from the same first-join run). Used downstream to compute the
     // reconciliation hash the worker stamps into the reconciled parquet's
-    // metadata. `Option` (not `Vec`) so the consistency check fires on
-    // every envelope past the first regardless of whether the recorded
-    // stems are empty (v1 legacy) or populated (v2). Without the Option
-    // wrapper, mixing v1 (empty) + v2 (populated) envelopes silently
-    // accepted by overwriting `join_file_stems` on first non-empty
-    // v2 and then gating the mismatch check on
-    // `!envelope.file_stems.is_empty()`.
-    let mut join_file_stems: Option<Vec<String>> = None;
+    // metadata. v1 envelopes (no file_stems field) are rejected at parse
+    // time by serde, and every v2 envelope has a non-empty stems list,
+    // so an `is_empty()` initial check unambiguously identifies the
+    // first envelope.
+    let mut join_file_stems: Vec<String> = Vec::new();
 
     for parquet_path in parquet_paths {
         // The parquet stem (with `.scores` stripped) is the canonical
@@ -203,36 +200,38 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
             ))
         })?;
 
-        // Capture the join file_stems from the first envelope. Every
-        // file's envelope must declare the same list (they all came
-        // from the same first-join phase). Validate consistency file-
-        // to-file -- including v1-vs-v2 mixing, which is detected
-        // because v1 envelopes have an empty `file_stems` and v2 have
-        // a populated one; the equality check below treats the two as
-        // a mismatch and fails loudly. An all-v1 set is consistent
-        // (every envelope is empty) and stays empty; an all-v2 set is
-        // consistent (every envelope has the same populated list).
+        // Reject any envelope whose format_version is not 2. v1
+        // envelopes (no file_stems) already fail at serde
+        // deserialization; this check covers a manually-constructed
+        // file with format_version != 2 + file_stems present.
+        if envelope.format_version != 2 {
+            return Err(OspreyError::config(format!(
+                "hydrate_for_rescore: reconciliation.json {} has format_version {} \
+                 (expected 2); re-run the first-join phase to regenerate the envelope.",
+                recon_path.display(),
+                envelope.format_version,
+            )));
+        }
+        // Capture the join file_stems from the first envelope and
+        // require every subsequent envelope to declare the same set
+        // (they all came from the same first-join phase). With v1
+        // rejected at parse time, every envelope here has a populated
+        // file_stems list, so an `is_empty()` check unambiguously
+        // identifies the first envelope.
         let mut these = envelope.file_stems.clone();
         these.sort();
         these.dedup();
-        match &join_file_stems {
-            None => {
-                join_file_stems = Some(these);
-            }
-            Some(expected) => {
-                if &these != expected {
-                    return Err(OspreyError::config(format!(
-                        "hydrate_for_rescore: reconciliation.json file_stems mismatch — {} \
-                         declares {:?}, expected {:?} (boundary files from different first-join \
-                         runs cannot be mixed in one rescore worker invocation; v1 envelopes \
-                         with empty file_stems cannot be mixed with v2 envelopes with populated \
-                         file_stems).",
-                        recon_path.display(),
-                        these,
-                        expected,
-                    )));
-                }
-            }
+        if join_file_stems.is_empty() {
+            join_file_stems = these;
+        } else if these != join_file_stems {
+            return Err(OspreyError::config(format!(
+                "hydrate_for_rescore: reconciliation.json file_stems mismatch — {} \
+                 declares {:?}, expected {:?} (boundary files from different first-join \
+                 runs cannot be mixed in one rescore worker invocation).",
+                recon_path.display(),
+                these,
+                join_file_stems,
+            )));
         }
 
         // 3a. Build entry_id → vec_idx map from the loaded stubs so the
@@ -354,11 +353,7 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
         refined_calibrations,
         per_file_gap_fill,
         seq_interner,
-        // unwrap_or_default: empty Vec when every envelope was v1
-        // (legacy / no file_stems declared). Downstream
-        // reconciliation_parameter_hash_for_stems uses config.input_files
-        // as the fallback in that case.
-        join_file_stems: join_file_stems.unwrap_or_default(),
+        join_file_stems,
     })
 }
 
@@ -534,28 +529,22 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         // straight-through in-process pipeline. The base_ids come from
         // the pre-compaction `per_file_entries` keyed by (file_name, idx)
         // in `reconciliation_actions_pre`.
-        {
-            let entries_by_name: HashMap<&str, &Vec<FdrEntry>> = per_file_entries
-                .iter()
-                .map(|(name, entries)| (name.as_str(), entries))
-                .collect();
-            for ((file_name, idx), _action) in reconciliation_actions_pre.iter() {
-                if let Some(entries) = entries_by_name.get(file_name.as_str()) {
-                    if let Some(e) = entries.get(*idx) {
-                        first_pass_base_ids.insert(e.entry_id & 0x7FFF_FFFF);
-                    }
+        let entries_by_name: HashMap<&str, &Vec<FdrEntry>> = per_file_entries
+            .iter()
+            .map(|(name, entries)| (name.as_str(), entries))
+            .collect();
+        for (file_name, idx) in reconciliation_actions_pre.keys() {
+            if let Some(entries) = entries_by_name.get(file_name.as_str()) {
+                if let Some(e) = entries.get(*idx) {
+                    first_pass_base_ids.insert(e.entry_id & 0x7FFF_FFFF);
                 }
             }
         }
 
         // Save (file, entry_id) → action before per_file_entries shrinks
-        // so we can rebuild (file, new_vec_idx) → action below. Use a
-        // file_name → entries lookup map so the per-action lookup is O(1)
-        // instead of O(num_files) on the inner find().
-        let entries_by_name: HashMap<&str, &Vec<FdrEntry>> = per_file_entries
-            .iter()
-            .map(|(name, entries)| (name.as_str(), entries))
-            .collect();
+        // so we can rebuild (file, new_vec_idx) → action below. Reuses
+        // the entries_by_name map built above so per-action lookup is
+        // O(1) instead of O(num_files) on an inner find().
         let mut actions_by_id: HashMap<(String, u32), ReconcileAction> =
             HashMap::with_capacity(reconciliation_actions_pre.len());
         for ((file_name, idx), action) in reconciliation_actions_pre.drain() {
