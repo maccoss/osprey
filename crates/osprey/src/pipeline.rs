@@ -2979,7 +2979,7 @@ pub(crate) fn rescore_per_file_loop(
         );
         log::debug!(
             "  {} entries ({} consensus, {} reconciliation, {} gap-fill, {} unique after dedup)",
-            all_targets.len() + n_gap_fill * 2,
+            all_targets.len() + n_gap_fill,
             n_multi_charge,
             n_inter_replicate,
             n_gap_fill,
