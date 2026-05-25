@@ -3006,7 +3006,7 @@ pub(crate) fn rescore_per_file_loop(
         );
         log::debug!(
             "  {} entries ({} consensus, {} reconciliation, {} gap-fill, {} unique after dedup)",
-            all_targets.len() + n_gap_fill * 2,
+            all_targets.len() + n_gap_fill,
             n_multi_charge,
             n_inter_replicate,
             n_gap_fill,
@@ -3031,11 +3031,19 @@ pub(crate) fn rescore_per_file_loop(
             .cloned()
             .collect();
 
-        // Build gap-fill library subset (targets + decoys, separate from re-scoring)
+        // Build gap-fill library subset (targets only, separate from re-scoring).
+        //
+        // Decoys are intentionally excluded from gap-fill: every decoy
+        // already has a 1st-pass parquet row at its own best peak, and
+        // re-scoring at the target's consensus RT both lacks biological
+        // basis and would APPEND a duplicate row (same entry_id + charge
+        // + scan_number) that breaks max-per-modseq aggregation downstream.
+        // Targets are still gap-filled because they are by definition
+        // missing from this file. See PR description for the cross-impl
+        // q-value-drift diagnosis that motivated this fix.
         let mut gap_fill_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for gf in &gap_fill_targets {
             gap_fill_ids.insert(gf.target_entry_id);
-            gap_fill_ids.insert(gf.decoy_entry_id);
         }
         let gap_fill_library: Vec<LibraryEntry> = if !gap_fill_ids.is_empty() {
             library
@@ -3187,19 +3195,13 @@ pub(crate) fn rescore_per_file_loop(
             let mut forced_overrides: HashMap<u32, (f64, f64, f64)> = HashMap::new();
             let mut forced_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for gf in &gap_fill_targets {
-                // Add target if CWT missed it
+                // Add target if CWT missed it. Decoys are intentionally
+                // excluded from gap-fill (see gap_fill_ids build above).
                 if !cwt_hit_ids.contains(&gf.target_entry_id) {
                     let start = gf.expected_rt - gf.half_width;
                     let end = gf.expected_rt + gf.half_width;
                     forced_overrides.insert(gf.target_entry_id, (gf.expected_rt, start, end));
                     forced_ids.insert(gf.target_entry_id);
-                }
-                // Add decoy if CWT missed it
-                if !cwt_hit_ids.contains(&gf.decoy_entry_id) {
-                    let start = gf.expected_rt - gf.half_width;
-                    let end = gf.expected_rt + gf.half_width;
-                    forced_overrides.insert(gf.decoy_entry_id, (gf.expected_rt, start, end));
-                    forced_ids.insert(gf.decoy_entry_id);
                 }
             }
 

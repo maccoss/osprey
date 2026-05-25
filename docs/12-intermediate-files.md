@@ -380,7 +380,7 @@ The Rust `serde_json` dependency must be built with the `float_roundtrip` featur
 |---|---|
 | `forced_integration_actions` | Reconciliation actions of type `ForcedIntegration` (the planner found no overlapping CWT candidate, so the worker integrates at the expected RT ± half-width). |
 | `use_cwt_peak_actions` | Reconciliation actions of type `UseCwtPeak` (the worker switches to alternate stored CWT candidate `candidate_idx` whose apex is closer to the consensus RT). |
-| `gap_fill_targets` | Precursors that passed FDR in a sibling replicate but missed in this file. The worker integrates at `expected_rt ± half_width` to recover the missing detection plus its paired decoy. |
+| `gap_fill_targets` | Precursors that passed FDR in a sibling replicate but missed in this file. The worker integrates the target at `expected_rt ± half_width` to recover the missing detection. Decoys are not gap-filled (each decoy already has a 1st-pass row at its own natural best peak; re-scoring at consensus RT would APPEND a duplicate row keyed on the same entry_id + charge + scan_number). |
 | `refined_rt_calibration` | LOESS refit on consensus peptides (or `null` if the refit failed for this file — falls back to the original first-pass calibration). The worker reconstructs an `RTCalibration` via `RTCalibration::from_model_params`. |
 | `search_hash` / `library_hash` | The same hashes stored in the parquet footer; the worker validates these match the per-file parquet before proceeding. |
 
