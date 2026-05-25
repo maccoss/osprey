@@ -1096,8 +1096,10 @@ fn run_calibration_discovery_windowed(
                     // Overwrite the LOESS input dump with pass 2's points
                     // so the diagnostic reflects the calibration actually
                     // used. C# overwrites unconditionally on pass 2; Rust
-                    // previously only wrote pass 1 (line 1000), leaving
-                    // ~960 entries unreported here on Stellar Single.
+                    // previously only wrote pass 1 (the initial
+                    // `dump_loess_input` call earlier in this function),
+                    // leaving ~960 entries unreported here on Stellar
+                    // Single.
                     crate::diagnostics::dump_loess_input(&refined_lib_rts, &refined_meas_rts);
 
                     // Re-collect mass errors from refined matches
