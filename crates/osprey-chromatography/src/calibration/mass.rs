@@ -109,29 +109,45 @@ fn calculate_single_calibration(errors: &[f64], unit: ToleranceUnit) -> MzCalibr
         };
     }
 
-    // Welford-Knuth online mean + variance.
+    // Naive sum/n with consistent left-to-right accumulation.
     //
-    // The naive `sum / n` formulation lets the running sum drift up to
-    // magnitude ~|n * mean|; for the MS2 calibration on Astral 3-file
-    // that reaches ~4000 (18,245 errors × ~-0.22 ppm), where f64 ULP is
-    // ~5e-13 — enough to produce a 1-ULP cross-impl drift in the
-    // computed mean and cascade through the calibration into
-    // `mass_accuracy_deviation_mean` features and the SVM training that
-    // depends on them. Welford's running mean keeps the accumulator
-    // bounded near the true mean (~0.22 magnitude, ULP ~2e-17), giving
-    // ~10,000× more headroom; the variance accumulator `m2` uses the
-    // companion `(x - mean_prev) * (x - mean_new)` formulation to stay
-    // bit-deterministic for a given input sequence. Mirrors Skyline's
-    // running-mean pattern (e.g. `NextGenFeatureCalc.MassErrorCalc`).
-    let mut mean = 0.0f64;
-    let mut m2 = 0.0f64;
-    for (i, &x) in errors.iter().enumerate() {
-        let n_f = (i + 1) as f64;
-        let delta = x - mean;
-        mean += delta / n_f;
-        let delta2 = x - mean;
-        m2 += delta * delta2;
+    // For ppm mass-error inputs the running sum stays well below the
+    // f64 precision wall: Astral 3-file MS2 worst case is ~18 k errors
+    // × ~0.22 ppm mean → sum magnitude ~4 000, where f64 ULP is ~5e-13.
+    // With ~16 significant digits available, sum/n preserves the mean
+    // to ~9 digits — far more headroom than the 1e-9 cross-impl gate.
+    //
+    // The caller (pipeline.rs `run_calibration_discovery_windowed`)
+    // sorts `passing_targets` by `(base_id, entry_id)` before pushing
+    // mass errors into `MzQCData`, so the iteration order here is
+    // deterministic AND matches the C# OspreySharp `matchArray` order
+    // by construction. With deterministic order and IEEE 754 strict
+    // (Rust default — no `-ffast-math`, no associative re-ordering),
+    // LLVM cannot vectorise the dependent reduction `sum = sum + x`,
+    // so the loop stays serial-scalar and bit-equal to the C# mirror
+    // which is similarly constrained by .NET's default IEEE 754 mode.
+    //
+    // The earlier Welford-Knuth formulation worked but cost ~21 s on
+    // Stellar Rust stage1to4 because its 4-op-per-element recurrence
+    // (mean update + m2 update) replaced what is fundamentally a
+    // 1-op-per-element reduction. Welford's stability advantage was
+    // unnecessary given the ppm magnitudes involved.
+    let mut sum = 0.0f64;
+    for &x in errors {
+        sum += x;
     }
+    let mean = sum / errors.len() as f64;
+
+    // Sample variance via the same one-pass-then-reduce pattern: take
+    // a second left-to-right walk over (x - mean)^2 contributions.
+    // Two passes total still vectorise to fewer ops than Welford's
+    // single-pass 4-op recurrence.
+    let mut sum_sq_dev = 0.0f64;
+    for &x in errors {
+        let d = x - mean;
+        sum_sq_dev += d * d;
+    }
+    let m2 = sum_sq_dev;
 
     // Calculate median (sort-based, unaffected by the Welford change)
     let mut sorted = errors.to_vec();
