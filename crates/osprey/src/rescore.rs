@@ -81,6 +81,13 @@ pub struct RescoreInputs {
     /// gap-fill stubs reuse the same `Arc<str>` identities that the
     /// hydrated stubs already hold.
     pub seq_interner: HashSet<Arc<str>>,
+    /// Full set of file stems that participated in the first-join phase
+    /// that produced the reconciliation actions in this RescoreInputs.
+    /// Read from `reconciliation.json`'s `file_stems` field (v2+);
+    /// empty for v1 files. Used to compute the reconciliation hash
+    /// written into the reconciled parquet's metadata so the downstream
+    /// `--join-at-pass=2` merge node will accept it.
+    pub join_file_stems: Vec<String>,
 }
 
 impl RescoreInputs {
@@ -131,6 +138,15 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
     let mut refined_calibrations: HashMap<String, RTCalibration> = HashMap::new();
     let mut per_file_gap_fill: HashMap<String, Vec<GapFillTarget>> = HashMap::new();
     let mut reconciliation_actions: HashMap<(String, usize), ReconcileAction> = HashMap::new();
+    // Captured from the first per-file reconciliation.json envelope; every
+    // file's envelope must declare the same join file_stems (all came
+    // from the same first-join run). Used downstream to compute the
+    // reconciliation hash the worker stamps into the reconciled parquet's
+    // metadata. v1 envelopes (no file_stems field) are rejected at parse
+    // time by serde, and every v2 envelope has a non-empty stems list,
+    // so an `is_empty()` initial check unambiguously identifies the
+    // first envelope.
+    let mut join_file_stems: Vec<String> = Vec::new();
 
     for parquet_path in parquet_paths {
         // The parquet stem (with `.scores` stripped) is the canonical
@@ -183,6 +199,40 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
                 e
             ))
         })?;
+
+        // Reject any envelope whose format_version is not 2. v1
+        // envelopes (no file_stems) already fail at serde
+        // deserialization; this check covers a manually-constructed
+        // file with format_version != 2 + file_stems present.
+        if envelope.format_version != 2 {
+            return Err(OspreyError::config(format!(
+                "hydrate_for_rescore: reconciliation.json {} has format_version {} \
+                 (expected 2); re-run the first-join phase to regenerate the envelope.",
+                recon_path.display(),
+                envelope.format_version,
+            )));
+        }
+        // Capture the join file_stems from the first envelope and
+        // require every subsequent envelope to declare the same set
+        // (they all came from the same first-join phase). With v1
+        // rejected at parse time, every envelope here has a populated
+        // file_stems list, so an `is_empty()` check unambiguously
+        // identifies the first envelope.
+        let mut these = envelope.file_stems.clone();
+        these.sort();
+        these.dedup();
+        if join_file_stems.is_empty() {
+            join_file_stems = these;
+        } else if these != join_file_stems {
+            return Err(OspreyError::config(format!(
+                "hydrate_for_rescore: reconciliation.json file_stems mismatch — {} \
+                 declares {:?}, expected {:?} (boundary files from different first-join \
+                 runs cannot be mixed in one rescore worker invocation).",
+                recon_path.display(),
+                these,
+                join_file_stems,
+            )));
+        }
 
         // 3a. Build entry_id → vec_idx map from the loaded stubs so the
         //     planner's entry_id-keyed actions can be rehomed onto the
@@ -303,6 +353,7 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
         refined_calibrations,
         per_file_gap_fill,
         seq_interner,
+        join_file_stems,
     })
 }
 
@@ -383,19 +434,23 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         };
         let cal_path = calibration_path_for_input(input_file, input_dir);
         if !cal_path.exists() {
-            continue;
+            return Err(OspreyError::config(format!(
+                "run_rescore: required calibration JSON not found at {} (input file: {}). \
+                 Stage 6 needs the Stage 1-4 calibration sidecar to rescore; without it the \
+                 worker would silently produce no reconciliation re-scores. Run Stages 1-4 \
+                 first or fix the path.",
+                cal_path.display(),
+                input_file.display()
+            )));
         }
-        let cal_params = match load_calibration(&cal_path) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!(
-                    "run_rescore: failed to read calibration JSON {}: {}",
-                    cal_path.display(),
-                    e
-                );
-                continue;
-            }
-        };
+        let cal_params = load_calibration(&cal_path).map_err(|e| {
+            OspreyError::config(format!(
+                "run_rescore: failed to read calibration JSON {}: {}. The file exists but \
+                 could not be parsed — check that it was written by a matching Osprey version.",
+                cal_path.display(),
+                e
+            ))
+        })?;
         if let Some(ref mp) = cal_params.rt_calibration.model_params {
             match RTCalibration::from_model_params(mp, cal_params.rt_calibration.residual_sd) {
                 Ok(rt_cal) => {
@@ -420,6 +475,7 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         refined_calibrations,
         per_file_gap_fill,
         mut seq_interner,
+        join_file_stems,
     } = hydrate_for_rescore(&config)?;
 
     // Cross-impl bisection seam (mirrors the dump call from
@@ -463,14 +519,32 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
             }
         }
 
-        // Save (file, entry_id) → action before per_file_entries shrinks
-        // so we can rebuild (file, new_vec_idx) → action below. Use a
-        // file_name → entries lookup map so the per-action lookup is O(1)
-        // instead of O(num_files) on the inner find().
+        // Union with entries that have reconciliation actions. The planner
+        // emits actions for entries that pass FDR via cross-file consensus
+        // rescue (`compute_consensus_rts` upgrades a peptide if it passes
+        // FDR in any file in the experiment, even if it fails locally).
+        // Without this union, the worker would drop those entries via
+        // local compaction and the planner's actions would be silently
+        // discarded — the per-file rescore would diverge from the
+        // straight-through in-process pipeline. The base_ids come from
+        // the pre-compaction `per_file_entries` keyed by (file_name, idx)
+        // in `reconciliation_actions_pre`.
         let entries_by_name: HashMap<&str, &Vec<FdrEntry>> = per_file_entries
             .iter()
             .map(|(name, entries)| (name.as_str(), entries))
             .collect();
+        for (file_name, idx) in reconciliation_actions_pre.keys() {
+            if let Some(entries) = entries_by_name.get(file_name.as_str()) {
+                if let Some(e) = entries.get(*idx) {
+                    first_pass_base_ids.insert(e.entry_id & 0x7FFF_FFFF);
+                }
+            }
+        }
+
+        // Save (file, entry_id) → action before per_file_entries shrinks
+        // so we can rebuild (file, new_vec_idx) → action below. Reuses
+        // the entries_by_name map built above so per-action lookup is
+        // O(1) instead of O(num_files) on an inner find().
         let mut actions_by_id: HashMap<(String, u32), ReconcileAction> =
             HashMap::with_capacity(reconciliation_actions_pre.len());
         for ((file_name, idx), action) in reconciliation_actions_pre.drain() {
@@ -519,8 +593,8 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         }
 
         log::info!(
-            "Worker compaction: {} -> {} entries ({} survived peptide-FDR or protein-rescue), \
-             {} reconciliation actions retained",
+            "Worker compaction: {} -> {} entries ({} survived peptide-FDR, protein-rescue, \
+             or cross-file consensus rescue), {} reconciliation actions retained",
             entries_before,
             entries_after,
             first_pass_base_ids.len(),
@@ -570,6 +644,13 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
         &file_name_to_idx,
         &config,
         &mut seq_interner,
+        // The per-file rescore worker's config.input_files reflects
+        // only this worker's single parquet. To stamp the reconciled
+        // parquet with the multi-file reconciliation hash the
+        // downstream `--join-at-pass=2` merge node will validate
+        // against, pass the full join file_stems list extracted from
+        // reconciliation.json.
+        &join_file_stems,
     )?;
 
     // Cross-impl bisection seam: dump the per-precursor q-values
