@@ -104,12 +104,20 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
 /// Dump the per-fragment MS2 mass errors that feed the MS2 mass
 /// calibration mean / sd computation, to `rust_ms2_cal_errors.txt`.
 ///
-/// One row per (entry_id, fragment_order_index, error) triple, sorted
-/// by (entry_id, fragment_order_index). Mirrors `cs_ms2_cal_errors.txt`
-/// emitted by OspreySharp. Use to bisect a 1-ULP MS2 calibration mean
-/// divergence cross-impl: if the dumps are identical, the divergence is
-/// in the calibration sum/mean computation; if not, divergence is in
+/// One row per (entry_id, fragment_order_index, error) triple, written
+/// in caller-provided match order (and within each match in
+/// `ms2_mass_errors` insertion order). Mirrors `cs_ms2_cal_errors.txt`
+/// emitted by OspreySharp. Use to bisect a cross-impl MS2 calibration
+/// mean divergence: if the dumps are identical, the divergence is in
+/// the calibration sum/mean computation; if not, divergence is in
 /// per-match top-N fragment selection or per-fragment error arithmetic.
+///
+/// **The caller must pass `matches` in the same order the calibration
+/// accumulator iterates them** (currently `(base_id, entry_id)` via
+/// `pipeline::run_calibration_discovery_windowed`'s `passing_sorted` /
+/// `refined_passing` shadowing). The dump does NOT re-sort: this
+/// diagnostic exists to catch iteration-order regressions, and
+/// re-sorting here would silently hide them.
 ///
 /// `matches` should be the iterable of `CalibrationMatch` whose
 /// `ms2_mass_errors` arrays feed the global calibration accumulator
@@ -118,8 +126,10 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
 /// responsible for that filtering — the dump just reads
 /// `ms2_mass_errors` from whatever matches are passed).
 ///
-/// Error values formatted with G17 / `{:.17e}` so f64 bits round-trip
-/// exactly.
+/// Error values formatted via `osprey_core::diagnostics::format_f64_roundtrip`
+/// — the shortest decimal that round-trips an f64, matching the
+/// `FormatF64Roundtrip` helper on the C# OspreySharp side so the two
+/// dumps are textually comparable.
 ///
 /// Gated by `OSPREY_DUMP_MS2_CAL_ERRORS=1`. When
 /// `OSPREY_MS2_CAL_ERRORS_ONLY=1` is also set, the process exits after
@@ -135,24 +145,18 @@ pub fn dump_ms2_cal_errors(matches: &[&CalibrationMatch]) {
         return;
     };
 
-    // entry_id ascending; within each entry, error position in the
-    // mass_errors vec (i.e., the order in which errors are appended
-    // to the global calibration accumulator).
-    let mut sorted_matches: Vec<&&CalibrationMatch> = matches.iter().collect();
-    sorted_matches.sort_by_key(|m| m.entry_id);
-
     writeln!(f, "entry_id\tfrag_order_idx\terror").ok();
 
+    // Write in caller-provided order -- see the function docstring.
+    // A previous version re-sorted by `entry_id` here, which would
+    // mask the very iteration-order regressions the dump exists to
+    // catch (e.g., LDA-side-effect-resort breaking the accumulator
+    // order on the Rust side).
     let mut n_rows = 0usize;
     let mut n_matches = 0usize;
-    for m in sorted_matches {
+    for m in matches {
         n_matches += 1;
         for (i, err) in m.ms2_mass_errors.iter().enumerate() {
-            // Round-trip-safe; same primitive used by other cross-impl
-            // dumps (`format_f64_roundtrip` from osprey-core). Strings
-            // are stable across language formatters because both go
-            // through Rust ↔ Python ↔ C# via this canonical
-            // representation (shortest decimal that round-trips).
             writeln!(
                 f,
                 "{}\t{}\t{}",
