@@ -71,6 +71,11 @@ use osprey_scoring::{
 /// fail on ~99.8% of matches. Fall back to a 10 ppm default in that case,
 /// matching C# OspreySharp's PerFileScoringTask ScoreCalibrationEntry
 /// behavior: `unit == Ppm ? tolerance : 10.0`.
+///
+/// Note: `OspreyConfig::precursor_tolerance` reuses the
+/// `FragmentToleranceConfig` struct -- the name "fragment" is historical;
+/// the same `tolerance + unit` shape happens to fit both the precursor
+/// and fragment tolerance fields.
 fn ms1_envelope_tolerance_ppm(precursor_tolerance: &osprey_core::FragmentToleranceConfig) -> f64 {
     match precursor_tolerance.unit {
         osprey_core::ToleranceUnit::Ppm => precursor_tolerance.tolerance,
@@ -10569,10 +10574,7 @@ mod tests {
     /// window for the MS1 envelope.
     #[test]
     fn ms1_envelope_tolerance_ppm_returns_configured_value_for_ppm_unit() {
-        let cfg = osprey_core::FragmentToleranceConfig {
-            tolerance: 7.5,
-            unit: osprey_core::ToleranceUnit::Ppm,
-        };
+        let cfg = osprey_core::FragmentToleranceConfig::hram(7.5);
         assert_eq!(ms1_envelope_tolerance_ppm(&cfg), 7.5);
     }
 
@@ -10582,17 +10584,23 @@ mod tests {
     /// `unit == Ppm ? tolerance : 10.0`.
     #[test]
     fn ms1_envelope_tolerance_ppm_returns_ten_for_mz_unit() {
-        let cfg = osprey_core::FragmentToleranceConfig {
-            tolerance: 1.0,
-            unit: osprey_core::ToleranceUnit::Mz,
-        };
+        let cfg = osprey_core::FragmentToleranceConfig::unit_resolution(1.0);
         assert_eq!(ms1_envelope_tolerance_ppm(&cfg), 10.0);
         // The configured numeric value is intentionally ignored on the Mz
         // branch -- any Da/Th tolerance maps to the same 10 ppm default.
-        let cfg2 = osprey_core::FragmentToleranceConfig {
-            tolerance: 0.02,
-            unit: osprey_core::ToleranceUnit::Mz,
-        };
+        let cfg2 = osprey_core::FragmentToleranceConfig::unit_resolution(0.02);
         assert_eq!(ms1_envelope_tolerance_ppm(&cfg2), 10.0);
+    }
+
+    /// A misconfigured zero-ppm tolerance must NOT be silently rescued
+    /// by the 10 ppm fallback -- that fallback fires only on the Mz
+    /// branch (to avoid the Da-treated-as-ppm pitfall). On the Ppm
+    /// branch, zero passes through so an upstream config error stays
+    /// visible (the empty MS1 envelope window will surface as a hard
+    /// drop in match counts rather than be papered over).
+    #[test]
+    fn ms1_envelope_tolerance_ppm_does_not_rescue_zero_ppm() {
+        let cfg = osprey_core::FragmentToleranceConfig::hram(0.0);
+        assert_eq!(ms1_envelope_tolerance_ppm(&cfg), 0.0);
     }
 }
