@@ -199,22 +199,88 @@ pub fn run_percolator(
     // two sides, cascading through every downstream computation.
     dump_stage5_standardizer(&standardizer, config.feature_names.as_deref());
 
-    // 3. Subsample by peptide groups if needed (before fold splitting, per PMC5059416)
-    //    Keeps target-decoy pairs and charge states together.
-    //    The subsampled set is used for fold assignment + SVM training.
-    //    ALL entries are scored with the trained model.
-    let train_subset: Option<Vec<usize>> = if config.max_train_size > 0 && n > config.max_train_size
-    {
-        Some(subsample_by_peptide_group(
-            &labels,
-            &entry_ids,
-            &peptides,
-            config.max_train_size,
-            config.seed,
-        ))
-    } else {
-        None
-    };
+    // One-shot diagnostic for 2nd-pass divergence localization. Dumps
+    // per-entry raw feature vectors so the cross-impl compare can see
+    // exactly which rows differ. Sorted by (entry_id, native_position)
+    // to align with the C# dump.
+    dump_stage5_perc_input(entries, config.feature_names.as_deref());
+
+    // 3a. Best-per-precursor: pick the single best-scoring observation per
+    //     (base_id, is_decoy) tuple across all files. With N files per peptide,
+    //     this avoids the SVM seeing the same precursor's target/decoy pair
+    //     N times, which would inflate apparent target/decoy separation and
+    //     cause the SVM to learn file-specific noise rather than peptide
+    //     discriminating features. The streaming path applies this dedup
+    //     inline (pipeline.rs::run_percolator_fdr); applying it here makes
+    //     the direct path statistically consistent. Without this, on multi-
+    //     file inputs below the streaming threshold (Stellar 3-file at 393K
+    //     entries) the SVM trained on N-times-redundant precursor pairs and
+    //     produced inflated target/decoy separation diverging from the
+    //     deduped C# port.
+    //
+    //     Dedup key is features[0] (fragment_coelution_sum, the first PIN
+    //     feature) which matches the streaming path's `coelution_sum`
+    //     dedup field exactly — same per-entry value.
+    let mut best_target: HashMap<u32, usize> = HashMap::new();
+    let mut best_decoy: HashMap<u32, usize> = HashMap::new();
+    for i in 0..n {
+        let base_id = entries[i].entry_id & 0x7FFF_FFFF;
+        let score = entries[i].features[0];
+        let map = if labels[i] {
+            &mut best_decoy
+        } else {
+            &mut best_target
+        };
+        match map.get(&base_id) {
+            Some(&existing) if entries[existing].features[0] >= score => {}
+            _ => {
+                map.insert(base_id, i);
+            }
+        }
+    }
+    let mut dedup_indices: Vec<usize> = best_target
+        .values()
+        .chain(best_decoy.values())
+        .copied()
+        .collect();
+    dedup_indices.sort();
+    log::debug!(
+        "  Best-per-precursor: {} entries ({} targets, {} decoys) from {} total",
+        dedup_indices.len(),
+        best_target.len(),
+        best_decoy.len(),
+        n
+    );
+
+    // 3b. Subsample by peptide groups if dedup'd count still exceeds the
+    //     training cap (before fold splitting, per PMC5059416). Keeps target-
+    //     decoy pairs and charge states together. The subsampled set is used
+    //     for fold assignment + SVM training; ALL entries are scored with
+    //     the trained model regardless.
+    let train_subset: Option<Vec<usize>> =
+        if config.max_train_size > 0 && dedup_indices.len() > config.max_train_size {
+            // Build dedup-local arrays for the subsample call. `dedup_peptides`
+            // holds borrowed `&str` slices into the existing `peptides: Vec<String>`
+            // backing storage -- `subsample_by_peptide_group` is generic over
+            // `AsRef<str>` so no `String` clones are needed on this hot path.
+            let dedup_labels: Vec<bool> = dedup_indices.iter().map(|&i| labels[i]).collect();
+            let dedup_entry_ids: Vec<u32> = dedup_indices.iter().map(|&i| entry_ids[i]).collect();
+            let dedup_peptides: Vec<&str> = dedup_indices
+                .iter()
+                .map(|&i| peptides[i].as_str())
+                .collect();
+            let local = subsample_by_peptide_group(
+                &dedup_labels,
+                &dedup_entry_ids,
+                &dedup_peptides,
+                config.max_train_size,
+                config.seed,
+            );
+            // Remap local indices back into the original entry index space.
+            Some(local.into_iter().map(|li| dedup_indices[li]).collect())
+        } else {
+            Some(dedup_indices)
+        };
 
     let sub_n = train_subset.as_ref().map_or(n, |s| s.len());
 
@@ -1305,7 +1371,21 @@ fn compute_per_run_peptide_qvalues(
     qvalues
 }
 
-/// Compute experiment-level precursor q-values (across all files)
+/// Compute experiment-level precursor q-values (across all files).
+///
+/// Propagates the winner's q-value to every observation sharing the
+/// same `base_id` (target and decoy). The streaming path
+/// (`run_percolator_fdr_streaming` in `crates/osprey/src/pipeline.rs`)
+/// already does this via its `base_id_exp_prec_q` map; the direct
+/// path used to assign the q-value only to the single winner,
+/// leaving every non-winning per-file observation at q=1.0. That
+/// undercount silently broke downstream stages that gate on
+/// `experiment_precursor_qvalue` (Stage 6 consensus selection /
+/// calibration refit, Stage 7 protein FDR) on multi-file inputs
+/// using the direct path (Stellar 3-file, ~393K entries below the
+/// 600K streaming threshold). The OspreySharp port matched the
+/// streaming path's "propagate to all base_id observations"
+/// semantics, so the direct path was the divergent side.
 fn compute_experiment_precursor_qvalues(
     scores: &[f64],
     labels: &[bool],
@@ -1320,8 +1400,20 @@ fn compute_experiment_precursor_qvalues(
     let ws: Vec<f64> = winner_indices.iter().map(|&i| scores[i]).collect();
     compute_conservative_qvalues(&ws, &winner_is_decoy, &mut q);
 
+    // Build base_id -> winner q-value map (one entry per base_id, since
+    // compete_all picks a single winner per base_id).
+    let mut base_id_q: HashMap<u32, f64> = HashMap::with_capacity(winner_indices.len());
     for (rank, &idx) in winner_indices.iter().enumerate() {
-        qvalues[idx] = q[rank];
+        let base_id = entry_ids[idx] & 0x7FFF_FFFF;
+        base_id_q.insert(base_id, q[rank]);
+    }
+
+    // Propagate winner's q-value to every observation of that base_id.
+    for i in 0..n {
+        let base_id = entry_ids[i] & 0x7FFF_FFFF;
+        if let Some(&qv) = base_id_q.get(&base_id) {
+            qvalues[i] = qv;
+        }
     }
 
     qvalues
@@ -1672,6 +1764,68 @@ fn dump_stage5_standardizer(standardizer: &FeatureStandardizer, feature_names: O
     exit_if_only("OSPREY_STANDARDIZER_ONLY", "Stage 5 standardizer dump");
 }
 
+/// One-shot diagnostic dump of the per-entry raw feature vectors that
+/// feed `FeatureStandardizer::fit_transform`. Gated by
+/// `OSPREY_DUMP_PERC_INPUT=1`. Writes `rust_stage5_perc_input.tsv` with
+/// columns `native_position, entry_id, is_decoy, <feature_name_0>..<feature_name_N>`
+/// sorted by (entry_id, native_position) for stable cross-impl compare.
+///
+/// This is a localizer for cross-impl standardizer divergence: when
+/// `rust_stage5_standardizer.tsv` differs but `2nd-pass entries[]`
+/// positions match, the divergence is in feature values themselves.
+fn dump_stage5_perc_input(entries: &[PercolatorEntry], feature_names: Option<&[String]>) {
+    if !is_dump_enabled("OSPREY_DUMP_PERC_INPUT") {
+        return;
+    }
+    let path = "rust_stage5_perc_input.tsv";
+    let Ok(mut f) =
+        std::fs::File::create(path).map(|file| std::io::BufWriter::with_capacity(8 << 20, file))
+    else {
+        log::warn!("Could not create {}", path);
+        return;
+    };
+    write!(f, "native_position\tentry_id\tis_decoy").ok();
+    let n_features = if entries.is_empty() {
+        0
+    } else {
+        entries[0].features.len()
+    };
+    for i in 0..n_features {
+        let name = feature_names
+            .and_then(|n| n.get(i))
+            .map(|s| s.as_str())
+            .unwrap_or("unknown");
+        write!(f, "\t{}", name).ok();
+    }
+    writeln!(f).ok();
+
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| (entries[i].entry_id, i));
+    for i in order {
+        let e = &entries[i];
+        write!(
+            f,
+            "{}\t{}\t{}",
+            i,
+            e.entry_id,
+            if e.is_decoy { "true" } else { "false" }
+        )
+        .ok();
+        for v in &e.features {
+            write!(f, "\t{}", format_f64_roundtrip(*v)).ok();
+        }
+        writeln!(f).ok();
+    }
+    let _ = f.flush();
+    drop(f);
+    log::info!(
+        "Wrote Stage 5 Percolator input dump: {} ({} rows)",
+        path,
+        entries.len()
+    );
+    exit_if_only("OSPREY_PERC_INPUT_ONLY", "Stage 5 Percolator input dump");
+}
+
 /// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.
 ///
 /// Groups entries by target peptide (via base_id), then randomly selects groups until
@@ -1679,10 +1833,10 @@ fn dump_stage5_standardizer(standardizer: &FeatureStandardizer, feature_names: O
 ///
 /// Per The et al. (2016, PMC5059416): subsample paired PSMs before fold splitting,
 /// then apply CV to the subset. The trained model is applied to ALL entries.
-pub fn subsample_by_peptide_group(
+pub fn subsample_by_peptide_group<S: AsRef<str>>(
     labels: &[bool],
     entry_ids: &[u32],
-    peptides: &[String],
+    peptides: &[S],
     max_entries: usize,
     seed: u64,
 ) -> Vec<usize> {
@@ -1691,14 +1845,17 @@ pub fn subsample_by_peptide_group(
         return (0..n).collect();
     }
 
-    // Build peptide groups (same as fold assignment: group by target peptide via base_id)
+    // Build peptide groups (same as fold assignment: group by target peptide via base_id).
+    // Generic over `AsRef<str>` so callers may pass `&[&str]` (cheap reference
+    // subsetting) or `&[String]` (owned storage) without forcing extra String
+    // clones on the subset construction path.
     let mut base_id_to_target_peptide: HashMap<u32, &str> = HashMap::new();
     for (i, (&is_decoy, &eid)) in labels.iter().zip(entry_ids).enumerate() {
         let base_id = eid & 0x7FFFFFFF;
         if !is_decoy {
             base_id_to_target_peptide
                 .entry(base_id)
-                .or_insert(peptides[i].as_str());
+                .or_insert(peptides[i].as_ref());
         }
     }
 
@@ -1708,7 +1865,7 @@ pub fn subsample_by_peptide_group(
         let key = base_id_to_target_peptide
             .get(&base_id)
             .copied()
-            .unwrap_or(peptides[i].as_str());
+            .unwrap_or(peptides[i].as_ref());
         peptide_groups.entry(key).or_default().push(i);
     }
 
