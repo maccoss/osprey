@@ -888,13 +888,18 @@ fn run_calibration_discovery_windowed(
         let mut mz_qc_data = MzQCData::new(config.fragment_tolerance.unit);
 
         // Sort by (base_id, entry_id) before accumulating mass errors into
-        // the calibration so the running Welford sum sees them in the same
-        // deterministic order C#'s OspreySharp uses (its `matchArray` is
-        // sorted (base_id, entry_id) and never re-sorted; Rust's
-        // `train_and_score_calibration` sorts `all_matches` by
-        // discriminant_score-descending as a side effect of LDA, which
-        // would otherwise feed Welford a different order cross-impl and
-        // leave a 1-ULP MS2 calibration mean drift.
+        // the calibration so the left-to-right `sum / n` accumulator
+        // (osprey-chromatography mass.rs::calculate_single_calibration)
+        // sees them in the same deterministic order C#'s OspreySharp
+        // uses (its `matchArray` is sorted (base_id, entry_id) and never
+        // re-sorted; Rust's `train_and_score_calibration` sorts
+        // `all_matches` by discriminant_score-descending as a side
+        // effect of LDA, which would otherwise feed the calibration sum
+        // a different order cross-impl. IEEE 754 strict mode forbids
+        // associative re-ordering, so the per-element addition order
+        // is bit-load-bearing for cross-impl mean agreement.
+        // (PR #46 reverted Welford-Knuth here back to sum/n; the
+        // order-dependence motivation is unchanged.)
         let mut passing_sorted: Vec<&CalibrationMatch> = passing_targets.clone();
         passing_sorted.sort_by_key(|m| (m.entry_id & 0x7FFFFFFF, m.entry_id));
         for m in &passing_sorted {
@@ -1103,10 +1108,13 @@ fn run_calibration_discovery_windowed(
                 // score-descending (matches.sort_by score_desc in
                 // calibration_ml.rs:89), but C# leaves matchArray in
                 // (base_id, entry_id) order. Without this re-sort the
-                // accumulated Welford running sum (and the LOESS input
-                // sequence) sees fragments in a different order cross-
-                // impl, leaving a 1-ULP residual in MS2 calibration mean
-                // even when the input set is bit-identical.
+                // left-to-right `sum / n` accumulator (and the LOESS
+                // input sequence) sees fragments in a different order
+                // cross-impl, leaving a 1-ULP residual in MS2 calibration
+                // mean even when the input set is bit-identical.
+                // (PR #46 reverted Welford-Knuth back to sum/n; this
+                // sort is still load-bearing because IEEE 754 strict
+                // mode forbids associative re-ordering of the sum.)
                 let refined_passing: Vec<&CalibrationMatch> = {
                     let mut v = refined_passing.clone();
                     v.sort_by_key(|m| (m.entry_id & 0x7FFFFFFF, m.entry_id));
