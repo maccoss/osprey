@@ -62,6 +62,27 @@ use osprey_scoring::{
     DecoyGenerator, DecoyMethod, Enzyme, SpectralScorer,
 };
 
+/// Resolve the precursor tolerance to a ppm value usable for MS1 isotope
+/// envelope extraction. If the configured precursor tolerance is already
+/// in ppm, return it as-is. If it's a Da/Mz tolerance (typical for unit-
+/// resolution data like Stellar), treating it as ppm would produce an
+/// absurdly tight window (e.g. a 1-ppm-treated 1 Da tolerance at 500 m/z
+/// is just 500 * 1e-6 = 0.5 mDa = 5e-4 Th), making `envelope.has_m0()`
+/// fail on ~99.8% of matches. Fall back to a 10 ppm default in that case,
+/// matching C# OspreySharp's PerFileScoringTask ScoreCalibrationEntry
+/// behavior: `unit == Ppm ? tolerance : 10.0`.
+///
+/// Note: `OspreyConfig::precursor_tolerance` reuses the
+/// `FragmentToleranceConfig` struct -- the name "fragment" is historical;
+/// the same `tolerance + unit` shape happens to fit both the precursor
+/// and fragment tolerance fields.
+fn ms1_envelope_tolerance_ppm(precursor_tolerance: &osprey_core::FragmentToleranceConfig) -> f64 {
+    match precursor_tolerance.unit {
+        osprey_core::ToleranceUnit::Ppm => precursor_tolerance.tolerance,
+        osprey_core::ToleranceUnit::Mz => 10.0,
+    }
+}
+
 /// Wrapper to implement MS1SpectrumLookup for MS1Index
 struct MS1IndexWrapper<'a>(&'a MS1Index);
 
@@ -749,7 +770,7 @@ fn run_calibration_discovery_windowed(
                 spectra,
                 Some(&MS1IndexWrapper(ms1_index)),
                 config.fragment_tolerance,
-                config.precursor_tolerance.tolerance,
+                ms1_envelope_tolerance_ppm(&config.precursor_tolerance),
                 initial_tolerance,
                 pass1_expected_rt_fn,
                 Some(&xcorr_scorer),
@@ -761,7 +782,7 @@ fn run_calibration_discovery_windowed(
                 spectra,
                 None,
                 config.fragment_tolerance,
-                config.precursor_tolerance.tolerance,
+                ms1_envelope_tolerance_ppm(&config.precursor_tolerance),
                 initial_tolerance,
                 pass1_expected_rt_fn,
                 Some(&xcorr_scorer),
@@ -1040,7 +1061,7 @@ fn run_calibration_discovery_windowed(
                     spectra,
                     Some(&MS1IndexWrapper(ms1_index)),
                     config.fragment_tolerance,
-                    config.precursor_tolerance.tolerance,
+                    ms1_envelope_tolerance_ppm(&config.precursor_tolerance),
                     pass1_tolerance,
                     Some(&predict_fn),
                     Some(&xcorr_scorer),
@@ -1052,7 +1073,7 @@ fn run_calibration_discovery_windowed(
                     spectra,
                     None,
                     config.fragment_tolerance,
-                    config.precursor_tolerance.tolerance,
+                    ms1_envelope_tolerance_ppm(&config.precursor_tolerance),
                     pass1_tolerance,
                     Some(&predict_fn),
                     Some(&xcorr_scorer),
@@ -10754,5 +10775,50 @@ mod tests {
 
         let mut entries = vec![make_fdr_entry(0, 0.0, 0.0, 0.0)];
         assert!(!load_fdr_scores_sidecar(&path, &mut entries, 1));
+    }
+
+    // ===== ms1_envelope_tolerance_ppm tests =====
+    //
+    // The MS1 envelope extractor accepts only ppm tolerances. A Da/Mz
+    // precursor tolerance (typical for unit-resolution data) cannot be
+    // passed through as-is: treating it as ppm would produce an
+    // absurdly tight window and break ~99.8% of M0 matches. The helper
+    // returns ppm-as-is or falls back to the C# OspreySharp default of
+    // 10 ppm; these tests pin that mapping so a future refactor cannot
+    // re-introduce the silent ppm-vs-Da conflation.
+
+    /// Ppm tolerance flows through unchanged: this is the only path
+    /// where the configured value can legitimately be used as a ppm
+    /// window for the MS1 envelope.
+    #[test]
+    fn ms1_envelope_tolerance_ppm_returns_configured_value_for_ppm_unit() {
+        let cfg = osprey_core::FragmentToleranceConfig::hram(7.5);
+        assert_eq!(ms1_envelope_tolerance_ppm(&cfg), 7.5);
+    }
+
+    /// Mz (Da/Th) tolerance must NOT be passed through as ppm; the
+    /// helper falls back to the 10 ppm default, matching the C#
+    /// OspreySharp PerFileScoringTask.ScoreCalibrationEntry behavior
+    /// `unit == Ppm ? tolerance : 10.0`.
+    #[test]
+    fn ms1_envelope_tolerance_ppm_returns_ten_for_mz_unit() {
+        let cfg = osprey_core::FragmentToleranceConfig::unit_resolution(1.0);
+        assert_eq!(ms1_envelope_tolerance_ppm(&cfg), 10.0);
+        // The configured numeric value is intentionally ignored on the Mz
+        // branch -- any Da/Th tolerance maps to the same 10 ppm default.
+        let cfg2 = osprey_core::FragmentToleranceConfig::unit_resolution(0.02);
+        assert_eq!(ms1_envelope_tolerance_ppm(&cfg2), 10.0);
+    }
+
+    /// A misconfigured zero-ppm tolerance must NOT be silently rescued
+    /// by the 10 ppm fallback -- that fallback fires only on the Mz
+    /// branch (to avoid the Da-treated-as-ppm pitfall). On the Ppm
+    /// branch, zero passes through so an upstream config error stays
+    /// visible (the empty MS1 envelope window will surface as a hard
+    /// drop in match counts rather than be papered over).
+    #[test]
+    fn ms1_envelope_tolerance_ppm_does_not_rescue_zero_ppm() {
+        let cfg = osprey_core::FragmentToleranceConfig::hram(0.0);
+        assert_eq!(ms1_envelope_tolerance_ppm(&cfg), 0.0);
     }
 }
