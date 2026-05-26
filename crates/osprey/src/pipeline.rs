@@ -3397,18 +3397,28 @@ pub(crate) fn rescore_per_file_loop(
                             // exists in the FDR entries vector but has no
                             // matching overlay row in the gap-fill section
                             // of the parquet -- typically indicates the
-                            // gap-fill writer dropped a row silently. Warn
-                            // and leave parquet_index = u32::MAX so the
-                            // downstream feature loader still surfaces the
-                            // mismatch as a hard "no features" failure.
+                            // gap-fill writer dropped a row silently. The
+                            // downstream feature loader (`score_with_avg_models`)
+                            // does a bounds check `if pq_idx < file_features.len()`
+                            // and then `continue`s on failure, so a stale
+                            // u32::MAX would silently drop the entry from
+                            // the next Percolator pass. **This warn is the
+                            // only surfacing of the mismatch** -- if it
+                            // fires, expect a quiet drop in scored-entry
+                            // count downstream. Leaving parquet_index =
+                            // u32::MAX is intentional so the feature
+                            // loader's bounds check skips the entry rather
+                            // than reading a wrong row.
                             match vec_idx_to_gap_pre_sort.get(&vec_idx) {
                                 Some(&row) => row,
                                 None => {
                                     log::warn!(
                                         "parquet_index remap: gap-fill stub at vec_idx {} has no \
-                                         entry in the gap-fill overlay (entry_id={}, charge={}); \
-                                         leaving parquet_index = u32::MAX",
+                                         entry in the gap-fill overlay (file={}, entry_id={}, \
+                                         charge={}); leaving parquet_index = u32::MAX -- the next \
+                                         Percolator pass will silently skip this entry",
                                         vec_idx,
+                                        file_name,
                                         fdr_entry.entry_id,
                                         fdr_entry.charge,
                                     );
@@ -3425,19 +3435,24 @@ pub(crate) fn rescore_per_file_loop(
                             // which is every row written to the reconciled
                             // parquet (rescored + gap-fill). An out-of-
                             // range pre_sort_row means the FDR entry
-                            // references a parquet row that does not
-                            // exist on disk -- a stub/parquet mismatch
-                            // that will silently mis-load features in the
-                            // next Percolator pass if we let it through.
-                            // Warn and leave the (stale) parquet_index
-                            // untouched so the surfacing happens at the
-                            // feature-loader.
+                            // references a parquet row that does not exist
+                            // on disk -- a stub/parquet mismatch. The
+                            // downstream feature loader does a bounds
+                            // check and silently `continue`s on failure,
+                            // so leaving the stale (and out-of-range)
+                            // parquet_index untouched means the entry
+                            // will be silently dropped from the next
+                            // Percolator pass. **This warn is the only
+                            // surfacing of the mismatch.** If you see it,
+                            // expect a quiet drop in scored-entry count.
                             log::warn!(
                                 "parquet_index remap: pre_sort_row {} >= pre_to_post.len() {} \
-                                 (entry_id={}, charge={}, vec_idx={}); stub/parquet mismatch, \
-                                 leaving parquet_index unchanged",
+                                 (file={}, entry_id={}, charge={}, vec_idx={}); stub/parquet \
+                                 mismatch, leaving parquet_index unchanged -- the next Percolator \
+                                 pass will silently skip this entry",
                                 pre_sort_row,
                                 pre_to_post.len(),
+                                file_name,
                                 fdr_entry.entry_id,
                                 fdr_entry.charge,
                                 vec_idx,
