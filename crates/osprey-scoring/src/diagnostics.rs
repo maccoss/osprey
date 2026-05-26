@@ -101,6 +101,83 @@ pub fn dump_cal_match(library: &[LibraryEntry], results: &[CalibrationMatch]) {
     exit_if_only("OSPREY_CAL_MATCH_ONLY", "match dump");
 }
 
+/// Dump the per-fragment MS2 mass errors that feed the MS2 mass
+/// calibration mean / sd computation, to `rust_ms2_cal_errors.txt`.
+///
+/// One row per (entry_id, fragment_order_index, error) triple, written
+/// in caller-provided match order (and within each match in
+/// `ms2_mass_errors` insertion order). Mirrors `cs_ms2_cal_errors.txt`
+/// emitted by OspreySharp. Use to bisect a cross-impl MS2 calibration
+/// mean divergence: if the dumps are identical, the divergence is in
+/// the calibration sum/mean computation; if not, divergence is in
+/// per-match top-N fragment selection or per-fragment error arithmetic.
+///
+/// **The caller must pass `matches` in the same order the calibration
+/// accumulator iterates them** (currently `(base_id, entry_id)` via
+/// `pipeline::run_calibration_discovery_windowed`'s `passing_sorted` /
+/// `refined_passing` shadowing). The dump does NOT re-sort: this
+/// diagnostic exists to catch iteration-order regressions, and
+/// re-sorting here would silently hide them.
+///
+/// `matches` should be the iterable of `CalibrationMatch` whose
+/// `ms2_mass_errors` arrays feed the global calibration accumulator
+/// (i.e., post-LDA passing targets with `q_value <= calibration_fdr`
+/// and `signal_to_noise >= MIN_SNR_FOR_RT_CAL`; the caller is
+/// responsible for that filtering — the dump just reads
+/// `ms2_mass_errors` from whatever matches are passed).
+///
+/// Error values formatted via `osprey_core::diagnostics::format_f64_roundtrip`
+/// — the shortest decimal that round-trips an f64, matching the
+/// `FormatF64Roundtrip` helper on the C# OspreySharp side so the two
+/// dumps are textually comparable.
+///
+/// Gated by `OSPREY_DUMP_MS2_CAL_ERRORS=1`. When
+/// `OSPREY_MS2_CAL_ERRORS_ONLY=1` is also set, the process exits after
+/// writing for fast cycle-time during calibration bisection.
+pub fn dump_ms2_cal_errors(matches: &[&CalibrationMatch]) {
+    if !is_dump_enabled("OSPREY_DUMP_MS2_CAL_ERRORS") {
+        return;
+    }
+
+    let dump_path = "rust_ms2_cal_errors.txt";
+    let Ok(mut f) = std::fs::File::create(dump_path) else {
+        log::warn!("Could not create {}", dump_path);
+        return;
+    };
+
+    writeln!(f, "entry_id\tfrag_order_idx\terror").ok();
+
+    // Write in caller-provided order -- see the function docstring.
+    // A previous version re-sorted by `entry_id` here, which would
+    // mask the very iteration-order regressions the dump exists to
+    // catch (e.g., LDA-side-effect-resort breaking the accumulator
+    // order on the Rust side).
+    let mut n_rows = 0usize;
+    let mut n_matches = 0usize;
+    for m in matches {
+        n_matches += 1;
+        for (i, err) in m.ms2_mass_errors.iter().enumerate() {
+            writeln!(
+                f,
+                "{}\t{}\t{}",
+                m.entry_id,
+                i,
+                osprey_core::diagnostics::format_f64_roundtrip(*err)
+            )
+            .ok();
+            n_rows += 1;
+        }
+    }
+    log::info!(
+        "Wrote MS2 calibration errors dump: {} ({} rows across {} matches)",
+        dump_path,
+        n_rows,
+        n_matches
+    );
+
+    exit_if_only("OSPREY_MS2_CAL_ERRORS_ONLY", "MS2 cal errors dump");
+}
+
 /// Dump per-entry LDA discriminant + q-value to `rust_lda_scores.txt`,
 /// sorted by entry_id for a stable diff against `cs_lda_scores.txt`.
 ///
