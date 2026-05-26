@@ -3393,15 +3393,55 @@ pub(crate) fn rescore_per_file_loop(
                     for (vec_idx, fdr_entry) in fdr_entries.iter_mut().enumerate() {
                         let pre_sort_row = if fdr_entry.parquet_index == u32::MAX {
                             // Gap-fill stub: look up pre-sort row by vec_idx.
+                            // A missing entry here means a gap-fill stub
+                            // exists in the FDR entries vector but has no
+                            // matching overlay row in the gap-fill section
+                            // of the parquet -- typically indicates the
+                            // gap-fill writer dropped a row silently. Warn
+                            // and leave parquet_index = u32::MAX so the
+                            // downstream feature loader still surfaces the
+                            // mismatch as a hard "no features" failure.
                             match vec_idx_to_gap_pre_sort.get(&vec_idx) {
                                 Some(&row) => row,
-                                None => continue, // gap-fill stub without an overlay entry?
+                                None => {
+                                    log::warn!(
+                                        "parquet_index remap: gap-fill stub at vec_idx {} has no \
+                                         entry in the gap-fill overlay (entry_id={}, charge={}); \
+                                         leaving parquet_index = u32::MAX",
+                                        vec_idx,
+                                        fdr_entry.entry_id,
+                                        fdr_entry.charge,
+                                    );
+                                    continue;
+                                }
                             }
                         } else {
                             fdr_entry.parquet_index as usize
                         };
                         if pre_sort_row < pre_to_post.len() {
                             fdr_entry.parquet_index = pre_to_post[pre_sort_row];
+                        } else {
+                            // pre_to_post is sized to full_entries.len(),
+                            // which is every row written to the reconciled
+                            // parquet (rescored + gap-fill). An out-of-
+                            // range pre_sort_row means the FDR entry
+                            // references a parquet row that does not
+                            // exist on disk -- a stub/parquet mismatch
+                            // that will silently mis-load features in the
+                            // next Percolator pass if we let it through.
+                            // Warn and leave the (stale) parquet_index
+                            // untouched so the surfacing happens at the
+                            // feature-loader.
+                            log::warn!(
+                                "parquet_index remap: pre_sort_row {} >= pre_to_post.len() {} \
+                                 (entry_id={}, charge={}, vec_idx={}); stub/parquet mismatch, \
+                                 leaving parquet_index unchanged",
+                                pre_sort_row,
+                                pre_to_post.len(),
+                                fdr_entry.entry_id,
+                                fdr_entry.charge,
+                                vec_idx,
+                            );
                         }
                     }
 

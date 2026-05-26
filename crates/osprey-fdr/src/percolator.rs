@@ -259,11 +259,16 @@ pub fn run_percolator(
     //     the trained model regardless.
     let train_subset: Option<Vec<usize>> =
         if config.max_train_size > 0 && dedup_indices.len() > config.max_train_size {
-            // Build dedup-local arrays for the subsample call.
+            // Build dedup-local arrays for the subsample call. `dedup_peptides`
+            // holds borrowed `&str` slices into the existing `peptides: Vec<String>`
+            // backing storage -- `subsample_by_peptide_group` is generic over
+            // `AsRef<str>` so no `String` clones are needed on this hot path.
             let dedup_labels: Vec<bool> = dedup_indices.iter().map(|&i| labels[i]).collect();
             let dedup_entry_ids: Vec<u32> = dedup_indices.iter().map(|&i| entry_ids[i]).collect();
-            let dedup_peptides: Vec<String> =
-                dedup_indices.iter().map(|&i| peptides[i].clone()).collect();
+            let dedup_peptides: Vec<&str> = dedup_indices
+                .iter()
+                .map(|&i| peptides[i].as_str())
+                .collect();
             let local = subsample_by_peptide_group(
                 &dedup_labels,
                 &dedup_entry_ids,
@@ -1828,10 +1833,10 @@ fn dump_stage5_perc_input(entries: &[PercolatorEntry], feature_names: Option<&[S
 ///
 /// Per The et al. (2016, PMC5059416): subsample paired PSMs before fold splitting,
 /// then apply CV to the subset. The trained model is applied to ALL entries.
-pub fn subsample_by_peptide_group(
+pub fn subsample_by_peptide_group<S: AsRef<str>>(
     labels: &[bool],
     entry_ids: &[u32],
-    peptides: &[String],
+    peptides: &[S],
     max_entries: usize,
     seed: u64,
 ) -> Vec<usize> {
@@ -1840,14 +1845,17 @@ pub fn subsample_by_peptide_group(
         return (0..n).collect();
     }
 
-    // Build peptide groups (same as fold assignment: group by target peptide via base_id)
+    // Build peptide groups (same as fold assignment: group by target peptide via base_id).
+    // Generic over `AsRef<str>` so callers may pass `&[&str]` (cheap reference
+    // subsetting) or `&[String]` (owned storage) without forcing extra String
+    // clones on the subset construction path.
     let mut base_id_to_target_peptide: HashMap<u32, &str> = HashMap::new();
     for (i, (&is_decoy, &eid)) in labels.iter().zip(entry_ids).enumerate() {
         let base_id = eid & 0x7FFFFFFF;
         if !is_decoy {
             base_id_to_target_peptide
                 .entry(base_id)
-                .or_insert(peptides[i].as_str());
+                .or_insert(peptides[i].as_ref());
         }
     }
 
@@ -1857,7 +1865,7 @@ pub fn subsample_by_peptide_group(
         let key = base_id_to_target_peptide
             .get(&base_id)
             .copied()
-            .unwrap_or(peptides[i].as_str());
+            .unwrap_or(peptides[i].as_ref());
         peptide_groups.entry(key).or_default().push(i);
     }
 
