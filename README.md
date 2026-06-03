@@ -1,9 +1,14 @@
 # Osprey
 
+> [!WARNING]
+> **This repository is no longer actively maintained.** Osprey started as a side project of Mike MacCoss's and has since been ported to the ProteoWizard project by the Skyline development team as **OspreySharp**. The port is faster, more robust, gives byte-identical results, and is where new features and capabilities will be added going forward. OspreySharp is platform-independent and supports direct vendor RAW file access without prior conversion to mzML.
+>
+> **For active development, use OspreySharp:** <https://github.com/ProteoWizard/pwiz/tree/master/pwiz_tools/OspreySharp>
+
 [![CI](https://github.com/maccoss/osprey/actions/workflows/ci.yml/badge.svg)](https://github.com/maccoss/osprey/actions/workflows/ci.yml)
 [![Release](https://github.com/maccoss/osprey/actions/workflows/release.yml/badge.svg)](https://github.com/maccoss/osprey/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/maccoss/osprey?display_name=tag&sort=semver)](https://github.com/maccoss/osprey/releases/latest)
-[![License: Apache 2.0](https://img.shields.io/github/license/maccoss/osprey)](LICENSE)
+[![License: LGPL v3](https://img.shields.io/github/license/maccoss/osprey)](LICENSE)
 [![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org)
 [![GitHub Downloads](https://img.shields.io/github/downloads/maccoss/osprey/total)](https://github.com/maccoss/osprey/releases)
 [![Last Commit](https://img.shields.io/github/last-commit/maccoss/osprey)](https://github.com/maccoss/osprey/commits)
@@ -649,7 +654,7 @@ If you use Osprey in your research, please cite:
 
 ## License
 
-Apache 2.0
+GNU Lesser General Public License v3.0 only (LGPL-3.0-only). See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
