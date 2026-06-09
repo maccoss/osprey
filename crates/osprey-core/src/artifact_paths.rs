@@ -105,14 +105,25 @@ fn probe_writable(dir: &Path) -> bool {
     if !dir.is_dir() {
         return false;
     }
-    let probe = dir.join(format!(".{}.osprey-wtest", uuid_like()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
+    // create_new avoids clobbering an existing file on a (rare) name collision
+    // and makes a concurrent probe in the same directory safe; retry a few times
+    // on AlreadyExists before giving up.
+    for _ in 0..3 {
+        let probe = dir.join(format!(".{}.osprey-wtest", uuid_like()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                return true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
         }
-        Err(_) => false,
     }
+    false
 }
 
 // A short, collision-resistant token for the probe file name. We don't need

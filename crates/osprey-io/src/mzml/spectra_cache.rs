@@ -214,9 +214,16 @@ pub fn load_spectra_cache(
     if stored_size != 0 {
         if let Some(src) = source_path {
             let (actual_size, actual_mtime_ms) = source_fingerprint(Some(src));
-            if actual_size != 0
-                && (actual_size != stored_size || actual_mtime_ms != stored_mtime_ms)
-            {
+            // actual_size == 0 means the source is unavailable -> trust the cache.
+            // mtime == 0 means "unknown" (per the format docs), so only treat a
+            // mtime difference as staleness when both sides recorded a real mtime;
+            // the size is always compared when the source is readable.
+            let size_changed = actual_size != 0 && actual_size != stored_size;
+            let mtime_changed = actual_size != 0
+                && actual_mtime_ms != 0
+                && stored_mtime_ms != 0
+                && actual_mtime_ms != stored_mtime_ms;
+            if size_changed || mtime_changed {
                 return Err(OspreyError::IoError(std::io::Error::other(format!(
                     "Spectra cache '{}' is stale: source file '{}' changed \
                      (size {} -> {}, mtime {} -> {} ms)",
