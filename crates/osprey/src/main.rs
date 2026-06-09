@@ -90,6 +90,31 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
+    /// Convenience that sets BOTH --output-dir and --cache-dir to <dir>.
+    /// An explicit --output-dir / --cache-dir overrides the matching
+    /// component. The simple "everything in one place" / testing option:
+    /// because it sets --cache-dir explicitly, the spectra cache lands in
+    /// <dir> regardless of whether the input directory is writable.
+    #[arg(long, value_name = "DIR")]
+    work_dir: Option<PathBuf>,
+
+    /// Base directory for all non-cache per-file derived artifacts (the
+    /// scores parquet, FDR score sidecars, reconciliation.json, and the
+    /// calibration JSON). Default: each input file's own directory
+    /// (current behavior). Keyed by input basename, so the produced bytes
+    /// are unchanged — only the directory moves.
+    #[arg(long, value_name = "DIR")]
+    output_dir: Option<PathBuf>,
+
+    /// Directory for the `.spectra.bin` cache only. Default resolution
+    /// order when unset: beside the data file if writable, else
+    /// --output-dir, else (when neither is set) the input file's own
+    /// directory. The cache is settings-independent, so a shared
+    /// --cache-dir lets many analyses (and straight-through vs. resume
+    /// passes) reuse one parse.
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
+
     /// Resolution mode: unit, hram, auto
     #[arg(long, default_value = "auto")]
     resolution: String,
@@ -486,6 +511,23 @@ fn resolve_input_scores(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Resolve the `--work-dir` / `--output-dir` / `--cache-dir` triple into the
+/// effective `(output_dir, cache_dir)` config values. `--work-dir` sets both
+/// components; an explicit `--output-dir` / `--cache-dir` overrides the
+/// matching one (`output_dir = explicit_output ?? work_dir`,
+/// `cache_dir = explicit_cache ?? work_dir`). Each returned value is `None`
+/// when neither the explicit flag nor `--work-dir` was supplied, so the
+/// caller leaves the config field (and any YAML value) untouched.
+fn resolve_artifact_dirs(
+    work_dir: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let out = output_dir.or_else(|| work_dir.clone());
+    let cache = cache_dir.or(work_dir);
+    (out, cache)
+}
+
 fn main() -> Result<()> {
     let mut args = Args::parse();
 
@@ -651,6 +693,24 @@ fn main() -> Result<()> {
     }
     if let Some(ref path) = args.decoy_pairing_manifest {
         config.decoy_pairing_manifest = Some(path.clone());
+    }
+
+    // Output / cache directory redirection. --work-dir is a convenience
+    // that sets both; an explicit --output-dir / --cache-dir overrides the
+    // matching component. Mirrors OspreySharp's Program.ParseArgs
+    // precedence. CLI-only (not via ConfigOverrides) so an explicit flag
+    // always wins over any YAML value; leaving all three unset preserves
+    // whatever the YAML config carried.
+    let (resolved_output_dir, resolved_cache_dir) = resolve_artifact_dirs(
+        args.work_dir.clone(),
+        args.output_dir.clone(),
+        args.cache_dir.clone(),
+    );
+    if resolved_output_dir.is_some() {
+        config.output_dir = resolved_output_dir;
+    }
+    if resolved_cache_dir.is_some() {
+        config.cache_dir = resolved_cache_dir;
     }
 
     // HPC scoring split: set the new config fields after merge_with_args.
@@ -1230,5 +1290,87 @@ mod tests {
             cfg.input_scores.is_none(),
             "input_scores should default to None"
         );
+    }
+
+    #[test]
+    fn config_defaults_no_output_or_cache_dir() {
+        let cfg = OspreyConfig::default();
+        assert!(
+            cfg.output_dir.is_none(),
+            "output_dir should default to None"
+        );
+        assert!(cfg.cache_dir.is_none(), "cache_dir should default to None");
+    }
+
+    // --- resolve_artifact_dirs (--work-dir / --output-dir / --cache-dir) --
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn artifact_dirs_all_unset_is_none() {
+        let (out, cache) = resolve_artifact_dirs(None, None, None);
+        assert!(out.is_none());
+        assert!(cache.is_none());
+    }
+
+    #[test]
+    fn artifact_dirs_work_dir_sets_both() {
+        let (out, cache) = resolve_artifact_dirs(Some(p("/work")), None, None);
+        assert_eq!(out, Some(p("/work")));
+        assert_eq!(cache, Some(p("/work")));
+    }
+
+    #[test]
+    fn artifact_dirs_explicit_output_overrides_work_component() {
+        // --work-dir D --output-dir O => outputs in O, cache in D.
+        let (out, cache) = resolve_artifact_dirs(Some(p("/work")), Some(p("/out")), None);
+        assert_eq!(out, Some(p("/out")));
+        assert_eq!(cache, Some(p("/work")));
+    }
+
+    #[test]
+    fn artifact_dirs_explicit_cache_overrides_work_component() {
+        // --work-dir D --cache-dir E => outputs in D, cache in E.
+        let (out, cache) = resolve_artifact_dirs(Some(p("/work")), None, Some(p("/cache")));
+        assert_eq!(out, Some(p("/work")));
+        assert_eq!(cache, Some(p("/cache")));
+    }
+
+    #[test]
+    fn artifact_dirs_output_and_cache_without_work() {
+        let (out, cache) = resolve_artifact_dirs(None, Some(p("/out")), Some(p("/cache")));
+        assert_eq!(out, Some(p("/out")));
+        assert_eq!(cache, Some(p("/cache")));
+    }
+
+    #[test]
+    fn cli_parses_work_output_cache_dirs() {
+        let args = parse(&[
+            "-i",
+            "a.mzML",
+            "-l",
+            "ref.blib",
+            "-o",
+            "out.blib",
+            "--work-dir",
+            "/work",
+            "--output-dir",
+            "/out",
+            "--cache-dir",
+            "/cache",
+        ]);
+        assert_eq!(args.work_dir, Some(p("/work")));
+        assert_eq!(args.output_dir, Some(p("/out")));
+        assert_eq!(args.cache_dir, Some(p("/cache")));
+    }
+
+    #[test]
+    fn cli_default_has_no_dir_flags() {
+        let args = parse(&["-i", "a.mzML", "-l", "ref.blib", "-o", "out.blib"]);
+        assert!(args.work_dir.is_none());
+        assert!(args.output_dir.is_none());
+        assert!(args.cache_dir.is_none());
     }
 }

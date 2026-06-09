@@ -176,11 +176,20 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
                 ))
             })?;
 
+        // The boundary files (FDR sidecar + reconciliation.json) are
+        // siblings of the input parquet — the first-join phase wrote all of
+        // them to the same directory the parquet was found in — so resolve
+        // them in the parquet's own directory.
+        let boundary_dir = synthetic_input
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
         // 2. Overlay SVM scores + q-values + PEP from .1st-pass.fdr_scores.bin.
         //    expected_pass = 1 because the worker reads the FIRST-pass
         //    sidecar — the planner's actions were computed against it,
         //    and the same q-values feed gap-fill eligibility.
-        let sidecar_path = fdr_scores_path_pass1(&synthetic_input);
+        let sidecar_path = fdr_scores_path_pass1(&synthetic_input, &boundary_dir);
         if !load_fdr_scores_sidecar(&sidecar_path, &mut stubs, 1) {
             return Err(OspreyError::config(format!(
                 "hydrate_for_rescore: failed to overlay .1st-pass.fdr_scores.bin for {} \
@@ -191,7 +200,7 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
         }
 
         // 3. Parse reconciliation.json.
-        let recon_path = reconciliation_path(&synthetic_input);
+        let recon_path = reconciliation_path(&synthetic_input, &boundary_dir);
         let envelope = read_reconciliation_file(&recon_path).map_err(|e| {
             OspreyError::config(format!(
                 "hydrate_for_rescore: failed to read {}: {}",
