@@ -24,14 +24,19 @@ use std::collections::HashMap;
 /// If the cache exists and is newer than the source, loads from cache directly
 /// (skipping TSV/blib/elib parsing and deduplication). Otherwise, loads from
 /// source, deduplicates, and saves the cache for future runs.
-pub fn load_library(source: &LibrarySource) -> Result<Vec<LibraryEntry>> {
+pub fn load_library(
+    source: &LibrarySource,
+    cache_dir: &std::path::Path,
+) -> Result<Vec<LibraryEntry>> {
     let source_path = source.path();
-    let cache_path = source_path.with_extension(
-        source_path
-            .extension()
-            .map(|e| format!("{}.libcache", e.to_string_lossy()))
-            .unwrap_or_else(|| "libcache".to_string()),
-    );
+    // Library cache filename ("<library-name>.libcache"), placed in cache_dir
+    // (--cache-dir / --work-dir) rather than beside a possibly read-only library.
+    // Only the directory moves; the filename is unchanged.
+    let cache_name = source_path
+        .file_name()
+        .map(|n| format!("{}.libcache", n.to_string_lossy()))
+        .unwrap_or_else(|| "library.libcache".to_string());
+    let cache_path = cache_dir.join(cache_name);
 
     // Try loading from cache if it exists and is newer than the source file
     if cache_path.exists() {
