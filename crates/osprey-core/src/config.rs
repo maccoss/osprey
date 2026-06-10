@@ -163,6 +163,24 @@ pub struct OspreyConfig {
     /// writes.
     #[serde(default)]
     pub parquet_compression: ParquetCompression,
+
+    // Output / cache directory redirection
+    /// Base directory for all non-cache per-file derived artifacts (the
+    /// scores parquet and its reconciled rewrite, the FDR score sidecars,
+    /// `reconciliation.json`, and the calibration JSON). `None` (the
+    /// default) writes each artifact in its input file's own directory
+    /// (the historical behavior). Set by `--output-dir` (or `--work-dir`).
+    /// Maps to OspreySharp `OspreyConfig.OutputDir`.
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
+    /// Directory for the `.spectra.bin` cache only. `None` (the default)
+    /// resolves the cache location at write time: beside the data file when
+    /// that directory is writable, else `output_dir`, else (when neither is
+    /// configured) the input file's own directory with no probe. Set by
+    /// `--cache-dir` (or `--work-dir`). Maps to OspreySharp
+    /// `OspreyConfig.CacheDir`.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
 }
 
 /// Compression codec for `.scores.parquet` writes. Reading auto-dispatches
@@ -212,6 +230,8 @@ impl Default for OspreyConfig {
             stop_after_stage5: false,
             expect_reconciled_input: false,
             parquet_compression: ParquetCompression::default(),
+            output_dir: None,
+            cache_dir: None,
         }
     }
 }
@@ -364,6 +384,27 @@ n_threads: 0  # 0 = auto-detect
         fs::write(path.as_ref(), template).map_err(|e| {
             OspreyError::ConfigError(format!("Failed to write template config: {}", e))
         })
+    }
+
+    /// Directory for a non-cache derived artifact of `input_path`:
+    /// [`OspreyConfig::output_dir`] when set, else the input file's own
+    /// directory (the historical default). See
+    /// [`crate::artifact_paths::resolve_output_dir`].
+    pub fn resolve_output_dir(&self, input_path: &Path) -> PathBuf {
+        crate::artifact_paths::resolve_output_dir(input_path, self.output_dir.as_deref())
+    }
+
+    /// Directory for the `.spectra.bin` cache of `input_path`. Resolution
+    /// order: explicit [`OspreyConfig::cache_dir`] -> beside the data file
+    /// when writable -> [`OspreyConfig::output_dir`] -> (when neither is
+    /// configured) the input file's own directory. See
+    /// [`crate::artifact_paths::resolve_cache_dir`].
+    pub fn resolve_cache_dir(&self, input_path: &Path) -> PathBuf {
+        crate::artifact_paths::resolve_cache_dir(
+            input_path,
+            self.output_dir.as_deref(),
+            self.cache_dir.as_deref(),
+        )
     }
 
     /// Merge command-line arguments over file configuration

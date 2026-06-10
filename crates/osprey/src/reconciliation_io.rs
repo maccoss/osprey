@@ -370,17 +370,18 @@ impl ReconciliationFile {
     }
 }
 
-/// Compute the per-file reconciliation JSON path: sibling to the input
-/// mzML at `<dir>/<stem>.reconciliation.json`. Mirrors the existing
-/// pattern used for `<stem>.calibration.json`, `<stem>.spectra.bin`,
-/// etc.
-pub fn reconciliation_path(input_path: &Path) -> std::path::PathBuf {
+/// Compute the per-file reconciliation JSON path in the resolved output
+/// directory: `<output_dir>/<stem>.reconciliation.json`. Mirrors the
+/// existing pattern used for `<stem>.calibration.json`,
+/// `<stem>.scores.parquet`, etc. The filename is unchanged; only the
+/// directory is redirected. Pass the directory from
+/// [`osprey_core::OspreyConfig::resolve_output_dir`].
+pub fn reconciliation_path(input_path: &Path, output_dir: &Path) -> std::path::PathBuf {
     let stem = input_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    let parent = input_path.parent().unwrap_or(Path::new("."));
-    parent.join(format!("{}.reconciliation.json", stem))
+    output_dir.join(format!("{}.reconciliation.json", stem))
 }
 
 /// Write the boundary file as pretty JSON with 2-space indent + LF line

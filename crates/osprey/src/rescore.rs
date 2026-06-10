@@ -176,11 +176,20 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
                 ))
             })?;
 
+        // The boundary files (FDR sidecar + reconciliation.json) are
+        // siblings of the input parquet — the first-join phase wrote all of
+        // them to the same directory the parquet was found in — so resolve
+        // them in the parquet's own directory.
+        let boundary_dir = synthetic_input
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
         // 2. Overlay SVM scores + q-values + PEP from .1st-pass.fdr_scores.bin.
         //    expected_pass = 1 because the worker reads the FIRST-pass
         //    sidecar — the planner's actions were computed against it,
         //    and the same q-values feed gap-fill eligibility.
-        let sidecar_path = fdr_scores_path_pass1(&synthetic_input);
+        let sidecar_path = fdr_scores_path_pass1(&synthetic_input, &boundary_dir);
         if !load_fdr_scores_sidecar(&sidecar_path, &mut stubs, 1) {
             return Err(OspreyError::config(format!(
                 "hydrate_for_rescore: failed to overlay .1st-pass.fdr_scores.bin for {} \
@@ -191,7 +200,7 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
         }
 
         // 3. Parse reconciliation.json.
-        let recon_path = reconciliation_path(&synthetic_input);
+        let recon_path = reconciliation_path(&synthetic_input, &boundary_dir);
         let envelope = read_reconciliation_file(&recon_path).map_err(|e| {
             OspreyError::config(format!(
                 "hydrate_for_rescore: failed to read {}: {}",
@@ -428,11 +437,11 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
             Some(s) => s.to_string(),
             None => continue,
         };
-        let input_dir = match input_file.parent() {
-            Some(d) => d,
-            None => continue,
-        };
-        let cal_path = calibration_path_for_input(input_file, input_dir);
+        // Stage 1-4 wrote the calibration sidecar to the configured output dir,
+        // which for an --output-dir/--work-dir run is NOT the (possibly read-only)
+        // input mzML's directory. Resolve it the same way the writer did.
+        let output_dir = config.resolve_output_dir(input_file);
+        let cal_path = calibration_path_for_input(input_file, &output_dir);
         if !cal_path.exists() {
             return Err(OspreyError::config(format!(
                 "run_rescore: required calibration JSON not found at {} (input file: {}). \

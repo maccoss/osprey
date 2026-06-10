@@ -3,6 +3,7 @@
 //! This crate provides the foundational types, configuration structures,
 //! error handling, and traits used throughout the Osprey analysis pipeline.
 
+pub mod artifact_paths;
 pub mod config;
 pub mod diagnostics;
 pub mod error;
@@ -10,6 +11,7 @@ pub mod isotope;
 pub mod traits;
 pub mod types;
 
+pub use artifact_paths::{resolve_cache_dir, resolve_output_dir};
 pub use config::*;
 pub use error::{OspreyError, Result};
 pub use isotope::*;

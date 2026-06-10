@@ -52,7 +52,7 @@ use osprey_fdr::{
     get_pin_feature_names, percolator, pin_feature_value, MokapotRunner, NUM_PIN_FEATURES,
 };
 use osprey_io::{
-    load_all_spectra, load_library, load_spectra_cache, save_spectra_cache, spectra_cache_path,
+    load_all_spectra, load_library, load_spectra_cache, save_spectra_cache, spectra_cache_path_in,
     BlibWriter, MS1Index,
 };
 use osprey_scoring::{
@@ -1379,15 +1379,20 @@ fn compute_roc_auc(target_vals: &[f64], decoy_vals: &[f64]) -> f64 {
 // Per-file score parquet caching
 // =============================================================================
 
-/// Derive the scores parquet path from an input mzML path.
-/// e.g., `/data/sample1.mzML` → `/data/sample1.scores.parquet`
-fn scores_path_for_input(input_path: &std::path::Path) -> std::path::PathBuf {
+/// Derive the scores parquet path from an input mzML path and the resolved
+/// output directory.
+/// e.g., `/data/sample1.mzML` with output dir `/data` → `/data/sample1.scores.parquet`.
+/// Pass the directory from [`OspreyConfig::resolve_output_dir`]; the
+/// filename (`{stem}.scores.parquet`) is unchanged.
+fn scores_path_for_input(
+    input_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> std::path::PathBuf {
     let stem = input_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
-    parent.join(format!("{}.scores.parquet", stem))
+    output_dir.join(format!("{}.scores.parquet", stem))
 }
 
 /// Inverse of `scores_path_for_input`: given `/data/sample1.scores.parquet`,
@@ -1406,24 +1411,30 @@ pub(crate) fn synthetic_input_from_parquet(parquet_path: &std::path::Path) -> st
     parent.join(format!("{}.mzML", stem))
 }
 
-/// Path for per-file first-pass FDR score sidecar.
-pub(crate) fn fdr_scores_path_pass1(input_path: &std::path::Path) -> std::path::PathBuf {
+/// Path for per-file first-pass FDR score sidecar, in the resolved output
+/// directory. The filename (`{stem}.1st-pass.fdr_scores.bin`) is unchanged.
+pub(crate) fn fdr_scores_path_pass1(
+    input_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> std::path::PathBuf {
     let stem = input_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
-    parent.join(format!("{}.1st-pass.fdr_scores.bin", stem))
+    output_dir.join(format!("{}.1st-pass.fdr_scores.bin", stem))
 }
 
-/// Path for per-file second-pass FDR score sidecar.
-fn fdr_scores_path_pass2(input_path: &std::path::Path) -> std::path::PathBuf {
+/// Path for per-file second-pass FDR score sidecar, in the resolved output
+/// directory. The filename (`{stem}.2nd-pass.fdr_scores.bin`) is unchanged.
+fn fdr_scores_path_pass2(
+    input_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> std::path::PathBuf {
     let stem = input_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
-    let parent = input_path.parent().unwrap_or(std::path::Path::new("."));
-    parent.join(format!("{}.2nd-pass.fdr_scores.bin", stem))
+    output_dir.join(format!("{}.2nd-pass.fdr_scores.bin", stem))
 }
 
 // Binary FDR-scores sidecar format (`<stem>.<phase>-pass.fdr_scores.bin`).
@@ -1715,14 +1726,15 @@ fn input_path_for_file_name(config: &OspreyConfig, file_name: &str) -> Option<st
 fn persist_fdr_scores(
     per_file_entries: &[(String, Vec<FdrEntry>)],
     config: &OspreyConfig,
-    path_fn: fn(&std::path::Path) -> std::path::PathBuf,
+    path_fn: fn(&std::path::Path, &std::path::Path) -> std::path::PathBuf,
     label: &str,
     pass: u8,
 ) -> usize {
     let mut failures = 0usize;
     for (file_name, entries) in per_file_entries.iter() {
         if let Some(input_file) = input_path_for_file_name(config, file_name) {
-            let sidecar_path = path_fn(&input_file);
+            let output_dir = config.resolve_output_dir(&input_file);
+            let sidecar_path = path_fn(&input_file, &output_dir);
             if let Err(e) = write_fdr_scores_sidecar(&sidecar_path, entries, pass) {
                 log::warn!(
                     "Failed to write {} score sidecar for {}: {}",
@@ -3143,9 +3155,10 @@ pub(crate) fn rescore_per_file_loop(
 
         // Load spectra and calibration for this file
         let (spectra, ms1_index) = {
-            let cache_path = spectra_cache_path(input_file);
+            let cache_path =
+                spectra_cache_path_in(input_file, &config.resolve_cache_dir(input_file));
             if cache_path.exists() {
-                match load_spectra_cache(&cache_path) {
+                match load_spectra_cache(&cache_path, Some(input_file)) {
                     Ok(result) => {
                         log::debug!(
                             "Loaded {} MS2 spectra from cache '{}'",
@@ -3192,14 +3205,8 @@ pub(crate) fn rescore_per_file_loop(
         // `run_rescore` so this catch is belt-and-suspenders for both
         // paths.
         let cal_params: CalibrationParams = {
-            let input_dir = input_file.parent().ok_or_else(|| {
-                OspreyError::config(format!(
-                    "rescore_per_file_loop: cannot derive parent directory from input path `{}`. \
-                     Stage 6 needs to locate the Stage 1-4 calibration sidecar next to the mzML.",
-                    input_file.display()
-                ))
-            })?;
-            let cal_path = calibration_path_for_input(input_file, input_dir);
+            let output_dir = config.resolve_output_dir(input_file);
+            let cal_path = calibration_path_for_input(input_file, &output_dir);
             if !cal_path.exists() {
                 return Err(OspreyError::config(format!(
                     "rescore_per_file_loop: required calibration JSON not found at `{}` (input \
@@ -3656,7 +3663,8 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         "Loading spectral library from {:?}",
         config.library_source.path()
     );
-    let mut library = load_library(&config.library_source)?;
+    let lib_cache_dir = config.resolve_cache_dir(config.library_source.path());
+    let mut library = load_library(&config.library_source, &lib_cache_dir)?;
     log::info!("Loaded {} library entries", library.len());
 
     if library.is_empty() {
@@ -3958,8 +3966,16 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             // computed from 2nd-pass scores during compaction and the
             // post-compaction pool size diverges (~6500 vs ~6200 protein
             // groups on Stellar 3-file).
-            let pass2 = fdr_scores_path_pass2(&synthetic);
-            let pass1 = fdr_scores_path_pass1(&synthetic);
+            // The FDR sidecars + calibration JSON are siblings of the input
+            // parquet (the worker that produced them wrote all three to the
+            // same directory), so resolve them in the parquet's own
+            // directory rather than the configured output_dir.
+            let join_dir = synthetic
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let pass2 = fdr_scores_path_pass2(&synthetic, &join_dir);
+            let pass1 = fdr_scores_path_pass1(&synthetic, &join_dir);
             // Tuple-bind the (primary, fallback) ordering once. Both branches
             // of `||` have side effects (each loader mutates `stubs`) so the
             // boolean OR is only equivalent at the type level -- ordering
@@ -3981,8 +3997,8 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             pass2_sidecar_paths.insert(file_name.clone(), pass2.clone());
 
             // Calibration JSON (best-effort, used by inter-replicate reconciliation)
-            if let Some(input_dir) = synthetic.parent() {
-                let cal_path = calibration_path_for_input(&synthetic, input_dir);
+            {
+                let cal_path = calibration_path_for_input(&synthetic, &join_dir);
                 if cal_path.exists() {
                     if let Ok(cal_params) = load_calibration(&cal_path) {
                         if let Some(ref mp) = cal_params.rt_calibration.model_params {
@@ -4041,16 +4057,22 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 .unwrap_or("unknown")
                 .to_string();
 
+            // Resolve the per-file artifact directories once. Non-cache
+            // artifacts (scores parquet, FDR sidecars, calibration JSON) use
+            // the output dir; the spectra cache uses the cache dir. (Named
+            // distinctly from the outer blib/mokapot `output_dir` above.)
+            let file_output_dir = config.resolve_output_dir(input_file);
+
             // Check for cached scores parquet (skip search if already scored)
-            let scores_path = scores_path_for_input(input_file);
+            let scores_path = scores_path_for_input(input_file, &file_output_dir);
             let scores_file_valid = scores_path.exists()
                 && scores_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
             let cached_stubs = if scores_file_valid {
                 match load_fdr_stubs_from_parquet(&scores_path, &mut seq_interner) {
                     Ok(mut stubs) => {
                         // Try loading SVM scores from sidecar (prefer 2nd-pass, fall back to 1st-pass)
-                        let pass2 = fdr_scores_path_pass2(input_file);
-                        let pass1 = fdr_scores_path_pass1(input_file);
+                        let pass2 = fdr_scores_path_pass2(input_file, &file_output_dir);
+                        let pass1 = fdr_scores_path_pass1(input_file, &file_output_dir);
                         if load_fdr_scores_sidecar(&pass2, &mut stubs, 2) {
                             log::debug!(
                                 "Loaded {} cached scores + 2nd-pass SVM scores from {}",
@@ -4072,8 +4094,8 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                             );
                         }
                         // Load cached calibration for inter-replicate reconciliation
-                        if let Some(input_dir) = input_file.parent() {
-                            let cal_path = calibration_path_for_input(input_file, input_dir);
+                        {
+                            let cal_path = calibration_path_for_input(input_file, &file_output_dir);
                             if cal_path.exists() {
                                 if let Ok(cal_params) = load_calibration(&cal_path) {
                                     if let Some(ref model_params) =
@@ -4142,8 +4164,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 }
 
                 // Save binary spectra cache for fast reload during re-scoring
-                let cache_path = spectra_cache_path(input_file);
-                if let Err(e) = save_spectra_cache(&cache_path, &spectra, &ms1_index) {
+                let cache_path =
+                    spectra_cache_path_in(input_file, &config.resolve_cache_dir(input_file));
+                if let Err(e) =
+                    save_spectra_cache(&cache_path, &spectra, &ms1_index, Some(input_file))
+                {
                     log::warn!("Failed to save spectra cache: {}", e);
                 }
 
@@ -4151,27 +4176,33 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 let (rt_cal, cal_params): (Option<RTCalibration>, Option<CalibrationParams>) =
                     if config.rt_calibration.enabled {
                         // Try to load cached calibration
-                        let cached = input_file.parent().and_then(|input_dir| {
-                            let cal_path = calibration_path_for_input(input_file, input_dir);
-                            if !cal_path.exists() {
-                                return None;
-                            }
-                            let cal_params = load_calibration(&cal_path).ok()?;
-                            if !cal_params.rt_calibration.has_model_data()
-                                || !cal_params.is_calibrated()
-                            {
-                                return None;
-                            }
-                            let model_params = cal_params.rt_calibration.model_params.as_ref()?;
-                            let rt_cal = RTCalibration::from_model_params(
-                                model_params,
-                                cal_params.rt_calibration.residual_sd,
-                            )
-                            .ok()?;
-                            log::debug!("Reusing cached calibration from {}", cal_path.display());
-                            cal_params.log_summary();
-                            Some((rt_cal, cal_params))
-                        });
+                        let cached = {
+                            let cal_path = calibration_path_for_input(input_file, &file_output_dir);
+                            (|| {
+                                if !cal_path.exists() {
+                                    return None;
+                                }
+                                let cal_params = load_calibration(&cal_path).ok()?;
+                                if !cal_params.rt_calibration.has_model_data()
+                                    || !cal_params.is_calibrated()
+                                {
+                                    return None;
+                                }
+                                let model_params =
+                                    cal_params.rt_calibration.model_params.as_ref()?;
+                                let rt_cal = RTCalibration::from_model_params(
+                                    model_params,
+                                    cal_params.rt_calibration.residual_sd,
+                                )
+                                .ok()?;
+                                log::debug!(
+                                    "Reusing cached calibration from {}",
+                                    cal_path.display()
+                                );
+                                cal_params.log_summary();
+                                Some((rt_cal, cal_params))
+                            })()
+                        };
 
                         if let Some((rt_cal, cal_params)) = cached {
                             (Some(rt_cal), Some(cal_params))
@@ -4182,9 +4213,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                             ) {
                                 Ok((rt_cal, cal_params)) => {
                                     cal_params.log_summary();
-                                    if let Some(input_dir) = input_file.parent() {
-                                        let cal_path =
-                                            calibration_path_for_input(input_file, input_dir);
+                                    {
+                                        let cal_path = calibration_path_for_input(
+                                            input_file,
+                                            &file_output_dir,
+                                        );
                                         if let Err(e) = save_calibration(&cal_params, &cal_path) {
                                             log::warn!("Failed to save calibration: {}", e);
                                         }
@@ -5072,7 +5105,9 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 recon_write_failures += 1;
                 continue;
             };
-            let recon_path = crate::reconciliation_io::reconciliation_path(&input_path);
+            let recon_output_dir = config.resolve_output_dir(&input_path);
+            let recon_path =
+                crate::reconciliation_io::reconciliation_path(&input_path, &recon_output_dir);
             let file_actions = actions_by_file
                 .get(file_name.as_str())
                 .map(|v| v.as_slice());
