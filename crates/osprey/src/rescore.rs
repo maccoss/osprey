@@ -437,11 +437,11 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
             Some(s) => s.to_string(),
             None => continue,
         };
-        let input_dir = match input_file.parent() {
-            Some(d) => d,
-            None => continue,
-        };
-        let cal_path = calibration_path_for_input(input_file, input_dir);
+        // Stage 1-4 wrote the calibration sidecar to the configured output dir,
+        // which for an --output-dir/--work-dir run is NOT the (possibly read-only)
+        // input mzML's directory. Resolve it the same way the writer did.
+        let output_dir = config.resolve_output_dir(input_file);
+        let cal_path = calibration_path_for_input(input_file, &output_dir);
         if !cal_path.exists() {
             return Err(OspreyError::config(format!(
                 "run_rescore: required calibration JSON not found at {} (input file: {}). \
