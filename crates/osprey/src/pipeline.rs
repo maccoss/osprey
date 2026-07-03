@@ -5123,6 +5123,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                     &search_hash,
                     &library_hash,
                     &join_file_stems,
+                    // The join-wide first-pass passing base_id set computed above
+                    // (before compaction). Carried in every per-file envelope so an
+                    // HPC per-file rescore worker compacts to the same set the
+                    // in-memory straight-through pipeline used, not a per-file subset.
+                    &first_pass_base_ids,
                 );
             if let Err(e) =
                 crate::reconciliation_io::write_reconciliation_file(&recon_path, &recon_file)
