@@ -26,7 +26,7 @@
 //! Mirrors `OspreySharp.IO.ReconciliationFile` on the C# side. Cross-impl
 //! byte parity is verified by a sibling test in both languages.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
@@ -156,6 +156,17 @@ impl<'a> Formatter for RoundtripPrettyFormatter<'a> {
 /// use, so backward compat is not maintained; v1 acceptance previously
 /// silently fell back to a single-stem hash that the merge node would
 /// reject anyway.
+///
+/// `first_pass_base_ids` (added format_version 3) carries the join-wide
+/// set of base_ids that survived first-pass compaction. The first-join
+/// phase computes it with every file in memory (the distinct base_ids
+/// remaining across all files after compaction); a per-file rescore
+/// worker, which only holds its own file, uses it to compact to exactly
+/// the set the in-memory straight-through pipeline used, instead of a
+/// per-file subset that drops cross-file entries. v2 files (no
+/// `first_pass_base_ids` field) are rejected at deserialization for the
+/// same no-backward-compat reason as v1. Mirrors `first_pass_base_ids` on
+/// the C# `ReconciliationFile` for cross-impl byte parity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReconciliationFile {
@@ -165,6 +176,12 @@ pub struct ReconciliationFile {
     /// are rejected at parse time with a clear error rather than
     /// silently falling back to single-stem hashes.
     pub file_stems: Vec<String>,
+    /// Join-wide set of first-pass passing base_ids, sorted ascending for
+    /// deterministic byte-parity output. Required (no `#[serde(default)]`):
+    /// a missing field triggers a serde deserialization error so legacy
+    /// v1/v2 envelopes are rejected at parse time rather than a per-file
+    /// worker silently recomputing a divergent per-file subset.
+    pub first_pass_base_ids: Vec<u32>,
     pub forced_integration_actions: Vec<ForcedIntegrationEntry>,
     pub format_version: u32,
     pub gap_fill_targets: Vec<GapFillEntry>,
@@ -228,7 +245,13 @@ pub struct RefinedRtCalibrationJson {
 ///     parquet). Old v1 files deserialize with empty `file_stems` via
 ///     `#[serde(default)]`; the worker falls back to its
 ///     `config.input_files` stems for those (preserving v1 behavior).
-pub const RECONCILIATION_FORMAT_VERSION: u32 = 2;
+/// v3: added `first_pass_base_ids`, the join-wide set of base_ids that
+///     survived first-pass compaction. A per-file rescore worker compacts
+///     to exactly this set instead of recomputing a per-file subset that
+///     drops cross-file entries, so the HPC chain matches the in-memory
+///     pipeline. Required in v3 (no `#[serde(default)]`): v2 envelopes are
+///     rejected at parse time.
+pub const RECONCILIATION_FORMAT_VERSION: u32 = 3;
 
 impl ReconciliationFile {
     /// Build the wire envelope for a single file. Filters
@@ -251,6 +274,7 @@ impl ReconciliationFile {
         search_hash: &str,
         library_hash: &str,
         file_stems: &[String],
+        first_pass_base_ids: &HashSet<u32>,
     ) -> Self {
         let file_actions: Vec<(usize, &ReconcileAction)> = reconciliation_actions
             .iter()
@@ -270,6 +294,7 @@ impl ReconciliationFile {
             search_hash,
             library_hash,
             file_stems,
+            first_pass_base_ids,
         )
     }
 
@@ -288,6 +313,7 @@ impl ReconciliationFile {
         search_hash: &str,
         library_hash: &str,
         file_stems: &[String],
+        first_pass_base_ids: &HashSet<u32>,
     ) -> Self {
         // Sort and deduplicate the file_stems for deterministic output
         // — matches the sort+dedup used by reconciliation_parameter_hash
@@ -295,6 +321,10 @@ impl ReconciliationFile {
         let mut stems: Vec<String> = file_stems.to_vec();
         stems.sort();
         stems.dedup();
+        // Sort the join-wide passing base_ids ascending for deterministic,
+        // byte-parity output (matches the Array.Sort on the C# side).
+        let mut base_ids: Vec<u32> = first_pass_base_ids.iter().copied().collect();
+        base_ids.sort_unstable();
         let mut use_cwt: Vec<UseCwtPeakEntry> = Vec::new();
         let mut forced: Vec<ForcedIntegrationEntry> = Vec::new();
         for (vec_idx, action) in file_actions {
@@ -359,6 +389,7 @@ impl ReconciliationFile {
 
         Self {
             file_stems: stems,
+            first_pass_base_ids: base_ids,
             forced_integration_actions: forced,
             format_version: RECONCILIATION_FORMAT_VERSION,
             gap_fill_targets: gap,
@@ -465,8 +496,13 @@ mod tests {
     use super::*;
 
     fn sample_file() -> ReconciliationFile {
+        // NOTE: keep these hardcoded inputs byte-identical to the C#
+        // sibling `MakeSampleReconciliationFile` so the cross-impl
+        // byte-parity hook below (OSPREY_CROSS_IMPL_RECONCILIATION_OUT)
+        // compares like against like.
         ReconciliationFile {
-            file_stems: vec!["fileA".to_string(), "fileB".to_string()],
+            file_stems: vec!["round_trip".to_string()],
+            first_pass_base_ids: vec![3, 100, 101, 200, 201],
             forced_integration_actions: vec![
                 ForcedIntegrationEntry {
                     entry_id: 200,
@@ -589,6 +625,7 @@ mod tests {
             file.forced_integration_actions.len()
         );
         assert_eq!(parsed.gap_fill_targets.len(), file.gap_fill_targets.len());
+        assert_eq!(parsed.first_pass_base_ids, file.first_pass_base_ids);
         // Spot-check bit-exact f64 round-trip on a non-trivial value.
         let cwt_orig = &file.use_cwt_peak_actions[0];
         let cwt_got = &parsed.use_cwt_peak_actions[0];
@@ -603,11 +640,12 @@ mod tests {
         let path = dir.path().join("bad_version.reconciliation.json");
         // Hand-craft a file with an out-of-range format_version. Field
         // order matches the alphabetical struct declaration so the
-        // reader doesn't trip over deny_unknown_fields. file_stems is
-        // present (non-default) so serde parse succeeds and the runtime
-        // format_version check fires.
+        // reader doesn't trip over deny_unknown_fields. All required
+        // fields (file_stems, first_pass_base_ids) are present so serde
+        // parse succeeds and the runtime format_version check fires.
         let bad = r#"{
   "file_stems": ["a", "b"],
+  "first_pass_base_ids": [1, 2],
   "forced_integration_actions": [],
   "format_version": 99,
   "gap_fill_targets": [],
@@ -645,6 +683,35 @@ mod tests {
         assert!(
             err.contains("missing field `file_stems`"),
             "expected v1 rejection at serde parse, got: {}",
+            err
+        );
+    }
+
+    /// v2 envelopes (have `file_stems` but no `first_pass_base_ids`) are
+    /// rejected at parse time: the missing-field serde error fires before
+    /// the runtime `format_version` check. Mirrors the OspreySharp side,
+    /// which hard-fails when `first_pass_base_ids` is absent so a per-file
+    /// worker never silently recomputes a divergent per-file base_id subset.
+    #[test]
+    fn reconciliation_file_v2_envelope_rejected_at_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.reconciliation.json");
+        let v2 = r#"{
+  "file_stems": ["a", "b"],
+  "forced_integration_actions": [],
+  "format_version": 2,
+  "gap_fill_targets": [],
+  "library_hash": "x",
+  "refined_rt_calibration": null,
+  "search_hash": "y",
+  "use_cwt_peak_actions": []
+}
+"#;
+        std::fs::write(&path, v2).unwrap();
+        let err = read_reconciliation_file(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("missing field `first_pass_base_ids`"),
+            "expected v2 rejection at serde parse, got: {}",
             err
         );
     }
