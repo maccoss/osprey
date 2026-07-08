@@ -83,6 +83,22 @@ fn ms1_envelope_tolerance_ppm(precursor_tolerance: &osprey_core::FragmentToleran
     }
 }
 
+/// Build isolation-window m/z intervals (center +/- width/2) from a loaded
+/// calibration's isolation scheme, for gap-fill m/z filtering. None when the
+/// calibration carries no isolation scheme.
+fn isolation_intervals_from_cal(cal_params: &CalibrationParams) -> Option<Vec<(f64, f64)>> {
+    cal_params.metadata.isolation_scheme.as_ref().map(|scheme| {
+        scheme
+            .windows
+            .iter()
+            .map(|&(center, width)| {
+                let half = width / 2.0;
+                (center - half, center + half)
+            })
+            .collect()
+    })
+}
+
 /// Wrapper to implement MS1SpectrumLookup for MS1Index
 struct MS1IndexWrapper<'a>(&'a MS1Index);
 
@@ -4018,6 +4034,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                                 per_file_calibrations.insert(file_name.clone(), rt_cal);
                             }
                         }
+                        // Retain isolation window coverage for gap-fill m/z
+                        // filtering (independent of the RT model_params above).
+                        if let Some(intervals) = isolation_intervals_from_cal(&cal_params) {
+                            per_file_isolation_mz.insert(file_name.clone(), intervals);
+                        }
                     }
                 }
             }
@@ -4107,6 +4128,14 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                                         ) {
                                             per_file_calibrations.insert(file_name.clone(), rt_cal);
                                         }
+                                    }
+                                    // Retain isolation window coverage for
+                                    // gap-fill m/z filtering (independent of the
+                                    // RT model_params above).
+                                    if let Some(intervals) =
+                                        isolation_intervals_from_cal(&cal_params)
+                                    {
+                                        per_file_isolation_mz.insert(file_name.clone(), intervals);
                                     }
                                 }
                             }
@@ -4244,15 +4273,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
 
                 // Retain isolation window coverage for gap-fill m/z filtering
                 if let Some(ref cp) = cal_params {
-                    if let Some(ref scheme) = cp.metadata.isolation_scheme {
-                        let intervals: Vec<(f64, f64)> = scheme
-                            .windows
-                            .iter()
-                            .map(|&(center, width)| {
-                                let half = width / 2.0;
-                                (center - half, center + half)
-                            })
-                            .collect();
+                    if let Some(intervals) = isolation_intervals_from_cal(cp) {
                         per_file_isolation_mz.insert(file_name.clone(), intervals);
                     }
                 }
