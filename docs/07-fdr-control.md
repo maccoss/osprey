@@ -93,15 +93,15 @@ The native Percolator implements the semi-supervised learning approach of Käll 
 Native Percolator Workflow:
   1. Standardize all features to zero mean, unit variance
   2. Assign folds: group by target peptide (base_id), keeping pairs together
-  3. Find best initial feature (test both ascending and descending directions)
+  3. Find best initial feature (single feature, ascending direction only)
   4. For each CV fold (trained in parallel):
-     a. Grid search for SVM cost parameter C (once, on initial labels)
-     b. Iterative SVM training (up to 10 iterations):
+     a. Iterative SVM training (up to 10 iterations):
         - Select positive training set: targets passing FDR threshold
+        - Grid search for SVM cost parameter C (each iteration)
         - Train linear SVM on selected targets + all decoys
         - Score training set, check for improvement
         - Stop after 2 consecutive non-improvements
-     c. Score held-out test set with best model
+     b. Score held-out test set with best model
   5. Calibrate scores between folds (Granholm et al. 2012)
   6. Compute PEP via KDE + isotonic regression
   7. Compute per-run and experiment-level q-values
@@ -164,14 +164,13 @@ This ensures ~100K+ unique peptides in the training set regardless of file count
 
 ### Initial Feature Selection
 
-Before SVM training, the single best-discriminating feature is found by testing **both ascending and descending** directions for each feature:
+Before SVM training, the single best-discriminating feature is chosen to seed the first iteration:
 
-- For each feature: score all entries using the raw standardized value
-- Also test negated values (descending — lower is better)
+- For each feature: score all entries by the raw standardized value (ascending)
 - Count targets passing the FDR threshold after paired competition
-- The feature + direction with the most passing targets is selected
+- The feature with the most passing targets is selected
 
-This ensures features like `rt_deviation` (lower is better) are not missed.
+Only the ascending direction is tested. Feature direction (e.g. `rt_deviation`, where lower is better) is resolved by the SVM during training, which learns a signed weight per feature.
 
 ### Iterative SVM Training
 
@@ -181,7 +180,7 @@ For each cross-validation fold:
 
 2. **Build SVM training set**: selected targets (positive class) + all decoys (negative class).
 
-3. **Grid search for C** (first iteration only): 6 values × 3 inner folds = 18 SVMs. The best C is reused for all subsequent iterations.
+3. **Grid search for C** (every iteration): 6 values × 3 inner folds = 18 SVMs on the current training set. The best C is used for this iteration's SVM.
 
 4. **Train linear SVM**: L2-regularized linear SVM with dual coordinate descent.
 
@@ -592,7 +591,7 @@ Osprey implements **true picked-protein FDR** (Savitski et al. 2015, PMC4563723)
 
 **Protein-aware compaction** (uses first-pass protein q-values):
 
-A peptide survives compaction if EITHER its peptide-level q-value is ≤ `reconciliation_compaction_fdr` (default 0.05, loosened from the old 0.01 run_fdr) OR its first-pass protein group q-value is ≤ `config.protein_fdr`. Rule (b) rescues borderline peptides whose protein has strong evidence. The loosened peptide gate alone already broadens the compaction pool; the protein rule is additive.
+A peptide survives compaction if EITHER its peptide-level q-value is ≤ `reconciliation_compaction_fdr` (an independently-configurable field, default 0.01 = `run_fdr`) OR its first-pass protein group q-value is ≤ `config.protein_fdr`. Rule (b) rescues borderline peptides whose protein has strong evidence. At the default the peptide gate equals `run_fdr`; raising `reconciliation_compaction_fdr` (e.g. to 0.05) broadens the compaction pool, and the protein rule is additive on top.
 
 **Reconciliation consensus** (uses first-pass protein q-values):
 
