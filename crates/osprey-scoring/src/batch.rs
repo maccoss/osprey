@@ -865,7 +865,18 @@ pub struct CalibrationMatch {
     pub library_rt: f64,
     /// Measured retention time (from best matching spectrum)
     pub measured_rt: f64,
-    /// Primary score (XCorr, same as xcorr_score)
+    /// Primary score of whichever calibration scorer produced this match.
+    ///
+    /// It is NOT always the XCorr:
+    /// * [`run_xcorr_calibration_scoring`] sets it to `xcorr_score`.
+    /// * [`run_coelution_calibration_scoring`] sets it to the co-elution
+    ///   correlation sum (i.e. `correlation_score`), not the XCorr.
+    ///
+    /// The pipeline's calibration retry ladder calls the co-elution scorer and
+    /// accumulates the best match per entry by comparing this field, so it is
+    /// comparing correlation sums. Anything that reimplements that accumulation
+    /// must compare the same quantity -- notably not `discriminant_score`, which
+    /// LDA overwrites in place between attempts.
     pub score: f64,
     /// MS1 (precursor) m/z error (in configured unit: ppm or Th)
     pub ms1_error: Option<f64>,
