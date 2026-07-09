@@ -37,7 +37,7 @@ pub struct RTCalibratorConfig {
     /// `OSPREY_LOESS_CLASSICAL_ROBUST=1` to this flag, and OspreySharp honors
     /// the same env var on the C# side for cross-impl validation.
     pub classical_robust_iterations: bool,
-    /// Fit a single global least-squares line instead of a LOESS curve, and report
+    /// Fit a single global robust (Theil-Sen) line instead of a LOESS curve, and report
     /// the calibration as [`RTCalibrationMethod::Linear`].
     ///
     /// The LOESS bandwidth is a *fraction* of the points, so its local window
@@ -140,7 +140,7 @@ impl RTCalibrator {
         let x: Vec<f64> = pairs.iter().map(|(x, _)| *x).collect();
         let y: Vec<f64> = pairs.iter().map(|(_, y)| *y).collect();
 
-        // A global least-squares line for point sets too thin to support a
+        // A robust (Theil-Sen) line for point sets too thin to support a
         // locally varying fit (see `RTCalibratorConfig::linear_fit`). The fitted
         // values are evaluated at the same x, so every downstream consumer --
         // predict, inverse_predict, the .calibration.json model params, resume and
@@ -416,7 +416,7 @@ pub struct RTCalibration {
     degree: usize,
     /// Residual standard deviation
     residual_std: f64,
-    /// Whether the fitted values came from a global least-squares line rather
+    /// Whether the fitted values came from a global robust (Theil-Sen) line rather
     /// than a LOESS curve. Reporting metadata only: prediction is knot
     /// interpolation either way.
     linear_fit: bool,
@@ -1142,7 +1142,7 @@ mod tests {
         }
     }
 
-    /// The linear tier fits a true global least-squares line, recovers exact
+    /// The linear tier fits a true global robust (Theil-Sen) line, recovers exact
     /// slope/intercept on collinear input, reports itself as `Linear`, and -- unlike
     /// LOESS -- does not bend toward a single outlier. Mirrors OspreySharp's
     /// `TestLinearRtCalibrationFit`. See issue #4401.

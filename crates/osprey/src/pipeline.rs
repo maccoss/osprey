@@ -685,9 +685,35 @@ fn is_plausible_linear_fit(
     pred_min >= mzml_min_rt - margin && pred_max <= mzml_max_rt + margin
 }
 
+/// May pass 2's refit replace pass 1's calibration?
+///
+/// A LOESS refit is judged on R² alone. A LINEAR refit must additionally clear the same
+/// span and plausibility guards pass 1's linear fit does, because R² is not evidence for
+/// a line: pass 2 re-scores inside a narrowed RT window, so its surviving points can be
+/// clustered over a short span where a line scores R² ~ 1 yet extrapolates badly across
+/// the rest of the gradient. Reachable whenever `n_refined` lands in
+/// [`ABSOLUTE_MIN_CALIBRATION_POINTS`, [`LINEAR_FIT_MAX_POINTS`]), since pass 2 only runs
+/// at all when pass 1 was a LOESS fit. Reported by Copilot on #52; see
+/// ProteoWizard/pwiz#4401.
+fn is_refined_fit_acceptable(
+    refined: &RTCalibration,
+    refined_lib_rts: &[f64],
+    lib_min_rt: f64,
+    lib_max_rt: f64,
+    range_slope: f64,
+    mzml_min_rt: f64,
+    mzml_max_rt: f64,
+) -> bool {
+    if refined.method() != RTCalibrationMethod::Linear {
+        return true;
+    }
+    has_sufficient_rt_span(refined_lib_rts, lib_min_rt, lib_max_rt)
+        && is_plausible_linear_fit(refined, range_slope, mzml_min_rt, mzml_max_rt)
+}
+
 /// Which curve to fit for a given number of calibration points.
 struct CalibrationFitPlan {
-    /// Fit a global least-squares line instead of a LOESS curve.
+    /// Fit a global robust (Theil-Sen) line instead of a LOESS curve.
     linear_fit: bool,
     /// LOESS bandwidth to use when `linear_fit` is false.
     bandwidth: f64,
@@ -701,7 +727,7 @@ struct CalibrationFitPlan {
 /// collapse, hold it near the size the default configuration yields at exactly
 /// `min_calibration_points` (0.3 * 200 = 60 points) by widening the bandwidth as `n`
 /// shrinks -- a wider bandwidth is a *stiffer*, less locally varying fit. Below
-/// [`LINEAR_FIT_MAX_POINTS`] even that is over-flexible, and a global least-squares
+/// [`LINEAR_FIT_MAX_POINTS`] even that is over-flexible, and a global robust (Theil-Sen)
 /// line is the better-conditioned estimator.
 ///
 /// Mirrors OspreySharp's `Calibrator.SelectFitPlan`. See issue #4401.
@@ -1450,8 +1476,25 @@ fn run_calibration_discovery_windowed(
                     rt_stats_refined.r_squared,
                 );
 
+                let refined_linear_ok = is_refined_fit_acceptable(
+                    &rt_cal_refined,
+                    &refined_lib_rts,
+                    lib_min_rt,
+                    lib_max_rt,
+                    rt_slope,
+                    mzml_min_rt,
+                    mzml_max_rt,
+                );
+                if !refined_linear_ok {
+                    log::debug!(
+                        "Refined calibration is a linear fit over {} points that fails the \
+                         span/plausibility guards, keeping original",
+                        n_refined
+                    );
+                }
+
                 // Accept refined calibration if R² didn't degrade significantly
-                if rt_stats_refined.r_squared >= rt_stats.r_squared * 0.99 {
+                if refined_linear_ok && rt_stats_refined.r_squared >= rt_stats.r_squared * 0.99 {
                     rt_calibration = rt_cal_refined;
                     rt_stats = rt_stats_refined;
                     // Update metadata to reflect the refined fit that's
@@ -9152,6 +9195,42 @@ mod tests {
             range_slope,
             0.0,
             100.0
+        ));
+    }
+
+    /// A pass-2 LOESS refit is judged on R² alone, but a pass-2 LINEAR refit must clear
+    /// the span and plausibility guards too -- otherwise a line fitted to points
+    /// clustered in a narrow RT window (where R² ~ 1) could displace a good pass-1 LOESS.
+    #[test]
+    fn test_refined_linear_fit_must_clear_pass1_guards() {
+        let spread: Vec<f64> = (0..20).map(|i| i as f64 * 5.0).collect(); // 0..95 of 0..100
+        let bunched: Vec<f64> = (0..20).map(|i| 40.0 + i as f64 * 0.5).collect(); // 40..49.5
+
+        // A LOESS refit is always acceptable here: R² alone decides it.
+        let loess = RTCalibrator::new()
+            .with_outlier_retention(1.0)
+            .fit(&spread, &spread.iter().map(|x| x + 1.0).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(loess.method(), RTCalibrationMethod::LOESS);
+        assert!(is_refined_fit_acceptable(
+            &loess, &bunched, 0.0, 100.0, 1.0, 0.0, 100.0
+        ));
+
+        // A linear refit spanning the gradient, agreeing with the range mapping: accept.
+        let good = line_calibration(0.0, 100.0, 1.0, 0.0);
+        assert!(is_refined_fit_acceptable(
+            &good, &spread, 0.0, 100.0, 1.0, 0.0, 100.0
+        ));
+
+        // Same line, but its points are bunched into one RT region: reject.
+        assert!(!is_refined_fit_acceptable(
+            &good, &bunched, 0.0, 100.0, 1.0, 0.0, 100.0
+        ));
+
+        // Well-spread points, but the line disagrees with the range mapping: reject.
+        let steep = line_calibration(0.0, 100.0, 3.0, 0.0);
+        assert!(!is_refined_fit_acceptable(
+            &steep, &spread, 0.0, 100.0, 1.0, 0.0, 100.0
         ));
     }
 
