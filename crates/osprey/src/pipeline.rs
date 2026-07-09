@@ -5761,33 +5761,14 @@ fn run_percolator_fdr(
     };
     let max_train = perc_config.max_train_size;
 
-    // For small experiments (total entries fit comfortably), use the direct path
-    // to preserve full cross-validation scoring semantics
-    let use_streaming = max_train > 0 && total_entries > max_train * 2;
-
-    if !use_streaming {
-        // Direct path: load all features and call run_percolator
-        log::debug!(
-            "Percolator: loading features for {} entries across {} files",
-            total_entries,
-            n_files
-        );
-        run_percolator_fdr_direct(
-            per_file_entries,
-            per_file_cache_paths,
-            &perc_config,
-            overlay,
-            restrict_base_ids,
-        )?;
-        // Best-of-runs monotonicity clamp (mirror of the C# call at the end of
-        // RunPercolatorFdr). Runs for both first-pass and reconciliation-aware
-        // second-pass so every consumer sees experiment q that never beats the
-        // entry's best single run.
-        clamp_experiment_q_to_best_run(per_file_entries);
-        return Ok(());
-    }
-
-    // === Streaming path for large experiments ===
+    // === Streaming Percolator: the ONLY path (streaming-only) ===
+    // Always stream, regardless of experiment size. The former direct/small-
+    // experiment path trained the SVM on ALL entries and held every file's
+    // features resident; the streaming path subsamples best-per-precursor for
+    // training and scores by streaming per-file features. There is no reason to
+    // ever hold the full feature set resident, so the direct path was removed --
+    // unifying on streaming drops the memory ceiling and keeps a single code path.
+    // (Cross-impl parity: mirror of the C# streaming-only change.)
     // Memory-efficient: no flat metadata arrays for all entries.
     // Subsamples directly from per_file_entries (~16 MB HashMaps),
     // scores directly to entry.score, computes q-values per-file.
@@ -6124,118 +6105,6 @@ fn run_percolator_fdr(
     // Best-of-runs monotonicity clamp (mirror of the C# call at the end of
     // RunPercolatorFdr).
     clamp_experiment_q_to_best_run(per_file_entries);
-
-    Ok(())
-}
-
-/// Direct (non-streaming) Percolator FDR for small-to-medium experiments.
-///
-/// Loads all features into memory and passes them to run_percolator.
-/// Used when total entries are small enough to fit in memory.
-fn run_percolator_fdr_direct(
-    per_file_entries: &mut [(String, Vec<FdrEntry>)],
-    per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
-    perc_config: &percolator::PercolatorConfig,
-    overlay: &RescoreOverlay,
-    restrict_base_ids: Option<&HashSet<u32>>,
-) -> Result<()> {
-    let mut perc_entries = Vec::new();
-    for (file_name, fdr_entries) in per_file_entries.iter() {
-        let file_overlay = overlay.get(file_name.as_str());
-        let cache_path = per_file_cache_paths
-            .get(file_name.as_str())
-            .ok_or_else(|| {
-                OspreyError::config(format!("No parquet cache path for file {}", file_name))
-            })?;
-        let file_features = load_pin_features_from_parquet(cache_path)?;
-
-        // Process entries using parquet_index for feature lookup
-        // (stubs may have been compacted, so Vec index != Parquet row index)
-        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate() {
-            if let Some(restrict) = restrict_base_ids {
-                if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
-                    continue;
-                }
-            }
-            let pq_idx = fdr_entry.parquet_index as usize;
-            // Use overlay features for re-scored entries, parquet features otherwise
-            let features = if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx))
-            {
-                pin_feature_vector(&overlay_entry.features)
-            } else if pq_idx < file_features.len() {
-                file_features[pq_idx].clone()
-            } else {
-                continue; // gap-fill entry without parquet features
-            };
-            let psm_id = format!(
-                "{}_{}_{}_{}",
-                file_name, fdr_entry.modified_sequence, fdr_entry.charge, fdr_entry.scan_number
-            );
-
-            perc_entries.push(percolator::PercolatorEntry {
-                id: psm_id,
-                file_name: file_name.clone(),
-                peptide: fdr_entry.modified_sequence.to_string(),
-                charge: fdr_entry.charge,
-                is_decoy: fdr_entry.is_decoy,
-                entry_id: fdr_entry.entry_id,
-                features,
-            });
-        }
-
-        // Process gap-fill entries (parquet_index == u32::MAX, features in overlay only)
-        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate() {
-            if fdr_entry.parquet_index != u32::MAX {
-                continue; // already processed above
-            }
-            if let Some(restrict) = restrict_base_ids {
-                if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
-                    continue;
-                }
-            }
-            if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
-                let features = pin_feature_vector(&overlay_entry.features);
-                let psm_id = format!(
-                    "{}_{}_{}_{}",
-                    file_name, fdr_entry.modified_sequence, fdr_entry.charge, fdr_entry.scan_number
-                );
-                perc_entries.push(percolator::PercolatorEntry {
-                    id: psm_id,
-                    file_name: file_name.clone(),
-                    peptide: fdr_entry.modified_sequence.to_string(),
-                    charge: fdr_entry.charge,
-                    is_decoy: fdr_entry.is_decoy,
-                    entry_id: fdr_entry.entry_id,
-                    features,
-                });
-            }
-        }
-    }
-
-    let results = percolator::run_percolator(&perc_entries, perc_config)
-        .map_err(|e| OspreyError::config(format!("Percolator failed: {}", e)))?;
-
-    // Build result lookup
-    let result_map: HashMap<&str, &percolator::PercolatorResult> =
-        results.entries.iter().map(|r| (r.id.as_str(), r)).collect();
-
-    // Map results back to FdrEntry stubs
-    for (file_name, entries) in per_file_entries.iter_mut() {
-        for entry in entries.iter_mut() {
-            let psm_id = format!(
-                "{}_{}_{}_{}",
-                file_name, entry.modified_sequence, entry.charge, entry.scan_number
-            );
-            if let Some(result) = result_map.get(psm_id.as_str()) {
-                entry.run_precursor_qvalue = result.run_precursor_qvalue;
-                entry.run_peptide_qvalue = result.run_peptide_qvalue;
-                entry.experiment_precursor_qvalue = result.experiment_precursor_qvalue;
-                entry.experiment_peptide_qvalue = result.experiment_peptide_qvalue;
-                entry.score = result.score;
-                entry.pep = result.pep;
-            }
-        }
-    }
 
     Ok(())
 }
