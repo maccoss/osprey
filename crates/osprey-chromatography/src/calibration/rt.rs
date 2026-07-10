@@ -6,7 +6,7 @@
 //! The calibration uses LOESS (Locally Estimated Scatterplot Smoothing)
 //! which fits local polynomial regressions weighted by distance.
 
-use super::RTModelParams;
+use super::{RTCalibrationMethod, RTModelParams};
 use osprey_core::{OspreyError, Result};
 
 /// RT calibration configuration
@@ -37,6 +37,15 @@ pub struct RTCalibratorConfig {
     /// `OSPREY_LOESS_CLASSICAL_ROBUST=1` to this flag, and OspreySharp honors
     /// the same env var on the C# side for cross-impl validation.
     pub classical_robust_iterations: bool,
+    /// Fit a single global robust (Theil-Sen) line instead of a LOESS curve, and report
+    /// the calibration as [`RTCalibrationMethod::Linear`].
+    ///
+    /// The LOESS bandwidth is a *fraction* of the points, so its local window
+    /// (`bandwidth * n`) thins as `n` falls; below ~100 points the window no longer
+    /// supports a locally varying fit and a line is the better-conditioned
+    /// estimator. `bandwidth`, `degree` and `robustness_iter` are ignored when this
+    /// is set. See issue #4401.
+    pub linear_fit: bool,
 }
 
 impl Default for RTCalibratorConfig {
@@ -48,6 +57,7 @@ impl Default for RTCalibratorConfig {
             robustness_iter: 2,
             outlier_retention: 0.8, // Keep best 80%, remove worst 20% (DIA-NN default)
             classical_robust_iterations: false,
+            linear_fit: false,
         }
     }
 }
@@ -129,6 +139,16 @@ impl RTCalibrator {
 
         let x: Vec<f64> = pairs.iter().map(|(x, _)| *x).collect();
         let y: Vec<f64> = pairs.iter().map(|(_, y)| *y).collect();
+
+        // A robust (Theil-Sen) line for point sets too thin to support a
+        // locally varying fit (see `RTCalibratorConfig::linear_fit`). The fitted
+        // values are evaluated at the same x, so every downstream consumer --
+        // predict, inverse_predict, the .calibration.json model params, resume and
+        // the HPC merge -- behaves exactly as it does for the LOESS path.
+        if self.config.linear_fit {
+            let fitted = robust_line(&x, &y);
+            return Ok(self.build_calibration(x, y, fitted, true));
+        }
 
         // Compute initial LOESS fit
         let fitted = self.loess_fit(&x, &y, None)?;
@@ -226,24 +246,36 @@ impl RTCalibrator {
             (x, y, final_fitted)
         };
 
-        // Compute residuals and absolute residuals on (possibly filtered) data
+        Ok(self.build_calibration(x, y, final_fitted, false))
+    }
+
+    /// Compute residual statistics from the fitted values and wrap them in an
+    /// [`RTCalibration`]. Shared by the LOESS and linear paths.
+    fn build_calibration(
+        &self,
+        x: Vec<f64>,
+        y: Vec<f64>,
+        fitted: Vec<f64>,
+        linear_fit: bool,
+    ) -> RTCalibration {
         let residuals: Vec<f64> = y
             .iter()
-            .zip(final_fitted.iter())
+            .zip(fitted.iter())
             .map(|(obs, pred)| obs - pred)
             .collect();
         let abs_residuals: Vec<f64> = residuals.iter().map(|r| r.abs()).collect();
         let residual_std = std_dev(&residuals);
 
-        Ok(RTCalibration {
+        RTCalibration {
             library_rts: x,
             measured_rts: y,
-            fitted_values: final_fitted,
+            fitted_values: fitted,
             abs_residuals,
             bandwidth: self.config.bandwidth,
             degree: self.config.degree,
             residual_std,
-        })
+            linear_fit,
+        }
     }
 
     /// Perform LOESS fit
@@ -384,9 +416,63 @@ pub struct RTCalibration {
     degree: usize,
     /// Residual standard deviation
     residual_std: f64,
+    /// Whether the fitted values came from a global robust (Theil-Sen) line rather
+    /// than a LOESS curve. Reporting metadata only: prediction is knot
+    /// interpolation either way.
+    linear_fit: bool,
 }
 
 impl RTCalibration {
+    /// The library-to-mzML RT mapping derived from the two RT *ranges*
+    /// (`slope * library_rt + intercept`), as a predict-only calibration.
+    ///
+    /// This is what the search should centre its RT window on when calibration fails.
+    /// Without it the search falls back to the raw library RT -- fine when the two RT
+    /// scales already agree (the mapping is then the identity and this changes
+    /// nothing), but badly wrong when they do not, e.g. a Carafe library whose
+    /// `Tr_recalibrated` is in seconds against a minutes-keyed mzML.
+    ///
+    /// Carries no residuals, so it must not be used to derive a search tolerance or
+    /// reported as a successful calibration -- the caller keeps the fallback tolerance
+    /// and `calibration_successful = false`. Returns `None` for a degenerate library
+    /// RT range. See issue #4401.
+    pub fn from_linear_mapping(
+        lib_min_rt: f64,
+        lib_max_rt: f64,
+        slope: f64,
+        intercept: f64,
+    ) -> Option<Self> {
+        if !lib_min_rt.is_finite() || !lib_max_rt.is_finite() || lib_max_rt <= lib_min_rt {
+            return None;
+        }
+        let library_rts = vec![lib_min_rt, lib_max_rt];
+        let fitted = vec![
+            intercept + slope * lib_min_rt,
+            intercept + slope * lib_max_rt,
+        ];
+        Some(Self {
+            library_rts,
+            measured_rts: fitted.clone(),
+            fitted_values: fitted,
+            abs_residuals: vec![0.0, 0.0],
+            bandwidth: 0.3,
+            degree: 1,
+            residual_std: 0.0,
+            linear_fit: true,
+        })
+    }
+
+    /// How the fitted values were produced. This reaches
+    /// `.calibration.json`'s `rt_calibration.method`; prediction is knot
+    /// interpolation in both cases.
+    pub fn method(&self) -> RTCalibrationMethod {
+        if self.linear_fit {
+            RTCalibrationMethod::Linear
+        } else {
+            RTCalibrationMethod::LOESS
+        }
+    }
+
     /// Predict measured RT from library RT
     ///
     /// Uses local interpolation for points within the training range
@@ -815,6 +901,10 @@ impl RTCalibration {
             bandwidth: 0.3, // Default value, not used for prediction
             degree: 1,      // Default value, not used for prediction
             residual_std,
+            // The saved model is just the knots and no longer records how they were
+            // fitted, so a rebuilt calibration reports LOESS. Prediction is knot
+            // interpolation either way, so this is reporting metadata only.
+            linear_fit: false,
         })
     }
 }
@@ -950,6 +1040,73 @@ pub fn median(values: &[f64]) -> f64 {
     }
 }
 
+/// Theil-Sen robust line through `(x, y)`, evaluated at each `x`: the slope is the
+/// median of the pairwise slopes over all distinct-x pairs, and the intercept the
+/// median of `y - slope*x`.
+///
+/// The linear tier fits point sets of a few dozen peptides. Each one cleared LDA + 1%
+/// FDR + S/N, but at that count the FDR estimate is granular, so one or two false
+/// positives can survive -- and ordinary least squares lets a single such point, if it
+/// sits at an RT extreme, lever the slope across the whole gradient. Theil-Sen has a
+/// ~29% breakdown point, so it shrugs those off. O(n^2) is trivial here (n < ~100 gives
+/// under 5,000 pairs).
+///
+/// A degenerate `x` (every library RT equal, so no distinct-x pair exists) yields a
+/// horizontal line at `median(y)` rather than dividing by zero. See issue #4401.
+fn robust_line(x: &[f64], y: &[f64]) -> Vec<f64> {
+    let n = x.len();
+    let mut slopes: Vec<f64> = Vec::with_capacity(n * n.saturating_sub(1) / 2);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dx = x[j] - x[i];
+            if dx != 0.0 {
+                slopes.push((y[j] - y[i]) / dx);
+            }
+        }
+    }
+
+    let slope = if slopes.is_empty() {
+        0.0
+    } else {
+        median(&slopes)
+    };
+
+    let offsets: Vec<f64> = x
+        .iter()
+        .zip(y.iter())
+        .map(|(xi, yi)| yi - slope * xi)
+        .collect();
+    let intercept = median(&offsets);
+
+    x.iter().map(|xi| intercept + slope * xi).collect()
+}
+
+/// The minimum RT search-window half-width appropriate for a calibration fitted from
+/// `n_points` points.
+///
+/// The configured `min_rt_tolerance` (0.5 min) is the floor that suits a
+/// *well-estimated* MAD -- one measured from at least `min_calibration_points`
+/// confident peptides. The sampling error of a scale estimate shrinks like `1/sqrt(n)`,
+/// so from a thin point set the MAD can come out small by luck, and clamping to 0.5 min
+/// would pair a tight window with a fit that does not deserve one. Widen the floor by
+/// `sqrt(min_calibration_points / n)` to compensate: the fit still tightens the window,
+/// but only as far as its own precision supports.
+///
+/// Reduces exactly to `min_tolerance` at `n >= min_calibration_points`, so a healthy
+/// calibration is unaffected. Never exceeds `max_tolerance`. See issue #4401.
+pub fn effective_min_rt_tolerance(
+    n_points: usize,
+    min_tolerance: f64,
+    max_tolerance: f64,
+    min_calibration_points: usize,
+) -> f64 {
+    if n_points == 0 || n_points >= min_calibration_points {
+        return min_tolerance;
+    }
+    let inflated = min_tolerance * (min_calibration_points as f64 / n_points as f64).sqrt();
+    inflated.min(max_tolerance)
+}
+
 /// Compute the value at a given percentile (0.0 to 1.0) of a slice
 pub fn percentile_value(values: &[f64], p: f64) -> f64 {
     if values.is_empty() {
@@ -975,6 +1132,157 @@ pub fn std_dev(values: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linear_config(n: usize) -> RTCalibratorConfig {
+        RTCalibratorConfig {
+            linear_fit: true,
+            min_points: n,
+            outlier_retention: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// The linear tier fits a true global robust (Theil-Sen) line, recovers exact
+    /// slope/intercept on collinear input, reports itself as `Linear`, and -- unlike
+    /// LOESS -- does not bend toward a single outlier. Mirrors OspreySharp's
+    /// `TestLinearRtCalibrationFit`. See issue #4401.
+    #[test]
+    fn test_linear_rt_calibration_fit() {
+        const N: usize = 60; // inside the linear tier
+        let library_rts: Vec<f64> = (0..N).map(|i| i as f64).collect();
+        let measured_rts: Vec<f64> = library_rts.iter().map(|&x| 2.0 * x + 5.0).collect();
+
+        let linear = RTCalibrator::with_config(linear_config(N))
+            .fit(&library_rts, &measured_rts)
+            .unwrap();
+
+        assert_eq!(linear.method(), RTCalibrationMethod::Linear);
+        assert!((linear.predict(10.0) - 25.0).abs() < 1e-9);
+        // Extrapolates along the line rather than flattening at the last knot.
+        let last = (N - 1) as f64;
+        assert!((linear.predict(last) - (2.0 * last + 5.0)).abs() < 1e-9);
+        assert!((linear.stats().r_squared - 1.0).abs() < 1e-9);
+        assert!(linear.stats().residual_std.abs() < 1e-9);
+
+        // A single gross outlier perturbs the line only slightly, and the fit stays
+        // linear rather than tracking it.
+        let mut perturbed_rts = measured_rts.clone();
+        perturbed_rts[N / 2] += 50.0;
+        let perturbed = RTCalibrator::with_config(linear_config(N))
+            .fit(&library_rts, &perturbed_rts)
+            .unwrap();
+        assert_eq!(perturbed.method(), RTCalibrationMethod::Linear);
+        assert!(
+            (perturbed.predict((N / 2) as f64) - perturbed_rts[N / 2]).abs() > 20.0,
+            "a linear fit must not chase a single outlier"
+        );
+
+        // Degenerate x (all library RTs identical) yields a horizontal line at mean(y).
+        let flat_x = vec![7.0; N];
+        let y: Vec<f64> = (0..N).map(|i| i as f64).collect();
+        let flat = RTCalibrator::with_config(linear_config(N))
+            .fit(&flat_x, &y)
+            .unwrap();
+        assert!((flat.predict(7.0) - (N - 1) as f64 / 2.0).abs() < 1e-9);
+    }
+
+    /// Theil-Sen must recover the true slope despite outliers that would lever an
+    /// ordinary least-squares line -- the reason the linear tier can trust a few dozen
+    /// confident peptides even when one or two of them are false positives.
+    #[test]
+    fn test_linear_rt_calibration_is_robust_to_outliers() {
+        const N: usize = 60;
+        let library_rts: Vec<f64> = (0..N).map(|i| i as f64).collect();
+        let mut measured_rts: Vec<f64> = library_rts.iter().map(|&x| 2.0 * x + 5.0).collect();
+
+        // Three false positives, two at the high-leverage RT extremes.
+        measured_rts[0] += 40.0;
+        measured_rts[N - 1] -= 40.0;
+        measured_rts[N / 3] += 25.0;
+
+        let cal = RTCalibrator::with_config(linear_config(N))
+            .fit(&library_rts, &measured_rts)
+            .unwrap();
+
+        let slope = (cal.predict(50.0) - cal.predict(10.0)) / 40.0;
+        assert!(
+            (slope - 2.0).abs() < 1e-9,
+            "Theil-Sen must recover the true slope, got {slope}"
+        );
+        assert!(
+            (cal.predict(10.0) - 25.0).abs() < 1e-9,
+            "and the true intercept"
+        );
+    }
+
+    /// The RT-tolerance floor widens as the calibration thins, and reduces exactly to
+    /// the configured floor at `min_calibration_points`.
+    #[test]
+    fn test_effective_min_rt_tolerance() {
+        const MIN_TOL: f64 = 0.5;
+        const MAX_TOL: f64 = 3.0;
+        const MIN_CAL: usize = 200;
+
+        for n in [200usize, 729, 5000] {
+            let tol = effective_min_rt_tolerance(n, MIN_TOL, MAX_TOL, MIN_CAL);
+            assert!((tol - MIN_TOL).abs() < 1e-12, "n={n} must keep the floor");
+        }
+
+        assert!(
+            (effective_min_rt_tolerance(100, MIN_TOL, MAX_TOL, MIN_CAL) - 0.5 * 2f64.sqrt()).abs()
+                < 1e-9
+        );
+        assert!((effective_min_rt_tolerance(50, MIN_TOL, MAX_TOL, MIN_CAL) - 1.0).abs() < 1e-9);
+
+        // Monotone: fewer points never buys a tighter floor.
+        let mut prev = 0.0;
+        for n in (15..200).rev() {
+            let tol = effective_min_rt_tolerance(n, MIN_TOL, MAX_TOL, MIN_CAL);
+            assert!(tol >= prev - 1e-12, "floor must not narrow as n falls");
+            prev = tol;
+        }
+
+        // Clamped to the configured maximum, and a degenerate n keeps the floor.
+        assert!((effective_min_rt_tolerance(1, MIN_TOL, MAX_TOL, MIN_CAL) - MAX_TOL).abs() < 1e-12);
+        assert!((effective_min_rt_tolerance(0, MIN_TOL, MAX_TOL, MIN_CAL) - MIN_TOL).abs() < 1e-12);
+    }
+
+    /// The predict-only range mapping used when calibration fails: it reproduces the
+    /// line exactly (including outside the library RT range), is the identity when the
+    /// two RT scales agree, and refuses a degenerate range.
+    #[test]
+    fn test_from_linear_mapping() {
+        // A seconds-to-minutes library, the case the identity fallback gets wrong.
+        let cal = RTCalibration::from_linear_mapping(0.0, 6000.0, 1.0 / 60.0, 0.0).unwrap();
+        assert_eq!(cal.method(), RTCalibrationMethod::Linear);
+        assert!((cal.predict(3000.0) - 50.0).abs() < 1e-9);
+        assert!((cal.predict(0.0) - 0.0).abs() < 1e-9);
+        assert!((cal.predict(6000.0) - 100.0).abs() < 1e-9);
+        // Extrapolates along the line rather than flattening at the end knots.
+        assert!((cal.predict(12000.0) - 200.0).abs() < 1e-9);
+
+        // Matching scales -> identity -> the search behaves exactly as before.
+        let identity = RTCalibration::from_linear_mapping(0.0, 100.0, 1.0, 0.0).unwrap();
+        for rt in [0.0, 12.5, 60.0, 100.0] {
+            assert!((identity.predict(rt) - rt).abs() < 1e-9);
+        }
+
+        // A degenerate library RT range yields no mapping.
+        assert!(RTCalibration::from_linear_mapping(5.0, 5.0, 1.0, 0.0).is_none());
+        assert!(RTCalibration::from_linear_mapping(5.0, 1.0, 1.0, 0.0).is_none());
+    }
+
+    /// A LOESS fit reports itself as LOESS, so `method()` distinguishes the tiers.
+    #[test]
+    fn test_loess_reports_loess_method() {
+        let library_rts: Vec<f64> = (0..50).map(|i| i as f64).collect();
+        let measured_rts: Vec<f64> = library_rts.iter().map(|&x| 2.0 * x + 5.0).collect();
+        let cal = RTCalibrator::new()
+            .with_outlier_retention(1.0)
+            .fit(&library_rts, &measured_rts)
+            .unwrap();
+        assert_eq!(cal.method(), RTCalibrationMethod::LOESS);
+    }
 
     /// Verifies LOESS calibration fits a linear RT relationship with high R-squared and accurate prediction/extrapolation.
     #[test]
@@ -1246,6 +1554,7 @@ mod tests {
             residual_std: 0.5,
             bandwidth: 0.3,
             degree: 1,
+            linear_fit: false,
         };
 
         // Test prediction at duplicate point — should NOT return NaN
@@ -1298,6 +1607,7 @@ mod tests {
             residual_std: 0.5,
             bandwidth: 0.3,
             degree: 1,
+            linear_fit: false,
         };
 
         let pred_below = cal2.predict(3.0);
@@ -1318,6 +1628,7 @@ mod tests {
             residual_std: 0.5,
             bandwidth: 0.3,
             degree: 1,
+            linear_fit: false,
         };
 
         let pred_above = cal3.predict(20.0);
@@ -1395,6 +1706,7 @@ mod tests {
             residual_std: 0.5,
             bandwidth: 0.3,
             degree: 1,
+            linear_fit: false,
         };
 
         let result = cal.inverse_predict(10.5);
@@ -1429,6 +1741,7 @@ mod tests {
             robustness_iter: iters,
             outlier_retention: 1.0,
             classical_robust_iterations: false,
+            linear_fit: false,
         };
 
         let cal_1 = RTCalibrator::with_config(make(1))
@@ -1475,6 +1788,7 @@ mod tests {
             robustness_iter: 5,
             outlier_retention: 1.0,
             classical_robust_iterations: classical,
+            linear_fit: false,
         };
 
         let cal_default = RTCalibrator::with_config(make(false))
