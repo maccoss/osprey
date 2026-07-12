@@ -7513,13 +7513,22 @@ fn compute_features_at_peak(
         n_coeluting_fragments: n_coeluting,
         n_fragment_pairs: n_pairs.min(255) as u8,
         fragment_corr,
-        peak_apex: peak.apex_intensity,
-        peak_area: peak.area,
+        // Condition the three intensity-magnitude PIN features with log10(x + 1).
+        // Raw peak intensity is heavy-tailed across ~4 orders of magnitude, so the
+        // single experiment-wide Percolator standardizer maps a lone high-intensity
+        // DIA interference to a z-score of 100-300 that dominates the linear SVM
+        // discriminant and lets intensity outliers hijack the top of the ranking.
+        // log10 compresses the tail (monotonic, so ranking within a feature is
+        // preserved). Mirrors the paired ProteoWizard/pwiz change (MQuestIntensityCalc)
+        // to keep C#/Rust cross-impl parity. Contained to these PIN features; peak.area
+        // itself stays raw for quantification.
+        peak_apex: (peak.apex_intensity + 1.0).log10(),
+        peak_area: (peak.area + 1.0).log10(),
         peak_width,
         peak_symmetry,
         signal_to_noise: peak.signal_to_noise,
         n_scans: peak_len as u16,
-        peak_sharpness,
+        peak_sharpness: (peak_sharpness + 1.0).log10(),
         hyperscore: spectral_score.hyperscore,
         xcorr: spectral_score.xcorr,
         dot_product: spectral_score.lib_cosine,
