@@ -7528,7 +7528,11 @@ fn compute_features_at_peak(
         peak_symmetry,
         signal_to_noise: peak.signal_to_noise,
         n_scans: peak_len as u16,
-        peak_sharpness: (peak_sharpness + 1.0).log10(),
+        // Floor sharpness at 0 BEFORE the log: the apex is an override/CWT lookup,
+        // not the recomputed reference-XIC max, so an apex below an edge yields a
+        // negative mean slope; max(0.0) keeps the argument >= 1 (result-flooring
+        // log10 of a negative is NaN). apex/area are >= 0 by construction.
+        peak_sharpness: (peak_sharpness.max(0.0) + 1.0).log10(),
         hyperscore: spectral_score.hyperscore,
         xcorr: spectral_score.xcorr,
         dot_product: spectral_score.lib_cosine,
