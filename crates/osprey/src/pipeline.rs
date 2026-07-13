@@ -7167,6 +7167,33 @@ struct FeatureComputeContext<'a> {
     use_sparse_xcorr: bool,
 }
 
+/// Condition an intensity-magnitude PIN feature: `log10(max(x, 0) + 1)`.
+///
+/// Raw peak intensity is heavy-tailed across ~4 orders of magnitude, so the single
+/// experiment-wide Percolator standardizer maps a lone high-intensity DIA
+/// interference to a z-score of 100-300 that dominates the linear SVM discriminant
+/// and lets intensity outliers hijack the top of the ranking. log10 compresses the
+/// tail; it is monotonic, so ranking within the feature is preserved. A linear SVM
+/// cannot learn a saturating transform on its own, so it must be applied in the
+/// feature. Mirrors Skyline mProphet's `MQuestIntensityCalc` and the paired
+/// ProteoWizard/pwiz change (pwiz#4412) that keeps C#/Rust cross-impl parity.
+///
+/// The `max(0.0)` floors the INPUT, not the result: `log10` of a negative argument
+/// is NaN, and `max(0.0, NaN)` is still NaN, so flooring afterwards would not save
+/// it. Flooring first keeps the argument >= 1, so the value is always finite and
+/// >= 0. `peak_apex` and `peak_area` are >= 0 by construction (XIC intensities are
+/// raw, never background-subtracted or smoothed), so for them the floor is a no-op
+/// that merely enforces an invariant the callers previously only assumed.
+/// `peak_sharpness` genuinely can be negative: its apex is the override/CWT-supplied
+/// apex, not the recomputed reference-XIC max, so a supplied apex sitting below a
+/// reference-XIC edge yields a negative edge slope.
+///
+/// Applied only to the PIN feature vector. Quantification uses the raw `peak.area`
+/// (and `bounds_area` downstream) and is unaffected.
+fn condition_intensity_feature(x: f64) -> f64 {
+    (x.max(0.0) + 1.0).log10()
+}
+
 /// Compute all coelution features and build a `CoelutionScoredEntry` at the
 /// specified peak boundaries.
 ///
@@ -7515,26 +7542,19 @@ fn compute_features_at_peak(
         n_coeluting_fragments: n_coeluting,
         n_fragment_pairs: n_pairs.min(255) as u8,
         fragment_corr,
-        // Condition the three intensity-magnitude PIN features with log10(x + 1).
-        // Raw peak intensity is heavy-tailed across ~4 orders of magnitude, so the
-        // single experiment-wide Percolator standardizer maps a lone high-intensity
-        // DIA interference to a z-score of 100-300 that dominates the linear SVM
-        // discriminant and lets intensity outliers hijack the top of the ranking.
-        // log10 compresses the tail (monotonic, so ranking within a feature is
-        // preserved). Mirrors the paired ProteoWizard/pwiz change (MQuestIntensityCalc)
-        // to keep C#/Rust cross-impl parity. Contained to these PIN features; peak.area
-        // itself stays raw for quantification.
-        peak_apex: (peak.apex_intensity + 1.0).log10(),
-        peak_area: (peak.area + 1.0).log10(),
+        // The three intensity-magnitude PIN features are log-conditioned; see
+        // condition_intensity_feature. apex/area are >= 0 by construction, so the
+        // helper's floor is a no-op for them and the values stay bit-identical to
+        // the plain (x + 1).log10() the C# side computes. peak_sharpness genuinely
+        // can be negative (the apex is an override/CWT lookup, not the recomputed
+        // reference-XIC max) and the floor is what keeps it finite.
+        peak_apex: condition_intensity_feature(peak.apex_intensity),
+        peak_area: condition_intensity_feature(peak.area),
         peak_width,
         peak_symmetry,
         signal_to_noise: peak.signal_to_noise,
         n_scans: peak_len as u16,
-        // Floor sharpness at 0 BEFORE the log: the apex is an override/CWT lookup,
-        // not the recomputed reference-XIC max, so an apex below an edge yields a
-        // negative mean slope; max(0.0) keeps the argument >= 1 (result-flooring
-        // log10 of a negative is NaN). apex/area are >= 0 by construction.
-        peak_sharpness: (peak_sharpness.max(0.0) + 1.0).log10(),
+        peak_sharpness: condition_intensity_feature(peak_sharpness),
         hyperscore: spectral_score.hyperscore,
         xcorr: spectral_score.xcorr,
         dot_product: spectral_score.lib_cosine,
@@ -11167,5 +11187,44 @@ mod tests {
         let decoy = &per_file_entries[0].1[1];
         assert_eq!(target.experiment_peptide_qvalue, 0.8);
         assert_eq!(decoy.experiment_peptide_qvalue, 0.001);
+    }
+
+    /// The intensity conditioning contract: log10(max(x, 0) + 1). Zero maps to
+    /// zero (preserving the invalid-peak sentinel), decades map to integers, the
+    /// transform is monotonic (so within-feature ranking survives), and a negative
+    /// input -- reachable for peak_sharpness, whose apex is a CWT/override lookup
+    /// rather than the recomputed XIC max -- collapses to 0 instead of producing a
+    /// non-finite feature that would silently poison the SVM.
+    #[test]
+    fn condition_intensity_feature_floors_logs_and_stays_finite() {
+        // 0 -> 0: an empty/invalid peak keeps its sentinel value.
+        assert_eq!(condition_intensity_feature(0.0), 0.0);
+
+        // Decade scaling: log10(9 + 1) = 1, log10(99 + 1) = 2, log10(1e6 - 1 + 1) = 6.
+        assert!((condition_intensity_feature(9.0) - 1.0).abs() < 1e-12);
+        assert!((condition_intensity_feature(99.0) - 2.0).abs() < 1e-12);
+        assert!((condition_intensity_feature(999_999.0) - 6.0).abs() < 1e-12);
+
+        // Monotonic: a four-orders-of-magnitude spread stays strictly increasing
+        // but compresses into ~4 units, which is the whole point -- the outlier no
+        // longer standardizes to z = 100-300.
+        let raw = [1.0, 10.0, 1_000.0, 100_000.0, 10_000_000.0];
+        let mut prev = f64::NEG_INFINITY;
+        for x in raw {
+            let v = condition_intensity_feature(x);
+            assert!(v > prev, "must be strictly increasing at x = {}", x);
+            prev = v;
+        }
+        assert!(prev < 8.0, "1e7 must compress to < 8, got {}", prev);
+
+        // Negative input (a supplied apex below both peak edges) floors to 0 and
+        // stays finite. The naive (x + 1).log10() would be NaN for x < -1 and
+        // -inf at exactly -1; max(0.0, NaN) is still NaN, so the floor must come
+        // FIRST -- these cases are what that ordering buys.
+        for x in [-40.0, -1.0, -0.5, f64::MIN] {
+            let v = condition_intensity_feature(x);
+            assert_eq!(v, 0.0, "negative input {} must floor to 0", x);
+            assert!(v.is_finite());
+        }
     }
 }
