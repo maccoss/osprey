@@ -242,9 +242,9 @@ pub struct RefinedRtCalibrationJson {
 ///     reconciliation parameter hash that the downstream
 ///     `--join-at-pass=2` merge node expects (which is computed over
 ///     all files participating in the join, not the worker's single
-///     parquet). Old v1 files deserialize with empty `file_stems` via
-///     `#[serde(default)]`; the worker falls back to its
-///     `config.input_files` stems for those (preserving v1 behavior).
+///     parquet). Required (no `#[serde(default)]`): v1 envelopes are
+///     rejected at deserialization rather than falling back to a
+///     single-stem hash the merge node would reject anyway.
 /// v3: added `first_pass_base_ids`, the join-wide set of base_ids that
 ///     survived first-pass compaction. A per-file rescore worker compacts
 ///     to exactly this set instead of recomputing a per-file subset that
