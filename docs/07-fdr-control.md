@@ -148,11 +148,13 @@ For large datasets (millions of entries), SVM training can be very slow (O(n²) 
 
 The default training cap is 300,000 total entries. Subsampling operates on peptide groups to preserve target-decoy pairs and charge state groupings.
 
-#### Best-Per-Precursor Subsampling (Multi-File Streaming)
+#### Best-Per-Precursor Subsampling (Streaming Percolator)
 
-For multi-file experiments (100+ files), naive peptide-group subsampling can be catastrophically bad: with 240 files, each peptide has ~480 entries (target + decoy × 240 files), so 300K entries yields only ~625 unique peptides — far too few for SVM training.
+Percolator **always streams**, for every experiment size. The former direct path — which loaded every file's features into memory and trained on all entries, and was selected for experiments small enough to "fit" — was removed in v26.7.0: it held the full feature set resident for no benefit, and a second code path is a second thing to keep in cross-impl parity.
 
-The streaming Percolator path uses **best-per-precursor subsampling**:
+Subsampling matters most on multi-file experiments, where naive peptide-group subsampling can be catastrophically bad: with 240 files, each peptide has ~480 entries (target + decoy × 240 files), so 300K entries yields only ~625 unique peptides — far too few for SVM training.
+
+Streaming Percolator uses **best-per-precursor subsampling**:
 
 1. Find the best-scoring observation (by `coelution_sum`) per `base_id` across ALL files — one target and one decoy per precursor
 2. This produces ~500K deduplicated entries with maximum peptide diversity
@@ -217,6 +219,21 @@ Q-values are computed at four levels, all using the conservative `(decoys + 1) /
 | Experiment peptide | Across all files, best precursor per peptide |
 
 For single-file runs, experiment-level q-values equal run-level q-values (no separate aggregation step).
+
+### Best-of-Runs Clamp on Experiment Q-Values
+
+Experiment-level FDR competes each precursor's single best observation against a de-duplicated (and therefore thinner) decoy null, so the raw experiment q-value can come out **below** every one of that precursor's per-run q-values. Left alone, a precursor could pass experiment-level FDR while no individual run passed run-level FDR — which yields reported peptides carrying no run-level ID, and an anti-conservative experiment-wide FDP.
+
+Each entry's experiment q-value is therefore floored at its own best (minimum over runs) *combined* run q-value (`FdrLevel::Both`, i.e. `max(precursor, peptide)`):
+
+```text
+experiment_precursor_qvalue = max(experiment_precursor_qvalue, min-over-runs run_both)   # keyed by entry_id
+experiment_peptide_qvalue   = max(experiment_peptide_qvalue,   min-over-runs run_both)   # keyed by (modified_sequence, is_decoy)
+```
+
+A best-of-runs aggregate can never be more confident than its own best single run. Both floors key on the target/decoy-specific identity — never the shared base_id or bare sequence — so a decoy's good run can never lower its paired target's floor. Run-level q is winner-only per file, so a losing run contributes 1.0 and the minimum naturally selects the entry's best genuine run.
+
+The clamp is applied after Percolator FDR and again on the final post-Stage-6 pool, because Stage-6 reconciliation resets the run q-values of moved and gap-filled peaks after the first clamp.
 
 ### Dual Precursor + Peptide FDR
 

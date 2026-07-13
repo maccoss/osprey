@@ -48,6 +48,31 @@ OspreySharp together.
   stays raw for quantification; only the PIN feature is conditioned. Mirrors the
   paired ProteoWizard/pwiz change to preserve C#/Rust bit parity.
 
+- **Experiment q-values are clamped to each entry's best run q-value (#49).**
+  *This changes reported q-values.* Experiment-level FDR competes each
+  precursor's single best observation against a de-duplicated (thinner) decoy
+  null, so the raw experiment q could fall BELOW every one of that precursor's
+  per-run q-values — letting a precursor pass experiment-level FDR when no
+  single run passed run-level FDR. Downstream that produced reported peptides
+  with no run-level ID (the blib ID-line artifact) and an anti-conservative
+  experiment-wide FDP calibration. Each entry's experiment q is now floored at
+  its best (minimum over runs) combined run q-value, at both the precursor and
+  peptide level, so "reported" once again implies "some run genuinely passed."
+  Expect slightly higher experiment q-values and correspondingly fewer IDs at a
+  fixed threshold than 26.6.x reported; the previous numbers were optimistic.
+  Mirrors `PercolatorEngine.ClampExperimentQToBestRun` on the OspreySharp side
+  (pwiz#4390).
+
+- **Percolator always streams; the direct small-experiment path is gone (#51).**
+  Percolator previously chose between a direct path (load every file's features
+  into memory, train the SVM on all entries) and a streaming path, based on
+  experiment size. The direct path held the full feature set resident for no
+  benefit, so it has been removed: every experiment now subsamples
+  best-per-precursor for training and streams per-file features for scoring.
+  This lowers the memory ceiling on small and mid-size experiments and leaves a
+  single code path to keep in cross-impl parity. Scores are unchanged except
+  where the two paths' cross-validation semantics previously differed.
+
 ## Bug Fixes
 
 - **Calibration pass-2 refit no longer discards a good pass-1 calibration
@@ -86,6 +111,15 @@ OspreySharp together.
   compaction, so a per-file HPC rescore worker can compact to exactly the set
   the in-memory pipeline used. Format stays byte-identical across
   implementations.
+- **The per-file rescore worker no longer rejects every v3 envelope (#55).**
+  `hydrate_for_rescore` carried its own `format_version != 2` check on top of
+  the one in `read_reconciliation_file`, which validates against the current
+  format version. Once the envelope went to v3 (above), the two checks became
+  mutually exclusive and the worker refused every reconciliation file the
+  pipeline could write, breaking the HPC per-file rescore stage outright. The
+  duplicate check is gone; `read_reconciliation_file` is the single gate, and
+  serde rejects legacy envelopes on their missing required fields. Users on the
+  4-step HPC chain in 26.6.x should upgrade.
 - **Calibration determinism (#39, #46).** Replaced the Welford running mean with
   a `sum / n` computation in `calculate_single_calibration` and applied
   ULP-scale tweaks so Rust and OspreySharp produce bit-identical calibrations.

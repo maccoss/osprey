@@ -209,18 +209,13 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
             ))
         })?;
 
-        // Reject any envelope whose format_version is not 2. v1
-        // envelopes (no file_stems) already fail at serde
-        // deserialization; this check covers a manually-constructed
-        // file with format_version != 2 + file_stems present.
-        if envelope.format_version != 2 {
-            return Err(OspreyError::config(format!(
-                "hydrate_for_rescore: reconciliation.json {} has format_version {} \
-                 (expected 2); re-run the first-join phase to regenerate the envelope.",
-                recon_path.display(),
-                envelope.format_version,
-            )));
-        }
+        // No format_version check here: read_reconciliation_file already rejects
+        // anything whose format_version is not RECONCILIATION_FORMAT_VERSION, and
+        // serde rejects legacy envelopes that lack a required field (v1: no
+        // file_stems; v2: no first_pass_base_ids). A second check against a
+        // hard-coded literal here only drifts -- it was pinned at 2 and would have
+        // rejected every v3 envelope this pipeline now writes.
+
         // Capture the join file_stems from the first envelope and
         // require every subsequent envelope to declare the same set
         // (they all came from the same first-join phase). With v1

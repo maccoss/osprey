@@ -4783,6 +4783,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 "SVM scores loaded from cache. Recomputing q-values (skipping Percolator training)..."
             );
             // First-pass: compute q-values on all entries
+            // No clamp here, and none is needed: the mainline path clamps inside
+            // run_percolator_fdr, but this HPC `--join-at-pass=2` recompute path
+            // falls through (no early return) to the authoritative
+            // clamp_experiment_q_to_best_run on the final post-Stage-6 pool, which
+            // runs before the blib gate -- the only consumer of experiment q.
             percolator::compute_fdr_from_stubs(&mut per_file_entries, config.run_fdr, None);
         }
     } else {
@@ -5167,6 +5172,9 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 "Recomputing second-pass q-values on {} first-pass precursors + paired decoys...",
                 first_pass_base_ids.len(),
             );
+            // No clamp here, and none is needed -- see the first-pass recompute
+            // above: this path reaches the authoritative clamp on the final
+            // post-Stage-6 pool before the blib gate reads any experiment q.
             percolator::compute_fdr_from_stubs(
                 &mut per_file_entries,
                 config.run_fdr,
@@ -5712,6 +5720,18 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         }
     }
 
+    // Authoritative re-clamp of experiment q to each entry's best run q on the
+    // FINAL post-Stage-6 pool. The pass-1 (and any pass-2) Percolator already
+    // clamped, but Stage-6 reconciliation resets the run q of moved / gap-fill
+    // peaks (via to_fdr_entry defaults) AFTER that clamp, so a precursor whose
+    // only run-passing observation was relocated can otherwise keep a stale low
+    // experiment q with no surviving run support — reported with no run-level ID
+    // (the blib ID-line artifact). Re-clamping here, against the run q's that
+    // actually feed the blib gate below, restores "reported => some run genuinely
+    // passed". Mirror of PercolatorEngine.ClampExperimentQToBestRun in
+    // MergeNodeTask.Run before WriteBlibOutput.
+    clamp_experiment_q_to_best_run(&mut per_file_entries);
+
     // Two-stage blib output gate.
     //
     // Stage 1 (peptide gate): the configured --fdr-level determines which
@@ -6084,27 +6104,14 @@ fn run_percolator_fdr(
     };
     let max_train = perc_config.max_train_size;
 
-    // For small experiments (total entries fit comfortably), use the direct path
-    // to preserve full cross-validation scoring semantics
-    let use_streaming = max_train > 0 && total_entries > max_train * 2;
-
-    if !use_streaming {
-        // Direct path: load all features and call run_percolator
-        log::debug!(
-            "Percolator: loading features for {} entries across {} files",
-            total_entries,
-            n_files
-        );
-        return run_percolator_fdr_direct(
-            per_file_entries,
-            per_file_cache_paths,
-            &perc_config,
-            overlay,
-            restrict_base_ids,
-        );
-    }
-
-    // === Streaming path for large experiments ===
+    // === Streaming Percolator: the ONLY path (streaming-only) ===
+    // Always stream, regardless of experiment size. The former direct/small-
+    // experiment path trained the SVM on ALL entries and held every file's
+    // features resident; the streaming path subsamples best-per-precursor for
+    // training and scores by streaming per-file features. There is no reason to
+    // ever hold the full feature set resident, so the direct path was removed --
+    // unifying on streaming drops the memory ceiling and keeps a single code path.
+    // (Cross-impl parity: mirror of the C# streaming-only change.)
     // Memory-efficient: no flat metadata arrays for all entries.
     // Subsamples directly from per_file_entries (~16 MB HashMaps),
     // scores directly to entry.score, computes q-values per-file.
@@ -6438,119 +6445,86 @@ fn run_percolator_fdr(
     );
     percolator::compute_fdr_from_stubs(per_file_entries, perc_config.test_fdr, restrict_base_ids);
 
+    // Best-of-runs monotonicity clamp (mirror of the C# call at the end of
+    // RunPercolatorFdr).
+    clamp_experiment_q_to_best_run(per_file_entries);
+
     Ok(())
 }
 
-/// Direct (non-streaming) Percolator FDR for small-to-medium experiments.
+/// Clamp each entry's experiment-level q-value up to its own best (min) run-level
+/// q-value, enforcing that a best-of-runs aggregate can never be more confident
+/// than its best single run.
 ///
-/// Loads all features into memory and passes them to run_percolator.
-/// Used when total entries are small enough to fit in memory.
-fn run_percolator_fdr_direct(
-    per_file_entries: &mut [(String, Vec<FdrEntry>)],
-    per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
-    perc_config: &percolator::PercolatorConfig,
-    overlay: &RescoreOverlay,
-    restrict_base_ids: Option<&HashSet<u32>>,
-) -> Result<()> {
-    let mut perc_entries = Vec::new();
-    for (file_name, fdr_entries) in per_file_entries.iter() {
-        let file_overlay = overlay.get(file_name.as_str());
-        let cache_path = per_file_cache_paths
-            .get(file_name.as_str())
-            .ok_or_else(|| {
-                OspreyError::config(format!("No parquet cache path for file {}", file_name))
-            })?;
-        let file_features = load_pin_features_from_parquet(cache_path)?;
+/// Experiment-level FDR competes each precursor's single best observation against
+/// a de-duplicated (thinner) decoy null, so the raw experiment q can fall BELOW
+/// every per-run q — letting a precursor pass experiment-level FDR with no run
+/// passing run-level FDR. Downstream that produces reported peptides with no
+/// run-level ID (the blib ID-line artifact) and an anti-conservative
+/// experiment-wide FDP calibration.
+///
+/// The run floor is the entry's best (min) *combined* run q-value
+/// (`FdrLevel::Both` = `max(precursor, peptide)`), matching the blib ID line:
+/// "reported => some run passes at BOTH the precursor and peptide granularity".
+/// Both floors key on the target/decoy-specific identity (never the shared
+/// base_id / bare sequence — a target must not inherit its paired decoy's good run):
+///   experiment_precursor_qvalue <- max(experiment_precursor_qvalue, min-over-runs run_both)  [by entry_id]
+///   experiment_peptide_qvalue   <- max(experiment_peptide_qvalue,   min-over-runs run_both)  [by (modified_sequence, is_decoy)]
+///
+/// Run-level q is winner-only per file, so a losing run contributes 1.0 and the
+/// min naturally picks the entry's best genuine run. Mirrors the C#
+/// `PercolatorEngine.ClampExperimentQToBestRun`.
+fn clamp_experiment_q_to_best_run(per_file_entries: &mut [(String, Vec<FdrEntry>)]) {
+    let mut min_run_both_by_entry_id: HashMap<u32, f64> = HashMap::new();
+    let mut min_run_both_by_peptide: HashMap<(Arc<str>, bool), f64> = HashMap::new();
 
-        // Process entries using parquet_index for feature lookup
-        // (stubs may have been compacted, so Vec index != Parquet row index)
-        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate() {
-            if let Some(restrict) = restrict_base_ids {
-                if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
-                    continue;
-                }
-            }
-            let pq_idx = fdr_entry.parquet_index as usize;
-            // Use overlay features for re-scored entries, parquet features otherwise
-            let features = if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx))
-            {
-                pin_feature_vector(&overlay_entry.features)
-            } else if pq_idx < file_features.len() {
-                file_features[pq_idx].clone()
-            } else {
-                continue; // gap-fill entry without parquet features
-            };
-            let psm_id = format!(
-                "{}_{}_{}_{}",
-                file_name, fdr_entry.modified_sequence, fdr_entry.charge, fdr_entry.scan_number
-            );
-
-            perc_entries.push(percolator::PercolatorEntry {
-                id: psm_id,
-                file_name: file_name.clone(),
-                peptide: fdr_entry.modified_sequence.to_string(),
-                charge: fdr_entry.charge,
-                is_decoy: fdr_entry.is_decoy,
-                entry_id: fdr_entry.entry_id,
-                features,
-            });
-        }
-
-        // Process gap-fill entries (parquet_index == u32::MAX, features in overlay only)
-        for (local_idx, fdr_entry) in fdr_entries.iter().enumerate() {
-            if fdr_entry.parquet_index != u32::MAX {
-                continue; // already processed above
-            }
-            if let Some(restrict) = restrict_base_ids {
-                if !restrict.contains(&(fdr_entry.entry_id & 0x7FFF_FFFF)) {
-                    continue;
-                }
-            }
-            if let Some(overlay_entry) = file_overlay.and_then(|o| o.get(&local_idx)) {
-                let features = pin_feature_vector(&overlay_entry.features);
-                let psm_id = format!(
-                    "{}_{}_{}_{}",
-                    file_name, fdr_entry.modified_sequence, fdr_entry.charge, fdr_entry.scan_number
-                );
-                perc_entries.push(percolator::PercolatorEntry {
-                    id: psm_id,
-                    file_name: file_name.clone(),
-                    peptide: fdr_entry.modified_sequence.to_string(),
-                    charge: fdr_entry.charge,
-                    is_decoy: fdr_entry.is_decoy,
-                    entry_id: fdr_entry.entry_id,
-                    features,
-                });
+    for (_, entries) in per_file_entries.iter() {
+        for e in entries {
+            let run_both = e.effective_run_qvalue(FdrLevel::Both);
+            min_run_both_by_entry_id
+                .entry(e.entry_id)
+                .and_modify(|cur| {
+                    if run_both < *cur {
+                        *cur = run_both;
+                    }
+                })
+                .or_insert(run_both);
+            // Peptide identity is (modified_sequence, is_decoy): a decoy can share its
+            // paired target's modified_sequence, so keying on the sequence alone would let
+            // a decoy's good run lower the target's peptide floor (anti-conservative). An
+            // empty modified_sequence (a stub loaded without the column) has no peptide
+            // identity and must not bucket unrelated entries under an empty key.
+            if !e.modified_sequence.is_empty() {
+                min_run_both_by_peptide
+                    .entry((e.modified_sequence.clone(), e.is_decoy))
+                    .and_modify(|cur| {
+                        if run_both < *cur {
+                            *cur = run_both;
+                        }
+                    })
+                    .or_insert(run_both);
             }
         }
     }
 
-    let results = percolator::run_percolator(&perc_entries, perc_config)
-        .map_err(|e| OspreyError::config(format!("Percolator failed: {}", e)))?;
-
-    // Build result lookup
-    let result_map: HashMap<&str, &percolator::PercolatorResult> =
-        results.entries.iter().map(|r| (r.id.as_str(), r)).collect();
-
-    // Map results back to FdrEntry stubs
-    for (file_name, entries) in per_file_entries.iter_mut() {
-        for entry in entries.iter_mut() {
-            let psm_id = format!(
-                "{}_{}_{}_{}",
-                file_name, entry.modified_sequence, entry.charge, entry.scan_number
-            );
-            if let Some(result) = result_map.get(psm_id.as_str()) {
-                entry.run_precursor_qvalue = result.run_precursor_qvalue;
-                entry.run_peptide_qvalue = result.run_peptide_qvalue;
-                entry.experiment_precursor_qvalue = result.experiment_precursor_qvalue;
-                entry.experiment_peptide_qvalue = result.experiment_peptide_qvalue;
-                entry.score = result.score;
-                entry.pep = result.pep;
+    for (_, entries) in per_file_entries.iter_mut() {
+        for e in entries.iter_mut() {
+            if let Some(&floor_prec) = min_run_both_by_entry_id.get(&e.entry_id) {
+                if floor_prec > e.experiment_precursor_qvalue {
+                    e.experiment_precursor_qvalue = floor_prec;
+                }
+            }
+            if !e.modified_sequence.is_empty() {
+                if let Some(&floor_pept) =
+                    min_run_both_by_peptide.get(&(e.modified_sequence.clone(), e.is_decoy))
+                {
+                    if floor_pept > e.experiment_peptide_qvalue {
+                        e.experiment_peptide_qvalue = floor_pept;
+                    }
+                }
             }
         }
     }
-
-    Ok(())
 }
 
 /// Run external mokapot FDR on coelution entries
@@ -7534,25 +7508,40 @@ struct FeatureComputeContext<'a> {
     use_sparse_xcorr: bool,
 }
 
-/// Condition a heavy-tailed intensity-magnitude PIN feature with `log10(max(0, x) + 1)`.
+/// Condition a heavy-tailed intensity-magnitude PIN feature: `log10(max(x, 0) + 1)`.
 ///
-/// Raw peak intensity spans ~4 orders of magnitude, so the single experiment-wide
-/// Percolator standardizer maps a lone high-intensity DIA interference to a z-score
-/// of 100-300 that dominates the linear SVM discriminant and lets intensity outliers
-/// (a random mix of target / decoy / entrapment) hijack the top of the score ranking.
-/// `log10` compresses the tail; it is monotonic, so ranking within the feature is
-/// preserved. A linear SVM cannot learn a saturating transform on its own, so it must
-/// be applied in the feature. Matches Skyline mProphet's `MQuestIntensityCalc` and
-/// mirrors the paired ProteoWizard/pwiz change (`PeakShapeCalculators`) to keep
-/// C#/Rust cross-impl bit parity.
+/// Raw peak intensity is heavy-tailed across ~4 orders of magnitude, so the single
+/// experiment-wide Percolator standardizer maps a lone high-intensity DIA
+/// interference to a z-score of 100-300 that dominates the linear SVM discriminant
+/// and lets intensity outliers (a random mix of target / decoy / entrapment) hijack
+/// the top of the score ranking. log10 compresses the tail; it is monotonic, so
+/// ranking within the feature is preserved. A linear SVM cannot learn a saturating
+/// transform on its own, so it must be applied in the feature. Mirrors Skyline
+/// mProphet's `MQuestIntensityCalc` and the paired ProteoWizard/pwiz change
+/// (pwiz#4412, `PeakShapeCalculators`) that keeps C#/Rust cross-impl bit parity.
 ///
-/// The `max(0.0)` floor keeps the argument `>= 1` so the result is always finite.
-/// `peak_sharpness` can be negative: the apex is an override / CWT lookup, not the
-/// recomputed reference-XIC max, so an apex below an edge yields a negative mean
-/// slope, and `log10` of a non-positive argument is `NaN`/`-inf`. `peak_apex` and
-/// `peak_area` are `>= 0` by construction today (no background subtraction), for
-/// which `max(0.0)` is the identity and thus bit-identical to the un-floored form;
-/// the floor future-proofs them if background correction ever produces negatives.
+/// The `max(0.0)` floors the INPUT, not the result. `peak_sharpness` genuinely can be
+/// negative: its apex is the override/CWT-supplied apex, not the recomputed
+/// reference-XIC max, so a supplied apex sitting below a reference-XIC edge yields a
+/// negative edge slope, and `log10` of a non-positive argument is NaN / -inf.
+/// Flooring first keeps the log argument at 1 or above, so the result is always finite
+/// and non-negative.
+///
+/// The input/result ordering is load-bearing for PARITY, not for Rust's own safety:
+/// Rust's `f64::max` IGNORES NaN (`f64::NAN.max(0.0) == 0.0`), so flooring the result
+/// would also come out finite here — but C#'s `Math.Max` PROPAGATES NaN, so on that
+/// side `Math.Max(0, Math.Log10(negative))` is NaN and only input-flooring is safe.
+/// Both implementations floor the input so the two agree bit-for-bit on every path.
+///
+/// `peak_apex` and `peak_area` are non-negative by construction (XIC intensities are
+/// raw, never background-subtracted or smoothed — the background subtraction in
+/// `compute_snr` works on a scalar and never rewrites the array), so for them the
+/// floor is the identity and the value stays bit-identical to the un-floored form. It
+/// enforces an invariant the callers previously only assumed, and future-proofs them
+/// if background correction ever produces negatives.
+///
+/// Applied only to the PIN feature vector. Quantification uses the raw `peak.area`
+/// (and `bounds_area` downstream) and is unaffected.
 #[inline]
 fn condition_intensity_feature(x: f64) -> f64 {
     (x.max(0.0) + 1.0).log10()
@@ -7907,9 +7896,11 @@ fn compute_features_at_peak(
         n_fragment_pairs: n_pairs.min(255) as u8,
         fragment_corr,
         // The three intensity-magnitude PIN features are log10-conditioned at this
-        // single computation point so the logged values flow identically into the
+        // single computation point, so the logged values flow identically into the
         // scores parquet, the PIN vector, and the streaming Percolator standardizer.
-        // See `condition_intensity_feature` for the rationale and cross-impl parity note.
+        // See condition_intensity_feature for the rationale and the cross-impl parity
+        // note (apex/area are non-negative, so the floor is the identity for them;
+        // peak_sharpness is the one that can genuinely go negative).
         peak_apex: condition_intensity_feature(peak.apex_intensity),
         peak_area: condition_intensity_feature(peak.area),
         peak_width,
@@ -9143,6 +9134,15 @@ mod tests {
     /// A negative argument (peak_sharpness can go negative when an override/CWT apex
     /// sits below an edge) is floored to 0.0 BEFORE the log, so the feature is finite
     /// instead of NaN/-inf.
+    ///
+    /// NaN CROSS-IMPL CAVEAT: the NaN case below pins RUST's behavior, which does not
+    /// match C#. Rust's `f64::max` ignores NaN (`f64::NAN.max(0.0) == 0.0`), so a NaN
+    /// input conditions to 0.0 here; C#'s `Math.Max` propagates NaN, so the same input
+    /// conditions to NaN in `PeakShapeCalculators`. This is unreachable in practice --
+    /// XIC intensities are finite and the slope divisors are guarded (`dt > 1e-10`), so
+    /// no NaN can reach this helper -- but if a NaN ever DOES reach it, the two
+    /// implementations will silently disagree rather than both failing. Fix the source
+    /// of the NaN; do not "harmonize" by removing the floor.
     #[test]
     fn test_condition_intensity_feature_floors_negative() {
         assert_eq!(condition_intensity_feature(-0.5), 0.0);
@@ -11654,5 +11654,143 @@ mod tests {
     fn ms1_envelope_tolerance_ppm_does_not_rescue_zero_ppm() {
         let cfg = osprey_core::FragmentToleranceConfig::hram(0.0);
         assert_eq!(ms1_envelope_tolerance_ppm(&cfg), 0.0);
+    }
+
+    /// Build an FdrEntry with fully explicit run/experiment q-values so the
+    /// best-of-runs clamp can be exercised without the +1e-9 offsets that
+    /// `make_fdr_entry` bakes in.
+    fn make_clamp_entry(
+        entry_id: u32,
+        modseq: &str,
+        run_precursor_q: f64,
+        run_peptide_q: f64,
+        exp_precursor_q: f64,
+        exp_peptide_q: f64,
+    ) -> FdrEntry {
+        FdrEntry {
+            entry_id,
+            parquet_index: 0,
+            is_decoy: entry_id & 0x8000_0000 != 0,
+            charge: 2,
+            scan_number: 0,
+            apex_rt: 0.0,
+            start_rt: 0.0,
+            end_rt: 0.0,
+            coelution_sum: 0.0,
+            score: 0.0,
+            run_precursor_qvalue: run_precursor_q,
+            run_peptide_qvalue: run_peptide_q,
+            run_protein_qvalue: 1.0,
+            experiment_precursor_qvalue: exp_precursor_q,
+            experiment_peptide_qvalue: exp_peptide_q,
+            experiment_protein_qvalue: 1.0,
+            pep: 0.0,
+            modified_sequence: modseq.into(),
+        }
+    }
+
+    /// The core best-of-runs monotonicity contract: an entry whose raw
+    /// experiment q dips below its best (min-over-runs) combined run q is
+    /// floored up to that run q; an entry already above its run floor is left
+    /// unchanged; and a target is NOT lifted by its paired decoy's good run
+    /// (distinct entry_id via the decoy high bit).
+    #[test]
+    fn clamp_experiment_q_to_best_run_floors_and_isolates_decoy() {
+        // File 0: the target's winning run has run_both = max(0.02, 0.015) = 0.02,
+        //         but its experiment q was competed down to 0.001.
+        // File 1: a losing run for the same target contributes run_both = 1.0.
+        // The paired decoy (high bit set) has an excellent run (0.0001) that must
+        // NOT leak into the target's floor.
+        let target_id = 42u32;
+        let decoy_id = 42u32 | 0x8000_0000;
+
+        let mut per_file_entries: Vec<(String, Vec<FdrEntry>)> = vec![
+            (
+                "file0".to_string(),
+                vec![
+                    make_clamp_entry(target_id, "PEPTIDER", 0.02, 0.015, 0.001, 0.001),
+                    // Decoy: great run q, distinct entry_id + distinct modseq.
+                    make_clamp_entry(decoy_id, "DECOY_PEPTIDER", 0.0001, 0.0001, 0.0001, 0.0001),
+                    // A second, independent target already above its run floor:
+                    // run_both = 0.05, experiment q = 0.06 (> floor) → unchanged.
+                    make_clamp_entry(7, "ELVISK", 0.05, 0.04, 0.06, 0.06),
+                ],
+            ),
+            (
+                "file1".to_string(),
+                vec![
+                    // Losing run for the target: run_both = 1.0 (does not lower min).
+                    make_clamp_entry(target_id, "PEPTIDER", 1.0, 1.0, 0.001, 0.001),
+                ],
+            ),
+        ];
+
+        clamp_experiment_q_to_best_run(&mut per_file_entries);
+
+        // Target floored up to its best run_both (0.02) on BOTH files, for both
+        // the precursor (by entry_id) and peptide (by modified_sequence) levels.
+        for (_, entries) in per_file_entries.iter() {
+            for e in entries.iter() {
+                if e.entry_id == target_id {
+                    assert_eq!(e.experiment_precursor_qvalue, 0.02);
+                    assert_eq!(e.experiment_peptide_qvalue, 0.02);
+                }
+            }
+        }
+
+        // Decoy keeps its own (already-consistent) low experiment q — it was not
+        // dragged up, and it did not drag the target down.
+        let decoy = &per_file_entries[0].1[1];
+        assert_eq!(decoy.entry_id, decoy_id);
+        assert_eq!(decoy.experiment_precursor_qvalue, 0.0001);
+        assert_eq!(decoy.experiment_peptide_qvalue, 0.0001);
+
+        // Independent target already above its run floor is untouched.
+        let elvis = &per_file_entries[0].1[2];
+        assert_eq!(elvis.experiment_precursor_qvalue, 0.06);
+        assert_eq!(elvis.experiment_peptide_qvalue, 0.06);
+    }
+
+    /// The peptide floor keys on (modified_sequence, is_decoy), not the bare
+    /// sequence: a decoy sharing its paired target's modified_sequence must not
+    /// lower the target's peptide floor with the decoy's good run.
+    #[test]
+    fn clamp_peptide_floor_separates_target_decoy_by_sequence() {
+        let target_id = 1u32;
+        let decoy_id = 1u32 | 0x8000_0000;
+        // Target has only a weak run (0.8); the decoy (SAME modified_sequence) has a
+        // strong run (0.001). The target's peptide floor must be its own 0.8, not 0.001.
+        let mut per_file_entries: Vec<(String, Vec<FdrEntry>)> = vec![(
+            "file0".to_string(),
+            vec![
+                make_clamp_entry(target_id, "PEPTIDER", 0.8, 0.8, 0.001, 0.001),
+                make_clamp_entry(decoy_id, "PEPTIDER", 0.001, 0.001, 0.001, 0.001),
+            ],
+        )];
+
+        clamp_experiment_q_to_best_run(&mut per_file_entries);
+
+        let target = &per_file_entries[0].1[0];
+        let decoy = &per_file_entries[0].1[1];
+        assert_eq!(target.experiment_peptide_qvalue, 0.8);
+        assert_eq!(decoy.experiment_peptide_qvalue, 0.001);
+    }
+
+    /// The heavy-tail compression itself: a four-orders-of-magnitude spread stays
+    /// strictly increasing but collapses into ~4 units. That IS the fix -- the lone
+    /// high-intensity interference no longer standardizes to z = 100-300 and can no
+    /// longer hijack the top of the ranking. (The zero / decade / monotonicity /
+    /// negative-floor cases are covered by the test_condition_intensity_feature_*
+    /// group above.)
+    #[test]
+    fn condition_intensity_feature_compresses_the_heavy_tail() {
+        let raw = [1.0, 10.0, 1_000.0, 100_000.0, 10_000_000.0];
+        let mut prev = f64::NEG_INFINITY;
+        for x in raw {
+            let v = condition_intensity_feature(x);
+            assert!(v > prev, "must be strictly increasing at x = {}", x);
+            prev = v;
+        }
+        assert!(prev < 8.0, "1e7 must compress to < 8, got {}", prev);
     }
 }
