@@ -7534,6 +7534,30 @@ struct FeatureComputeContext<'a> {
     use_sparse_xcorr: bool,
 }
 
+/// Condition a heavy-tailed intensity-magnitude PIN feature with `log10(max(0, x) + 1)`.
+///
+/// Raw peak intensity spans ~4 orders of magnitude, so the single experiment-wide
+/// Percolator standardizer maps a lone high-intensity DIA interference to a z-score
+/// of 100-300 that dominates the linear SVM discriminant and lets intensity outliers
+/// (a random mix of target / decoy / entrapment) hijack the top of the score ranking.
+/// `log10` compresses the tail; it is monotonic, so ranking within the feature is
+/// preserved. A linear SVM cannot learn a saturating transform on its own, so it must
+/// be applied in the feature. Matches Skyline mProphet's `MQuestIntensityCalc` and
+/// mirrors the paired ProteoWizard/pwiz change (`PeakShapeCalculators`) to keep
+/// C#/Rust cross-impl bit parity.
+///
+/// The `max(0.0)` floor keeps the argument `>= 1` so the result is always finite.
+/// `peak_sharpness` can be negative: the apex is an override / CWT lookup, not the
+/// recomputed reference-XIC max, so an apex below an edge yields a negative mean
+/// slope, and `log10` of a non-positive argument is `NaN`/`-inf`. `peak_apex` and
+/// `peak_area` are `>= 0` by construction today (no background subtraction), for
+/// which `max(0.0)` is the identity and thus bit-identical to the un-floored form;
+/// the floor future-proofs them if background correction ever produces negatives.
+#[inline]
+fn condition_intensity_feature(x: f64) -> f64 {
+    (x.max(0.0) + 1.0).log10()
+}
+
 /// Compute all coelution features and build a `CoelutionScoredEntry` at the
 /// specified peak boundaries.
 ///
@@ -7882,13 +7906,17 @@ fn compute_features_at_peak(
         n_coeluting_fragments: n_coeluting,
         n_fragment_pairs: n_pairs.min(255) as u8,
         fragment_corr,
-        peak_apex: peak.apex_intensity,
-        peak_area: peak.area,
+        // The three intensity-magnitude PIN features are log10-conditioned at this
+        // single computation point so the logged values flow identically into the
+        // scores parquet, the PIN vector, and the streaming Percolator standardizer.
+        // See `condition_intensity_feature` for the rationale and cross-impl parity note.
+        peak_apex: condition_intensity_feature(peak.apex_intensity),
+        peak_area: condition_intensity_feature(peak.area),
         peak_width,
         peak_symmetry,
         signal_to_noise: peak.signal_to_noise,
         n_scans: peak_len as u16,
-        peak_sharpness,
+        peak_sharpness: condition_intensity_feature(peak_sharpness),
         hyperscore: spectral_score.hyperscore,
         xcorr: spectral_score.xcorr,
         dot_product: spectral_score.lib_cosine,
@@ -9083,6 +9111,56 @@ mod tests {
 
     fn make_test_entry(id: u32, mz: f64, rt: f64) -> LibraryEntry {
         LibraryEntry::new(id, "PEPTIDE".into(), "PEPTIDE".into(), 2, mz, rt)
+    }
+
+    // ===== condition_intensity_feature (log10 intensity conditioning) =====
+
+    /// Zero intensity conditions to exactly 0.0 (log10(0 + 1) = 0), so an empty
+    /// peak contributes a neutral, well-defined feature rather than -inf.
+    #[test]
+    fn test_condition_intensity_feature_zero_is_zero() {
+        assert_eq!(condition_intensity_feature(0.0), 0.0);
+    }
+
+    /// A decade of raw intensity maps to one unit of the conditioned feature,
+    /// matching Skyline mProphet's MQuestIntensityCalc scale.
+    #[test]
+    fn test_condition_intensity_feature_decades() {
+        assert!((condition_intensity_feature(9.0) - 1.0).abs() < 1e-12);
+        assert!((condition_intensity_feature(99.0) - 2.0).abs() < 1e-12);
+        assert!((condition_intensity_feature(999.0) - 3.0).abs() < 1e-12);
+    }
+
+    /// The transform is monotonic, so within-feature ranking is preserved and the
+    /// standardizer no longer sees a 100-300 z-score tail from a lone interference.
+    #[test]
+    fn test_condition_intensity_feature_is_monotonic() {
+        assert!(condition_intensity_feature(10.0) < condition_intensity_feature(100.0));
+        assert!(condition_intensity_feature(100.0) < condition_intensity_feature(1_000.0));
+        assert!(condition_intensity_feature(1e6) < condition_intensity_feature(1e9));
+    }
+
+    /// A negative argument (peak_sharpness can go negative when an override/CWT apex
+    /// sits below an edge) is floored to 0.0 BEFORE the log, so the feature is finite
+    /// instead of NaN/-inf.
+    #[test]
+    fn test_condition_intensity_feature_floors_negative() {
+        assert_eq!(condition_intensity_feature(-0.5), 0.0);
+        assert_eq!(condition_intensity_feature(-1.0), 0.0);
+        assert_eq!(condition_intensity_feature(-1_000.0), 0.0);
+        assert!(condition_intensity_feature(f64::NAN).is_finite());
+        assert_eq!(condition_intensity_feature(f64::NAN), 0.0);
+    }
+
+    /// For non-negative inputs (peak_apex/peak_area by construction) the max(0.0)
+    /// floor is the identity, so conditioning stays bit-identical to the un-floored
+    /// log10(x + 1) that the paired ProteoWizard/pwiz change applies.
+    #[test]
+    fn test_condition_intensity_feature_floor_is_identity_when_nonnegative() {
+        for &x in &[0.0, 1.0, 42.0, 1234.5, 1e6, 1e12] {
+            assert_eq!(condition_intensity_feature(x), (x + 1.0).log10());
+        }
+        assert!(condition_intensity_feature(1e12).is_finite());
     }
 
     // ===== select_fit_plan (graduated calibration fit, issue #4401) =====

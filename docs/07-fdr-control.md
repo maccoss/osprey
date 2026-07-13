@@ -373,13 +373,23 @@ Osprey computes ~47 features per precursor in the `CoelutionFeatureSet` struct, 
 | Category | Count | PIN Features |
 |----------|-------|--------------|
 | Pairwise coelution | 3 | fragment_coelution_sum, fragment_coelution_max, n_coeluting_fragments |
-| Peak shape | 3 | peak_apex, peak_area, peak_sharpness |
+| Peak shape | 3 | peak_apex, peak_area, peak_sharpness (each `log10`-conditioned) |
 | Spectral at apex | 3 | xcorr, consecutive_ions, explained_intensity |
 | Mass accuracy | 2 | mass_accuracy_deviation_mean, abs_mass_accuracy_deviation_mean |
 | RT deviation | 2 | rt_deviation, abs_rt_deviation |
 | MS1 | 2 | ms1_precursor_coelution, ms1_isotope_cosine |
 | Tukey median polish | 2 | median_polish_cosine, median_polish_residual_ratio |
 | SG-weighted multi-scan | 4 | sg_weighted_xcorr, sg_weighted_cosine, median_polish_min_fragment_r2, median_polish_residual_correlation |
+
+The three peak-shape features are intensity magnitudes conditioned with
+`log10(max(0, x) + 1)` at their single computation point (`compute_features_at_peak`),
+matching Skyline mProphet's `MQuestIntensityCalc`. Raw peak intensity is heavy-tailed,
+so a single experiment-wide standardizer feeding one linear SVM would let a lone
+high-intensity interference (z-score 100-300) hijack the top of the ranking; the
+monotonic `log10` compresses the tail without changing within-feature ordering. The
+logged values flow identically into the scores Parquet, the PIN vector, and the
+streaming Percolator standardizer. Because feature semantics changed, upgrading the
+binary invalidates 26.6.x `.scores.parquet` caches, which are re-scored on first run.
 
 See [Pipeline Overview](README.md#feature-set-21-pin-features) for the full feature set documentation including removed features.
 
