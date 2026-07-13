@@ -83,6 +83,22 @@ fn ms1_envelope_tolerance_ppm(precursor_tolerance: &osprey_core::FragmentToleran
     }
 }
 
+/// Build isolation-window m/z intervals (center +/- width/2) from a loaded
+/// calibration's isolation scheme, for gap-fill m/z filtering. None when the
+/// calibration carries no isolation scheme.
+fn isolation_intervals_from_cal(cal_params: &CalibrationParams) -> Option<Vec<(f64, f64)>> {
+    cal_params.metadata.isolation_scheme.as_ref().map(|scheme| {
+        scheme
+            .windows
+            .iter()
+            .map(|&(center, width)| {
+                let half = width / 2.0;
+                (center - half, center + half)
+            })
+            .collect()
+    })
+}
+
 /// Wrapper to implement MS1SpectrumLookup for MS1Index
 struct MS1IndexWrapper<'a>(&'a MS1Index);
 
@@ -564,6 +580,185 @@ pub(crate) fn compute_rt_mapping(
     }
 }
 
+/// Below this many calibration points a LOESS local window (`bandwidth * n`) holds
+/// fewer than ~30 points, too few to support a locally varying fit, so a single
+/// global line is the better-conditioned estimator. See [`select_fit_plan`].
+const LINEAR_FIT_MAX_POINTS: usize = 100;
+
+/// Fewest confident peptides that can still support a robust line. A line has two
+/// degrees of freedom, and Theil-Sen needs enough pairs for its median to mean
+/// anything; below this we would be extrapolating a gradient from noise. Replaces
+/// `ABSOLUTE_MIN_CALIBRATION_POINTS` as the *fit* floor: a fit on a few dozen confident
+/// peptides beats searching at the raw library RT (issue #4401).
+const MIN_LINEAR_FIT_POINTS: usize = 15;
+
+/// A line is only identifiable if its points have leverage. Twenty peptides spread
+/// across the gradient determine a slope; twenty bunched into one region do not,
+/// however confident each one is.
+const MIN_LINEAR_FIT_RT_SPAN_FRACTION: f64 = 0.5;
+
+/// A fitted slope this far from the range-derived mapping means the fit has gone
+/// somewhere the data cannot justify; fall back rather than trust it.
+const MAX_LINEAR_FIT_SLOPE_RATIO: f64 = 2.0;
+
+/// The library-to-mzML RT range mapping, as a predict-only calibration to centre the
+/// search window on when calibration fails.
+///
+/// Without it the search uses the raw library RT -- fine when the two RT scales agree
+/// (the mapping is then the identity), badly wrong when they do not. Predict-only: the
+/// caller keeps `cal_params = None`, so the RT tolerance stays the fallback, the file is
+/// still reported as `calibration_successful = false`, and it does not seed
+/// reconciliation. See issue #4401.
+fn fallback_rt_map(library: &[LibraryEntry], spectra: &[Spectrum]) -> Option<RTCalibration> {
+    let library_rts: Vec<f64> = library
+        .iter()
+        .filter(|e| !e.is_decoy)
+        .map(|e| e.retention_time)
+        .collect();
+    if library_rts.is_empty() || spectra.is_empty() {
+        return None;
+    }
+
+    let lib_min_rt = library_rts.iter().copied().fold(f64::INFINITY, f64::min);
+    let lib_max_rt = library_rts
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mzml_min_rt = spectra
+        .iter()
+        .map(|s| s.retention_time)
+        .fold(f64::INFINITY, f64::min);
+    let mzml_max_rt = spectra
+        .iter()
+        .map(|s| s.retention_time)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    let mapping = compute_rt_mapping(lib_min_rt, lib_max_rt, mzml_min_rt, mzml_max_rt);
+    RTCalibration::from_linear_mapping(lib_min_rt, lib_max_rt, mapping.slope, mapping.intercept)
+}
+
+/// Do the confident calibration points cover enough of the library RT range to
+/// determine a slope? Guards the linear tier (issue #4401).
+fn has_sufficient_rt_span(lib_rts: &[f64], lib_min_rt: f64, lib_max_rt: f64) -> bool {
+    let lib_range = lib_max_rt - lib_min_rt;
+    if lib_range <= 0.0 || lib_rts.is_empty() {
+        return false;
+    }
+    let min = lib_rts.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = lib_rts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (max - min) >= lib_range * MIN_LINEAR_FIT_RT_SPAN_FRACTION
+}
+
+/// Sanity-check a linear calibration against the library/mzML RT range mapping. A thin
+/// fit that lands somewhere the ranges cannot justify would re-centre every search
+/// window on a wrong gradient -- strictly worse than no fit (issue #4401).
+fn is_plausible_linear_fit(
+    calibration: &RTCalibration,
+    range_slope: f64,
+    mzml_min_rt: f64,
+    mzml_max_rt: f64,
+) -> bool {
+    let (lib_min, lib_max) = calibration.library_rt_range();
+    if lib_max <= lib_min {
+        return false;
+    }
+
+    let pred_min = calibration.predict(lib_min);
+    let pred_max = calibration.predict(lib_max);
+    let fitted_slope = (pred_max - pred_min) / (lib_max - lib_min);
+
+    // A negative, vanishing or non-finite gradient means RT ordering is not preserved.
+    if !fitted_slope.is_finite() || fitted_slope <= 0.0 || range_slope <= 0.0 {
+        return false;
+    }
+
+    let ratio = fitted_slope / range_slope;
+    if !(1.0 / MAX_LINEAR_FIT_SLOPE_RATIO..=MAX_LINEAR_FIT_SLOPE_RATIO).contains(&ratio) {
+        return false;
+    }
+
+    let mzml_range = mzml_max_rt - mzml_min_rt;
+    if mzml_range <= 0.0 {
+        return false;
+    }
+    let margin = mzml_range * 0.1;
+    pred_min >= mzml_min_rt - margin && pred_max <= mzml_max_rt + margin
+}
+
+/// May pass 2's refit replace pass 1's calibration?
+///
+/// A LOESS refit is judged on R² alone. A LINEAR refit must additionally clear the same
+/// span and plausibility guards pass 1's linear fit does, because R² is not evidence for
+/// a line: pass 2 re-scores inside a narrowed RT window, so its surviving points can be
+/// clustered over a short span where a line scores R² ~ 1 yet extrapolates badly across
+/// the rest of the gradient. Reachable whenever `n_refined` lands in
+/// [`ABSOLUTE_MIN_CALIBRATION_POINTS`, [`LINEAR_FIT_MAX_POINTS`]), since pass 2 only runs
+/// at all when pass 1 was a LOESS fit. Reported by Copilot on #52; see
+/// ProteoWizard/pwiz#4401.
+fn is_refined_fit_acceptable(
+    refined: &RTCalibration,
+    refined_lib_rts: &[f64],
+    lib_min_rt: f64,
+    lib_max_rt: f64,
+    range_slope: f64,
+    mzml_min_rt: f64,
+    mzml_max_rt: f64,
+) -> bool {
+    if refined.method() != RTCalibrationMethod::Linear {
+        return true;
+    }
+    has_sufficient_rt_span(refined_lib_rts, lib_min_rt, lib_max_rt)
+        && is_plausible_linear_fit(refined, range_slope, mzml_min_rt, mzml_max_rt)
+}
+
+/// Which curve to fit for a given number of calibration points.
+struct CalibrationFitPlan {
+    /// Fit a global robust (Theil-Sen) line instead of a LOESS curve.
+    linear_fit: bool,
+    /// LOESS bandwidth to use when `linear_fit` is false.
+    bandwidth: f64,
+}
+
+/// Choose the curve to fit for `n_points` calibration points.
+///
+/// A LOESS bandwidth is a *fraction* of the points, so the local window it fits is
+/// `bandwidth * n` and thins as `n` falls: at the default 0.3, n=729 gives 219-point
+/// windows, n=193 gives 58, n=100 gives 30, n=50 gives 15. Rather than let the window
+/// collapse, hold it near the size the default configuration yields at exactly
+/// `min_calibration_points` (0.3 * 200 = 60 points) by widening the bandwidth as `n`
+/// shrinks -- a wider bandwidth is a *stiffer*, less locally varying fit. Below
+/// [`LINEAR_FIT_MAX_POINTS`] even that is over-flexible, and a global robust (Theil-Sen)
+/// line is the better-conditioned estimator.
+///
+/// Mirrors OspreySharp's `Calibrator.SelectFitPlan`. See issue #4401.
+fn select_fit_plan(
+    n_points: usize,
+    loess_bandwidth: f64,
+    min_calibration_points: usize,
+) -> CalibrationFitPlan {
+    // Enough points for the configured bandwidth: unchanged behavior.
+    if n_points >= min_calibration_points {
+        return CalibrationFitPlan {
+            linear_fit: false,
+            bandwidth: loess_bandwidth,
+        };
+    }
+
+    if n_points < LINEAR_FIT_MAX_POINTS {
+        return CalibrationFitPlan {
+            linear_fit: true,
+            bandwidth: loess_bandwidth,
+        };
+    }
+
+    let target_window = loess_bandwidth * min_calibration_points as f64;
+    let bandwidth = (target_window / n_points as f64).clamp(loess_bandwidth, 1.0);
+    CalibrationFitPlan {
+        linear_fit: false,
+        bandwidth,
+    }
+}
+
 /// Run the complete Osprey analysis pipeline
 fn run_calibration_discovery_windowed(
     library: &[LibraryEntry],
@@ -1009,22 +1204,40 @@ fn run_calibration_discovery_windowed(
                     }
                 );
                 continue;
-            } else if num_confident_peptides >= ABSOLUTE_MIN_CALIBRATION_POINTS {
-                // Final attempt: Use what we have if >= absolute minimum
+            } else if num_confident_peptides >= MIN_LINEAR_FIT_POINTS {
+                // Final attempt: fit what we have. A fit on a few dozen confident
+                // peptides beats searching at the raw library RT, so the floor is
+                // MIN_LINEAR_FIT_POINTS rather than ABSOLUTE_MIN_CALIBRATION_POINTS
+                // (issue #4401); select_fit_plan chooses a robust line down here.
                 log::warn!(
                     "Calibration: Using {} peptides (below target of {} but above minimum of {})",
                     num_confident_peptides,
                     rt_config.min_calibration_points,
-                    ABSOLUTE_MIN_CALIBRATION_POINTS
+                    MIN_LINEAR_FIT_POINTS
                 );
-                // Continue to calibration with reduced point count
             } else {
-                // Final attempt: Not enough points even for absolute minimum
+                // Final attempt: too few points to determine even a line
                 return Err(OspreyError::ConfigError(format!(
-                    "Insufficient calibration points: {} < {} absolute minimum (after {} attempts)",
-                    num_confident_peptides, ABSOLUTE_MIN_CALIBRATION_POINTS, attempt
+                    "Insufficient calibration points: {} < {} minimum for a fit (after {} attempts)",
+                    num_confident_peptides, MIN_LINEAR_FIT_POINTS, attempt
                 )));
             }
+        }
+
+        // A line is only identifiable if its points have leverage. Check the span
+        // BEFORE fitting: a tight cluster of confident peptides cannot determine a
+        // gradient, however confident each one is (issue #4401).
+        if select_fit_plan(
+            num_confident_peptides,
+            rt_config.loess_bandwidth,
+            rt_config.min_calibration_points,
+        )
+        .linear_fit
+            && !has_sufficient_rt_span(&library_rts_detected, lib_min_rt, lib_max_rt)
+        {
+            return Err(OspreyError::ConfigError(format!(
+                "Calibration: {num_confident_peptides} points span too little of the library RT range to determine a slope"
+            )));
         }
 
         // Fit LOESS RT calibration
@@ -1034,27 +1247,75 @@ fn run_calibration_discovery_windowed(
         // residuals at each iteration. Set OSPREY_LOESS_CLASSICAL_ROBUST=0 to
         // revert to the legacy single-refresh behavior for comparison.
         let classical_robust = std::env::var("OSPREY_LOESS_CLASSICAL_ROBUST").as_deref() != Ok("0");
+
+        // Graduated fit: thin point sets get a stiffer LOESS, and very thin ones a
+        // global line, rather than a collapsing local window (issue #4401).
+        let plan = select_fit_plan(
+            num_confident_peptides,
+            rt_config.loess_bandwidth,
+            rt_config.min_calibration_points,
+        );
+        if plan.linear_fit {
+            log::warn!(
+                "Calibration: {} points is below {}; fitting a global linear calibration",
+                num_confident_peptides,
+                LINEAR_FIT_MAX_POINTS
+            );
+        } else if plan.bandwidth > rt_config.loess_bandwidth {
+            log::warn!(
+                "Calibration: {} points is below {}; widening LOESS bandwidth {:.2} -> {:.2} to hold the local window near {:.0} points",
+                num_confident_peptides,
+                rt_config.min_calibration_points,
+                rt_config.loess_bandwidth,
+                plan.bandwidth,
+                rt_config.loess_bandwidth * rt_config.min_calibration_points as f64
+            );
+        }
+
         let calibrator_config = RTCalibratorConfig {
-            bandwidth: rt_config.loess_bandwidth,
+            bandwidth: plan.bandwidth,
             degree: 1,
             min_points: effective_min_points,
             robustness_iter: 2,
             outlier_retention: 1.0, // Use all calibration points — LDA + S/N already filtered
             classical_robust_iterations: classical_robust,
+            linear_fit: plan.linear_fit,
         };
 
         crate::diagnostics::dump_loess_input(&library_rts_detected, &measured_rts_detected);
 
-        let calibrator = RTCalibrator::with_config(calibrator_config);
+        let calibrator = RTCalibrator::with_config(calibrator_config.clone());
         let mut rt_calibration = calibrator.fit(&library_rts_detected, &measured_rts_detected)?;
+
+        // A thin fit that lands somewhere the range mapping cannot justify is worse
+        // than no fit: it would re-centre every search window on a wrong gradient
+        // (issue #4401).
+        if rt_calibration.method() == RTCalibrationMethod::Linear
+            && !is_plausible_linear_fit(&rt_calibration, rt_slope, mzml_min_rt, mzml_max_rt)
+        {
+            return Err(OspreyError::ConfigError(
+                "Calibration: the linear fit disagrees with the library/mzML RT range mapping"
+                    .to_string(),
+            ));
+        }
+
         let mut rt_stats = rt_calibration.stats();
 
         // === Iterative calibration refinement (2-pass) ===
         // Compute first-pass tolerance using MAD-based robust estimate
         // MAD × 1.4826 ≈ SD for normal distribution; 3× that covers ~99.7% of peptides
         let mad_tolerance = rt_stats.mad * 1.4826 * 3.0;
+        // The floor widens for a thin fit, so a MAD that came out small by luck cannot
+        // buy a window the fit does not support (issue #4401).
+        let pass1_min_tolerance =
+            osprey_chromatography::calibration::rt::effective_min_rt_tolerance(
+                rt_stats.n_points,
+                config.rt_calibration.min_rt_tolerance,
+                config.rt_calibration.max_rt_tolerance,
+                rt_config.min_calibration_points,
+            );
         let pass1_tolerance = mad_tolerance
-            .max(config.rt_calibration.min_rt_tolerance)
+            .max(pass1_min_tolerance)
             .min(config.rt_calibration.max_rt_tolerance);
 
         log::debug!(
@@ -1067,8 +1328,17 @@ fn run_calibration_discovery_windowed(
             rt_stats.r_squared
         );
 
-        // Only refine if tolerance narrowed significantly (at least 2× tighter)
-        if pass1_tolerance < initial_tolerance * 0.5 {
+        // Only refine if tolerance narrowed significantly (at least 2× tighter), and
+        // never off a linear fit: pass 2 re-scores inside the narrowed window, so
+        // points outside a mis-centred window can never be recovered. That is harmless
+        // at n=729 and is the whole risk at the bottom of the graduated tier (#4401).
+        if rt_calibration.method() == RTCalibrationMethod::Linear {
+            log::debug!(
+                "Refinement pass skipped: pass 1 used a linear fit ({} points); \
+                 narrowing the window from it would be self-confirming",
+                rt_stats.n_points
+            );
+        } else if pass1_tolerance < initial_tolerance * 0.5 {
             log::debug!(
                 "Calibration refinement: re-scoring with {:.2} min tolerance (was {:.1} min)",
                 pass1_tolerance,
@@ -1148,12 +1418,52 @@ fn run_calibration_discovery_windowed(
                 let refined_meas_rts: Vec<f64> =
                     refined_passing.iter().map(|m| m.measured_rt).collect();
 
-                let rt_cal_refined = calibrator.fit(&refined_lib_rts, &refined_meas_rts)?;
+                // Refit with the refinement's OWN adaptive floor rather than reusing
+                // `calibrator`, whose `min_points` is pass 1's `effective_min_points`.
+                //
+                // Reusing it silently demands that the refit produce at least as many
+                // confident peptides as pass 1. On a file whose pass-1 count fell below
+                // `min_calibration_points` (so `effective_min_points == n_pass1`), a
+                // narrowed RT window that legitimately yields fewer points then clears
+                // the ABSOLUTE_MIN_CALIBRATION_POINTS guard above only to trip
+                // `RTCalibrator::fit`'s `min_points` check. That error propagates out of
+                // calibration, and the caller turns it into "Calibration failed ... Using
+                // fallback tolerance" -- so the file is searched uncalibrated even though
+                // pass 1 had produced a perfectly good LOESS fit, and the documented
+                // behaviour ("the original pass-1 calibration is kept", docs/02-calibration.md)
+                // never happens. Clean files never hit this because they refit well above
+                // `min_calibration_points`; files in the
+                // [ABSOLUTE_MIN_CALIBRATION_POINTS, min_calibration_points) band -- the
+                // very ones the retry ladder exists to rescue -- are the ones that do.
+                //
+                // `min_points` is only a fit-time guard here (the other branch reading
+                // it is behind `outlier_retention < 1.0`, and calibration pins that to
+                // 1.0), and this floor is always <= the point count, so a refit that
+                // used to succeed still fits exactly as before.
+                let refined_plan = select_fit_plan(
+                    n_refined,
+                    rt_config.loess_bandwidth,
+                    rt_config.min_calibration_points,
+                );
+                let refined_calibrator = RTCalibrator::with_config(RTCalibratorConfig {
+                    min_points: n_refined.min(rt_config.min_calibration_points),
+                    bandwidth: refined_plan.bandwidth,
+                    linear_fit: refined_plan.linear_fit,
+                    ..calibrator_config.clone()
+                });
+                let rt_cal_refined = refined_calibrator.fit(&refined_lib_rts, &refined_meas_rts)?;
                 let rt_stats_refined = rt_cal_refined.stats();
 
                 let refined_mad_tolerance = rt_stats_refined.mad * 1.4826 * 3.0;
                 let refined_tolerance = refined_mad_tolerance
-                    .max(config.rt_calibration.min_rt_tolerance)
+                    .max(
+                        osprey_chromatography::calibration::rt::effective_min_rt_tolerance(
+                            rt_stats_refined.n_points,
+                            config.rt_calibration.min_rt_tolerance,
+                            config.rt_calibration.max_rt_tolerance,
+                            rt_config.min_calibration_points,
+                        ),
+                    )
                     .min(config.rt_calibration.max_rt_tolerance);
 
                 log::debug!(
@@ -1166,8 +1476,25 @@ fn run_calibration_discovery_windowed(
                     rt_stats_refined.r_squared,
                 );
 
+                let refined_linear_ok = is_refined_fit_acceptable(
+                    &rt_cal_refined,
+                    &refined_lib_rts,
+                    lib_min_rt,
+                    lib_max_rt,
+                    rt_slope,
+                    mzml_min_rt,
+                    mzml_max_rt,
+                );
+                if !refined_linear_ok {
+                    log::debug!(
+                        "Refined calibration is a linear fit over {} points that fails the \
+                         span/plausibility guards, keeping original",
+                        n_refined
+                    );
+                }
+
                 // Accept refined calibration if R² didn't degrade significantly
-                if rt_stats_refined.r_squared >= rt_stats.r_squared * 0.99 {
+                if refined_linear_ok && rt_stats_refined.r_squared >= rt_stats.r_squared * 0.99 {
                     rt_calibration = rt_cal_refined;
                     rt_stats = rt_stats_refined;
                     // Update metadata to reflect the refined fit that's
@@ -1240,7 +1567,7 @@ fn run_calibration_discovery_windowed(
             ms1_calibration,
             ms2_calibration,
             rt_calibration: RTCalibrationParams {
-                method: RTCalibrationMethod::LOESS,
+                method: rt_calibration.method(),
                 residual_sd: rt_stats.residual_std,
                 n_points: rt_stats.n_points,
                 r_squared: rt_stats.r_squared,
@@ -4018,6 +4345,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                                 per_file_calibrations.insert(file_name.clone(), rt_cal);
                             }
                         }
+                        // Retain isolation window coverage for gap-fill m/z
+                        // filtering (independent of the RT model_params above).
+                        if let Some(intervals) = isolation_intervals_from_cal(&cal_params) {
+                            per_file_isolation_mz.insert(file_name.clone(), intervals);
+                        }
                     }
                 }
             }
@@ -4107,6 +4439,14 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                                         ) {
                                             per_file_calibrations.insert(file_name.clone(), rt_cal);
                                         }
+                                    }
+                                    // Retain isolation window coverage for
+                                    // gap-fill m/z filtering (independent of the
+                                    // RT model_params above).
+                                    if let Some(intervals) =
+                                        isolation_intervals_from_cal(&cal_params)
+                                    {
+                                        per_file_isolation_mz.insert(file_name.clone(), intervals);
                                     }
                                 }
                             }
@@ -4229,7 +4569,13 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                                         "Calibration failed: {}. Using fallback tolerance.",
                                         e
                                     );
-                                    (None, None)
+                                    // Still centre the search window on the
+                                    // library/mzML RT range mapping rather than the raw
+                                    // library RT (issue #4401). Identity, hence a
+                                    // no-op, when the two RT scales already agree.
+                                    // `cal_params` stays None, so the tolerance remains
+                                    // the fallback and calibration_successful is false.
+                                    (fallback_rt_map(&library, &spectra), None)
                                 }
                             }
                         }
@@ -4237,22 +4583,17 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                         (None, None)
                     };
 
-                // Retain RT calibration for inter-replicate reconciliation
-                if let Some(ref cal) = rt_cal {
+                // Retain RT calibration for inter-replicate reconciliation. Gated on
+                // `cal_params`, not `rt_cal`: on failure `rt_cal` now carries the
+                // predict-only range mapping (issue #4401), which is not a fitted
+                // calibration and must not seed reconciliation.
+                if let (Some(cal), Some(_)) = (rt_cal.as_ref(), cal_params.as_ref()) {
                     per_file_calibrations.insert(file_name.clone(), cal.clone());
                 }
 
                 // Retain isolation window coverage for gap-fill m/z filtering
                 if let Some(ref cp) = cal_params {
-                    if let Some(ref scheme) = cp.metadata.isolation_scheme {
-                        let intervals: Vec<(f64, f64)> = scheme
-                            .windows
-                            .iter()
-                            .map(|&(center, width)| {
-                                let half = width / 2.0;
-                                (center - half, center + half)
-                            })
-                            .collect();
+                    if let Some(intervals) = isolation_intervals_from_cal(cp) {
                         per_file_isolation_mz.insert(file_name.clone(), intervals);
                     }
                 }
@@ -7798,7 +8139,16 @@ fn run_search(
             )
         };
 
-        let tol = raw_tol.max(config.rt_calibration.min_rt_tolerance);
+        // Widen the floor for a calibration fitted from few points (issue #4401);
+        // a no-op at n >= min_calibration_points.
+        let tol = raw_tol.max(
+            osprey_chromatography::calibration::rt::effective_min_rt_tolerance(
+                cal.rt_calibration.n_points,
+                config.rt_calibration.min_rt_tolerance,
+                config.rt_calibration.max_rt_tolerance,
+                config.rt_calibration.min_calibration_points,
+            ),
+        );
         let tol = tol.min(config.rt_calibration.max_rt_tolerance);
 
         if raw_tol > config.rt_calibration.max_rt_tolerance {
@@ -8740,6 +9090,172 @@ mod tests {
 
     fn make_test_entry(id: u32, mz: f64, rt: f64) -> LibraryEntry {
         LibraryEntry::new(id, "PEPTIDE".into(), "PEPTIDE".into(), 2, mz, rt)
+    }
+
+    // ===== select_fit_plan (graduated calibration fit, issue #4401) =====
+
+    /// A full-bandwidth LOESS when there are enough points, a progressively stiffer
+    /// (wider-bandwidth) LOESS as the point set thins, and a global linear fit once
+    /// even that is over-flexible. Mirrors OspreySharp's
+    /// `TestCalibrationGraduatedFitPlan`.
+    #[test]
+    fn test_select_fit_plan_tiers() {
+        const BW: f64 = 0.3; // RTCalibrationConfig::loess_bandwidth
+        const MIN: usize = 200; // RTCalibrationConfig::min_calibration_points
+
+        // At or above the target, nothing changes -- this is what keeps the
+        // Stellar/Astral goldens bit-identical.
+        for n in [200usize, 633, 729] {
+            let plan = select_fit_plan(n, BW, MIN);
+            assert!(!plan.linear_fit);
+            assert!((plan.bandwidth - BW).abs() < 1e-12);
+        }
+
+        // In the band, bandwidth widens so the local window stays near 60 points.
+        for n in [199usize, 193, 150, 120, 100] {
+            let plan = select_fit_plan(n, BW, MIN);
+            assert!(!plan.linear_fit, "n={n} must still use LOESS");
+            assert!(plan.bandwidth >= BW, "bandwidth must never narrow");
+            assert!(plan.bandwidth <= 1.0, "bandwidth must stay a fraction");
+            let window = plan.bandwidth * n as f64;
+            assert!(
+                (window - 60.0).abs() <= 1.0,
+                "n={n} window={window} should hold ~60 points"
+            );
+        }
+
+        // 193 points -- the worst SEA-AD file before the retry ladder -- already gives
+        // 58-point windows at the default bandwidth, so the tier barely moves it.
+        assert!((select_fit_plan(193, BW, MIN).bandwidth - 0.311).abs() < 0.001);
+        assert!((select_fit_plan(100, BW, MIN).bandwidth - 0.600).abs() < 0.001);
+
+        // Below the cutoff: a global line.
+        for n in [99usize, 75, 50] {
+            assert!(
+                select_fit_plan(n, BW, MIN).linear_fit,
+                "n={n} must fall back to a linear fit"
+            );
+        }
+
+        // A config whose target sits below the linear cutoff must not produce a band.
+        assert!(!select_fit_plan(60, BW, 50).linear_fit);
+        assert!(select_fit_plan(40, BW, 50).linear_fit);
+
+        // Clamped to a valid fraction when the target window exceeds the point count.
+        assert!((select_fit_plan(120, 0.9, 200).bandwidth - 1.0).abs() < 1e-12);
+    }
+
+    /// The two guards on a thin linear fit: its points must span enough of the library
+    /// RT range to determine a slope, and the resulting line must agree with the
+    /// library/mzML range mapping.
+    #[test]
+    fn test_low_point_calibration_guards() {
+        // --- RT span ---
+        let spread: Vec<f64> = (0..20).map(|i| i as f64 * 5.0).collect(); // 0..95 of 0..100
+        assert!(has_sufficient_rt_span(&spread, 0.0, 100.0));
+
+        let bunched: Vec<f64> = (0..20).map(|i| 40.0 + i as f64 * 0.5).collect(); // 40..49.5
+        assert!(
+            !has_sufficient_rt_span(&bunched, 0.0, 100.0),
+            "a tight cluster cannot determine a gradient, however confident"
+        );
+        assert!(!has_sufficient_rt_span(&spread, 5.0, 5.0));
+
+        // --- fitted-line plausibility, against a range slope of 1.0 ---
+        let range_slope = 1.0;
+        assert!(is_plausible_linear_fit(
+            &line_calibration(0.0, 100.0, 1.0, 0.0),
+            range_slope,
+            0.0,
+            100.0
+        ));
+        // 3x steeper, and 3x flatter, are not credible from a thin fit.
+        assert!(!is_plausible_linear_fit(
+            &line_calibration(0.0, 100.0, 3.0, 0.0),
+            range_slope,
+            0.0,
+            100.0
+        ));
+        assert!(!is_plausible_linear_fit(
+            &line_calibration(0.0, 100.0, 1.0 / 3.0, 0.0),
+            range_slope,
+            0.0,
+            100.0
+        ));
+        // A negative gradient does not preserve RT ordering.
+        assert!(!is_plausible_linear_fit(
+            &line_calibration(0.0, 100.0, -1.0, 100.0),
+            range_slope,
+            0.0,
+            100.0
+        ));
+        // A plausible slope that predicts RTs outside the acquisition window.
+        assert!(!is_plausible_linear_fit(
+            &line_calibration(0.0, 100.0, 1.0, 60.0),
+            range_slope,
+            0.0,
+            100.0
+        ));
+        // Exactly at the 2x ratio bound is still accepted.
+        assert!(is_plausible_linear_fit(
+            &line_calibration(0.0, 50.0, 2.0, 0.0),
+            range_slope,
+            0.0,
+            100.0
+        ));
+    }
+
+    /// A pass-2 LOESS refit is judged on R² alone, but a pass-2 LINEAR refit must clear
+    /// the span and plausibility guards too -- otherwise a line fitted to points
+    /// clustered in a narrow RT window (where R² ~ 1) could displace a good pass-1 LOESS.
+    #[test]
+    fn test_refined_linear_fit_must_clear_pass1_guards() {
+        let spread: Vec<f64> = (0..20).map(|i| i as f64 * 5.0).collect(); // 0..95 of 0..100
+        let bunched: Vec<f64> = (0..20).map(|i| 40.0 + i as f64 * 0.5).collect(); // 40..49.5
+
+        // A LOESS refit is always acceptable here: R² alone decides it.
+        let loess = RTCalibrator::new()
+            .with_outlier_retention(1.0)
+            .fit(&spread, &spread.iter().map(|x| x + 1.0).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(loess.method(), RTCalibrationMethod::LOESS);
+        assert!(is_refined_fit_acceptable(
+            &loess, &bunched, 0.0, 100.0, 1.0, 0.0, 100.0
+        ));
+
+        // A linear refit spanning the gradient, agreeing with the range mapping: accept.
+        let good = line_calibration(0.0, 100.0, 1.0, 0.0);
+        assert!(is_refined_fit_acceptable(
+            &good, &spread, 0.0, 100.0, 1.0, 0.0, 100.0
+        ));
+
+        // Same line, but its points are bunched into one RT region: reject.
+        assert!(!is_refined_fit_acceptable(
+            &good, &bunched, 0.0, 100.0, 1.0, 0.0, 100.0
+        ));
+
+        // Well-spread points, but the line disagrees with the range mapping: reject.
+        let steep = line_calibration(0.0, 100.0, 3.0, 0.0);
+        assert!(!is_refined_fit_acceptable(
+            &steep, &spread, 0.0, 100.0, 1.0, 0.0, 100.0
+        ));
+    }
+
+    /// Build a linear RTCalibration spanning [x_min, x_max] with the given line.
+    fn line_calibration(x_min: f64, x_max: f64, slope: f64, intercept: f64) -> RTCalibration {
+        const N: usize = 20;
+        let x: Vec<f64> = (0..N)
+            .map(|i| x_min + (x_max - x_min) * i as f64 / (N - 1) as f64)
+            .collect();
+        let y: Vec<f64> = x.iter().map(|xi| intercept + slope * xi).collect();
+        RTCalibrator::with_config(RTCalibratorConfig {
+            linear_fit: true,
+            min_points: N,
+            outlier_retention: 1.0,
+            ..Default::default()
+        })
+        .fit(&x, &y)
+        .unwrap()
     }
 
     // ===== compute_rt_mapping tests =====

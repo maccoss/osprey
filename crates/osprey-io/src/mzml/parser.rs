@@ -398,16 +398,12 @@ impl Iterator for MzmlReader {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             // mzdata 0.63 iterator returns MultiLayerSpectrum directly, not Result
-            match self.reader.next() {
-                Some(mz_spectrum) => {
-                    self.current_index += 1;
-                    match self.convert_spectrum(mz_spectrum) {
-                        Ok(Some(spectrum)) => return Some(Ok(spectrum)),
-                        Ok(None) => continue, // Skip non-MS2 spectra
-                        Err(e) => return Some(Err(e)),
-                    }
-                }
-                None => return None,
+            let mz_spectrum = self.reader.next()?;
+            self.current_index += 1;
+            match self.convert_spectrum(mz_spectrum) {
+                Ok(Some(spectrum)) => return Some(Ok(spectrum)),
+                Ok(None) => continue, // Skip non-MS2 spectra
+                Err(e) => return Some(Err(e)),
             }
         }
     }
