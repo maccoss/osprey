@@ -4442,9 +4442,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 "SVM scores loaded from cache. Recomputing q-values (skipping Percolator training)..."
             );
             // First-pass: compute q-values on all entries
-            // PARITY NOTE: the mainline path applies clamp_experiment_q_to_best_run
-            // after Percolator FDR; this HPC `--join-at-pass=2` recompute path does
-            // not yet. A follow-up should clamp here for full HPC cross-impl parity.
+            // No clamp here, and none is needed: the mainline path clamps inside
+            // run_percolator_fdr, but this HPC `--join-at-pass=2` recompute path
+            // falls through (no early return) to the authoritative
+            // clamp_experiment_q_to_best_run on the final post-Stage-6 pool, which
+            // runs before the blib gate -- the only consumer of experiment q.
             percolator::compute_fdr_from_stubs(&mut per_file_entries, config.run_fdr, None);
         }
     } else {
@@ -4829,9 +4831,9 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                 "Recomputing second-pass q-values on {} first-pass precursors + paired decoys...",
                 first_pass_base_ids.len(),
             );
-            // PARITY NOTE: the mainline path applies clamp_experiment_q_to_best_run
-            // after Percolator FDR; this HPC `--join-at-pass=2` recompute path does
-            // not yet. A follow-up should clamp here for full HPC cross-impl parity.
+            // No clamp here, and none is needed -- see the first-pass recompute
+            // above: this path reaches the authoritative clamp on the final
+            // post-Stage-6 pool before the blib gate reads any experiment q.
             percolator::compute_fdr_from_stubs(
                 &mut per_file_entries,
                 config.run_fdr,
