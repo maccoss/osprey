@@ -149,9 +149,18 @@ Osprey computes ~47 features per precursor in the `CoelutionFeatureSet` struct, 
 
 | Feature | Description |
 |---------|-------------|
-| `peak_apex` | Peak apex intensity (background-subtracted) |
-| `peak_area` | Integrated peak area within boundaries |
-| `peak_sharpness` | Steepness of peak edges |
+| `peak_apex` | Peak apex intensity, `log10`-conditioned |
+| `peak_area` | Integrated peak area within boundaries, `log10`-conditioned |
+| `peak_sharpness` | Steepness of peak edges, `log10`-conditioned |
+
+These three intensity-magnitude features are conditioned with `log10(max(0, x) + 1)`
+before they reach the PIN vector. Raw peak intensity is heavy-tailed across ~4 orders
+of magnitude, so the single experiment-wide Percolator standardizer would map a lone
+high-intensity interference to a z-score of 100-300 that dominates the linear SVM
+discriminant. The transform is monotonic (ranking within the feature is preserved) and
+matches Skyline mProphet's `MQuestIntensityCalc`. The `max(0, x)` floor keeps the
+feature finite when `peak_sharpness` goes negative. Only the PIN feature is
+conditioned; the raw `peak.area` used for quantification is unchanged.
 
 ### Spectral at Apex (3)
 

@@ -187,7 +187,7 @@ Per-file cache of all scored entries (targets + decoys) with full feature vector
 | Group | Features |
 |---|---|
 | Pairwise coelution (3) | `fragment_coelution_sum`, `fragment_coelution_max`, `n_coeluting_fragments` |
-| Peak shape (3) | `peak_apex`, `peak_area`, `peak_sharpness` |
+| Peak shape (3) | `peak_apex`, `peak_area`, `peak_sharpness` (stored `log10`-conditioned) |
 | Spectral at apex (3) | `xcorr`, `consecutive_ions`, `explained_intensity` |
 | Mass accuracy (2) | `mass_accuracy_deviation_mean`, `abs_mass_accuracy_deviation_mean` |
 | RT deviation (2) | `rt_deviation`, `abs_rt_deviation` |
