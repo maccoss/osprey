@@ -11434,6 +11434,107 @@ mod tests {
         }
     }
 
+    /// hydrate_for_rescore must accept a CURRENT-format reconciliation envelope.
+    ///
+    /// Regression test. hydrate_for_rescore used to carry its own
+    /// `format_version != 2` check on top of the one inside read_reconciliation_file,
+    /// which validates against RECONCILIATION_FORMAT_VERSION. When the envelope went to
+    /// v3, the two checks became mutually exclusive: every envelope that could still
+    /// parse (v3) was then rejected by the worker as "expected 2". The HPC per-file
+    /// rescore stage was dead outright, and CI stayed green because the only test
+    /// covering hydration (`hydrate_round_trips_a_synthetic_pair`) was a placeholder
+    /// with no assertions.
+    ///
+    /// This test builds the real on-disk trio a worker is handed -- scores parquet,
+    /// first-pass FDR sidecar, reconciliation.json -- and asserts hydration reconstructs
+    /// the in-memory state. Pinning RECONCILIATION_FORMAT_VERSION (not a literal) means a
+    /// future format bump cannot silently re-introduce the same class of gate.
+    #[test]
+    fn hydrate_for_rescore_accepts_a_current_format_envelope() {
+        use crate::reconciliation_io::{
+            reconciliation_path, write_reconciliation_file, ReconciliationFile, UseCwtPeakEntry,
+            RECONCILIATION_FORMAT_VERSION,
+        };
+        use crate::rescore::hydrate_for_rescore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let stem = "hydrate_worker";
+        let parquet_path = dir.path().join(format!("{}.scores.parquet", stem));
+
+        // 1. The per-file scores parquet the worker is pointed at (--input-scores).
+        let scored = vec![
+            make_scored_entry(7, "PEPTIDER", 2, 10.0, 9.5, 10.5, 3.0),
+            make_scored_entry(9, "ELVISK", 2, 20.0, 19.5, 20.5, 2.0),
+        ];
+        write_scores_parquet_with_metadata(
+            &parquet_path,
+            &scored,
+            None,
+            parquet::basic::Compression::UNCOMPRESSED,
+        )
+        .unwrap();
+
+        let synthetic_input = synthetic_input_from_parquet(&parquet_path);
+
+        // 2. The first-pass FDR sidecar, keyed by the same entry_ids. The worker overlays
+        //    SVM score / q-values / PEP from here onto the parquet stubs.
+        let sidecar_path = fdr_scores_path_pass1(&synthetic_input, dir.path());
+        let fdr_entries = vec![
+            make_fdr_entry(7, 2.5, 0.001, 0.01),
+            make_fdr_entry(9, 1.5, 0.02, 0.2),
+        ];
+        write_fdr_scores_sidecar(&sidecar_path, &fdr_entries, 1).unwrap();
+
+        // 3. The reconciliation envelope, at the CURRENT format version.
+        let recon = ReconciliationFile {
+            file_stems: vec![stem.to_string()],
+            first_pass_base_ids: vec![7, 9],
+            forced_integration_actions: vec![],
+            format_version: RECONCILIATION_FORMAT_VERSION,
+            gap_fill_targets: vec![],
+            library_hash: "lib-hash".to_string(),
+            refined_rt_calibration: None,
+            search_hash: "search-hash".to_string(),
+            use_cwt_peak_actions: vec![UseCwtPeakEntry {
+                apex_rt: 10.0,
+                candidate_idx: 0,
+                end_rt: 10.5,
+                entry_id: 7,
+                start_rt: 9.5,
+            }],
+        };
+        write_reconciliation_file(&reconciliation_path(&synthetic_input, dir.path()), &recon)
+            .unwrap();
+
+        // 4. Hydrate. Before the fix this returned Err("... has format_version 3
+        //    (expected 2) ..."), i.e. the worker could not start at all.
+        let mut config = make_test_config();
+        config.input_scores = Some(vec![parquet_path.clone()]);
+        let inputs = hydrate_for_rescore(&config)
+            .expect("a current-format envelope must hydrate; a duplicate format_version gate here killed the HPC worker");
+
+        // Stubs came from the parquet...
+        assert_eq!(inputs.per_file_entries.len(), 1);
+        let (file_name, entries) = &inputs.per_file_entries[0];
+        assert_eq!(file_name, stem);
+        assert_eq!(entries.len(), 2);
+
+        // ...and the sidecar overlay actually landed on them (the parquet carries no
+        // scores; these values exist only in the sidecar).
+        let e7 = entries.iter().find(|e| e.entry_id == 7).unwrap();
+        assert_eq!(e7.score, 2.5);
+        assert_eq!(e7.run_precursor_qvalue, 0.001);
+
+        // The planner's action survived, joined from entry_id onto the stub's vec index.
+        assert_eq!(inputs.reconciliation_actions.len(), 1);
+        assert!(inputs
+            .reconciliation_actions
+            .contains_key(&(stem.to_string(), 0)));
+
+        // The join-wide stem list is what the worker hashes for the merge node.
+        assert_eq!(inputs.join_file_stems, vec![stem.to_string()]);
+    }
+
     #[test]
     fn fdr_scores_sidecar_v3_round_trip() {
         let dir = tempfile::tempdir().unwrap();

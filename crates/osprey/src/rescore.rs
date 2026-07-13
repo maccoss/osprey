@@ -214,7 +214,8 @@ pub fn hydrate_for_rescore(config: &OspreyConfig) -> Result<RescoreInputs> {
         // serde rejects legacy envelopes that lack a required field (v1: no
         // file_stems; v2: no first_pass_base_ids). A second check against a
         // hard-coded literal here only drifts -- it was pinned at 2 and would have
-        // rejected every v3 envelope this pipeline now writes.
+        // rejected every v3 envelope this pipeline now writes. Covered by
+        // hydrate_for_rescore_accepts_a_current_format_envelope in pipeline.rs.
 
         // Capture the join file_stems from the first envelope and
         // require every subsequent envelope to declare the same set
@@ -717,43 +718,14 @@ pub fn hydrate_and_log(config: &OspreyConfig) -> Result<RescoreInputs> {
     Ok(inputs)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::reconciliation_io::{
-        ForcedIntegrationEntry, GapFillEntry, ReconciliationFile, RefinedRtCalibrationJson,
-        UseCwtPeakEntry, RECONCILIATION_FORMAT_VERSION,
-    };
-    use osprey_core::FdrEntry;
-
-    /// Build a parquet + sidecar pair + reconciliation.json for two
-    /// hand-coded files, then verify hydrate_for_rescore reconstructs
-    /// the same in-memory state. Catches schema-drift bugs in the
-    /// boundary writers/readers and any future ID-vs-index confusion.
-    #[test]
-    fn hydrate_round_trips_a_synthetic_pair() {
-        // This test is a placeholder skeleton — the full round-trip
-        // requires building a .scores.parquet with the right column set,
-        // which `load_fdr_stubs_from_parquet` validates strictly. The
-        // existing `reconciliation_file_round_trip` test in
-        // `reconciliation_io.rs` and the `fdr_scores_sidecar_*` tests in
-        // `pipeline.rs` already cover the per-file readers; the
-        // hydration layer's logic above (entry_id → vec_idx join,
-        // RTModelParams reconstruction) is exercised end-to-end by the
-        // cross-impl harness once the worker is wired.
-        //
-        // TODO(stage6 worker): add a focused round-trip here once the
-        // parquet test fixtures are in place.
-        let _ = (
-            RECONCILIATION_FORMAT_VERSION,
-            std::mem::size_of::<FdrEntry>(),
-        );
-        let _ = (
-            std::any::type_name::<UseCwtPeakEntry>(),
-            std::any::type_name::<ForcedIntegrationEntry>(),
-            std::any::type_name::<GapFillEntry>(),
-            std::any::type_name::<RefinedRtCalibrationJson>(),
-            std::any::type_name::<ReconciliationFile>(),
-        );
-        // Intentionally no assertions yet — see TODO above.
-    }
-}
+// Hydration is covered by `hydrate_for_rescore_accepts_a_current_format_envelope` in
+// pipeline.rs, which builds the real on-disk trio (scores parquet + first-pass FDR
+// sidecar + reconciliation.json) and asserts hydrate_for_rescore reconstructs the
+// in-memory state. The test lives there because the parquet and sidecar writers are
+// private to that module.
+//
+// It replaces a placeholder that used to sit here: a #[test] with a TODO and
+// "intentionally no assertions yet", which could not fail. That is why a
+// `format_version != 2` gate in hydrate_for_rescore -- which rejected every envelope the
+// pipeline could write, once the format went to v3 -- sat in main for nine days with CI
+// green. A test that cannot fail is worse than no test: it reads as coverage.
