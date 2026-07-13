@@ -7521,13 +7521,13 @@ struct FeatureComputeContext<'a> {
 ///
 /// The `max(0.0)` floors the INPUT, not the result: `log10` of a negative argument
 /// is NaN, and `max(0.0, NaN)` is still NaN, so flooring afterwards would not save
-/// it. Flooring first keeps the argument >= 1, so the value is always finite and
-/// >= 0. `peak_apex` and `peak_area` are >= 0 by construction (XIC intensities are
-/// raw, never background-subtracted or smoothed), so for them the floor is a no-op
-/// that merely enforces an invariant the callers previously only assumed.
-/// `peak_sharpness` genuinely can be negative: its apex is the override/CWT-supplied
-/// apex, not the recomputed reference-XIC max, so a supplied apex sitting below a
-/// reference-XIC edge yields a negative edge slope.
+/// it. Flooring first keeps the log argument at 1 or above, so the value is always
+/// finite and non-negative. `peak_apex` and `peak_area` are non-negative by
+/// construction (XIC intensities are raw, never background-subtracted or smoothed),
+/// so for them the floor is a no-op that merely enforces an invariant the callers
+/// previously only assumed. `peak_sharpness` genuinely can be negative: its apex is
+/// the override/CWT-supplied apex, not the recomputed reference-XIC max, so a
+/// supplied apex sitting below a reference-XIC edge yields a negative edge slope.
 ///
 /// Applied only to the PIN feature vector. Quantification uses the raw `peak.area`
 /// (and `bounds_area` downstream) and is unaffected.
