@@ -11477,11 +11477,17 @@ mod tests {
         let synthetic_input = synthetic_input_from_parquet(&parquet_path);
 
         // 2. The first-pass FDR sidecar, keyed by the same entry_ids. The worker overlays
-        //    SVM score / q-values / PEP from here onto the parquet stubs.
+        //    all seven sidecar f64s onto the parquet stubs: SVM score, both run q-values,
+        //    both experiment q-values, PEP, and the run protein q-value.
+        //
+        //    Written in REVERSE order relative to the parquet stubs on purpose.
+        //    load_fdr_scores_sidecar matches records by entry_id, NOT by position, and the
+        //    assertions below would catch a regression to positional overlay: the two
+        //    entries' values would land on each other.
         let sidecar_path = fdr_scores_path_pass1(&synthetic_input, dir.path());
         let fdr_entries = vec![
-            make_fdr_entry(7, 2.5, 0.001, 0.01),
             make_fdr_entry(9, 1.5, 0.02, 0.2),
+            make_fdr_entry(7, 2.5, 0.001, 0.01),
         ];
         write_fdr_scores_sidecar(&sidecar_path, &fdr_entries, 1).unwrap();
 
@@ -11519,11 +11525,30 @@ mod tests {
         assert_eq!(file_name, stem);
         assert_eq!(entries.len(), 2);
 
-        // ...and the sidecar overlay actually landed on them (the parquet carries no
-        // scores; these values exist only in the sidecar).
+        // ...and the sidecar overlay actually landed on them. These values exist ONLY in
+        // the sidecar -- the parquet carries no scores or q-values -- so every field below
+        // is evidence the overlay ran. All seven sidecar f64s are checked, on BOTH entries:
+        // a partial check would miss drift in whichever field it skipped, and checking one
+        // entry would miss a mis-keyed join. The sidecar was written in reverse order, so
+        // if the overlay ever regressed from entry_id-keyed to positional, entry 7 would be
+        // wearing entry 9's numbers here.
         let e7 = entries.iter().find(|e| e.entry_id == 7).unwrap();
         assert_eq!(e7.score, 2.5);
         assert_eq!(e7.run_precursor_qvalue, 0.001);
+        assert_eq!(e7.run_peptide_qvalue, 0.001 + 1.0e-9);
+        assert_eq!(e7.experiment_precursor_qvalue, 0.001 + 2.0e-9);
+        assert_eq!(e7.experiment_peptide_qvalue, 0.001 + 3.0e-9);
+        assert_eq!(e7.pep, 0.01);
+        assert_eq!(e7.run_protein_qvalue, 1.0);
+
+        let e9 = entries.iter().find(|e| e.entry_id == 9).unwrap();
+        assert_eq!(e9.score, 1.5);
+        assert_eq!(e9.run_precursor_qvalue, 0.02);
+        assert_eq!(e9.run_peptide_qvalue, 0.02 + 1.0e-9);
+        assert_eq!(e9.experiment_precursor_qvalue, 0.02 + 2.0e-9);
+        assert_eq!(e9.experiment_peptide_qvalue, 0.02 + 3.0e-9);
+        assert_eq!(e9.pep, 0.2);
+        assert_eq!(e9.run_protein_qvalue, 1.0);
 
         // The planner's action survived, joined from entry_id onto the stub's vec index.
         assert_eq!(inputs.reconciliation_actions.len(), 1);
