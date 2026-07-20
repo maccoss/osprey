@@ -8065,10 +8065,17 @@ fn run_search(
     use osprey_chromatography::{compute_snr, detect_all_xic_peaks, detect_cwt_consensus_peaks};
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
     use osprey_scoring::{
-        extract_fragment_xics, pearson_correlation_raw, tukey_median_polish, SpectralScorer,
+        extract_fragment_xics, median_polish_libcosine, pearson_correlation_raw,
+        tukey_median_polish, SpectralScorer,
     };
 
     let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
+
+    // Learned per-platform peak-pick model (default), or None for the legacy product
+    // pick (OSPREY_PICK_LEGACY). Resolved once per process; keyed by resolution so unit
+    // data uses the Stellar-trained model and HRAM data the Astral-trained one. Mirrors
+    // C# PeakDataExtractor's model selection.
+    let pick_model = crate::pick_lda::active_model(is_hram);
 
     // Set up fragment tolerance (calibrated if available)
     let fragment_tolerance = if let Some(cal) = calibration {
@@ -8691,11 +8698,51 @@ fn run_search(
                                 let apex_intensity = ref_xic[bp.apex_index].1;
                                 let intensity_weight = (1.0 + apex_intensity).ln();
 
-                                Some((
-                                    bp,
-                                    coelution_score,
-                                    coelution_score * rt_penalty * intensity_weight,
-                                ))
+                                // Rank score. With a learned pick model active (default),
+                                // replace the product form with a standardized linear
+                                // combination of the same four raw terms — coelution,
+                                // ln_intensity, rt_penalty, and a per-candidate
+                                // median-polish cosine. Without a model
+                                // (OSPREY_PICK_LEGACY) it stays the pure product form
+                                // used for cross-impl parity and the regression golden.
+                                let rank_score = match pick_model {
+                                    Some(model) => {
+                                        // Per-candidate median-polish cosine (mirrors C#
+                                        // CandidateLibCosine): Tukey median polish over
+                                        // THIS peak's XIC slice, then LibCosine vs the
+                                        // library fragments; neutral 1.0 on failure
+                                        // (peak too short, degenerate polish, or
+                                        // non-positive cosine).
+                                        let peak_xics: Vec<(usize, Vec<(f64, f64)>)> = xics
+                                            .iter()
+                                            .map(|(idx, data)| (*idx, data[si..=ei].to_vec()))
+                                            .collect();
+                                        let median_polish =
+                                            match tukey_median_polish(&peak_xics, 10, 0.01) {
+                                                Some(mp) => {
+                                                    let lc = median_polish_libcosine(
+                                                        &mp,
+                                                        &entry.fragments,
+                                                    );
+                                                    if lc.is_finite() && lc > 0.0 {
+                                                        lc
+                                                    } else {
+                                                        1.0
+                                                    }
+                                                }
+                                                None => 1.0,
+                                            };
+                                        model.score(
+                                            coelution_score,
+                                            intensity_weight,
+                                            rt_penalty,
+                                            median_polish,
+                                        )
+                                    }
+                                    None => coelution_score * rt_penalty * intensity_weight,
+                                };
+
+                                Some((bp, coelution_score, rank_score))
                             })
                             .collect();
                         // Sort by RT-penalized score (third element)

@@ -58,6 +58,9 @@ pub mod reconciliation_io;
 // Runtime peptide trace (env-var gated)
 pub mod trace;
 
+// Learned per-platform peak-pick model (env-var gated; default per resolution)
+pub mod pick_lda;
+
 // Pipeline
 mod pipeline;
 pub use pipeline::run_analysis;
