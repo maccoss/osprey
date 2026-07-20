@@ -22,6 +22,7 @@ osprey-io = { workspace = true }
 osprey-chromatography = { workspace = true }
 osprey-scoring = { workspace = true }
 osprey-fdr = { workspace = true }
+osprey-ml = { workspace = true }
 
 ndarray = { workspace = true }
 clap = { workspace = true }

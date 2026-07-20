@@ -1872,6 +1872,34 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
     Ok(())
 }
 
+/// Read the raw `(entry_id, svm_score)` scalars from an FDR scores sidecar — the full
+/// population in file order, independent of any stub list. Used by the transfer-compete
+/// pass-2 recompute to stream the full pre-compaction 1st-pass population. Returns `None`
+/// on any header/size mismatch. Mirrors the C# `FdrScoresSidecar.ReadScalars`.
+pub(crate) fn read_fdr_scores_scalars(path: &std::path::Path) -> Option<(Vec<u32>, Vec<f64>)> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < FDR_SIDECAR_HEADER_LEN
+        || &data[0..8] != FDR_SIDECAR_MAGIC
+        || data[8] != FDR_SIDECAR_VERSION
+    {
+        return None;
+    }
+    let count = u64::from_le_bytes(data[16..24].try_into().ok()?) as usize;
+    if data.len() != FDR_SIDECAR_HEADER_LEN + count * FDR_SIDECAR_RECORD_LEN {
+        return None;
+    }
+    let mut entry_ids = Vec::with_capacity(count);
+    let mut scores = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = FDR_SIDECAR_HEADER_LEN + i * FDR_SIDECAR_RECORD_LEN;
+        entry_ids.push(u32::from_le_bytes(data[base..base + 4].try_into().ok()?));
+        scores.push(f64::from_le_bytes(
+            data[base + 4..base + 12].try_into().ok()?,
+        ));
+    }
+    Some((entry_ids, scores))
+}
+
 /// Load per-file FDR scores from sidecar into FdrEntry stubs. Returns true if successful.
 /// Refuses to load if the file's magic/version don't match v3 or if the entry
 /// count in the header disagrees with the stub list (indicates parquet drift).
@@ -3921,6 +3949,10 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // Parsed by Measure-Pipeline.ps1 for cross-impl perf comparison.
     let mut stage_marker = std::time::Instant::now();
 
+    // Fold-averaged first-pass Percolator model, captured for the transfer-compete pass-2
+    // recompute (OSPREY_PASS2_QVALUE=transfer-compete). None until first-pass FDR runs.
+    let mut frozen_first_pass_model: Option<crate::pass2_qvalue::FrozenLinearModel> = None;
+
     // Validate config: --join-only feeds per-file state from --input-scores
     // parquets and ignores --input-files; default + --no-join modes both
     // require mzML inputs.
@@ -4815,6 +4847,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                     &config,
                     &empty_overlay,
                     None,
+                    Some(&mut frozen_first_pass_model),
                 )?;
             }
             FdrMethod::Mokapot => {
@@ -5093,6 +5126,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                         &config,
                         &empty_overlay,
                         Some(&first_pass_base_ids),
+                        None,
                     )?;
                 }
                 FdrMethod::Mokapot => {
@@ -5575,13 +5609,42 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             log::info!("Second-pass FDR");
             match config.fdr_method {
                 FdrMethod::Percolator => {
-                    run_percolator_fdr(
-                        &mut per_file_entries,
-                        &per_file_cache_paths,
-                        &config,
-                        &per_file_overlays,
-                        Some(&first_pass_base_ids),
-                    )?;
+                    // OSPREY_PASS2_QVALUE=transfer-compete: apply the FROZEN 1st-pass model to
+                    // the reconciled survivors and recompute q + PEP by a fresh target-decoy
+                    // competition over the full pre-compaction population (no retrain). Falls
+                    // back to the retrain if the frozen model or 1st-pass scalars are absent.
+                    let did_transfer_compete = if crate::pass2_qvalue::pass2_mode()
+                        == crate::pass2_qvalue::Pass2QValueMode::TransferCompete
+                    {
+                        match frozen_first_pass_model.as_ref() {
+                            Some(frozen) => compute_pass2_transfer_compete(
+                                &mut per_file_entries,
+                                &per_file_cache_paths,
+                                &per_file_overlays,
+                                frozen,
+                                None,
+                            ),
+                            None => {
+                                log::warn!(
+                                    "OSPREY_PASS2_QVALUE=transfer-compete: no frozen 1st-pass \
+                                     model captured; falling back to the 2nd-pass retrain."
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if !did_transfer_compete {
+                        run_percolator_fdr(
+                            &mut per_file_entries,
+                            &per_file_cache_paths,
+                            &config,
+                            &per_file_overlays,
+                            Some(&first_pass_base_ids),
+                            None,
+                        )?;
+                    }
                 }
                 FdrMethod::Mokapot => {
                     run_mokapot_fdr(
@@ -6046,12 +6109,141 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
 ///
 /// This avoids loading all Parquet files into memory simultaneously and
 /// avoids creating PercolatorEntry objects for all entries.
+/// Transfer-compete pass-2 recompute (OSPREY_PASS2_QVALUE=transfer-compete): score the
+/// reconciled survivors with the frozen 1st-pass model and recompute run/experiment q + PEP
+/// by a fresh target-decoy competition over the full pre-compaction population (the per-file
+/// `.1st-pass.fdr_scores.bin` scalar sidecars). Writes q/PEP directly onto the survivor
+/// stubs. Returns `false` (→ the caller falls back to the retrain) if the frozen model or any
+/// 1st-pass sidecar is missing.
+///
+/// `stratum_base_ids`: `None` = full-population (transfer-compete); `Some` = constrained
+/// competition (protein-compact, feature #3 — the map-back then leaves off-stratum survivors
+/// on their 1st-pass q). Port of C# `Pass2FdrSidecar.ComputePass2TransferCompeteFull`.
+fn compute_pass2_transfer_compete(
+    per_file_entries: &mut [(String, Vec<FdrEntry>)],
+    per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
+    overlay: &RescoreOverlay,
+    frozen: &crate::pass2_qvalue::FrozenLinearModel,
+    stratum_base_ids: Option<&HashSet<u32>>,
+) -> bool {
+    let n_files = per_file_entries.len();
+    let n_features = frozen.num_features();
+
+    // Locate every file's 1st-pass scalar sidecar (sibling of its parquet cache); fail fast so
+    // we fall back to the retrain before streaming anything.
+    let mut sidecar_paths: Vec<std::path::PathBuf> = Vec::with_capacity(n_files);
+    for (file_name, _) in per_file_entries.iter() {
+        let cache = match per_file_cache_paths.get(file_name.as_str()) {
+            Some(p) => p,
+            None => {
+                log::warn!(
+                    "transfer-compete: no parquet cache path for '{}'",
+                    file_name
+                );
+                return false;
+            }
+        };
+        let dir = cache.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let sidecar = dir.join(format!("{}.1st-pass.fdr_scores.bin", file_name));
+        if !sidecar.exists() {
+            log::warn!(
+                "transfer-compete: 1st-pass sidecar not found: {}",
+                sidecar.display()
+            );
+            return false;
+        }
+        sidecar_paths.push(sidecar);
+    }
+
+    // Frozen-model score every reconciled survivor from its reconciled features (overlay for
+    // rescored entries, reconciled parquet otherwise) — the same feature lookup the retrain
+    // score pass uses. Keyed by (file_idx, entry_id). Collect the survivor list too.
+    let mut survivor_score_override: HashMap<(usize, u32), f64> = HashMap::new();
+    let mut survivors: Vec<(usize, u32)> = Vec::new();
+    for (file_idx, (file_name, entries)) in per_file_entries.iter().enumerate() {
+        let file_overlay = overlay.get(file_name.as_str());
+        let file_features = per_file_cache_paths
+            .get(file_name.as_str())
+            .and_then(|p| load_pin_features_from_parquet(p).ok());
+        for (local_idx, e) in entries.iter().enumerate() {
+            survivors.push((file_idx, e.entry_id));
+            let pq_idx = e.parquet_index as usize;
+            let raw: Option<Vec<f64>> =
+                if let Some(ov) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                    Some(pin_feature_vector(&ov.features))
+                } else {
+                    file_features.as_ref().and_then(|f| f.get(pq_idx).cloned())
+                };
+            if let Some(raw) = raw {
+                if raw.len() == n_features {
+                    survivor_score_override.insert((file_idx, e.entry_id), frozen.score(&raw));
+                }
+            }
+        }
+    }
+    let n_override = survivor_score_override.len();
+
+    // Stream the full-population competition; only one file's scalars resident at a time.
+    let read_file = |file_idx: usize| -> (Vec<u32>, Vec<f64>) {
+        read_fdr_scores_scalars(&sidecar_paths[file_idx]).unwrap_or_default()
+    };
+    let (run_q, exp_q, pep) = crate::pass2_qvalue::compute_full_population_fdr_streaming(
+        n_files,
+        read_file,
+        &survivor_score_override,
+        &survivors,
+        stratum_base_ids,
+    );
+
+    // Map the recomputed q/PEP back onto the survivor stubs. Under a constrained stratum, an
+    // off-stratum survivor is absent from run_q → keep its 1st-pass q (report = pass1 ∪ stratum).
+    let mut n_mapped = 0usize;
+    for (file_idx, (_file_name, entries)) in per_file_entries.iter_mut().enumerate() {
+        for e in entries.iter_mut() {
+            // Under a constrained stratum (protein-compact), an off-stratum survivor keeps its
+            // already-passing 1st-pass q — the streaming competition returns q=1.0 for it, so it
+            // must be skipped rather than written (report = pass1 ∪ stratum passers).
+            if let Some(strat) = stratum_base_ids {
+                if !strat.contains(&(e.entry_id & 0x7FFF_FFFF)) {
+                    continue;
+                }
+            }
+            let key = (file_idx, e.entry_id);
+            let rq = match run_q.get(&key) {
+                Some(&v) => v,
+                None => continue,
+            };
+            e.run_precursor_qvalue = rq;
+            e.experiment_precursor_qvalue = exp_q[&key];
+            e.pep = pep[&key];
+            // Precursor-level path: keep peptide q in step with precursor q for the reported set.
+            e.run_peptide_qvalue = rq;
+            e.experiment_peptide_qvalue = exp_q[&key];
+            n_mapped += 1;
+        }
+    }
+    log::info!(
+        "OSPREY_PASS2_QVALUE={}: recomputed q/PEP for {} survivors across {} file(s), {} \
+         frozen-model scores swapped in — no retrain.",
+        if stratum_base_ids.is_some() {
+            "protein-compact"
+        } else {
+            "transfer-compete"
+        },
+        n_mapped,
+        n_files,
+        n_override
+    );
+    true
+}
+
 fn run_percolator_fdr(
     per_file_entries: &mut [(String, Vec<FdrEntry>)],
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
     config: &OspreyConfig,
     overlay: &RescoreOverlay,
     restrict_base_ids: Option<&HashSet<u32>>,
+    frozen_out: Option<&mut Option<crate::pass2_qvalue::FrozenLinearModel>>,
 ) -> Result<()> {
     use osprey_fdr::percolator;
 
@@ -6361,6 +6553,18 @@ fn run_percolator_fdr(
 
     let standardizer = train_results.standardizer.clone();
 
+    // Capture the fold-averaged frozen model for the transfer-compete pass-2 recompute
+    // (OSPREY_PASS2_QVALUE=transfer-compete). Only the first-pass caller requests it; the
+    // captured weights + standardizer are exactly what the score pass below applies, so a
+    // survivor re-scored from this model matches its 1st-pass sidecar score.
+    if let Some(slot) = frozen_out {
+        *slot = Some(crate::pass2_qvalue::FrozenLinearModel::new(
+            avg_weights.clone(),
+            avg_bias,
+            standardizer.clone(),
+        ));
+    }
+
     // Free training memory
     drop(subset_perc_entries);
     drop(train_results);
@@ -6546,6 +6750,7 @@ fn run_mokapot_fdr(
             config,
             &empty_overlay,
             None,
+            None,
         );
     }
 
@@ -6659,6 +6864,7 @@ fn run_mokapot_fdr(
                 per_file_cache_paths,
                 config,
                 &empty_overlay,
+                None,
                 None,
             )?;
         }

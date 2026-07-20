@@ -61,6 +61,9 @@ pub mod trace;
 // Learned per-platform peak-pick model (env-var gated; default per resolution)
 pub mod pick_lda;
 
+// Second-pass q-value strategy (OSPREY_PASS2_QVALUE): default retrain, or transfer-compete
+pub mod pass2_qvalue;
+
 // Pipeline
 mod pipeline;
 pub use pipeline::run_analysis;
