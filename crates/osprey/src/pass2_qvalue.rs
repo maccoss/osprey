@@ -34,6 +34,21 @@ pub enum Pass2QValueMode {
     Percolator,
     /// Frozen 1st-pass model + fresh full-population target-decoy competition (no retrain).
     TransferCompete,
+    /// Like `TransferCompete`, but the competition is CONSTRAINED to the protein stratum
+    /// (peptides of proteins with >=2 first-pass-detected peptides) and the compaction gate
+    /// is expanded to admit those peptides — recovering present-protein depth at honest FDR.
+    ProteinCompact,
+}
+
+impl Pass2QValueMode {
+    /// True when the mode replaces the 2nd-pass retrain with the frozen 1st-pass model +
+    /// full-population competition. Only transfer-compete does this. protein-compact does NOT
+    /// (the projection 2nd-pass RETRAINS over the stratum-expanded compacted pool — the
+    /// stratum's only effect is the compaction-gate expansion; see
+    /// FirstJoinTask.RunPercolatorFdr's projection overload, which passes no frozen model).
+    pub fn uses_frozen_model(self) -> bool {
+        matches!(self, Pass2QValueMode::TransferCompete)
+    }
 }
 
 static PASS2_MODE: OnceLock<Pass2QValueMode> = OnceLock::new();
@@ -45,6 +60,7 @@ pub fn pass2_mode() -> Pass2QValueMode {
     *PASS2_MODE.get_or_init(|| match std::env::var("OSPREY_PASS2_QVALUE") {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
             "transfer-compete" => Pass2QValueMode::TransferCompete,
+            "protein-compact" => Pass2QValueMode::ProteinCompact,
             _ => Pass2QValueMode::Percolator,
         },
         Err(_) => Pass2QValueMode::Percolator,

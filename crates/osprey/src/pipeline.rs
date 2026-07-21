@@ -3953,6 +3953,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // recompute (OSPREY_PASS2_QVALUE=transfer-compete). None until first-pass FDR runs.
     let mut frozen_first_pass_model: Option<crate::pass2_qvalue::FrozenLinearModel> = None;
 
+    // Protein-compact stratum (base_ids of >=2-detected-peptide proteins), built during
+    // first-pass protein FDR when OSPREY_PASS2_QVALUE=protein-compact. Consumed at the
+    // compaction gate (admit present-protein peptides) and the pass-2 recompute (constrain
+    // the competition). None in every other mode.
+    let mut protein_compact_stratum: Option<HashSet<u32>> = None;
+
     // Validate config: --join-only feeds per-file state from --input-scores
     // parquets and ignores --input-files; default + --no-join modes both
     // require mzML inputs.
@@ -4917,6 +4923,16 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             .filter(|e| !e.is_decoy && e.run_peptide_qvalue <= config.run_fdr)
             .map(|e| e.modified_sequence.to_string())
             .collect();
+
+        // Protein-compact: build the >=2-detected-peptide protein stratum now, while the
+        // detected-peptide set and full library are in scope. Held for the compaction gate
+        // and the pass-2 constrained competition.
+        if crate::pass2_qvalue::pass2_mode() == crate::pass2_qvalue::Pass2QValueMode::ProteinCompact
+        {
+            protein_compact_stratum =
+                Some(build_protein_compact_stratum(&library, &detected_peptides));
+        }
+
         let parsimony = protein::build_protein_parsimony(
             &library,
             config.shared_peptides,
@@ -5032,9 +5048,17 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         .iter()
         .flat_map(|(_, entries)| entries.iter())
         .filter(|e| {
+            // Protein-compact (OSPREY_PASS2_QVALUE=protein-compact) adds a third clause: admit
+            // present-protein peptides (>=2-detected-peptide proteins) even if they failed both
+            // the peptide-q and protein-rescue gates, so they get reconciled + rescored +
+            // reported. Everything downstream keys off first_pass_base_ids, so this single
+            // admission point carries them through (mirrors C# FirstJoinTask's expanded gate).
             !e.is_decoy
                 && (e.run_peptide_qvalue <= peptide_compaction_gate
-                    || e.run_protein_qvalue <= protein_compaction_gate)
+                    || e.run_protein_qvalue <= protein_compaction_gate
+                    || protein_compact_stratum
+                        .as_ref()
+                        .is_some_and(|s| s.contains(&(e.entry_id & 0x7FFF_FFFF))))
         })
         .map(|e| e.entry_id & 0x7FFF_FFFF)
         .collect();
@@ -5609,13 +5633,15 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             log::info!("Second-pass FDR");
             match config.fdr_method {
                 FdrMethod::Percolator => {
-                    // OSPREY_PASS2_QVALUE=transfer-compete: apply the FROZEN 1st-pass model to
-                    // the reconciled survivors and recompute q + PEP by a fresh target-decoy
-                    // competition over the full pre-compaction population (no retrain). Falls
-                    // back to the retrain if the frozen model or 1st-pass scalars are absent.
-                    let did_transfer_compete = if crate::pass2_qvalue::pass2_mode()
-                        == crate::pass2_qvalue::Pass2QValueMode::TransferCompete
-                    {
+                    // transfer-compete: recompute q for every survivor by a fresh target-decoy
+                    // competition over the full pre-compaction population using the FROZEN
+                    // 1st-pass model (no retrain). protein-compact does NOT take this path — it
+                    // RETRAINS the 2nd pass over the stratum-EXPANDED compacted pool (the
+                    // stratum's only effect is the compaction-gate expansion), matching the C#
+                    // projection 2nd-pass which passes no frozen model. Every other mode
+                    // (percolator default, protein-compact) falls through to the retrain below.
+                    let pass2 = crate::pass2_qvalue::pass2_mode();
+                    let did_frozen_pass2 = if pass2.uses_frozen_model() {
                         match frozen_first_pass_model.as_ref() {
                             Some(frozen) => compute_pass2_transfer_compete(
                                 &mut per_file_entries,
@@ -5626,8 +5652,9 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                             ),
                             None => {
                                 log::warn!(
-                                    "OSPREY_PASS2_QVALUE=transfer-compete: no frozen 1st-pass \
-                                     model captured; falling back to the 2nd-pass retrain."
+                                    "OSPREY_PASS2_QVALUE={:?}: no frozen 1st-pass model captured; \
+                                     falling back to the 2nd-pass retrain.",
+                                    pass2
                                 );
                                 false
                             }
@@ -5635,7 +5662,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                     } else {
                         false
                     };
-                    if !did_transfer_compete {
+                    if !did_frozen_pass2 {
                         run_percolator_fdr(
                             &mut per_file_entries,
                             &per_file_cache_paths,
@@ -6109,6 +6136,56 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
 ///
 /// This avoids loading all Parquet files into memory simultaneously and
 /// avoids creating PercolatorEntry objects for all entries.
+/// Build the protein-compact stratum: the base_ids of every library precursor belonging to a
+/// protein with >= 2 distinct first-pass-detected peptides. Literal port of C#
+/// `FirstJoinTask.BuildProteinCompactStratum` — it uses the RAW library protein assignments (a
+/// detected peptide counts toward ALL of its proteins, with no parsimony/razor), so it matches
+/// OspreySharp given the same (byte-identical) detected-peptide set and library.
+fn build_protein_compact_stratum(
+    library: &[LibraryEntry],
+    detected_peptides: &HashSet<String>,
+) -> HashSet<u32> {
+    // modified_sequence -> its protein ids (from target library entries, first occurrence).
+    let mut pep_proteins: HashMap<&str, &[String]> = HashMap::new();
+    for e in library {
+        if !e.is_decoy && !e.protein_ids.is_empty() {
+            pep_proteins
+                .entry(e.modified_sequence.as_str())
+                .or_insert(&e.protein_ids);
+        }
+    }
+    // Count DISTINCT detected peptides per protein; keep proteins with >= 2.
+    let mut prot_pep_count: HashMap<&str, u32> = HashMap::new();
+    for pep in detected_peptides {
+        if let Some(pids) = pep_proteins.get(pep.as_str()) {
+            for p in pids.iter() {
+                *prot_pep_count.entry(p.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+    let present2: HashSet<&str> = prot_pep_count
+        .iter()
+        .filter(|(_, &c)| c >= 2)
+        .map(|(&p, _)| p)
+        .collect();
+    // stratum = base_ids of every library precursor (target or paired decoy, which share a
+    // base_id) of a present-2 protein.
+    let mut stratum: HashSet<u32> = HashSet::new();
+    for e in library {
+        if e.protein_ids.iter().any(|p| present2.contains(p.as_str())) {
+            stratum.insert(e.id & 0x7FFF_FFFF);
+        }
+    }
+    log::info!(
+        "protein-compact: {} proteins with >=2 detected peptides -> stratum of {} base_ids \
+         (from {} detected peptides).",
+        present2.len(),
+        stratum.len(),
+        detected_peptides.len()
+    );
+    stratum
+}
+
 /// Transfer-compete pass-2 recompute (OSPREY_PASS2_QVALUE=transfer-compete): score the
 /// reconciled survivors with the frozen 1st-pass model and recompute run/experiment q + PEP
 /// by a fresh target-decoy competition over the full pre-compaction population (the per-file
