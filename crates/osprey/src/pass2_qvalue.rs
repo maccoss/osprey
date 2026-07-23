@@ -70,6 +70,23 @@ pub fn pass2_mode() -> Pass2QValueMode {
     })
 }
 
+static PASS2_PROTEIN_COMPACT_RETRAIN: OnceLock<bool> = OnceLock::new();
+
+/// Whether protein-compact should RETRAIN the 2nd-pass SVM over the stratum-expanded pool
+/// instead of applying the frozen 1st-pass model (`OSPREY_PROTEIN_COMPACT_RETRAIN`, set and
+/// not `"0"`). Default off (frozen). This is a deliberate diagnostic A/B toggle: the frozen
+/// path is the calibrated one; retrain over the decoy-depleted post-compaction null is
+/// anti-conservative (measured ~1.2–1.5% FDP against entrapments). Mirrors the C#
+/// `OspreyEnvironment.Pass2ProteinCompactRetrain` (`IsSetAndNotZero`: set and not `"0"`).
+pub fn pass2_protein_compact_retrain() -> bool {
+    *PASS2_PROTEIN_COMPACT_RETRAIN.get_or_init(|| {
+        match std::env::var("OSPREY_PROTEIN_COMPACT_RETRAIN") {
+            Ok(v) => !v.is_empty() && v != "0",
+            Err(_) => false,
+        }
+    })
+}
+
 /// The frozen 1st-pass linear model: the fold-averaged SVM weights + bias and the training
 /// standardizer. Reproduces byte-for-byte the averaged-model scoring `run_percolator_fdr`
 /// applies (standardize the raw features in place, then `bias + Σ w·x`), so a survivor

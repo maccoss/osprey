@@ -5649,35 +5649,65 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                     let pass2 = crate::pass2_qvalue::pass2_mode();
                     let is_protein_compact =
                         matches!(pass2, crate::pass2_qvalue::Pass2QValueMode::ProteinCompact);
-                    let stratum = if is_protein_compact {
-                        protein_compact_stratum.as_ref()
-                    } else {
-                        None
-                    };
-                    let did_frozen_pass2 = if pass2.uses_frozen_model()
-                        && !(is_protein_compact && stratum.is_none())
-                    {
-                        match frozen_first_pass_model.as_ref() {
-                            Some(frozen) => compute_pass2_transfer_compete(
-                                &mut per_file_entries,
-                                &per_file_cache_paths,
-                                &per_file_overlays,
-                                frozen,
-                                stratum,
-                            ),
-                            None => {
-                                log::warn!(
-                                    "OSPREY_PASS2_QVALUE={:?}: no frozen 1st-pass model captured; \
-                                     falling back to the 2nd-pass retrain.",
-                                    pass2
-                                );
-                                false
-                            }
+                    // Protein-compact honors an explicit retrain opt-in
+                    // (OSPREY_PROTEIN_COMPACT_RETRAIN): a deliberate A/B that retrains the 2nd-pass
+                    // SVM over the stratum-expanded pool instead of applying the frozen 1st-pass
+                    // model. Default off (frozen) — matches C# Pass2ProteinCompactRetrain.
+                    let protein_compact_retrain =
+                        is_protein_compact && crate::pass2_qvalue::pass2_protein_compact_retrain();
+                    let want_frozen = pass2.uses_frozen_model() && !protein_compact_retrain;
+                    if want_frozen {
+                        let stratum = if is_protein_compact {
+                            protein_compact_stratum.as_ref()
+                        } else {
+                            None
+                        };
+                        // Fail-fast: an explicitly requested frozen mode must NEVER silently
+                        // degrade to the anti-conservative retrain. A warm rerun that loaded
+                        // cached SVM scores and skipped 1st-pass training leaves the frozen model
+                        // (and, for protein-compact, the stratum) unbuilt; abort with actionable
+                        // guidance rather than reporting looser FDR than a cold run under the same
+                        // flag.
+                        let frozen = frozen_first_pass_model.as_ref().ok_or_else(|| {
+                            OspreyError::ConfigError(format!(
+                                "OSPREY_PASS2_QVALUE={:?} needs the 1st-pass frozen model, but it \
+                                 was not captured (a warm rerun that loaded cached SVM scores and \
+                                 skipped 1st-pass training). Rerun without the score cache, unset \
+                                 OSPREY_PASS2_QVALUE for the default retrain{}.",
+                                pass2,
+                                if is_protein_compact {
+                                    ", or set OSPREY_PROTEIN_COMPACT_RETRAIN=1 to retrain over the \
+                                     stratum"
+                                } else {
+                                    ""
+                                }
+                            ))
+                        })?;
+                        if is_protein_compact && stratum.is_none() {
+                            return Err(OspreyError::ConfigError(
+                                "OSPREY_PASS2_QVALUE=protein-compact needs the protein stratum, \
+                                 but it was not built (a warm rerun that skipped 1st-pass protein \
+                                 FDR). Rerun without the score cache, or set \
+                                 OSPREY_PROTEIN_COMPACT_RETRAIN=1 to retrain over the stratum."
+                                    .to_string(),
+                            ));
+                        }
+                        if !compute_pass2_transfer_compete(
+                            &mut per_file_entries,
+                            &per_file_cache_paths,
+                            &per_file_overlays,
+                            frozen,
+                            stratum,
+                        ) {
+                            return Err(OspreyError::ConfigError(format!(
+                                "OSPREY_PASS2_QVALUE={:?}: a 1st-pass score sidecar is missing or \
+                                 corrupt, so the frozen recompute cannot be honored. Rerun without \
+                                 the score cache, or unset OSPREY_PASS2_QVALUE for the default \
+                                 retrain.",
+                                pass2
+                            )));
                         }
                     } else {
-                        false
-                    };
-                    if !did_frozen_pass2 {
                         run_percolator_fdr(
                             &mut per_file_entries,
                             &per_file_cache_paths,
@@ -6205,8 +6235,9 @@ fn build_protein_compact_stratum(
 /// reconciled survivors with the frozen 1st-pass model and recompute run/experiment q + PEP
 /// by a fresh target-decoy competition over the full pre-compaction population (the per-file
 /// `.1st-pass.fdr_scores.bin` scalar sidecars). Writes q/PEP directly onto the survivor
-/// stubs. Returns `false` (→ the caller falls back to the retrain) if the frozen model or any
-/// 1st-pass sidecar is missing.
+/// stubs. Returns `false` if any 1st-pass sidecar is missing or corrupt; because the mode was
+/// explicitly requested, the caller treats that as a hard error (fail-fast) rather than
+/// silently degrading to the anti-conservative retrain.
 ///
 /// `stratum_base_ids`: `None` = full-population (transfer-compete); `Some` = constrained
 /// competition (protein-compact, feature #3 — the map-back then leaves off-stratum survivors
