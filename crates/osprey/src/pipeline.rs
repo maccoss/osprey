@@ -1885,7 +1885,12 @@ pub(crate) fn read_fdr_scores_scalars(path: &std::path::Path) -> Option<(Vec<u32
         return None;
     }
     let count = u64::from_le_bytes(data[16..24].try_into().ok()?) as usize;
-    if data.len() != FDR_SIDECAR_HEADER_LEN + count * FDR_SIDECAR_RECORD_LEN {
+    // Guard the size arithmetic against overflow so a corrupt/oversized header count is
+    // rejected (→ None, caller falls back to retrain) rather than wrapping in release builds.
+    let expected_len = count
+        .checked_mul(FDR_SIDECAR_RECORD_LEN)
+        .and_then(|body| body.checked_add(FDR_SIDECAR_HEADER_LEN))?;
+    if data.len() != expected_len {
         return None;
     }
     let mut entry_ids = Vec::with_capacity(count);
@@ -6249,9 +6254,25 @@ fn compute_pass2_transfer_compete(
     let mut survivors: Vec<(usize, u32)> = Vec::new();
     for (file_idx, (file_name, entries)) in per_file_entries.iter().enumerate() {
         let file_overlay = overlay.get(file_name.as_str());
-        let file_features = per_file_cache_paths
-            .get(file_name.as_str())
-            .and_then(|p| load_pin_features_from_parquet(p).ok());
+        // Frozen re-score of NON-rescored survivors is a no-op (frozen == the 1st-pass model that
+        // wrote the sidecar scalars), so a failed load can't corrupt q-values — those survivors
+        // keep their identical 1st-pass sidecar score. Reconciliation-rescored survivors take the
+        // overlay path below, independent of this load. Warn so a genuinely missing cache is visible.
+        let file_features = match per_file_cache_paths.get(file_name.as_str()) {
+            Some(p) => match load_pin_features_from_parquet(p) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    log::warn!(
+                        "transfer-compete: features for '{}' unavailable ({}); non-rescored \
+                         survivors keep their 1st-pass sidecar score",
+                        file_name,
+                        e
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         for (local_idx, e) in entries.iter().enumerate() {
             survivors.push((file_idx, e.entry_id));
             let pq_idx = e.parquet_index as usize;
@@ -6270,9 +6291,19 @@ fn compute_pass2_transfer_compete(
     }
     let n_override = survivor_score_override.len();
 
-    // Stream the full-population competition; only one file's scalars resident at a time.
+    // Stream the full-population competition; only one file's scalars resident at a time. A
+    // present-but-corrupt sidecar must NOT silently contribute an empty population (that would
+    // understate the null → anti-conservative q); flag it and fall back to the retrain, matching
+    // the "missing sidecar → retrain" contract in this function's docstring.
+    let read_failed = std::cell::Cell::new(false);
     let read_file = |file_idx: usize| -> (Vec<u32>, Vec<f64>) {
-        read_fdr_scores_scalars(&sidecar_paths[file_idx]).unwrap_or_default()
+        match read_fdr_scores_scalars(&sidecar_paths[file_idx]) {
+            Some(scalars) => scalars,
+            None => {
+                read_failed.set(true);
+                (Vec::new(), Vec::new())
+            }
+        }
     };
     let (run_q, exp_q, pep) = crate::pass2_qvalue::compute_full_population_fdr_streaming(
         n_files,
@@ -6281,6 +6312,12 @@ fn compute_pass2_transfer_compete(
         &survivors,
         stratum_base_ids,
     );
+    if read_failed.get() {
+        log::warn!(
+            "transfer-compete: a 1st-pass sidecar failed to parse; falling back to 2nd-pass retrain"
+        );
+        return false;
+    }
 
     // Map the recomputed q/PEP back onto the survivor stubs. Under a constrained stratum, an
     // off-stratum survivor is absent from run_q → keep its 1st-pass q (report = pass1 ∪ stratum).
