@@ -8373,8 +8373,8 @@ fn run_search(
 
     let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
 
-    // Learned per-platform peak-pick model (default), or None for the legacy product
-    // pick (OSPREY_PICK_LEGACY). Resolved once per process; keyed by resolution so unit
+    // Learned per-platform peak-pick model (opt-in via OSPREY_PICK_LDA), or None for the
+    // default legacy product pick. Resolved once per process; keyed by resolution so unit
     // data uses the Stellar-trained model and HRAM data the Astral-trained one. Mirrors
     // C# PeakDataExtractor's model selection.
     let pick_model = crate::pick_lda::active_model(is_hram);
@@ -9004,9 +9004,9 @@ fn run_search(
                                 // replace the product form with a standardized linear
                                 // combination of the same four raw terms — coelution,
                                 // ln_intensity, rt_penalty, and a per-candidate
-                                // median-polish cosine. Without a model
-                                // (OSPREY_PICK_LEGACY) it stays the pure product form
-                                // used for cross-impl parity and the regression golden.
+                                // median-polish cosine. Without a model (the default; the
+                                // model is opt-in via OSPREY_PICK_LDA) it stays the pure
+                                // product form used for cross-impl parity + the regression golden.
                                 let rank_score = match pick_model {
                                     Some(model) => {
                                         // Per-candidate median-polish cosine (mirrors C#

@@ -15,9 +15,9 @@
 //!
 //! Selection precedence (matches C#), resolved once at first use:
 //!   1. `OSPREY_PICK_LDA_MODEL` (path to a JSON model) → that model (test override);
-//!   2. else `OSPREY_PICK_LEGACY` set and not `"0"` → the pure product pick (`None`);
-//!   3. else (DEFAULT) → the hardcoded model for this resolution (Stellar for unit,
-//!      Astral for HRAM).
+//!   2. else `OSPREY_PICK_LDA` set and not `"0"` → the hardcoded resolution-keyed model
+//!      (Stellar for unit, Astral for HRAM);
+//!   3. else (DEFAULT) → the pure product pick (`None`; Rust parity + regression golden).
 
 use std::sync::OnceLock;
 
@@ -113,10 +113,10 @@ const ASTRAL_MODEL: PickLdaModel = PickLdaModel {
 enum PickMode {
     /// `OSPREY_PICK_LDA_MODEL` override — applies to every resolution.
     EnvModel(PickLdaModel),
-    /// `OSPREY_PICK_LEGACY` — the pure product-form pick (no model).
+    /// `OSPREY_PICK_LDA` — the hardcoded resolution-keyed model (opt-in).
+    ResolutionModel,
+    /// Default: the pure product-form pick (no model).
     Legacy,
-    /// Default: the hardcoded model for the run's resolution.
-    Default,
 }
 
 static PICK_MODE: OnceLock<PickMode> = OnceLock::new();
@@ -131,14 +131,14 @@ fn pick_mode() -> &'static PickMode {
                 return PickMode::EnvModel(load_from_json(&path));
             }
         }
-        // (2) OSPREY_PICK_LEGACY: set and not "0" → legacy product pick.
-        if let Ok(v) = std::env::var("OSPREY_PICK_LEGACY") {
+        // (2) OSPREY_PICK_LDA: set and not "0" → the resolution-keyed built-in model (opt-in).
+        if let Ok(v) = std::env::var("OSPREY_PICK_LDA") {
             if !v.is_empty() && v != "0" {
-                return PickMode::Legacy;
+                return PickMode::ResolutionModel;
             }
         }
-        // (3) Default: resolution-keyed hardcoded model.
-        PickMode::Default
+        // (3) Default: the legacy pure product-form pick (Rust parity + regression golden).
+        PickMode::Legacy
     })
 }
 
@@ -148,12 +148,12 @@ fn pick_mode() -> &'static PickMode {
 pub fn active_model(is_hram: bool) -> Option<&'static PickLdaModel> {
     match pick_mode() {
         PickMode::EnvModel(m) => Some(m),
-        PickMode::Legacy => None,
-        PickMode::Default => Some(if is_hram {
+        PickMode::ResolutionModel => Some(if is_hram {
             &ASTRAL_MODEL
         } else {
             &STELLAR_MODEL
         }),
+        PickMode::Legacy => None,
     }
 }
 
