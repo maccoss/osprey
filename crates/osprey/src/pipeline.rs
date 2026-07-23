@@ -5633,22 +5633,32 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             log::info!("Second-pass FDR");
             match config.fdr_method {
                 FdrMethod::Percolator => {
-                    // transfer-compete: recompute q for every survivor by a fresh target-decoy
-                    // competition over the full pre-compaction population using the FROZEN
-                    // 1st-pass model (no retrain). protein-compact does NOT take this path — it
-                    // RETRAINS the 2nd pass over the stratum-EXPANDED compacted pool (the
-                    // stratum's only effect is the compaction-gate expansion), matching the C#
-                    // projection 2nd-pass which passes no frozen model. Every other mode
-                    // (percolator default, protein-compact) falls through to the retrain below.
+                    // transfer-compete / protein-compact: recompute q for every survivor with the
+                    // FROZEN 1st-pass model (no retrain) by a fresh target-decoy competition --
+                    // transfer-compete over the full pre-compaction population, protein-compact
+                    // constrained to the protein stratum (peptides of >=2-peptide 1st-pass
+                    // proteins). Both stream one file at a time via
+                    // compute_full_population_fdr_streaming, mirroring the C# streaming frozen 2nd
+                    // pass. The default percolator mode (and protein-compact when the stratum is
+                    // absent) falls through to the retrain below.
                     let pass2 = crate::pass2_qvalue::pass2_mode();
-                    let did_frozen_pass2 = if pass2.uses_frozen_model() {
+                    let is_protein_compact =
+                        matches!(pass2, crate::pass2_qvalue::Pass2QValueMode::ProteinCompact);
+                    let stratum = if is_protein_compact {
+                        protein_compact_stratum.as_ref()
+                    } else {
+                        None
+                    };
+                    let did_frozen_pass2 = if pass2.uses_frozen_model()
+                        && !(is_protein_compact && stratum.is_none())
+                    {
                         match frozen_first_pass_model.as_ref() {
                             Some(frozen) => compute_pass2_transfer_compete(
                                 &mut per_file_entries,
                                 &per_file_cache_paths,
                                 &per_file_overlays,
                                 frozen,
-                                None,
+                                stratum,
                             ),
                             None => {
                                 log::warn!(
@@ -6630,10 +6640,10 @@ fn run_percolator_fdr(
 
     let standardizer = train_results.standardizer.clone();
 
-    // Capture the fold-averaged frozen model for the transfer-compete pass-2 recompute
-    // (OSPREY_PASS2_QVALUE=transfer-compete). Only the first-pass caller requests it; the
-    // captured weights + standardizer are exactly what the score pass below applies, so a
-    // survivor re-scored from this model matches its 1st-pass sidecar score.
+    // Capture the fold-averaged frozen model for the frozen pass-2 recompute
+    // (OSPREY_PASS2_QVALUE=transfer-compete or protein-compact). Only the first-pass caller
+    // requests it; the captured weights + standardizer are exactly what the score pass below
+    // applies, so a survivor re-scored from this model matches its 1st-pass sidecar score.
     if let Some(slot) = frozen_out {
         *slot = Some(crate::pass2_qvalue::FrozenLinearModel::new(
             avg_weights.clone(),
@@ -7442,8 +7452,14 @@ fn build_shared_boundaries_from_plan(
     entries: &[BlibPlanEntry],
 ) -> (HashMap<(Arc<str>, u16), (f64, f64, f64)>, usize) {
     // For each (modified_sequence, file_name_idx), keep boundaries from entry
-    // with lowest run q-value
-    let mut best_by_key: HashMap<(Arc<str>, u16), (f64, f64, f64, f64)> = HashMap::new();
+    // with lowest run q-value. On a run_qvalue TIE (e.g. two charge states both
+    // gap-filled at q=1.0), break deterministically by LOWEST CHARGE so the
+    // winner does not depend on plan-entry iteration order — otherwise Rust
+    // (parquet row order) and C# (in-memory per-file entry order) can keep
+    // different charges' windows for the same peptide, diverging the blib
+    // RetentionTimes start/end. C# BuildSharedBoundaries applies the identical
+    // (lower run_qvalue, then lower charge) rule.
+    let mut best_by_key: HashMap<(Arc<str>, u16), (f64, f64, f64, f64, u8)> = HashMap::new();
     let mut charges_by_key: HashMap<(Arc<str>, u16), HashSet<u8>> = HashMap::new();
 
     for entry in entries {
@@ -7456,7 +7472,9 @@ fn build_shared_boundaries_from_plan(
 
         let should_update = best_by_key
             .get(&key)
-            .map_or(true, |&(_, _, _, qval)| entry.run_qvalue < qval);
+            .map_or(true, |&(_, _, _, qval, charge)| {
+                entry.run_qvalue < qval || (entry.run_qvalue == qval && entry.charge < charge)
+            });
 
         if should_update {
             best_by_key.insert(
@@ -7466,6 +7484,7 @@ fn build_shared_boundaries_from_plan(
                     entry.start_rt,
                     entry.end_rt,
                     entry.run_qvalue,
+                    entry.charge,
                 ),
             );
         }
@@ -7475,7 +7494,7 @@ fn build_shared_boundaries_from_plan(
 
     let shared_bounds: HashMap<(Arc<str>, u16), (f64, f64, f64)> = best_by_key
         .into_iter()
-        .map(|(k, (apex, start, end, _))| (k, (apex, start, end)))
+        .map(|(k, (apex, start, end, _, _))| (k, (apex, start, end)))
         .collect();
 
     (shared_bounds, n_shared)
@@ -12248,5 +12267,47 @@ mod tests {
             prev = v;
         }
         assert!(prev < 8.0, "1e7 must compress to < 8, got {}", prev);
+    }
+
+    /// Cross-impl determinism: when two charge states of the same peptide are both
+    /// gap-filled at run_qvalue=1.0 (a tie) with DIFFERENT per-charge windows, the
+    /// shared boundary must resolve to the LOWEST-CHARGE entry's window regardless of
+    /// plan-entry order. Otherwise Rust (parquet row order) and C# (in-memory per-file
+    /// entry order) keep different charges and the blib RetentionTimes start/end
+    /// diverge (the Astral transfer-compete 20-row divergence). C#
+    /// MergeNodeTask.BuildSharedBoundaries applies the identical rule.
+    #[test]
+    fn test_shared_boundaries_tie_broken_by_lowest_charge() {
+        let seq: Arc<str> = Arc::from("SVDEVFDEVVQIFDK");
+        let mk = |entry_id: u32, charge: u8, start: f64, end: f64| BlibPlanEntry {
+            entry_id,
+            charge,
+            file_name_idx: 0,
+            run_qvalue: 1.0,
+            experiment_qvalue: 0.0004,
+            apex_rt: (start + end) / 2.0,
+            start_rt: start,
+            end_rt: end,
+            bounds_area: 1.0,
+            modified_sequence: seq.clone(),
+        };
+        let key = (seq.clone(), 0u16);
+        // Same tie, both input orders -> the z=2 (lowest-charge) window must win both times.
+        for swap in [false, true] {
+            let z2 = mk(1304921, 2, 22.925, 23.850); // wide window
+            let z3 = mk(1304922, 3, 23.665, 23.854); // narrow window
+            let order = if swap { vec![z3, z2] } else { vec![z2, z3] };
+            let (bounds, n_shared) = build_shared_boundaries_from_plan(&order);
+            let (_apex, start, end) = bounds[&key];
+            assert_eq!(n_shared, 1, "peptide has 2 charge states in the file");
+            assert_eq!(
+                start, 22.925,
+                "lowest charge (z=2) start must win regardless of order (swap={swap})"
+            );
+            assert_eq!(
+                end, 23.850,
+                "lowest charge (z=2) end must win regardless of order (swap={swap})"
+            );
+        }
     }
 }

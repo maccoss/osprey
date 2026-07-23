@@ -41,13 +41,16 @@ pub enum Pass2QValueMode {
 }
 
 impl Pass2QValueMode {
-    /// True when the mode replaces the 2nd-pass retrain with the frozen 1st-pass model +
-    /// full-population competition. Only transfer-compete does this. protein-compact does NOT
-    /// (the projection 2nd-pass RETRAINS over the stratum-expanded compacted pool — the
-    /// stratum's only effect is the compaction-gate expansion; see
-    /// FirstJoinTask.RunPercolatorFdr's projection overload, which passes no frozen model).
+    /// True when the mode replaces the 2nd-pass retrain with the frozen 1st-pass model + a
+    /// target-decoy competition (no retrain): transfer-compete competes over the full
+    /// pre-compaction population; protein-compact competes over the protein stratum. Both feed
+    /// `compute_full_population_fdr_streaming` (the stratum via its `stratum_base_ids` arg). This
+    /// mirrors the C# streaming frozen 2nd pass (Pass2FdrSidecar.ComputePass2TransferCompeteFull).
     pub fn uses_frozen_model(self) -> bool {
-        matches!(self, Pass2QValueMode::TransferCompete)
+        matches!(
+            self,
+            Pass2QValueMode::TransferCompete | Pass2QValueMode::ProteinCompact
+        )
     }
 }
 
