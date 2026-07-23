@@ -26,6 +26,12 @@ use serde::Deserialize;
 /// Number of pick features: coelution, ln_intensity, rt_penalty, median_polish.
 const N: usize = 4;
 
+/// The fixed feature order `score()` applies weights to. A loaded model MUST list these
+/// names in this exact order (see `load_from_json`) so a re-ordered or older-schema file
+/// cannot silently map weights to the wrong term. Matches the C# `ExpectedFeatures` and
+/// pick_lda_train.py's FEATURES.
+const EXPECTED_FEATURES: [&str; N] = ["coelution", "ln_intensity", "rt_penalty", "median_polish"];
+
 /// A frozen linear pick model: per-feature weights over standardized (z-scored) terms.
 #[derive(Clone, Debug)]
 pub struct PickLdaModel {
@@ -161,6 +167,8 @@ pub fn active_model(is_hram: bool) -> Option<&'static PickLdaModel> {
 /// `{ "features": [...], "weights": [w..], "means": [m..], "scales": [s..] }`.
 #[derive(Deserialize)]
 struct Dto {
+    #[serde(default)]
+    features: Vec<String>,
     weights: Vec<f64>,
     means: Vec<f64>,
     scales: Vec<f64>,
@@ -176,6 +184,22 @@ fn load_from_json(path: &str) -> PickLdaModel {
         panic!(
             "OSPREY_PICK_LDA_MODEL: pick model JSON at '{path}' must define weights, means, \
              and scales as length-{N} arrays."
+        );
+    }
+    // The weights are positional (score() applies weights[i] to the i-th raw term), so a file
+    // whose features are in a different order -- or absent -- would silently score the wrong
+    // term. Require the names and the exact expected order rather than trusting array position.
+    if dto.features.len() != N
+        || dto
+            .features
+            .iter()
+            .zip(EXPECTED_FEATURES)
+            .any(|(got, want)| got.as_str() != want)
+    {
+        panic!(
+            "OSPREY_PICK_LDA_MODEL: pick model JSON at '{path}' must list features as \
+             {EXPECTED_FEATURES:?} in that exact order; got {:?}.",
+            dto.features
         );
     }
     let to_arr = |v: Vec<f64>| -> [f64; N] {
