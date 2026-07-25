@@ -1457,6 +1457,7 @@ dependencies = [
  "osprey-core",
  "osprey-fdr",
  "osprey-io",
+ "osprey-ml",
  "osprey-scoring",
  "parquet",
  "pathdiff",

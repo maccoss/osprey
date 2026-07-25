@@ -1872,6 +1872,39 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
     Ok(())
 }
 
+/// Read the raw `(entry_id, svm_score)` scalars from an FDR scores sidecar — the full
+/// population in file order, independent of any stub list. Used by the transfer-compete
+/// pass-2 recompute to stream the full pre-compaction 1st-pass population. Returns `None`
+/// on any header/size mismatch. Mirrors the C# `FdrScoresSidecar.ReadScalars`.
+pub(crate) fn read_fdr_scores_scalars(path: &std::path::Path) -> Option<(Vec<u32>, Vec<f64>)> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < FDR_SIDECAR_HEADER_LEN
+        || &data[0..8] != FDR_SIDECAR_MAGIC
+        || data[8] != FDR_SIDECAR_VERSION
+    {
+        return None;
+    }
+    let count = u64::from_le_bytes(data[16..24].try_into().ok()?) as usize;
+    // Guard the size arithmetic against overflow so a corrupt/oversized header count is
+    // rejected (→ None, caller falls back to retrain) rather than wrapping in release builds.
+    let expected_len = count
+        .checked_mul(FDR_SIDECAR_RECORD_LEN)
+        .and_then(|body| body.checked_add(FDR_SIDECAR_HEADER_LEN))?;
+    if data.len() != expected_len {
+        return None;
+    }
+    let mut entry_ids = Vec::with_capacity(count);
+    let mut scores = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = FDR_SIDECAR_HEADER_LEN + i * FDR_SIDECAR_RECORD_LEN;
+        entry_ids.push(u32::from_le_bytes(data[base..base + 4].try_into().ok()?));
+        scores.push(f64::from_le_bytes(
+            data[base + 4..base + 12].try_into().ok()?,
+        ));
+    }
+    Some((entry_ids, scores))
+}
+
 /// Load per-file FDR scores from sidecar into FdrEntry stubs. Returns true if successful.
 /// Refuses to load if the file's magic/version don't match v3 or if the entry
 /// count in the header disagrees with the stub list (indicates parquet drift).
@@ -3921,6 +3954,16 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // Parsed by Measure-Pipeline.ps1 for cross-impl perf comparison.
     let mut stage_marker = std::time::Instant::now();
 
+    // Fold-averaged first-pass Percolator model, captured for the transfer-compete pass-2
+    // recompute (OSPREY_PASS2_QVALUE=transfer-compete). None until first-pass FDR runs.
+    let mut frozen_first_pass_model: Option<crate::pass2_qvalue::FrozenLinearModel> = None;
+
+    // Protein-compact stratum (base_ids of >=2-detected-peptide proteins), built during
+    // first-pass protein FDR when OSPREY_PASS2_QVALUE=protein-compact. Consumed at the
+    // compaction gate (admit present-protein peptides) and the pass-2 recompute (constrain
+    // the competition). None in every other mode.
+    let mut protein_compact_stratum: Option<HashSet<u32>> = None;
+
     // Validate config: --join-only feeds per-file state from --input-scores
     // parquets and ignores --input-files; default + --no-join modes both
     // require mzML inputs.
@@ -4815,6 +4858,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                     &config,
                     &empty_overlay,
                     None,
+                    Some(&mut frozen_first_pass_model),
                 )?;
             }
             FdrMethod::Mokapot => {
@@ -4884,6 +4928,16 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             .filter(|e| !e.is_decoy && e.run_peptide_qvalue <= config.run_fdr)
             .map(|e| e.modified_sequence.to_string())
             .collect();
+
+        // Protein-compact: build the >=2-detected-peptide protein stratum now, while the
+        // detected-peptide set and full library are in scope. Held for the compaction gate
+        // and the pass-2 constrained competition.
+        if crate::pass2_qvalue::pass2_mode() == crate::pass2_qvalue::Pass2QValueMode::ProteinCompact
+        {
+            protein_compact_stratum =
+                Some(build_protein_compact_stratum(&library, &detected_peptides));
+        }
+
         let parsimony = protein::build_protein_parsimony(
             &library,
             config.shared_peptides,
@@ -4999,9 +5053,17 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         .iter()
         .flat_map(|(_, entries)| entries.iter())
         .filter(|e| {
+            // Protein-compact (OSPREY_PASS2_QVALUE=protein-compact) adds a third clause: admit
+            // present-protein peptides (>=2-detected-peptide proteins) even if they failed both
+            // the peptide-q and protein-rescue gates, so they get reconciled + rescored +
+            // reported. Everything downstream keys off first_pass_base_ids, so this single
+            // admission point carries them through (mirrors C# FirstJoinTask's expanded gate).
             !e.is_decoy
                 && (e.run_peptide_qvalue <= peptide_compaction_gate
-                    || e.run_protein_qvalue <= protein_compaction_gate)
+                    || e.run_protein_qvalue <= protein_compaction_gate
+                    || protein_compact_stratum
+                        .as_ref()
+                        .is_some_and(|s| s.contains(&(e.entry_id & 0x7FFF_FFFF))))
         })
         .map(|e| e.entry_id & 0x7FFF_FFFF)
         .collect();
@@ -5093,6 +5155,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                         &config,
                         &empty_overlay,
                         Some(&first_pass_base_ids),
+                        None,
                     )?;
                 }
                 FdrMethod::Mokapot => {
@@ -5575,13 +5638,85 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             log::info!("Second-pass FDR");
             match config.fdr_method {
                 FdrMethod::Percolator => {
-                    run_percolator_fdr(
-                        &mut per_file_entries,
-                        &per_file_cache_paths,
-                        &config,
-                        &per_file_overlays,
-                        Some(&first_pass_base_ids),
-                    )?;
+                    // transfer-compete / protein-compact: recompute q for every survivor with the
+                    // FROZEN 1st-pass model (no retrain) by a fresh target-decoy competition --
+                    // transfer-compete over the full pre-compaction population, protein-compact
+                    // constrained to the protein stratum (peptides of >=2-peptide 1st-pass
+                    // proteins). Both stream one file at a time via
+                    // compute_full_population_fdr_streaming, mirroring the C# streaming frozen 2nd
+                    // pass. The default percolator mode (and protein-compact when the stratum is
+                    // absent) falls through to the retrain below.
+                    let pass2 = crate::pass2_qvalue::pass2_mode();
+                    let is_protein_compact =
+                        matches!(pass2, crate::pass2_qvalue::Pass2QValueMode::ProteinCompact);
+                    // Protein-compact honors an explicit retrain opt-in
+                    // (OSPREY_PROTEIN_COMPACT_RETRAIN): a deliberate A/B that retrains the 2nd-pass
+                    // SVM over the stratum-expanded pool instead of applying the frozen 1st-pass
+                    // model. Default off (frozen) — matches C# Pass2ProteinCompactRetrain.
+                    let protein_compact_retrain =
+                        is_protein_compact && crate::pass2_qvalue::pass2_protein_compact_retrain();
+                    let want_frozen = pass2.uses_frozen_model() && !protein_compact_retrain;
+                    if want_frozen {
+                        let stratum = if is_protein_compact {
+                            protein_compact_stratum.as_ref()
+                        } else {
+                            None
+                        };
+                        // Fail-fast: an explicitly requested frozen mode must NEVER silently
+                        // degrade to the anti-conservative retrain. A warm rerun that loaded
+                        // cached SVM scores and skipped 1st-pass training leaves the frozen model
+                        // (and, for protein-compact, the stratum) unbuilt; abort with actionable
+                        // guidance rather than reporting looser FDR than a cold run under the same
+                        // flag.
+                        let frozen = frozen_first_pass_model.as_ref().ok_or_else(|| {
+                            OspreyError::ConfigError(format!(
+                                "OSPREY_PASS2_QVALUE={:?} needs the 1st-pass frozen model, but it \
+                                 was not captured (a warm rerun that loaded cached SVM scores and \
+                                 skipped 1st-pass training). Rerun without the score cache, unset \
+                                 OSPREY_PASS2_QVALUE for the default retrain{}.",
+                                pass2,
+                                if is_protein_compact {
+                                    ", or set OSPREY_PROTEIN_COMPACT_RETRAIN=1 to retrain over the \
+                                     stratum"
+                                } else {
+                                    ""
+                                }
+                            ))
+                        })?;
+                        if is_protein_compact && stratum.is_none() {
+                            return Err(OspreyError::ConfigError(
+                                "OSPREY_PASS2_QVALUE=protein-compact needs the protein stratum, \
+                                 but it was not built (a warm rerun that skipped 1st-pass protein \
+                                 FDR). Rerun without the score cache, or set \
+                                 OSPREY_PROTEIN_COMPACT_RETRAIN=1 to retrain over the stratum."
+                                    .to_string(),
+                            ));
+                        }
+                        if !compute_pass2_transfer_compete(
+                            &mut per_file_entries,
+                            &per_file_cache_paths,
+                            &per_file_overlays,
+                            frozen,
+                            stratum,
+                        ) {
+                            return Err(OspreyError::ConfigError(format!(
+                                "OSPREY_PASS2_QVALUE={:?}: a 1st-pass score sidecar is missing or \
+                                 corrupt, so the frozen recompute cannot be honored. Rerun without \
+                                 the score cache, or unset OSPREY_PASS2_QVALUE for the default \
+                                 retrain.",
+                                pass2
+                            )));
+                        }
+                    } else {
+                        run_percolator_fdr(
+                            &mut per_file_entries,
+                            &per_file_cache_paths,
+                            &config,
+                            &per_file_overlays,
+                            Some(&first_pass_base_ids),
+                            None,
+                        )?;
+                    }
                 }
                 FdrMethod::Mokapot => {
                     run_mokapot_fdr(
@@ -6046,12 +6181,224 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
 ///
 /// This avoids loading all Parquet files into memory simultaneously and
 /// avoids creating PercolatorEntry objects for all entries.
+/// Build the protein-compact stratum: the base_ids of every library precursor belonging to a
+/// protein with >= 2 distinct first-pass-detected peptides. Literal port of C#
+/// `FirstJoinTask.BuildProteinCompactStratum` — it uses the RAW library protein assignments (a
+/// detected peptide counts toward ALL of its proteins, with no parsimony/razor), so it matches
+/// OspreySharp given the same (byte-identical) detected-peptide set and library.
+fn build_protein_compact_stratum(
+    library: &[LibraryEntry],
+    detected_peptides: &HashSet<String>,
+) -> HashSet<u32> {
+    // modified_sequence -> its protein ids (from target library entries, first occurrence).
+    let mut pep_proteins: HashMap<&str, &[String]> = HashMap::new();
+    for e in library {
+        if !e.is_decoy && !e.protein_ids.is_empty() {
+            pep_proteins
+                .entry(e.modified_sequence.as_str())
+                .or_insert(&e.protein_ids);
+        }
+    }
+    // Count DISTINCT detected peptides per protein; keep proteins with >= 2.
+    let mut prot_pep_count: HashMap<&str, u32> = HashMap::new();
+    for pep in detected_peptides {
+        if let Some(pids) = pep_proteins.get(pep.as_str()) {
+            for p in pids.iter() {
+                *prot_pep_count.entry(p.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+    let present2: HashSet<&str> = prot_pep_count
+        .iter()
+        .filter(|(_, &c)| c >= 2)
+        .map(|(&p, _)| p)
+        .collect();
+    // stratum = base_ids of every library precursor (target or paired decoy, which share a
+    // base_id) of a present-2 protein.
+    let mut stratum: HashSet<u32> = HashSet::new();
+    for e in library {
+        if e.protein_ids.iter().any(|p| present2.contains(p.as_str())) {
+            stratum.insert(e.id & 0x7FFF_FFFF);
+        }
+    }
+    log::info!(
+        "protein-compact: {} proteins with >=2 detected peptides -> stratum of {} base_ids \
+         (from {} detected peptides).",
+        present2.len(),
+        stratum.len(),
+        detected_peptides.len()
+    );
+    stratum
+}
+
+/// Transfer-compete pass-2 recompute (OSPREY_PASS2_QVALUE=transfer-compete): score the
+/// reconciled survivors with the frozen 1st-pass model and recompute run/experiment q + PEP
+/// by a fresh target-decoy competition over the full pre-compaction population (the per-file
+/// `.1st-pass.fdr_scores.bin` scalar sidecars). Writes q/PEP directly onto the survivor
+/// stubs. Returns `false` if any 1st-pass sidecar is missing or corrupt; because the mode was
+/// explicitly requested, the caller treats that as a hard error (fail-fast) rather than
+/// silently degrading to the anti-conservative retrain.
+///
+/// `stratum_base_ids`: `None` = full-population (transfer-compete); `Some` = constrained
+/// competition (protein-compact, feature #3 — the map-back then leaves off-stratum survivors
+/// on their 1st-pass q). Port of C# `Pass2FdrSidecar.ComputePass2TransferCompeteFull`.
+fn compute_pass2_transfer_compete(
+    per_file_entries: &mut [(String, Vec<FdrEntry>)],
+    per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
+    overlay: &RescoreOverlay,
+    frozen: &crate::pass2_qvalue::FrozenLinearModel,
+    stratum_base_ids: Option<&HashSet<u32>>,
+) -> bool {
+    let n_files = per_file_entries.len();
+    let n_features = frozen.num_features();
+
+    // Locate every file's 1st-pass scalar sidecar (sibling of its parquet cache); fail fast so
+    // we fall back to the retrain before streaming anything.
+    let mut sidecar_paths: Vec<std::path::PathBuf> = Vec::with_capacity(n_files);
+    for (file_name, _) in per_file_entries.iter() {
+        let cache = match per_file_cache_paths.get(file_name.as_str()) {
+            Some(p) => p,
+            None => {
+                log::warn!(
+                    "transfer-compete: no parquet cache path for '{}'",
+                    file_name
+                );
+                return false;
+            }
+        };
+        let dir = cache.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let sidecar = dir.join(format!("{}.1st-pass.fdr_scores.bin", file_name));
+        if !sidecar.exists() {
+            log::warn!(
+                "transfer-compete: 1st-pass sidecar not found: {}",
+                sidecar.display()
+            );
+            return false;
+        }
+        sidecar_paths.push(sidecar);
+    }
+
+    // Frozen-model score every reconciled survivor from its reconciled features (overlay for
+    // rescored entries, reconciled parquet otherwise) — the same feature lookup the retrain
+    // score pass uses. Keyed by (file_idx, entry_id). Collect the survivor list too.
+    let mut survivor_score_override: HashMap<(usize, u32), f64> = HashMap::new();
+    let mut survivors: Vec<(usize, u32)> = Vec::new();
+    for (file_idx, (file_name, entries)) in per_file_entries.iter().enumerate() {
+        let file_overlay = overlay.get(file_name.as_str());
+        // Frozen re-score of NON-rescored survivors is a no-op (frozen == the 1st-pass model that
+        // wrote the sidecar scalars), so a failed load can't corrupt q-values — those survivors
+        // keep their identical 1st-pass sidecar score. Reconciliation-rescored survivors take the
+        // overlay path below, independent of this load. Warn so a genuinely missing cache is visible.
+        let file_features = match per_file_cache_paths.get(file_name.as_str()) {
+            Some(p) => match load_pin_features_from_parquet(p) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    log::warn!(
+                        "transfer-compete: features for '{}' unavailable ({}); non-rescored \
+                         survivors keep their 1st-pass sidecar score",
+                        file_name,
+                        e
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        for (local_idx, e) in entries.iter().enumerate() {
+            survivors.push((file_idx, e.entry_id));
+            let pq_idx = e.parquet_index as usize;
+            let raw: Option<Vec<f64>> =
+                if let Some(ov) = file_overlay.and_then(|o| o.get(&local_idx)) {
+                    Some(pin_feature_vector(&ov.features))
+                } else {
+                    file_features.as_ref().and_then(|f| f.get(pq_idx).cloned())
+                };
+            if let Some(raw) = raw {
+                if raw.len() == n_features {
+                    survivor_score_override.insert((file_idx, e.entry_id), frozen.score(&raw));
+                }
+            }
+        }
+    }
+    let n_override = survivor_score_override.len();
+
+    // Stream the full-population competition; only one file's scalars resident at a time. A
+    // present-but-corrupt sidecar must NOT silently contribute an empty population (that would
+    // understate the null → anti-conservative q); flag it and fall back to the retrain, matching
+    // the "missing sidecar → retrain" contract in this function's docstring.
+    let read_failed = std::cell::Cell::new(false);
+    let read_file = |file_idx: usize| -> (Vec<u32>, Vec<f64>) {
+        match read_fdr_scores_scalars(&sidecar_paths[file_idx]) {
+            Some(scalars) => scalars,
+            None => {
+                read_failed.set(true);
+                (Vec::new(), Vec::new())
+            }
+        }
+    };
+    let (run_q, exp_q, pep) = crate::pass2_qvalue::compute_full_population_fdr_streaming(
+        n_files,
+        read_file,
+        &survivor_score_override,
+        &survivors,
+        stratum_base_ids,
+    );
+    if read_failed.get() {
+        log::warn!(
+            "transfer-compete: a 1st-pass sidecar failed to parse; falling back to 2nd-pass retrain"
+        );
+        return false;
+    }
+
+    // Map the recomputed q/PEP back onto the survivor stubs. Under a constrained stratum, an
+    // off-stratum survivor is absent from run_q → keep its 1st-pass q (report = pass1 ∪ stratum).
+    let mut n_mapped = 0usize;
+    for (file_idx, (_file_name, entries)) in per_file_entries.iter_mut().enumerate() {
+        for e in entries.iter_mut() {
+            // Under a constrained stratum (protein-compact), an off-stratum survivor keeps its
+            // already-passing 1st-pass q — the streaming competition returns q=1.0 for it, so it
+            // must be skipped rather than written (report = pass1 ∪ stratum passers).
+            if let Some(strat) = stratum_base_ids {
+                if !strat.contains(&(e.entry_id & 0x7FFF_FFFF)) {
+                    continue;
+                }
+            }
+            let key = (file_idx, e.entry_id);
+            let rq = match run_q.get(&key) {
+                Some(&v) => v,
+                None => continue,
+            };
+            e.run_precursor_qvalue = rq;
+            e.experiment_precursor_qvalue = exp_q[&key];
+            e.pep = pep[&key];
+            // Precursor-level path: keep peptide q in step with precursor q for the reported set.
+            e.run_peptide_qvalue = rq;
+            e.experiment_peptide_qvalue = exp_q[&key];
+            n_mapped += 1;
+        }
+    }
+    log::info!(
+        "OSPREY_PASS2_QVALUE={}: recomputed q/PEP for {} survivors across {} file(s), {} \
+         frozen-model scores swapped in — no retrain.",
+        if stratum_base_ids.is_some() {
+            "protein-compact"
+        } else {
+            "transfer-compete"
+        },
+        n_mapped,
+        n_files,
+        n_override
+    );
+    true
+}
+
 fn run_percolator_fdr(
     per_file_entries: &mut [(String, Vec<FdrEntry>)],
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
     config: &OspreyConfig,
     overlay: &RescoreOverlay,
     restrict_base_ids: Option<&HashSet<u32>>,
+    frozen_out: Option<&mut Option<crate::pass2_qvalue::FrozenLinearModel>>,
 ) -> Result<()> {
     use osprey_fdr::percolator;
 
@@ -6361,6 +6708,18 @@ fn run_percolator_fdr(
 
     let standardizer = train_results.standardizer.clone();
 
+    // Capture the fold-averaged frozen model for the frozen pass-2 recompute
+    // (OSPREY_PASS2_QVALUE=transfer-compete or protein-compact). Only the first-pass caller
+    // requests it; the captured weights + standardizer are exactly what the score pass below
+    // applies, so a survivor re-scored from this model matches its 1st-pass sidecar score.
+    if let Some(slot) = frozen_out {
+        *slot = Some(crate::pass2_qvalue::FrozenLinearModel::new(
+            avg_weights.clone(),
+            avg_bias,
+            standardizer.clone(),
+        ));
+    }
+
     // Free training memory
     drop(subset_perc_entries);
     drop(train_results);
@@ -6546,6 +6905,7 @@ fn run_mokapot_fdr(
             config,
             &empty_overlay,
             None,
+            None,
         );
     }
 
@@ -6659,6 +7019,7 @@ fn run_mokapot_fdr(
                 per_file_cache_paths,
                 config,
                 &empty_overlay,
+                None,
                 None,
             )?;
         }
@@ -7159,8 +7520,14 @@ fn build_shared_boundaries_from_plan(
     entries: &[BlibPlanEntry],
 ) -> (HashMap<(Arc<str>, u16), (f64, f64, f64)>, usize) {
     // For each (modified_sequence, file_name_idx), keep boundaries from entry
-    // with lowest run q-value
-    let mut best_by_key: HashMap<(Arc<str>, u16), (f64, f64, f64, f64)> = HashMap::new();
+    // with lowest run q-value. On a run_qvalue TIE (e.g. two charge states both
+    // gap-filled at q=1.0), break deterministically by LOWEST CHARGE so the
+    // winner does not depend on plan-entry iteration order — otherwise Rust
+    // (parquet row order) and C# (in-memory per-file entry order) can keep
+    // different charges' windows for the same peptide, diverging the blib
+    // RetentionTimes start/end. C# BuildSharedBoundaries applies the identical
+    // (lower run_qvalue, then lower charge) rule.
+    let mut best_by_key: HashMap<(Arc<str>, u16), (f64, f64, f64, f64, u8)> = HashMap::new();
     let mut charges_by_key: HashMap<(Arc<str>, u16), HashSet<u8>> = HashMap::new();
 
     for entry in entries {
@@ -7173,7 +7540,9 @@ fn build_shared_boundaries_from_plan(
 
         let should_update = best_by_key
             .get(&key)
-            .map_or(true, |&(_, _, _, qval)| entry.run_qvalue < qval);
+            .map_or(true, |&(_, _, _, qval, charge)| {
+                entry.run_qvalue < qval || (entry.run_qvalue == qval && entry.charge < charge)
+            });
 
         if should_update {
             best_by_key.insert(
@@ -7183,6 +7552,7 @@ fn build_shared_boundaries_from_plan(
                     entry.start_rt,
                     entry.end_rt,
                     entry.run_qvalue,
+                    entry.charge,
                 ),
             );
         }
@@ -7192,7 +7562,7 @@ fn build_shared_boundaries_from_plan(
 
     let shared_bounds: HashMap<(Arc<str>, u16), (f64, f64, f64)> = best_by_key
         .into_iter()
-        .map(|(k, (apex, start, end, _))| (k, (apex, start, end)))
+        .map(|(k, (apex, start, end, _, _))| (k, (apex, start, end)))
         .collect();
 
     (shared_bounds, n_shared)
@@ -8065,10 +8435,17 @@ fn run_search(
     use osprey_chromatography::{compute_snr, detect_all_xic_peaks, detect_cwt_consensus_peaks};
     use osprey_scoring::batch::{group_spectra_by_isolation_window, MIN_COELUTION_SPECTRA};
     use osprey_scoring::{
-        extract_fragment_xics, pearson_correlation_raw, tukey_median_polish, SpectralScorer,
+        extract_fragment_xics, median_polish_libcosine, pearson_correlation_raw,
+        tukey_median_polish, SpectralScorer,
     };
 
     let is_hram = matches!(config.resolution_mode, osprey_core::ResolutionMode::HRAM);
+
+    // Learned per-platform peak-pick model (opt-in via OSPREY_PICK_LDA), or None for the
+    // default legacy product pick. Resolved once per process; keyed by resolution so unit
+    // data uses the Stellar-trained model and HRAM data the Astral-trained one. Mirrors
+    // C# PeakDataExtractor's model selection.
+    let pick_model = crate::pick_lda::active_model(is_hram);
 
     // Set up fragment tolerance (calibrated if available)
     let fragment_tolerance = if let Some(cal) = calibration {
@@ -8691,11 +9068,51 @@ fn run_search(
                                 let apex_intensity = ref_xic[bp.apex_index].1;
                                 let intensity_weight = (1.0 + apex_intensity).ln();
 
-                                Some((
-                                    bp,
-                                    coelution_score,
-                                    coelution_score * rt_penalty * intensity_weight,
-                                ))
+                                // Rank score. With a learned pick model active (default),
+                                // replace the product form with a standardized linear
+                                // combination of the same four raw terms — coelution,
+                                // ln_intensity, rt_penalty, and a per-candidate
+                                // median-polish cosine. Without a model (the default; the
+                                // model is opt-in via OSPREY_PICK_LDA) it stays the pure
+                                // product form used for cross-impl parity + the regression golden.
+                                let rank_score = match pick_model {
+                                    Some(model) => {
+                                        // Per-candidate median-polish cosine (mirrors C#
+                                        // CandidateLibCosine): Tukey median polish over
+                                        // THIS peak's XIC slice, then LibCosine vs the
+                                        // library fragments; neutral 1.0 on failure
+                                        // (peak too short, degenerate polish, or
+                                        // non-positive cosine).
+                                        let peak_xics: Vec<(usize, Vec<(f64, f64)>)> = xics
+                                            .iter()
+                                            .map(|(idx, data)| (*idx, data[si..=ei].to_vec()))
+                                            .collect();
+                                        let median_polish =
+                                            match tukey_median_polish(&peak_xics, 10, 0.01) {
+                                                Some(mp) => {
+                                                    let lc = median_polish_libcosine(
+                                                        &mp,
+                                                        &entry.fragments,
+                                                    );
+                                                    if lc.is_finite() && lc > 0.0 {
+                                                        lc
+                                                    } else {
+                                                        1.0
+                                                    }
+                                                }
+                                                None => 1.0,
+                                            };
+                                        model.score(
+                                            coelution_score,
+                                            intensity_weight,
+                                            rt_penalty,
+                                            median_polish,
+                                        )
+                                    }
+                                    None => coelution_score * rt_penalty * intensity_weight,
+                                };
+
+                                Some((bp, coelution_score, rank_score))
                             })
                             .collect();
                         // Sort by RT-penalized score (third element)
@@ -11918,5 +12335,47 @@ mod tests {
             prev = v;
         }
         assert!(prev < 8.0, "1e7 must compress to < 8, got {}", prev);
+    }
+
+    /// Cross-impl determinism: when two charge states of the same peptide are both
+    /// gap-filled at run_qvalue=1.0 (a tie) with DIFFERENT per-charge windows, the
+    /// shared boundary must resolve to the LOWEST-CHARGE entry's window regardless of
+    /// plan-entry order. Otherwise Rust (parquet row order) and C# (in-memory per-file
+    /// entry order) keep different charges and the blib RetentionTimes start/end
+    /// diverge (the Astral transfer-compete 20-row divergence). C#
+    /// MergeNodeTask.BuildSharedBoundaries applies the identical rule.
+    #[test]
+    fn test_shared_boundaries_tie_broken_by_lowest_charge() {
+        let seq: Arc<str> = Arc::from("SVDEVFDEVVQIFDK");
+        let mk = |entry_id: u32, charge: u8, start: f64, end: f64| BlibPlanEntry {
+            entry_id,
+            charge,
+            file_name_idx: 0,
+            run_qvalue: 1.0,
+            experiment_qvalue: 0.0004,
+            apex_rt: (start + end) / 2.0,
+            start_rt: start,
+            end_rt: end,
+            bounds_area: 1.0,
+            modified_sequence: seq.clone(),
+        };
+        let key = (seq.clone(), 0u16);
+        // Same tie, both input orders -> the z=2 (lowest-charge) window must win both times.
+        for swap in [false, true] {
+            let z2 = mk(1304921, 2, 22.925, 23.850); // wide window
+            let z3 = mk(1304922, 3, 23.665, 23.854); // narrow window
+            let order = if swap { vec![z3, z2] } else { vec![z2, z3] };
+            let (bounds, n_shared) = build_shared_boundaries_from_plan(&order);
+            let (_apex, start, end) = bounds[&key];
+            assert_eq!(n_shared, 1, "peptide has 2 charge states in the file");
+            assert_eq!(
+                start, 22.925,
+                "lowest charge (z=2) start must win regardless of order (swap={swap})"
+            );
+            assert_eq!(
+                end, 23.850,
+                "lowest charge (z=2) end must win regardless of order (swap={swap})"
+            );
+        }
     }
 }
