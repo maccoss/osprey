@@ -3170,18 +3170,23 @@ impl DecoyGenerator {
     ) -> Option<LibraryFragment> {
         let annotation = &frag.annotation;
 
-        // Handle b and y ions - they swap when sequence is reversed
+        // The decoy fragment keeps the target's ion type and ordinal (a target y7 yields a
+        // decoy y7); only the m/z is recomputed below for the permuted sequence, so the
+        // copied relative intensity stays on the same-numbered ion.
+        //
+        // This replaced a b<->y swap (target b_k -> decoy y_{n-k}) that carried the intensity
+        // along with the relabel. The residue-coverage reasoning behind that mapping was
+        // sound, but intensity is dominated by ion TYPE, not by which residues an ion spans:
+        // y ions are systematically more intense than b ions, so the swap inverted the decoy
+        // spectrum's intensity structure relative to any real peptide. The decoy then lost the
+        // target/decoy competition ~4 times out of 5 against a known-false entrapment target,
+        // and entrapment-measured FDP was 10.9% at a claimed 1% q on Stellar and 7.6% on
+        // Astral -- against 1.5% / 2.0% once the swap was removed.
+        //
+        // Skyline, OpenSWATH, DIA-NN, EncyclopeDIA and SpectraST all map the intensity to the
+        // same ion; none of them swaps.
         let (new_ion_type, new_ordinal) = match annotation.ion_type {
-            IonType::B => {
-                // b{i} covers residues 0..i (N-terminal)
-                // In reversed sequence, this becomes y{seq_len - i}
-                (IonType::Y, (seq_len - annotation.ordinal as usize) as u8)
-            }
-            IonType::Y => {
-                // y{i} covers residues (seq_len-i)..seq_len (C-terminal)
-                // In reversed sequence, this becomes b{seq_len - i}
-                (IonType::B, (seq_len - annotation.ordinal as usize) as u8)
-            }
+            IonType::B | IonType::Y => (annotation.ion_type, annotation.ordinal),
             // For other ion types, keep as-is but don't recalculate
             _ => return Some(frag.clone()),
         };
