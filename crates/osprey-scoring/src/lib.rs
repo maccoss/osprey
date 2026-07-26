@@ -3294,6 +3294,103 @@ impl DecoyGenerator {
     /// 4. If all methods fail, excludes the target-decoy pair
     ///
     /// Returns (valid_targets, decoys, statistics)
+    /// Maximum fraction of a candidate decoy's theoretical b/y ions that may fall within
+    /// `LADDER_MATCH_TOLERANCE` of its target's. EncyclopeDIA's threshold
+    /// (`PeptideUtils.getSmartDecoy` rejects above 0.4 and reshuffles).
+    const MAX_FRAGMENT_OVERLAP: f64 = 0.4;
+
+    /// Fixed m/z window for counting ladder coincidences, in daltons.
+    ///
+    /// Deliberately NOT the run's fragment tolerance: the decoy set must be a pure function
+    /// of the library, and keying it to the search tolerance would make the same library
+    /// produce different decoys under unit vs HRAM resolution. A fixed window also keeps this
+    /// rule identical to the C# implementation without plumbing config into DecoyGenerator.
+    const LADDER_MATCH_TOLERANCE: f64 = 0.02;
+
+    /// Reject a candidate decoy sequence whose theoretical b/y ladder is too close to its
+    /// target's, so the cycling fallback supplies another candidate instead.
+    ///
+    /// Osprey previously accepted the first sequence that merely differed from its target and
+    /// collided with no target sequence. EncyclopeDIA, SpectraST and OpenSWATH all also
+    /// measure how SIMILAR the candidate is and regenerate when it is too close: a decoy whose
+    /// ladder nearly coincides with its target's cannot lose the target/decoy competition on
+    /// fragment evidence, so it is not an honest null.
+    ///
+    /// Effect at library scale is nil (on the order of 1e-4 of peptides excluded, entrapment
+    /// FDP unchanged within noise). It is kept for robustness at SMALL library scale, where
+    /// palindromes and low-complexity runs are a far larger fraction.
+    ///
+    /// Computed from the stripped sequences only -- no modifications. Modifications shift both
+    /// ladders alike so they cannot change whether the two coincide, and excluding them keeps
+    /// the rule trivially identical to the C# side.
+    fn is_candidate_acceptable(&self, target_seq: &str, candidate_seq: &str) -> bool {
+        let mut target_ladder = self.theoretical_ladder(target_seq);
+        let decoy_ladder = self.theoretical_ladder(candidate_seq);
+        if decoy_ladder.is_empty() {
+            return true;
+        }
+        target_ladder.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let matches = decoy_ladder
+            .iter()
+            .filter(|&&mz| Self::matches_within_tolerance(&target_ladder, mz))
+            .count();
+        (matches as f64) / (decoy_ladder.len() as f64) <= Self::MAX_FRAGMENT_OVERLAP
+    }
+
+    /// Singly-charged b and y ion m/z for every cleavage site of a stripped sequence, using
+    /// the same residue masses and terminal adjustments as `calculate_fragment_mz`. Ions
+    /// spanning an unknown residue are skipped rather than aborting the ladder.
+    fn theoretical_ladder(&self, sequence: &str) -> Vec<f64> {
+        const PROTON_MASS: f64 = 1.007276;
+        const H2O_MASS: f64 = 18.010565;
+
+        let chars: Vec<char> = sequence.chars().collect();
+        let len = chars.len();
+        if len < 2 {
+            return Vec::new();
+        }
+
+        // Prefix sums of residue masses; NaN marks an unknown residue so any ion spanning it
+        // is dropped.
+        let mut prefix = vec![0.0f64; len + 1];
+        for i in 0..len {
+            prefix[i + 1] = match self.aa_masses.get(&chars[i]) {
+                Some(m) if !prefix[i].is_nan() => prefix[i] + m,
+                _ => f64::NAN,
+            };
+        }
+
+        let total = prefix[len];
+        let mut ladder = Vec::with_capacity((len - 1) * 2);
+        for ordinal in 1..len {
+            let b_mass = prefix[ordinal];
+            if !b_mass.is_nan() {
+                ladder.push(b_mass + PROTON_MASS);
+            }
+            // y{ordinal} spans the last `ordinal` residues.
+            let y_mass = total - prefix[len - ordinal];
+            if !y_mass.is_nan() {
+                ladder.push(y_mass + H2O_MASS + PROTON_MASS);
+            }
+        }
+        ladder
+    }
+
+    /// True when `mz` is within `LADDER_MATCH_TOLERANCE` of any entry of the sorted
+    /// `sorted_ladder`. Binary search keeps the gate O(n log n) over a library.
+    fn matches_within_tolerance(sorted_ladder: &[f64], mz: f64) -> bool {
+        let idx = sorted_ladder
+            .binary_search_by(|probe| probe.partial_cmp(&mz).unwrap_or(std::cmp::Ordering::Equal));
+        match idx {
+            Ok(_) => true,
+            Err(i) => {
+                (i < sorted_ladder.len() && sorted_ladder[i] - mz <= Self::LADDER_MATCH_TOLERANCE)
+                    || (i > 0 && mz - sorted_ladder[i - 1] <= Self::LADDER_MATCH_TOLERANCE)
+            }
+        }
+    }
+
     pub fn generate_all_with_collision_detection(
         &self,
         targets: &[LibraryEntry],
@@ -3329,6 +3426,7 @@ impl DecoyGenerator {
                 // 2. Not in target database (no collision)
                 if reversed_seq != target.sequence
                     && !target_sequences.contains(reversed_seq.as_str())
+                    && self.is_candidate_acceptable(&target.sequence, &reversed_seq)
                 {
                     // Reversal succeeded - create decoy
                     match self.create_decoy_from_mapping(target, &reversed_seq, &position_mapping) {
@@ -3351,6 +3449,7 @@ impl DecoyGenerator {
                     // Check if cycled sequence is valid
                     if cycled_seq != target.sequence
                         && !target_sequences.contains(cycled_seq.as_str())
+                        && self.is_candidate_acceptable(&target.sequence, &cycled_seq)
                     {
                         match self.create_decoy_from_mapping(target, &cycled_seq, &cycle_mapping) {
                             Ok(decoy) => {
