@@ -3170,18 +3170,23 @@ impl DecoyGenerator {
     ) -> Option<LibraryFragment> {
         let annotation = &frag.annotation;
 
-        // Handle b and y ions - they swap when sequence is reversed
+        // The decoy fragment keeps the target's ion type and ordinal (a target y7 yields a
+        // decoy y7); only the m/z is recomputed below for the permuted sequence, so the
+        // copied relative intensity stays on the same-numbered ion.
+        //
+        // This replaced a b<->y swap (target b_k -> decoy y_{n-k}) that carried the intensity
+        // along with the relabel. The residue-coverage reasoning behind that mapping was
+        // sound, but intensity is dominated by ion TYPE, not by which residues an ion spans:
+        // y ions are systematically more intense than b ions, so the swap inverted the decoy
+        // spectrum's intensity structure relative to any real peptide. The decoy then lost the
+        // target/decoy competition ~4 times out of 5 against a known-false entrapment target,
+        // and entrapment-measured FDP was 10.9% at a claimed 1% q on Stellar and 7.6% on
+        // Astral -- against 1.5% / 2.0% once the swap was removed.
+        //
+        // Skyline, OpenSWATH, DIA-NN, EncyclopeDIA and SpectraST all map the intensity to the
+        // same ion; none of them swaps.
         let (new_ion_type, new_ordinal) = match annotation.ion_type {
-            IonType::B => {
-                // b{i} covers residues 0..i (N-terminal)
-                // In reversed sequence, this becomes y{seq_len - i}
-                (IonType::Y, (seq_len - annotation.ordinal as usize) as u8)
-            }
-            IonType::Y => {
-                // y{i} covers residues (seq_len-i)..seq_len (C-terminal)
-                // In reversed sequence, this becomes b{seq_len - i}
-                (IonType::B, (seq_len - annotation.ordinal as usize) as u8)
-            }
+            IonType::B | IonType::Y => (annotation.ion_type, annotation.ordinal),
             // For other ion types, keep as-is but don't recalculate
             _ => return Some(frag.clone()),
         };
@@ -3280,6 +3285,115 @@ impl DecoyGenerator {
         targets.iter().map(|t| self.generate(t)).collect()
     }
 
+    /// Maximum fraction of a candidate decoy's theoretical b/y ions that may fall within
+    /// `LADDER_MATCH_TOLERANCE` of its target's. EncyclopeDIA's threshold
+    /// (`PeptideUtils.getSmartDecoy` rejects above 0.4 and reshuffles).
+    const MAX_FRAGMENT_OVERLAP: f64 = 0.4;
+
+    /// Fixed m/z window for counting ladder coincidences, in daltons.
+    ///
+    /// Deliberately NOT the run's fragment tolerance: the decoy set must be a pure function
+    /// of the library, and keying it to the search tolerance would make the same library
+    /// produce different decoys under unit vs HRAM resolution. A fixed window also keeps this
+    /// rule identical to the C# implementation without plumbing config into DecoyGenerator.
+    const LADDER_MATCH_TOLERANCE: f64 = 0.02;
+
+    /// Reject a candidate decoy sequence whose theoretical b/y ladder is too close to its
+    /// target's, so the cycling fallback supplies another candidate instead.
+    ///
+    /// Osprey previously accepted the first sequence that merely differed from its target and
+    /// collided with no target sequence. EncyclopeDIA, SpectraST and OpenSWATH all also
+    /// measure how SIMILAR the candidate is and regenerate when it is too close: a decoy whose
+    /// ladder nearly coincides with its target's cannot lose the target/decoy competition on
+    /// fragment evidence, so it is not an honest null.
+    ///
+    /// Effect at library scale is nil (on the order of 1e-4 of peptides excluded, entrapment
+    /// FDP unchanged within noise). It is kept for robustness at SMALL library scale, where
+    /// palindromes and low-complexity runs are a far larger fraction.
+    ///
+    /// Computed from the stripped sequences only -- no modifications. Modifications shift both
+    /// ladders alike so they cannot change whether the two coincide, and excluding them keeps
+    /// the rule trivially identical to the C# side.
+    fn is_candidate_acceptable(&self, target_seq: &str, candidate_seq: &str) -> bool {
+        let mut target_ladder = self.theoretical_ladder(target_seq);
+        let decoy_ladder = self.theoretical_ladder(candidate_seq);
+        if decoy_ladder.is_empty() {
+            return true;
+        }
+        target_ladder.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let matches = decoy_ladder
+            .iter()
+            .filter(|&&mz| Self::matches_within_tolerance(&target_ladder, mz))
+            .count();
+        (matches as f64) / (decoy_ladder.len() as f64) <= Self::MAX_FRAGMENT_OVERLAP
+    }
+
+    /// Singly-charged b and y ion m/z for every cleavage site of a stripped sequence, using
+    /// the same residue masses and terminal adjustments as `calculate_fragment_mz`. Ions
+    /// spanning an unknown residue are skipped rather than aborting the ladder.
+    fn theoretical_ladder(&self, sequence: &str) -> Vec<f64> {
+        const PROTON_MASS: f64 = 1.007276;
+        const H2O_MASS: f64 = 18.010565;
+
+        let chars: Vec<char> = sequence.chars().collect();
+        let len = chars.len();
+        if len < 2 {
+            return Vec::new();
+        }
+
+        // Prefix sums for b ions and SUFFIX sums for y ions; NaN marks an unknown residue so
+        // only ions actually spanning it are dropped. Deriving y from (total - prefix)
+        // instead would poison EVERY y ion the moment any residue is unknown, because total
+        // itself is then NaN, and a leading unknown residue would empty the ladder outright,
+        // which the caller reads as "accept". Selenocysteine (U) and the ambiguity codes
+        // B/Z/X/J/O are all absent from the standard residue table and do occur in
+        // UniProt-derived libraries.
+        let mut prefix = vec![0.0f64; len + 1];
+        for i in 0..len {
+            prefix[i + 1] = match self.aa_masses.get(&chars[i]) {
+                Some(m) if !prefix[i].is_nan() => prefix[i] + m,
+                _ => f64::NAN,
+            };
+        }
+        let mut suffix = vec![0.0f64; len + 1];
+        for i in (0..len).rev() {
+            let n = len - i;
+            suffix[n] = match self.aa_masses.get(&chars[i]) {
+                Some(m) if !suffix[n - 1].is_nan() => suffix[n - 1] + m,
+                _ => f64::NAN,
+            };
+        }
+
+        let mut ladder = Vec::with_capacity((len - 1) * 2);
+        for ordinal in 1..len {
+            let b_mass = prefix[ordinal];
+            if !b_mass.is_nan() {
+                ladder.push(b_mass + PROTON_MASS);
+            }
+            // y{ordinal} spans the last `ordinal` residues.
+            let y_mass = suffix[ordinal];
+            if !y_mass.is_nan() {
+                ladder.push(y_mass + H2O_MASS + PROTON_MASS);
+            }
+        }
+        ladder
+    }
+
+    /// True when `mz` is within `LADDER_MATCH_TOLERANCE` of any entry of the sorted
+    /// `sorted_ladder`. Binary search keeps the gate O(n log n) over a library.
+    fn matches_within_tolerance(sorted_ladder: &[f64], mz: f64) -> bool {
+        let idx = sorted_ladder
+            .binary_search_by(|probe| probe.partial_cmp(&mz).unwrap_or(std::cmp::Ordering::Equal));
+        match idx {
+            Ok(_) => true,
+            Err(i) => {
+                (i < sorted_ladder.len() && sorted_ladder[i] - mz <= Self::LADDER_MATCH_TOLERANCE)
+                    || (i > 0 && mz - sorted_ladder[i - 1] <= Self::LADDER_MATCH_TOLERANCE)
+            }
+        }
+    }
+
     /// Generate decoys with collision detection (pyXcorrDIA approach)
     ///
     /// This method:
@@ -3324,6 +3438,7 @@ impl DecoyGenerator {
                 // 2. Not in target database (no collision)
                 if reversed_seq != target.sequence
                     && !target_sequences.contains(reversed_seq.as_str())
+                    && self.is_candidate_acceptable(&target.sequence, &reversed_seq)
                 {
                     // Reversal succeeded - create decoy
                     match self.create_decoy_from_mapping(target, &reversed_seq, &position_mapping) {
@@ -3346,6 +3461,7 @@ impl DecoyGenerator {
                     // Check if cycled sequence is valid
                     if cycled_seq != target.sequence
                         && !target_sequences.contains(cycled_seq.as_str())
+                        && self.is_candidate_acceptable(&target.sequence, &cycled_seq)
                     {
                         match self.create_decoy_from_mapping(target, &cycled_seq, &cycle_mapping) {
                             Ok(decoy) => {
@@ -5345,5 +5461,126 @@ mod tests {
             "Drift should be small but measurable: {:.2e}",
             max_diff
         );
+    }
+
+    // Decoy CONSTRUCTION, as opposed to which sequence is chosen. These mirror the C#
+    // DecoyConstructionTest one for one; a change here that is not mirrored there breaks
+    // cross-impl parity on the decoy set rather than on anything real.
+
+    /// The internal residues of AILLAK reverse to ALLIA, and because I and L have identical
+    /// residue masses every b and y rung of ALLIAK coincides exactly with AILLAK's. Different
+    /// string, same spectrum: the case the overlap gate exists for.
+    const ISOBARIC_TARGET: &str = "AILLAK";
+    const ISOBARIC_REVERSAL: &str = "ALLIAK";
+
+    #[test]
+    fn test_decoy_fragment_keeps_ion_type_and_ordinal() {
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+        let mut target = LibraryEntry::new(1, "PEPTIDEK".into(), "PEPTIDEK".into(), 2, 500.0, 10.0);
+        target.fragments = vec![
+            LibraryFragment {
+                mz: 300.0,
+                relative_intensity: 1.0,
+                annotation: FragmentAnnotation {
+                    ion_type: IonType::B,
+                    ordinal: 3,
+                    charge: 1,
+                    neutral_loss: None,
+                },
+            },
+            LibraryFragment {
+                mz: 400.0,
+                relative_intensity: 0.5,
+                annotation: FragmentAnnotation {
+                    ion_type: IonType::Y,
+                    ordinal: 4,
+                    charge: 1,
+                    neutral_loss: None,
+                },
+            },
+        ];
+
+        let decoy = generator.generate(&target).unwrap();
+        assert_eq!(decoy.sequence, "EDITPEPK");
+        assert_eq!(decoy.fragments.len(), 2);
+
+        // Same ion type, same ordinal, same relative intensity. A b3 that came back as y5
+        // would be the b<->y swap returning.
+        assert_eq!(decoy.fragments[0].annotation.ion_type, IonType::B);
+        assert_eq!(decoy.fragments[0].annotation.ordinal, 3);
+        assert_eq!(decoy.fragments[0].relative_intensity, 1.0);
+        assert_eq!(decoy.fragments[1].annotation.ion_type, IonType::Y);
+        assert_eq!(decoy.fragments[1].annotation.ordinal, 4);
+        assert_eq!(decoy.fragments[1].relative_intensity, 0.5);
+
+        // Only the m/z is recomputed, and it is the decoy sequence's own b3 / y4. The ladder
+        // interleaves b and y per cleavage site, so b{k} sits at 2*(k-1) and y{k} one past it.
+        let ladder = generator.theoretical_ladder("EDITPEPK");
+        assert!((decoy.fragments[0].mz - ladder[2 * (3 - 1)]).abs() < 1e-9);
+        assert!((decoy.fragments[1].mz - ladder[2 * (4 - 1) + 1]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_overlap_gate_rejects_an_isobaric_near_duplicate() {
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+
+        // Rejected: every rung coincides, so the ratio is 1.0 against a 0.4 budget.
+        assert!(!generator.is_candidate_acceptable(ISOBARIC_TARGET, ISOBARIC_REVERSAL));
+
+        // Accepted: an ordinary tryptic reversal. Without this half the test would pass just
+        // as well with a gate that rejected everything, dropping every peptide from the search.
+        assert!(generator.is_candidate_acceptable("PEPTIDEK", "EDITPEPK"));
+    }
+
+    #[test]
+    fn test_generation_never_emits_a_rejected_candidate() {
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+        let mut targets = vec![LibraryEntry::new(
+            1,
+            ISOBARIC_TARGET.into(),
+            ISOBARIC_TARGET.into(),
+            2,
+            500.0,
+            10.0,
+        )];
+        for t in &mut targets {
+            t.fragments = vec![LibraryFragment {
+                mz: 300.0,
+                relative_intensity: 100.0,
+                annotation: FragmentAnnotation::default(),
+            }];
+        }
+
+        let (_valid, decoys, _stats) = generator.generate_all_with_collision_detection(&targets);
+        assert!(
+            !decoys.iter().any(|d| d.sequence == ISOBARIC_REVERSAL),
+            "The fragment-overlap gate must reject the isobaric reversal"
+        );
+    }
+
+    #[test]
+    fn test_ladder_drops_only_the_ions_spanning_an_unknown_residue() {
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+
+        // Selenocysteine (U) is absent from the standard residue table and is real in
+        // UniProt-derived libraries (GPX1, GPX4, SELENOP, TXNRD1). A LEADING unknown is the
+        // case that matters: deriving y ions as (total - prefix) makes total NaN and empties
+        // the whole ladder, and an empty ladder is read as "accept", which silently switches
+        // the gate off for exactly those peptides.
+        assert_eq!(
+            generator.theoretical_ladder("UPEPTIDEK").len(),
+            8,
+            "Every b ion spans the leading U, but all eight y ions survive"
+        );
+
+        // An interior unknown drops the ions that span it from both series, and only those:
+        // b1-b3 and y1-y4 of PEPUIDEK never cross position 4.
+        assert_eq!(generator.theoretical_ladder("PEPUIDEK").len(), 7);
+
+        // Control: a clean sequence yields the full 2*(n-1) ladder.
+        assert_eq!(generator.theoretical_ladder("PEPTIDEK").len(), 14);
+
+        // Too short to have any cleavage site at all.
+        assert_eq!(generator.theoretical_ladder("K").len(), 0);
     }
 }

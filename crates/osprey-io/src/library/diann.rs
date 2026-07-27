@@ -111,6 +111,10 @@ impl DiannTsvLoader {
                 continue;
             }
 
+            // Checked here, after the min-fragment filter, so a row that is not going into
+            // the library at all cannot fail the run.
+            super::validate_peptide_length(&data.sequence)?;
+
             // Parse modifications from modified sequence
             let modifications = parse_modifications(&data.modified_sequence);
 

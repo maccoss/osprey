@@ -18,6 +18,40 @@ pub use elib::ElibLoader;
 use osprey_core::{LibraryEntry, LibrarySource, OspreyError, Result};
 use std::collections::HashMap;
 
+/// Shortest peptide a library may contain.
+///
+/// Deliberately a constant rather than a setting: a tryptic peptide below this length is not
+/// specific enough to identify, and the field has converged on excluding them (MaxQuant uses
+/// 6; the Carafe libraries the regression runs against start at 7).
+pub const MIN_PEPTIDE_LENGTH: usize = 6;
+
+/// Reject a library peptide shorter than [`MIN_PEPTIDE_LENGTH`].
+///
+/// A hard error rather than a skip: a library carrying peptides this short is almost certainly
+/// built wrong, and silently dropping them would change the searched set without saying so.
+/// Downstream code is allowed to rely on the bound. `DecoyGenerator::is_candidate_acceptable`
+/// is the case that matters today: its fragment-overlap ratio carries a structural 1/(n-1)
+/// floor, which is 0.2 against a 0.4 threshold at the enforced minimum but 0.5 at length 3,
+/// where every candidate decoy would be rejected and the peptide would vanish from the search.
+///
+/// Called by every format loader. An invariant enforced on only one of the paths into the
+/// library is not an invariant, and the decoy generator cannot tell which loader produced its
+/// input.
+pub fn validate_peptide_length(sequence: &str) -> Result<()> {
+    let len = sequence.chars().count();
+    if len >= MIN_PEPTIDE_LENGTH {
+        return Ok(());
+    }
+    // Name the offending peptide: on a multi-million-row library an error that does not is
+    // unactionable.
+    Err(OspreyError::InvalidLibraryEntry(format!(
+        "Library peptide '{sequence}' has {len} residues; the minimum supported length is \
+         {MIN_PEPTIDE_LENGTH}. Peptides this short are not specific enough to identify and are \
+         excluded by convention from spectral libraries. Rebuild the library with a longer \
+         minimum."
+    )))
+}
+
 /// Load a library from any supported source.
 ///
 /// Checks for a binary cache file (`.libcache`) alongside the source library.
@@ -282,5 +316,30 @@ mod tests {
         let mut ids: Vec<u32> = result.iter().map(|e| e.id).collect();
         ids.sort();
         assert_eq!(ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_min_peptide_length_is_six() {
+        // Pinned deliberately: this is a judgement encoded as a constant, not a tuning knob.
+        // Changing it changes which libraries osprey will accept, so a change here should be
+        // a conscious decision that trips this test first.
+        assert_eq!(MIN_PEPTIDE_LENGTH, 6);
+    }
+
+    #[test]
+    fn test_validate_peptide_length_enforces_the_bound() {
+        let err = validate_peptide_length("PEPTK").unwrap_err();
+        let msg = err.to_string();
+        // The message has to identify WHICH peptide, or the error is unactionable on a
+        // multi-million-row library.
+        assert!(
+            msg.contains("PEPTK"),
+            "message did not name the peptide: {msg}"
+        );
+        assert!(msg.contains('6'), "message did not state the bound: {msg}");
+
+        // Boundary: exactly MIN_PEPTIDE_LENGTH must pass. A test that only checked the
+        // rejection case would pass just as well with an off-by-one that rejected 6.
+        assert!(validate_peptide_length("PEPTIK").is_ok());
     }
 }

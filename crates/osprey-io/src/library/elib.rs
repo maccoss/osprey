@@ -118,6 +118,7 @@ impl ElibLoader {
 
             // Parse sequence and modifications
             let (sequence, modifications) = parse_modified_sequence(&peptide_mod_seq)?;
+            super::validate_peptide_length(&sequence)?;
 
             // Decode fragment peaks
             let fragments = if let (Some(mass_blob), Some(int_blob)) = (mass_array, intensity_array)
@@ -187,6 +188,7 @@ impl ElibLoader {
                 .map_err(|e| OspreyError::LibraryLoadError(format!("Row read error: {}", e)))?;
 
             let (sequence, modifications) = parse_modified_sequence(&peptide_mod_seq)?;
+            super::validate_peptide_length(&sequence)?;
 
             let entry = LibraryEntry {
                 id: lib_id as u32,
