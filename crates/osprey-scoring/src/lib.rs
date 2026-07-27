@@ -3285,15 +3285,6 @@ impl DecoyGenerator {
         targets.iter().map(|t| self.generate(t)).collect()
     }
 
-    /// Generate decoys with collision detection (pyXcorrDIA approach)
-    ///
-    /// This method:
-    /// 1. Builds a set of all target sequences for collision detection
-    /// 2. For each target, tries reversal first
-    /// 3. If reversed sequence collides with a target, uses cycling fallback
-    /// 4. If all methods fail, excludes the target-decoy pair
-    ///
-    /// Returns (valid_targets, decoys, statistics)
     /// Maximum fraction of a candidate decoy's theoretical b/y ions that may fall within
     /// `LADDER_MATCH_TOLERANCE` of its target's. EncyclopeDIA's threshold
     /// (`PeptideUtils.getSmartDecoy` rejects above 0.4 and reshuffles).
@@ -3351,8 +3342,13 @@ impl DecoyGenerator {
             return Vec::new();
         }
 
-        // Prefix sums of residue masses; NaN marks an unknown residue so any ion spanning it
-        // is dropped.
+        // Prefix sums for b ions and SUFFIX sums for y ions; NaN marks an unknown residue so
+        // only ions actually spanning it are dropped. Deriving y from (total - prefix)
+        // instead would poison EVERY y ion the moment any residue is unknown, because total
+        // itself is then NaN, and a leading unknown residue would empty the ladder outright,
+        // which the caller reads as "accept". Selenocysteine (U) and the ambiguity codes
+        // B/Z/X/J/O are all absent from the standard residue table and do occur in
+        // UniProt-derived libraries.
         let mut prefix = vec![0.0f64; len + 1];
         for i in 0..len {
             prefix[i + 1] = match self.aa_masses.get(&chars[i]) {
@@ -3360,8 +3356,15 @@ impl DecoyGenerator {
                 _ => f64::NAN,
             };
         }
+        let mut suffix = vec![0.0f64; len + 1];
+        for i in (0..len).rev() {
+            let n = len - i;
+            suffix[n] = match self.aa_masses.get(&chars[i]) {
+                Some(m) if !suffix[n - 1].is_nan() => suffix[n - 1] + m,
+                _ => f64::NAN,
+            };
+        }
 
-        let total = prefix[len];
         let mut ladder = Vec::with_capacity((len - 1) * 2);
         for ordinal in 1..len {
             let b_mass = prefix[ordinal];
@@ -3369,7 +3372,7 @@ impl DecoyGenerator {
                 ladder.push(b_mass + PROTON_MASS);
             }
             // y{ordinal} spans the last `ordinal` residues.
-            let y_mass = total - prefix[len - ordinal];
+            let y_mass = suffix[ordinal];
             if !y_mass.is_nan() {
                 ladder.push(y_mass + H2O_MASS + PROTON_MASS);
             }
@@ -3391,6 +3394,15 @@ impl DecoyGenerator {
         }
     }
 
+    /// Generate decoys with collision detection (pyXcorrDIA approach)
+    ///
+    /// This method:
+    /// 1. Builds a set of all target sequences for collision detection
+    /// 2. For each target, tries reversal first
+    /// 3. If reversed sequence collides with a target, uses cycling fallback
+    /// 4. If all methods fail, excludes the target-decoy pair
+    ///
+    /// Returns (valid_targets, decoys, statistics)
     pub fn generate_all_with_collision_detection(
         &self,
         targets: &[LibraryEntry],
@@ -5449,5 +5461,126 @@ mod tests {
             "Drift should be small but measurable: {:.2e}",
             max_diff
         );
+    }
+
+    // Decoy CONSTRUCTION, as opposed to which sequence is chosen. These mirror the C#
+    // DecoyConstructionTest one for one; a change here that is not mirrored there breaks
+    // cross-impl parity on the decoy set rather than on anything real.
+
+    /// The internal residues of AILLAK reverse to ALLIA, and because I and L have identical
+    /// residue masses every b and y rung of ALLIAK coincides exactly with AILLAK's. Different
+    /// string, same spectrum: the case the overlap gate exists for.
+    const ISOBARIC_TARGET: &str = "AILLAK";
+    const ISOBARIC_REVERSAL: &str = "ALLIAK";
+
+    #[test]
+    fn test_decoy_fragment_keeps_ion_type_and_ordinal() {
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+        let mut target = LibraryEntry::new(1, "PEPTIDEK".into(), "PEPTIDEK".into(), 2, 500.0, 10.0);
+        target.fragments = vec![
+            LibraryFragment {
+                mz: 300.0,
+                relative_intensity: 1.0,
+                annotation: FragmentAnnotation {
+                    ion_type: IonType::B,
+                    ordinal: 3,
+                    charge: 1,
+                    neutral_loss: None,
+                },
+            },
+            LibraryFragment {
+                mz: 400.0,
+                relative_intensity: 0.5,
+                annotation: FragmentAnnotation {
+                    ion_type: IonType::Y,
+                    ordinal: 4,
+                    charge: 1,
+                    neutral_loss: None,
+                },
+            },
+        ];
+
+        let decoy = generator.generate(&target).unwrap();
+        assert_eq!(decoy.sequence, "EDITPEPK");
+        assert_eq!(decoy.fragments.len(), 2);
+
+        // Same ion type, same ordinal, same relative intensity. A b3 that came back as y5
+        // would be the b<->y swap returning.
+        assert_eq!(decoy.fragments[0].annotation.ion_type, IonType::B);
+        assert_eq!(decoy.fragments[0].annotation.ordinal, 3);
+        assert_eq!(decoy.fragments[0].relative_intensity, 1.0);
+        assert_eq!(decoy.fragments[1].annotation.ion_type, IonType::Y);
+        assert_eq!(decoy.fragments[1].annotation.ordinal, 4);
+        assert_eq!(decoy.fragments[1].relative_intensity, 0.5);
+
+        // Only the m/z is recomputed, and it is the decoy sequence's own b3 / y4. The ladder
+        // interleaves b and y per cleavage site, so b{k} sits at 2*(k-1) and y{k} one past it.
+        let ladder = generator.theoretical_ladder("EDITPEPK");
+        assert!((decoy.fragments[0].mz - ladder[2 * (3 - 1)]).abs() < 1e-9);
+        assert!((decoy.fragments[1].mz - ladder[2 * (4 - 1) + 1]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_overlap_gate_rejects_an_isobaric_near_duplicate() {
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+
+        // Rejected: every rung coincides, so the ratio is 1.0 against a 0.4 budget.
+        assert!(!generator.is_candidate_acceptable(ISOBARIC_TARGET, ISOBARIC_REVERSAL));
+
+        // Accepted: an ordinary tryptic reversal. Without this half the test would pass just
+        // as well with a gate that rejected everything, dropping every peptide from the search.
+        assert!(generator.is_candidate_acceptable("PEPTIDEK", "EDITPEPK"));
+    }
+
+    #[test]
+    fn test_generation_never_emits_a_rejected_candidate() {
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+        let mut targets = vec![LibraryEntry::new(
+            1,
+            ISOBARIC_TARGET.into(),
+            ISOBARIC_TARGET.into(),
+            2,
+            500.0,
+            10.0,
+        )];
+        for t in &mut targets {
+            t.fragments = vec![LibraryFragment {
+                mz: 300.0,
+                relative_intensity: 100.0,
+                annotation: FragmentAnnotation::default(),
+            }];
+        }
+
+        let (_valid, decoys, _stats) = generator.generate_all_with_collision_detection(&targets);
+        assert!(
+            !decoys.iter().any(|d| d.sequence == ISOBARIC_REVERSAL),
+            "The fragment-overlap gate must reject the isobaric reversal"
+        );
+    }
+
+    #[test]
+    fn test_ladder_drops_only_the_ions_spanning_an_unknown_residue() {
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+
+        // Selenocysteine (U) is absent from the standard residue table and is real in
+        // UniProt-derived libraries (GPX1, GPX4, SELENOP, TXNRD1). A LEADING unknown is the
+        // case that matters: deriving y ions as (total - prefix) makes total NaN and empties
+        // the whole ladder, and an empty ladder is read as "accept", which silently switches
+        // the gate off for exactly those peptides.
+        assert_eq!(
+            generator.theoretical_ladder("UPEPTIDEK").len(),
+            8,
+            "Every b ion spans the leading U, but all eight y ions survive"
+        );
+
+        // An interior unknown drops the ions that span it from both series, and only those:
+        // b1-b3 and y1-y4 of PEPUIDEK never cross position 4.
+        assert_eq!(generator.theoretical_ladder("PEPUIDEK").len(), 7);
+
+        // Control: a clean sequence yields the full 2*(n-1) ladder.
+        assert_eq!(generator.theoretical_ladder("PEPTIDEK").len(), 14);
+
+        // Too short to have any cleavage site at all.
+        assert_eq!(generator.theoretical_ladder("K").len(), 0);
     }
 }

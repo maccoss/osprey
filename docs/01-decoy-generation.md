@@ -13,7 +13,7 @@ Decoy peptide:  EDITPEPK
                     ↓
       Fragment m/z recalculation
                     ↓
-   Decoy spectrum (b↔y swapped)
+   Decoy spectrum (same ion types, recomputed m/z)
 ```
 
 ## Why Decoys?
@@ -106,18 +106,53 @@ Target PEPTIDEK:          Decoy EDITPEPK:
 
 If we don't recalculate, the decoy spectrum won't match any observed peaks!
 
-### The Solution: Ion Type Swapping
+### The Solution: Recompute the m/z, Keep the Ion
 
-When a sequence is reversed:
-
-- **b-ions become y-ions** at complementary positions
-- **y-ions become b-ions** at complementary positions
+Each decoy fragment keeps its target's ion type and ordinal; only the m/z is recomputed
+for the permuted sequence. A target y7 yields a decoy y7, so the copied relative
+intensity stays on the same-numbered ion of the same series.
 
 ```text
 For sequence length N:
-  b{i} → y{N-i}
-  y{i} → b{N-i}
+  b{i} → b{i}, m/z recomputed from the decoy sequence
+  y{i} → y{i}, m/z recomputed from the decoy sequence
 ```
+
+Osprey used to relabel instead - b{i} → y{N-i} and y{i} → b{N-i} - carrying the
+intensity along with the relabel. The residue-coverage reasoning behind that mapping was
+sound, but fragment intensity is dominated by ion TYPE, not by which residues an ion
+spans. y ions are systematically more intense than b ions, so the swap inverted the decoy
+spectrum's intensity structure relative to any real peptide. The decoys were easy to
+beat, the target-decoy null was not a null, and the reported q-values were far too
+optimistic. Measured with entrapment (pass 1, experiment-wide), true FDP at a claimed
+1% q:
+
+```text
+                with the swap   without
+  Stellar       10.9%           1.5%
+  Astral         7.6%           2.0%     (library-decoy reference: 1.9%)
+```
+
+Skyline, OpenSWATH, DIA-NN, EncyclopeDIA and SpectraST all map the intensity to the same
+ion; none of them swaps.
+
+### Rejecting a candidate that is too similar to its target
+
+A permutation that merely differs from the target is not automatically a usable decoy. If
+the candidate's theoretical b/y ladder nearly coincides with the target's, the decoy
+cannot lose the target/decoy competition on fragment evidence, so it is not an honest
+null. `is_candidate_acceptable` rejects a candidate whose ladder overlaps its target's by
+more than **0.4** of the candidate's rungs, within a fixed **0.02 Da** window, and the
+cycling fallback then supplies another candidate.
+
+The 0.4 threshold is EncyclopeDIA's (`PeptideUtils.getSmartDecoy` rejects above it and
+reshuffles). The window is deliberately NOT the run's fragment tolerance: the decoy set
+must be a pure function of the library, and keying it to the search tolerance would make
+the same library produce different decoys under unit vs HRAM resolution.
+
+At library scale the effect is nil - on the order of 1e-4 of peptides excluded, entrapment
+FDP unchanged within noise. It is kept for robustness at SMALL library scale, where
+palindromes, low-complexity runs, and isobaric I/L permutations are a far larger fraction.
 
 ### Example: Target and Decoy Library Spectra
 
