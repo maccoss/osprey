@@ -111,6 +111,10 @@ impl BlibLoader {
                     entries.push(entry);
                 }
 
+                // The same bound the TSV loader enforces. DecoyGenerator's fragment-overlap
+                // gate relies on it whatever the library was built from.
+                super::validate_peptide_length(&peptide_seq)?;
+
                 // Parse modifications from modified sequence
                 let modifications = parse_blib_modifications(&peptide_mod_seq);
 
