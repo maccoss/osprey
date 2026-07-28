@@ -257,7 +257,7 @@ pub fn run_percolator(
     //     decoy pairs and charge states together. The subsampled set is used
     //     for fold assignment + SVM training; ALL entries are scored with
     //     the trained model regardless.
-    let train_subset: Option<Vec<usize>> =
+    let train_subset: Vec<usize> =
         if config.max_train_size > 0 && dedup_indices.len() > config.max_train_size {
             // Build dedup-local arrays for the subsample call. `dedup_peptides`
             // holds borrowed `&str` slices into the existing `peptides: Vec<String>`
@@ -277,32 +277,23 @@ pub fn run_percolator(
                 config.seed,
             );
             // Remap local indices back into the original entry index space.
-            Some(local.into_iter().map(|li| dedup_indices[li]).collect())
+            local.into_iter().map(|li| dedup_indices[li]).collect()
         } else {
-            Some(dedup_indices)
+            dedup_indices
         };
 
-    let sub_n = train_subset.as_ref().map_or(n, |s| s.len());
+    let sub_n = train_subset.len();
 
-    // Build subset-local arrays (or reference full arrays if no subsampling)
-    let sub_labels: Vec<bool> = match &train_subset {
-        Some(indices) => indices.iter().map(|&i| labels[i]).collect(),
-        None => labels.clone(),
-    };
-    let sub_entry_ids: Vec<u32> = match &train_subset {
-        Some(indices) => indices.iter().map(|&i| entry_ids[i]).collect(),
-        None => entry_ids.clone(),
-    };
-    let sub_peptides: Vec<String> = match &train_subset {
-        Some(indices) => indices.iter().map(|&i| peptides[i].clone()).collect(),
-        None => peptides.clone(),
-    };
-    let sub_features = match &train_subset {
-        Some(indices) => extract_rows(&std_features, indices),
-        None => std_features.clone(),
-    };
+    // Build subset-local arrays. Both arms above yield a materialized Vec, so there
+    // is no "no subsampling" case to fall back to: when the dedup'd set already fits
+    // the cap, train_subset IS the dedup'd index set.
+    let sub_labels: Vec<bool> = train_subset.iter().map(|&i| labels[i]).collect();
+    let sub_entry_ids: Vec<u32> = train_subset.iter().map(|&i| entry_ids[i]).collect();
+    let sub_peptides: Vec<String> = train_subset.iter().map(|&i| peptides[i].clone()).collect();
+    let sub_features = extract_rows(&std_features, &train_subset);
 
-    if let Some(ref indices) = train_subset {
+    {
+        let indices = &train_subset;
         let sub_targets = sub_labels.iter().filter(|&&d| !d).count();
         let sub_decoys = sub_labels.iter().filter(|&&d| d).count();
         log::debug!(
@@ -328,7 +319,7 @@ pub fn run_percolator(
     // whether the two tools pick the same 300K subset and assign the same
     // fold IDs. Both algorithms are identical in source — drift here
     // indicates input-array ordering differs between Rust and C#.
-    dump_stage5_subsample(entries, train_subset.as_deref(), &fold_assignments);
+    dump_stage5_subsample(entries, &train_subset, &fold_assignments);
 
     // 5. Find best initial feature (on subsampled set)
     let (best_feat_idx, best_feat_passing) =
@@ -428,59 +419,47 @@ pub fn run_percolator(
     pb.finish_and_clear();
 
     // Score ALL entries with trained models
-    match &train_subset {
-        Some(indices) => {
-            // Build set of global indices in subset for quick lookup
-            let in_subset: HashSet<usize> = indices.iter().copied().collect();
+    // Cross-validated scoring. train_subset is always a materialized Vec (see above),
+    // so there is no un-subsampled fallback: subset entries get their held-out fold's
+    // model, and entries outside the subset get the average over all folds.
+    {
+        let indices = &train_subset;
+        // Build set of global indices in subset for quick lookup
+        let in_subset: HashSet<usize> = indices.iter().copied().collect();
 
-            // For subset entries: score with the held-out fold model (standard CV)
-            for (fold, best_model, _) in &fold_results {
-                let test_sub_indices: Vec<usize> = (0..sub_n)
-                    .filter(|&i| fold_assignments[i] == *fold)
-                    .collect();
-                let test_global_indices: Vec<usize> =
-                    test_sub_indices.iter().map(|&i| indices[i]).collect();
-                let test_features = extract_rows(&std_features, &test_global_indices);
-                let test_scores = best_model.decision_function(&test_features);
-                for (i, &idx) in test_global_indices.iter().enumerate() {
-                    final_scores[idx] = test_scores[i];
-                }
-            }
-
-            // For non-subset entries: average scores from all fold models (batch)
-            let non_subset_indices: Vec<usize> =
-                (0..n).filter(|i| !in_subset.contains(i)).collect();
-            if !non_subset_indices.is_empty() {
-                let non_sub_features = extract_rows(&std_features, &non_subset_indices);
-                let models: Vec<&LinearSvm> = fold_results.iter().map(|(_, m, _)| m).collect();
-                let n_models = models.len() as f64;
-                // Batch score all non-subset entries per model, then average
-                let mut avg_scores = vec![0.0f64; non_subset_indices.len()];
-                for model in &models {
-                    let model_scores = model.decision_function(&non_sub_features);
-                    for (i, s) in model_scores.iter().enumerate() {
-                        avg_scores[i] += s;
-                    }
-                }
-                for (i, &idx) in non_subset_indices.iter().enumerate() {
-                    final_scores[idx] = avg_scores[i] / n_models;
-                }
+        // For subset entries: score with the held-out fold model (standard CV)
+        for (fold, best_model, _) in &fold_results {
+            let test_sub_indices: Vec<usize> = (0..sub_n)
+                .filter(|&i| fold_assignments[i] == *fold)
+                .collect();
+            let test_global_indices: Vec<usize> =
+                test_sub_indices.iter().map(|&i| indices[i]).collect();
+            let test_features = extract_rows(&std_features, &test_global_indices);
+            let test_scores = best_model.decision_function(&test_features);
+            for (i, &idx) in test_global_indices.iter().enumerate() {
+                final_scores[idx] = test_scores[i];
             }
         }
-        None => {
-            // No subsampling: score test fold directly (standard CV)
-            for (fold, best_model, _) in &fold_results {
-                let test_indices: Vec<usize> =
-                    (0..n).filter(|&i| fold_assignments[i] == *fold).collect();
-                let test_features = extract_rows(&std_features, &test_indices);
-                let test_scores = best_model.decision_function(&test_features);
-                for (i, &idx) in test_indices.iter().enumerate() {
-                    final_scores[idx] = test_scores[i];
+
+        // For non-subset entries: average scores from all fold models (batch)
+        let non_subset_indices: Vec<usize> = (0..n).filter(|i| !in_subset.contains(i)).collect();
+        if !non_subset_indices.is_empty() {
+            let non_sub_features = extract_rows(&std_features, &non_subset_indices);
+            let models: Vec<&LinearSvm> = fold_results.iter().map(|(_, m, _)| m).collect();
+            let n_models = models.len() as f64;
+            // Batch score all non-subset entries per model, then average
+            let mut avg_scores = vec![0.0f64; non_subset_indices.len()];
+            for model in &models {
+                let model_scores = model.decision_function(&non_sub_features);
+                for (i, s) in model_scores.iter().enumerate() {
+                    avg_scores[i] += s;
                 }
+            }
+            for (i, &idx) in non_subset_indices.iter().enumerate() {
+                final_scores[idx] = avg_scores[i] / n_models;
             }
         }
     }
-
     let mut fold_biases: Vec<f64> = Vec::new();
     for (fold, best_model, n_iterations) in &fold_results {
         fold_weights.push(best_model.weights().to_vec());
@@ -514,33 +493,20 @@ pub fn run_percolator(
     // 6b. Calibrate scores between folds (Granholm et al. 2012)
     // For subsampled runs, calibrate using subset fold assignments;
     // non-subset entries already have averaged scores (no fold-specific bias).
-    match &train_subset {
-        Some(indices) => {
-            // Build global fold assignments: subset entries get their fold, others get usize::MAX
-            let mut global_fold_assignments = vec![usize::MAX; n];
-            for (sub_i, &global_i) in indices.iter().enumerate() {
-                global_fold_assignments[global_i] = fold_assignments[sub_i];
-            }
-            calibrate_scores_between_folds(
-                &mut final_scores,
-                &global_fold_assignments,
-                &labels,
-                &entry_ids,
-                config.n_folds,
-                config.train_fdr,
-            );
-        }
-        None => {
-            calibrate_scores_between_folds(
-                &mut final_scores,
-                &fold_assignments,
-                &labels,
-                &entry_ids,
-                config.n_folds,
-                config.train_fdr,
-            );
-        }
+    // fold_assignments is indexed subset-locally, so it always needs remapping into the
+    // global index space; there is no unmapped fallback because train_subset is never absent.
+    let mut global_fold_assignments = vec![usize::MAX; n];
+    for (sub_i, &global_i) in train_subset.iter().enumerate() {
+        global_fold_assignments[global_i] = fold_assignments[sub_i];
     }
+    calibrate_scores_between_folds(
+        &mut final_scores,
+        &global_fold_assignments,
+        &labels,
+        &entry_ids,
+        config.n_folds,
+        config.train_fdr,
+    );
 
     // 6. Compute PEP on competition winners
     let (winner_indices, winner_scores, winner_is_decoy) =
@@ -1571,7 +1537,7 @@ fn create_stratified_folds_by_peptide(
 /// hash-joins on `entry_id`, sort-order-agnostic.
 fn dump_stage5_subsample(
     entries: &[PercolatorEntry],
-    train_subset: Option<&[usize]>,
+    train_subset: &[usize],
     fold_assignments: &[usize],
 ) {
     if !is_dump_enabled("OSPREY_DUMP_SUBSAMPLE") {
@@ -1581,19 +1547,9 @@ fn dump_stage5_subsample(
     let n = entries.len();
     let mut in_sub = vec![false; n];
     let mut fold_for = vec![-1i32; n];
-    match train_subset {
-        Some(indices) => {
-            for (sub_pos, &native_pos) in indices.iter().enumerate() {
-                in_sub[native_pos] = true;
-                fold_for[native_pos] = fold_assignments[sub_pos] as i32;
-            }
-        }
-        None => {
-            for (i, &f) in fold_assignments.iter().enumerate() {
-                in_sub[i] = true;
-                fold_for[i] = f as i32;
-            }
-        }
+    for (sub_pos, &native_pos) in train_subset.iter().enumerate() {
+        in_sub[native_pos] = true;
+        fold_for[native_pos] = fold_assignments[sub_pos] as i32;
     }
 
     let path = "rust_stage5_subsample.tsv";
