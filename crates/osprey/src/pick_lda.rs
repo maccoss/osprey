@@ -119,9 +119,9 @@ const ASTRAL_MODEL: PickLdaModel = PickLdaModel {
 enum PickMode {
     /// `OSPREY_PICK_LDA_MODEL` override — applies to every resolution.
     EnvModel(PickLdaModel),
-    /// `OSPREY_PICK_LDA` — the hardcoded resolution-keyed model (opt-in).
+    /// Default: the hardcoded resolution-keyed model.
     ResolutionModel,
-    /// Default: the pure product-form pick (no model).
+    /// `OSPREY_PICK_LDA=0` — the legacy pure product-form pick (no model).
     Legacy,
 }
 
@@ -137,14 +137,15 @@ fn pick_mode() -> &'static PickMode {
                 return PickMode::EnvModel(load_from_json(&path));
             }
         }
-        // (2) OSPREY_PICK_LDA: set and not "0" → the resolution-keyed built-in model (opt-in).
+        // (2) OSPREY_PICK_LDA=0 opts OUT, back to the legacy product-form pick. Kept as an
+        // A/B lever: the learned model is the default, but the two remain comparable.
         if let Ok(v) = std::env::var("OSPREY_PICK_LDA") {
-            if !v.is_empty() && v != "0" {
-                return PickMode::ResolutionModel;
+            if v == "0" {
+                return PickMode::Legacy;
             }
         }
-        // (3) Default: the legacy pure product-form pick (Rust parity + regression golden).
-        PickMode::Legacy
+        // (3) Default: the resolution-keyed learned pick model.
+        PickMode::ResolutionModel
     })
 }
 

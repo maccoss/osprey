@@ -5652,10 +5652,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                     // Protein-compact honors an explicit retrain opt-in
                     // (OSPREY_PROTEIN_COMPACT_RETRAIN): a deliberate A/B that retrains the 2nd-pass
                     // SVM over the stratum-expanded pool instead of applying the frozen 1st-pass
-                    // model. Default off (frozen) — matches C# Pass2ProteinCompactRetrain.
+                    // model. Default off (frozen) — matches C# Pass2ProteinCompactRetrain. Since
+                    // the retraining `percolator` mode was removed, this A/B is now the ONLY way
+                    // to reach the retrain below.
                     let protein_compact_retrain =
                         is_protein_compact && crate::pass2_qvalue::pass2_protein_compact_retrain();
-                    let want_frozen = pass2.uses_frozen_model() && !protein_compact_retrain;
+                    let want_frozen = !protein_compact_retrain;
                     if want_frozen {
                         let stratum = if is_protein_compact {
                             protein_compact_stratum.as_ref()
