@@ -174,10 +174,20 @@ pub fn compute_full_population_fdr_streaming(
         let (entry_ids, mut scores) = read_file_scalars(file_idx);
         let m = entry_ids.len();
         let mut labels = vec![false; m];
+        // Marks the observations Stage 6 actually CHANGED (see the note below).
+        let mut changed_flags = vec![false; m];
         for i in 0..m {
             let eid = entry_ids[i];
             labels[i] = (eid & !BASE_ID_MASK) != 0; // decoy high bit set
             if let Some(&ov) = survivor_score_override.get(&(file_idx, eid)) {
+                // BIT-EXACT inequality is the "changed" discriminator: an unchanged survivor's
+                // reconciled features ARE its original Stage-4 features (unchanged rows stream
+                // through untouched) and the sidecar score came from those same features under
+                // this same averaged model, so the recomputation reproduces it exactly. A moved
+                // peak carries rescored features, so its score differs.
+                if ov != scores[i] {
+                    changed_flags[i] = true;
+                }
                 scores[i] = ov; // swap in the reconciled survivor's frozen-model score
             }
         }
@@ -187,16 +197,20 @@ pub fn compute_full_population_fdr_streaming(
         // described a peak that no longer exists, and the post-rescore overlay zeroes it
         // precisely to say so. Such a peak must EARN a fresh run q here, exactly the way
         // on-stratum members do; neither inheriting the prior q nor keeping the q=1 sentinel is
-        // a calibrated answer. Presence in `survivor_score_override` IS the "changed" signal:
-        // the override exists only for peaks re-scored against the reconciled features, and it
-        // is keyed by entry_id, so it means the same thing in-process and on a distributed
-        // merge node.
+        // a calibrated answer. The "changed" signal is a frozen-model score that DIFFERS from
+        // the entry's 1st-pass sidecar score, computed above — NOT mere presence in
+        // `survivor_score_override`. That map holds every post-reconciliation survivor whose
+        // identity resolves in the effective parquet, including files Stage 6 never touched
+        // (the effective path falls back to the ORIGINAL parquet), so keying on presence
+        // admitted most of the survivor pool and quietly widened the very stratum this mode
+        // exists to enforce. The score comparison is keyed by entry_id, so it means the same
+        // thing in-process and on a distributed merge node.
         //
         // Admitted BY BASE_ID so a target and its paired decoy always enter together —
         // admitting a lone target would let it auto-win its competition and inflate the null.
         let changed_base_ids: Option<HashSet<u32>> = stratum_base_ids.map(|_| {
             (0..m)
-                .filter(|&i| survivor_score_override.contains_key(&(file_idx, entry_ids[i])))
+                .filter(|&i| changed_flags[i])
                 .map(|i| entry_ids[i] & BASE_ID_MASK)
                 .collect()
         });
