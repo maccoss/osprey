@@ -1876,6 +1876,36 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
 /// population in file order, independent of any stub list. Used by the transfer-compete
 /// pass-2 recompute to stream the full pre-compaction 1st-pass population. Returns `None`
 /// on any header/size mismatch. Mirrors the C# `FdrScoresSidecar.ReadScalars`.
+/// Read `entry_id -> (experiment_precursor_qvalue, experiment_peptide_qvalue)` from an FDR
+/// scores sidecar. Used by the protein-compact map-back to carry an off-stratum peak's pass-1
+/// experiment q, which the post-rescore overlay has already zeroed in memory. Returns `None` on
+/// any header/size mismatch, exactly as `read_fdr_scores_scalars` does.
+pub(crate) fn read_fdr_scores_experiment_q(
+    path: &std::path::Path,
+) -> Option<HashMap<u32, (f64, f64)>> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < FDR_SIDECAR_HEADER_LEN
+        || &data[0..8] != FDR_SIDECAR_MAGIC
+        || data[8] != FDR_SIDECAR_VERSION
+    {
+        return None;
+    }
+    let body = &data[FDR_SIDECAR_HEADER_LEN..];
+    if body.len() % FDR_SIDECAR_RECORD_LEN != 0 {
+        return None;
+    }
+    let n = body.len() / FDR_SIDECAR_RECORD_LEN;
+    let mut out = HashMap::with_capacity(n);
+    for i in 0..n {
+        let r = &body[i * FDR_SIDECAR_RECORD_LEN..(i + 1) * FDR_SIDECAR_RECORD_LEN];
+        let entry_id = u32::from_le_bytes(r[0..4].try_into().ok()?);
+        let exp_prec = f64::from_le_bytes(r[28..36].try_into().ok()?);
+        let exp_pep = f64::from_le_bytes(r[36..44].try_into().ok()?);
+        out.insert(entry_id, (exp_prec, exp_pep));
+    }
+    Some(out)
+}
+
 pub(crate) fn read_fdr_scores_scalars(path: &std::path::Path) -> Option<(Vec<u32>, Vec<f64>)> {
     let data = std::fs::read(path).ok()?;
     if data.len() < FDR_SIDECAR_HEADER_LEN
@@ -6356,6 +6386,15 @@ fn compute_pass2_transfer_compete(
     // off-stratum survivor is absent from run_q → keep its 1st-pass q (report = pass1 ∪ stratum).
     let mut n_mapped = 0usize;
     for (file_idx, (_file_name, entries)) in per_file_entries.iter_mut().enumerate() {
+        // Pass-1 experiment q for this file, needed only when stratified: an off-stratum peak
+        // keeps its pass-1 experiment q, and the post-rescore overlay already zeroed the
+        // in-memory copy for the ones Stage 6 changed. Read per file and dropped at the end of
+        // the iteration, so residency stays one file deep.
+        let pass1_exp_q: Option<HashMap<u32, (f64, f64)>> = if stratum_base_ids.is_some() {
+            read_fdr_scores_experiment_q(&sidecar_paths[file_idx])
+        } else {
+            None
+        };
         for e in entries.iter_mut() {
             // Under a constrained stratum (protein-compact), an off-stratum survivor keeps its
             // already-passing 1st-pass q — the streaming competition returns q=1.0 for it, so it
@@ -6367,14 +6406,34 @@ fn compute_pass2_transfer_compete(
             // rather than "not yet computed". Presence in survivor_score_override is the
             // entry-id-keyed "this peak changed" signal, so it means the same thing in-process
             // and on a distributed merge node.
+            let key = (file_idx, e.entry_id);
             if let Some(strat) = stratum_base_ids {
-                if !strat.contains(&(e.entry_id & 0x7FFF_FFFF))
-                    && !survivor_score_override.contains_key(&(file_idx, e.entry_id))
-                {
+                if !strat.contains(&(e.entry_id & 0x7FFF_FFFF)) {
+                    // Off-stratum: only the RUN-level q of a peak Stage 6 changed is refreshed.
+                    // An unchanged one never competed, so it is absent from run_q and keeps
+                    // everything from pass 1.
+                    //
+                    // The EXPERIMENT q is never recomputed here. It is a pass-1 property
+                    // anchored on the best-scoring peak, and reconciliation corrects peaks
+                    // TOWARD that anchor rather than moving it, so a changed peak was not the
+                    // one that set the maximum and cannot become it. Carrying the pass-1 value
+                    // is therefore exact, and it is what keeps the re-scoping additive.
+                    let rq_off = match run_q.get(&key) {
+                        Some(&v) => v,
+                        None => continue,
+                    };
+                    e.run_precursor_qvalue = rq_off;
+                    e.run_peptide_qvalue = rq_off;
+                    if let Some(map) = pass1_exp_q.as_ref() {
+                        if let Some(&(prec, pep_q)) = map.get(&e.entry_id) {
+                            e.experiment_precursor_qvalue = prec;
+                            e.experiment_peptide_qvalue = pep_q;
+                        }
+                    }
+                    n_mapped += 1;
                     continue;
                 }
             }
-            let key = (file_idx, e.entry_id);
             let rq = match run_q.get(&key) {
                 Some(&v) => v,
                 None => continue,

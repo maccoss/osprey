@@ -252,11 +252,26 @@ pub fn compute_full_population_fdr_streaming(
             }
         }
 
-        // Experiment-level: fold every observation into the per-base_id bests.
+        // Experiment-level: fold every observation into the per-base_id bests. When stratified
+        // this is the STRATUM ONLY — deliberately not the run-level admitted set, which also
+        // carries the changed off-stratum peaks.
+        //
+        // An off-stratum peak would be admitted only in the files that CHANGED it, so its best
+        // would be a max over that subset while every stratum member maxes over all files. And
+        // because reconciliation anchors on the best-scoring peak and corrects the others toward
+        // it, a changed peak is never the one that supplied the maximum — so maxing over changed
+        // observations alone is GUARANTEED to understate the precursor's experiment-wide score.
+        // The correct value is the pass-1 experiment q, which by that same anchor argument
+        // reconciliation cannot have invalidated; the caller carries it through instead, which is
+        // what keeps the re-scoping additive.
         for i in 0..m {
             let eid = entry_ids[i];
             let bid = eid & BASE_ID_MASK;
-            if !admit(bid) {
+            let in_stratum = match stratum_base_ids {
+                None => true,
+                Some(strat) => strat.contains(&bid),
+            };
+            if !in_stratum {
                 continue;
             }
             let s = scores[i];
