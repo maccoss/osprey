@@ -6360,8 +6360,17 @@ fn compute_pass2_transfer_compete(
             // Under a constrained stratum (protein-compact), an off-stratum survivor keeps its
             // already-passing 1st-pass q — the streaming competition returns q=1.0 for it, so it
             // must be skipped rather than written (report = pass1 ∪ stratum passers).
+            //
+            // EXCEPT where Stage 6 changed the peak. A changed peak competed above on its
+            // recalculated score, so it has an EARNED q here; skipping it would leave it on the
+            // q=1 sentinel the post-rescore overlay wrote, which reads as a confident rejection
+            // rather than "not yet computed". Presence in survivor_score_override is the
+            // entry-id-keyed "this peak changed" signal, so it means the same thing in-process
+            // and on a distributed merge node.
             if let Some(strat) = stratum_base_ids {
-                if !strat.contains(&(e.entry_id & 0x7FFF_FFFF)) {
+                if !strat.contains(&(e.entry_id & 0x7FFF_FFFF))
+                    && !survivor_score_override.contains_key(&(file_idx, e.entry_id))
+                {
                     continue;
                 }
             }

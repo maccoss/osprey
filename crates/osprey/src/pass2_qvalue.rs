@@ -182,13 +182,41 @@ pub fn compute_full_population_fdr_streaming(
             }
         }
 
-        // Run-level: compete within this file (only stratum members when stratified).
-        let all_idx: Vec<usize> = match stratum_base_ids {
-            None => (0..m).collect(),
-            Some(strat) => (0..m)
-                .filter(|&i| strat.contains(&(entry_ids[i] & BASE_ID_MASK)))
-                .collect(),
+        // protein-compact: a peak Stage 6 CHANGED (reconciliation moved it, or gap-fill created
+        // it) carries a NEW composite score and no longer has a valid pass-1 run q — the old q
+        // described a peak that no longer exists, and the post-rescore overlay zeroes it
+        // precisely to say so. Such a peak must EARN a fresh run q here, exactly the way
+        // on-stratum members do; neither inheriting the prior q nor keeping the q=1 sentinel is
+        // a calibrated answer. Presence in `survivor_score_override` IS the "changed" signal:
+        // the override exists only for peaks re-scored against the reconciled features, and it
+        // is keyed by entry_id, so it means the same thing in-process and on a distributed
+        // merge node.
+        //
+        // Admitted BY BASE_ID so a target and its paired decoy always enter together —
+        // admitting a lone target would let it auto-win its competition and inflate the null.
+        let changed_base_ids: Option<HashSet<u32>> = stratum_base_ids.map(|_| {
+            (0..m)
+                .filter(|&i| survivor_score_override.contains_key(&(file_idx, entry_ids[i])))
+                .map(|i| entry_ids[i] & BASE_ID_MASK)
+                .collect()
+        });
+        let admit = |bid: u32| -> bool {
+            match stratum_base_ids {
+                None => true,
+                Some(strat) => {
+                    strat.contains(&bid)
+                        || changed_base_ids
+                            .as_ref()
+                            .is_some_and(|changed| changed.contains(&bid))
+                }
+            }
         };
+
+        // Run-level: compete within this file (stratum members plus changed peaks when
+        // stratified).
+        let all_idx: Vec<usize> = (0..m)
+            .filter(|&i| admit(entry_ids[i] & BASE_ID_MASK))
+            .collect();
         let (wi, ws, wd) = compete_from_indices(&scores, &labels, &entry_ids, &all_idx);
         let mut q = vec![0.0f64; wi.len()];
         compute_conservative_qvalues(&ws, &wd, &mut q);
@@ -214,10 +242,8 @@ pub fn compute_full_population_fdr_streaming(
         for i in 0..m {
             let eid = entry_ids[i];
             let bid = eid & BASE_ID_MASK;
-            if let Some(strat) = stratum_base_ids {
-                if !strat.contains(&bid) {
-                    continue;
-                }
+            if !admit(bid) {
+                continue;
             }
             let s = scores[i];
             if labels[i] {
