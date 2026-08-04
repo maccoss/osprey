@@ -2862,6 +2862,26 @@ fn ln_gamma(x: f64) -> f64 {
     0.5 * (2.0 * std::f64::consts::PI).ln() + (t.ln() * (x_adj + 0.5)) - t + sum.ln()
 }
 
+/// Normalise isoleucine to leucine for collision detection.
+///
+/// I and L have identical residue masses (113.08406), so a decoy differing from a real
+/// target only by I<->L substitutions is precursor-mass-identical AND produces an identical
+/// b/y ladder - indistinguishable from that target by mass spectrometry. It is therefore not
+/// a valid null: it will be detected wherever its target twin is, and every such detection
+/// is counted as a decoy hit when it is really a target hit, deflating the estimated FDR.
+///
+/// This SUBSUMES the exact-string collision check rather than adding to it, because a
+/// sequence containing no isoleucine normalises to itself.
+///
+/// It is also independent of the fragment-overlap gate, which cannot catch this: that gate
+/// compares a candidate to its OWN source target, while a collision here is an isobaric
+/// match to a DIFFERENT target. Measured over the 1,390,979-target Astral set with the
+/// overlap gate on, simulating this path: 0 exact collisions and 742 I/L-isobaric ones
+/// (0.0534%), e.g. AAEESLR -> LSEEAAR.
+fn normalize_il(sequence: &str) -> String {
+    sequence.replace('I', "L")
+}
+
 /// Decoy generator using enzyme-aware sequence reversal
 ///
 /// Following the pyXcorrDIA approach:
@@ -3409,8 +3429,9 @@ impl DecoyGenerator {
     ) -> (Vec<LibraryEntry>, Vec<LibraryEntry>, DecoyGenerationStats) {
         use std::collections::HashSet;
 
-        // Build set of all target sequences for collision detection
-        let target_sequences: HashSet<&str> = targets.iter().map(|t| t.sequence.as_str()).collect();
+        // Build set of all target sequences for collision detection, I->L normalised.
+        let target_sequences: HashSet<String> =
+            targets.iter().map(|t| normalize_il(&t.sequence)).collect();
 
         // Result type for each parallel task
         enum DecoyResult {
@@ -3437,7 +3458,7 @@ impl DecoyGenerator {
                 // 1. Different from original (not palindromic)
                 // 2. Not in target database (no collision)
                 if reversed_seq != target.sequence
-                    && !target_sequences.contains(reversed_seq.as_str())
+                    && !target_sequences.contains(&normalize_il(&reversed_seq))
                     && self.is_candidate_acceptable(&target.sequence, &reversed_seq)
                 {
                     // Reversal succeeded - create decoy
@@ -3460,7 +3481,7 @@ impl DecoyGenerator {
 
                     // Check if cycled sequence is valid
                     if cycled_seq != target.sequence
-                        && !target_sequences.contains(cycled_seq.as_str())
+                        && !target_sequences.contains(&normalize_il(&cycled_seq))
                         && self.is_candidate_acceptable(&target.sequence, &cycled_seq)
                     {
                         match self.create_decoy_from_mapping(target, &cycled_seq, &cycle_mapping) {
@@ -5556,6 +5577,45 @@ mod tests {
             !decoys.iter().any(|d| d.sequence == ISOBARIC_REVERSAL),
             "The fragment-overlap gate must reject the isobaric reversal"
         );
+    }
+
+    #[test]
+    fn test_collision_check_rejects_a_decoy_isobaric_to_a_different_target() {
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+
+        // AAEESLR reverses to LSEEAAR, which is I/L-isobaric to the SECOND target below -
+        // one of the 742 real collisions measured over the Astral target set.
+        let collider = "AAEESLR";
+        let reversal = "LSEEAAR";
+        let twin = "ISEEAAR";
+
+        // The property that makes this worth its own gate: the fragment-overlap gate PASSES
+        // this candidate. It compares a candidate to its OWN source target, and against
+        // AAEESLR the ladder of LSEEAAR is ordinary. The collision is with a DIFFERENT
+        // target, which that gate never looks at - so the two checks are independent, not
+        // redundant, and an exact-string audit reports 0 here.
+        assert!(generator.is_candidate_acceptable(collider, reversal));
+
+        let mut targets = vec![
+            LibraryEntry::new(1, collider.into(), collider.into(), 2, 500.0, 10.0),
+            LibraryEntry::new(2, twin.into(), twin.into(), 2, 500.0, 10.0),
+        ];
+        for t in &mut targets {
+            t.fragments = vec![LibraryFragment {
+                mz: 300.0,
+                relative_intensity: 100.0,
+                annotation: FragmentAnnotation::default(),
+            }];
+        }
+
+        let (_valid, decoys, _stats) = generator.generate_all_with_collision_detection(&targets);
+        assert!(
+            !decoys.iter().any(|d| d.sequence == reversal),
+            "A decoy I/L-isobaric to a real target is not a valid null and must be rejected"
+        );
+        // The cycling fallback must still supply decoys. Without this the test would pass
+        // just as well with a check that rejected every candidate.
+        assert_eq!(decoys.len(), 2, "both targets should still receive a decoy");
     }
 
     #[test]

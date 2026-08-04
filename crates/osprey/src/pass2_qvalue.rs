@@ -4,8 +4,12 @@
 //! `Pass2FdrSidecar.ComputePass2TransferCompeteFull`,
 //! `PercolatorFdr.ComputeFullPopulationPrecursorFdrStreaming`) for cross-impl parity.
 //!
-//! Default is `percolator` (retrain the 2nd-pass SVM) — identical to the historical
-//! Rust behaviour, so nothing changes unless `OSPREY_PASS2_QVALUE` is set.
+//! Default is `protein-compact`. The former `percolator` default — retrain the 2nd-pass SVM
+//! and recompute q over the COMPACTED pool — has been removed: compaction depletes the decoys,
+//! so the retrained null is thin and the reported q is anti-conservative (measured ~9% true FDP
+//! at a nominal 1% on an 82-file SEA-AD entrapment set). The linear model trained by the 1st-pass
+//! SVM is now the model for pass 2 in every mode; only the diagnostic
+//! `OSPREY_PROTEIN_COMPACT_RETRAIN` A/B still retrains.
 //!
 //! `transfer-compete`: do NOT retrain. Apply the FROZEN 1st-pass model to the reconciled
 //! survivors and recompute run/experiment q + PEP by a fresh target-decoy competition over
@@ -28,45 +32,43 @@ use osprey_ml::svm::FeatureStandardizer;
 const BASE_ID_MASK: u32 = 0x7FFF_FFFF;
 
 /// How the merge-node second pass assigns the reported q-values.
+/// Every mode applies the FROZEN 1st-pass linear model; they differ only in the population the
+/// target-decoy competition runs over. Nothing here retrains.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pass2QValueMode {
-    /// Default: retrain the 2nd-pass Percolator SVM and recompute q over the compacted pool.
-    Percolator,
     /// Frozen 1st-pass model + fresh full-population target-decoy competition (no retrain).
     TransferCompete,
-    /// Like `TransferCompete`, but the competition is CONSTRAINED to the protein stratum
-    /// (peptides of proteins with >=2 first-pass-detected peptides) and the compaction gate
-    /// is expanded to admit those peptides — recovering present-protein depth at honest FDR.
+    /// Default. Like `TransferCompete`, but the competition is CONSTRAINED to the protein
+    /// stratum (peptides of proteins with >=2 first-pass-detected peptides) and the compaction
+    /// gate is expanded to admit those peptides — recovering present-protein depth.
     ProteinCompact,
-}
-
-impl Pass2QValueMode {
-    /// True when the mode replaces the 2nd-pass retrain with the frozen 1st-pass model + a
-    /// target-decoy competition (no retrain): transfer-compete competes over the full
-    /// pre-compaction population; protein-compact competes over the protein stratum. Both feed
-    /// `compute_full_population_fdr_streaming` (the stratum via its `stratum_base_ids` arg). This
-    /// mirrors the C# streaming frozen 2nd pass (Pass2FdrSidecar.ComputePass2TransferCompeteFull).
-    pub fn uses_frozen_model(self) -> bool {
-        matches!(
-            self,
-            Pass2QValueMode::TransferCompete | Pass2QValueMode::ProteinCompact
-        )
-    }
 }
 
 static PASS2_MODE: OnceLock<Pass2QValueMode> = OnceLock::new();
 
 /// The process-wide pass-2 q-value mode, resolved once from `OSPREY_PASS2_QVALUE`.
-/// Unset / `percolator` / unrecognized → `Percolator` (the default). `transfer-compete`
-/// → `TransferCompete`. Mirrors the C# `NormalizePass2QValue` (trim + lowercase).
+/// Unset → `ProteinCompact` (the default). Mirrors the C# `NormalizePass2QValue`
+/// (trim + lowercase).
+///
+/// An unrecognized value PANICS rather than falling back. Silently substituting the default
+/// would report numbers the caller did not ask for under an output name that says otherwise —
+/// and the removed `percolator` token in particular is one that existing sweep scripts still
+/// pass. These environment variables are developer-side instrumentation, not a supported
+/// interface, so a removed name is expected to fail loudly rather than be aliased forever.
 pub fn pass2_mode() -> Pass2QValueMode {
     *PASS2_MODE.get_or_init(|| match std::env::var("OSPREY_PASS2_QVALUE") {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+        Ok(v) if !v.trim().is_empty() => match v.trim().to_ascii_lowercase().as_str() {
             "transfer-compete" => Pass2QValueMode::TransferCompete,
             "protein-compact" => Pass2QValueMode::ProteinCompact,
-            _ => Pass2QValueMode::Percolator,
+            other => panic!(
+                "OSPREY_PASS2_QVALUE='{other}' is not a recognized mode. Recognized: \
+                 'transfer-compete', 'protein-compact'. Unset it for the default \
+                 (protein-compact). The 'percolator' mode was REMOVED: it retrained the \
+                 2nd-pass SVM on a compaction-depleted decoy pool, which reports \
+                 anti-conservative q-values."
+            ),
         },
-        Err(_) => Pass2QValueMode::Percolator,
+        _ => Pass2QValueMode::ProteinCompact,
     })
 }
 
@@ -172,21 +174,63 @@ pub fn compute_full_population_fdr_streaming(
         let (entry_ids, mut scores) = read_file_scalars(file_idx);
         let m = entry_ids.len();
         let mut labels = vec![false; m];
+        // Marks the observations Stage 6 actually CHANGED (see the note below).
+        let mut changed_flags = vec![false; m];
         for i in 0..m {
             let eid = entry_ids[i];
             labels[i] = (eid & !BASE_ID_MASK) != 0; // decoy high bit set
             if let Some(&ov) = survivor_score_override.get(&(file_idx, eid)) {
+                // BIT-EXACT inequality is the "changed" discriminator: an unchanged survivor's
+                // reconciled features ARE its original Stage-4 features (unchanged rows stream
+                // through untouched) and the sidecar score came from those same features under
+                // this same averaged model, so the recomputation reproduces it exactly. A moved
+                // peak carries rescored features, so its score differs.
+                if ov != scores[i] {
+                    changed_flags[i] = true;
+                }
                 scores[i] = ov; // swap in the reconciled survivor's frozen-model score
             }
         }
 
-        // Run-level: compete within this file (only stratum members when stratified).
-        let all_idx: Vec<usize> = match stratum_base_ids {
-            None => (0..m).collect(),
-            Some(strat) => (0..m)
-                .filter(|&i| strat.contains(&(entry_ids[i] & BASE_ID_MASK)))
-                .collect(),
+        // protein-compact: a peak Stage 6 CHANGED (reconciliation moved it, or gap-fill created
+        // it) carries a NEW composite score and no longer has a valid pass-1 run q — the old q
+        // described a peak that no longer exists, and the post-rescore overlay zeroes it
+        // precisely to say so. Such a peak must EARN a fresh run q here, exactly the way
+        // on-stratum members do; neither inheriting the prior q nor keeping the q=1 sentinel is
+        // a calibrated answer. The "changed" signal is a frozen-model score that DIFFERS from
+        // the entry's 1st-pass sidecar score, computed above — NOT mere presence in
+        // `survivor_score_override`. That map holds every post-reconciliation survivor whose
+        // identity resolves in the effective parquet, including files Stage 6 never touched
+        // (the effective path falls back to the ORIGINAL parquet), so keying on presence
+        // admitted most of the survivor pool and quietly widened the very stratum this mode
+        // exists to enforce. The score comparison is keyed by entry_id, so it means the same
+        // thing in-process and on a distributed merge node.
+        //
+        // Admitted BY BASE_ID so a target and its paired decoy always enter together —
+        // admitting a lone target would let it auto-win its competition and inflate the null.
+        let changed_base_ids: Option<HashSet<u32>> = stratum_base_ids.map(|_| {
+            (0..m)
+                .filter(|&i| changed_flags[i])
+                .map(|i| entry_ids[i] & BASE_ID_MASK)
+                .collect()
+        });
+        let admit = |bid: u32| -> bool {
+            match stratum_base_ids {
+                None => true,
+                Some(strat) => {
+                    strat.contains(&bid)
+                        || changed_base_ids
+                            .as_ref()
+                            .is_some_and(|changed| changed.contains(&bid))
+                }
+            }
         };
+
+        // Run-level: compete within this file (stratum members plus changed peaks when
+        // stratified).
+        let all_idx: Vec<usize> = (0..m)
+            .filter(|&i| admit(entry_ids[i] & BASE_ID_MASK))
+            .collect();
         let (wi, ws, wd) = compete_from_indices(&scores, &labels, &entry_ids, &all_idx);
         let mut q = vec![0.0f64; wi.len()];
         compute_conservative_qvalues(&ws, &wd, &mut q);
@@ -208,14 +252,27 @@ pub fn compute_full_population_fdr_streaming(
             }
         }
 
-        // Experiment-level: fold every observation into the per-base_id bests.
+        // Experiment-level: fold every observation into the per-base_id bests. When stratified
+        // this is the STRATUM ONLY — deliberately not the run-level admitted set, which also
+        // carries the changed off-stratum peaks.
+        //
+        // An off-stratum peak would be admitted only in the files that CHANGED it, so its best
+        // would be a max over that subset while every stratum member maxes over all files. And
+        // because reconciliation anchors on the best-scoring peak and corrects the others toward
+        // it, a changed peak is never the one that supplied the maximum — so maxing over changed
+        // observations alone is GUARANTEED to understate the precursor's experiment-wide score.
+        // The correct value is the pass-1 experiment q, which by that same anchor argument
+        // reconciliation cannot have invalidated; the caller carries it through instead, which is
+        // what keeps the re-scoping additive.
         for i in 0..m {
             let eid = entry_ids[i];
             let bid = eid & BASE_ID_MASK;
-            if let Some(strat) = stratum_base_ids {
-                if !strat.contains(&bid) {
-                    continue;
-                }
+            let in_stratum = match stratum_base_ids {
+                None => true,
+                Some(strat) => strat.contains(&bid),
+            };
+            if !in_stratum {
+                continue;
             }
             let s = scores[i];
             if labels[i] {
