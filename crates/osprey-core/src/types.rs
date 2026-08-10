@@ -1003,6 +1003,9 @@ impl CoelutionScoredEntry {
             experiment_peptide_qvalue: self.experiment_peptide_qvalue,
             experiment_protein_qvalue: self.experiment_protein_qvalue,
             pep: self.pep,
+            // Not known until the experiment-scope competition has seen every run;
+            // compute_experiment_level_qvalues fills it in alongside the experiment q-values.
+            experiment_aggregate_score: 0.0,
             modified_sequence: Arc::from(self.modified_sequence.as_str()),
         }
     }
@@ -1057,6 +1060,16 @@ pub struct FdrEntry {
     pub experiment_protein_qvalue: f64,
     /// Posterior error probability (mutated by FDR)
     pub pep: f64,
+    /// The per-entry score the EXPERIMENT-scope competitions ranked this entry on: the max
+    /// of `score` over the entry's observations across all runs (sidecar v4).
+    ///
+    /// `score` is the per-observation SVM discriminant, which is what the RUN-scope q-values
+    /// compete on. The experiment scope competes on this cross-run roll-up instead, so
+    /// persisting only `score` left no consumer able to build a score-space acceptance
+    /// boundary at experiment scope - it had to rebuild the roll-up itself, and any consumer
+    /// that got the roll-up rule wrong failed silently. Written by
+    /// `compute_experiment_level_qvalues` beside the experiment q-values it produced.
+    pub experiment_aggregate_score: f64,
     /// Modified sequence (interned Arc<str> for psm_id, grouping, passing_precursors)
     pub modified_sequence: Arc<str>,
 }
