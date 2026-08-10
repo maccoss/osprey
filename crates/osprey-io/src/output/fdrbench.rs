@@ -329,6 +329,7 @@ mod tests {
             experiment_peptide_qvalue: exp_q_precursor,
             experiment_protein_qvalue: 1.0,
             pep: 0.0,
+            experiment_aggregate_score: 0.0,
             modified_sequence: Arc::from(modseq),
         }
     }

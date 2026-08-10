@@ -1205,6 +1205,7 @@ mod tests {
             experiment_peptide_qvalue: experiment_qvalue,
             experiment_protein_qvalue: 1.0,
             pep: 1.0,
+            experiment_aggregate_score: 0.0,
             modified_sequence: Arc::from(modified_sequence),
         }
     }
@@ -1242,6 +1243,7 @@ mod tests {
             experiment_peptide_qvalue: run_peptide_qvalue,
             experiment_protein_qvalue: run_protein_qvalue,
             pep: 1.0,
+            experiment_aggregate_score: 0.0,
             modified_sequence: Arc::from(modified_sequence),
         }
     }

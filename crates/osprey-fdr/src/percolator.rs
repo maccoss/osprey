@@ -2223,6 +2223,42 @@ pub fn compute_fdr_from_stubs(
     }
 
     // === Experiment-level q-values ===
+    // The score the experiment scope competes on, per entry: the max of `score` over the
+    // entry's observations across every run (sidecar v4). Keyed by FULL entry_id, so a target
+    // and its decoy stay distinct even though the competition below pairs them by base_id.
+    //
+    // Computed for the single-file case too, and deliberately NOT short-circuited to `score`
+    // there: the pre-compaction pool holds several observations per precursor per file, so
+    // even within one run the roll-up is a max over rows rather than the row's own score.
+    // Order-independent (a max), so it does not perturb any competition ordering.
+    {
+        let mut agg_by_entry_id: HashMap<u32, f64> = HashMap::new();
+        for (_, entries) in per_file_entries.iter() {
+            for entry in entries.iter() {
+                if let Some(restrict) = restrict_base_ids {
+                    if !restrict.contains(&(entry.entry_id & 0x7FFF_FFFF)) {
+                        continue;
+                    }
+                }
+                agg_by_entry_id
+                    .entry(entry.entry_id)
+                    .and_modify(|best| {
+                        if entry.score > *best {
+                            *best = entry.score;
+                        }
+                    })
+                    .or_insert(entry.score);
+            }
+        }
+        for (_, entries) in per_file_entries.iter_mut() {
+            for entry in entries.iter_mut() {
+                if let Some(&agg) = agg_by_entry_id.get(&entry.entry_id) {
+                    entry.experiment_aggregate_score = agg;
+                }
+            }
+        }
+    }
+
     if is_single_file {
         // Single file: experiment q-values = run q-values
         for (_, entries) in per_file_entries.iter_mut() {
@@ -3092,6 +3128,7 @@ mod tests {
             experiment_peptide_qvalue: 1.0,
             experiment_protein_qvalue: 1.0,
             pep: 1.0,
+            experiment_aggregate_score: 0.0,
             modified_sequence: std::sync::Arc::from(peptide),
         }
     }

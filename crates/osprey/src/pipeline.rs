@@ -1793,14 +1793,14 @@ fn fdr_scores_path_pass2(
 // reloading the same FdrEntry sequence from the per-file parquet
 // cache and applying records in order.
 //
-// Format (v3):
+// Format (v4):
 //   magic           [0..8]   = b"OSPRYFDR"
-//   version         [8]      = u8 (= 3)
+//   version         [8]      = u8 (= 4)
 //   pass            [9]      = u8 (1 = first-pass, 2 = second-pass)
 //   reserved        [10..16] = 6 bytes (zero)
 //   entry_count     [16..24] = u64 little-endian
 //   reserved        [24..32] = 8 bytes (zero)
-//   body            [32..]   = entry_count * 60 bytes, where each record is:
+//   body            [32..]   = entry_count * 68 bytes, where each record is:
 //                              [0..4]   entry_id                     u32 LE
 //                              [4..12]  svm_score                    f64 LE
 //                              [12..20] run_precursor_qvalue         f64 LE
@@ -1809,8 +1809,9 @@ fn fdr_scores_path_pass2(
 //                              [36..44] experiment_peptide_qvalue    f64 LE
 //                              [44..52] pep                          f64 LE
 //                              [52..60] run_protein_qvalue           f64 LE
+//                              [60..68] experiment_aggregate_score   f64 LE
 //
-// Total file size is `32 + 60 * entry_count`.
+// Total file size is `32 + 68 * entry_count`.
 //
 // v2 → v3 (2026-05-02): added `run_protein_qvalue` to support the
 // Stage 6 worker's compaction step. The in-process pipeline filters
@@ -1819,12 +1820,20 @@ fn fdr_scores_path_pass2(
 // sidecar carried only the first half of that predicate, so a
 // rehydrated worker couldn't reproduce in-process compaction when
 // `--protein-fdr` is set. v3 closes that gap.
+//
+// v3 → v4 (2026-08-10): added `experiment_aggregate_score`. The record
+// persisted one score for the run-scope and experiment-scope q-values
+// alike, but they compete on different quantities - the run scope on
+// the per-observation discriminant, the experiment scope on a per-entry
+// roll-up across runs - so a consumer re-gating at experiment scope had
+// to rebuild the roll-up itself, with no way to be checked. Appended at
+// the END so every v3 field offset is unchanged.
 const FDR_SIDECAR_MAGIC: &[u8; 8] = b"OSPRYFDR";
-const FDR_SIDECAR_VERSION: u8 = 3;
+const FDR_SIDECAR_VERSION: u8 = 4;
 const FDR_SIDECAR_HEADER_LEN: usize = 32;
-const FDR_SIDECAR_RECORD_LEN: usize = 60;
+const FDR_SIDECAR_RECORD_LEN: usize = 68;
 
-/// Write per-file FDR scores to a sidecar binary file (v2 format).
+/// Write per-file FDR scores to a sidecar binary file (v4 format).
 fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: u8) -> Result<()> {
     let tmp_path = std::env::temp_dir().join(format!(
         "osprey_{}_{}",
@@ -1853,7 +1862,7 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
     file.write_all(&header)
         .map_err(|e| OspreyError::OutputError(format!("Failed to write header: {}", e)))?;
 
-    // Body: 60 bytes per entry (entry_id + 7 f64s)
+    // Body: 68 bytes per entry (entry_id + 8 f64s)
     let mut record = [0u8; FDR_SIDECAR_RECORD_LEN];
     for entry in entries {
         record[0..4].copy_from_slice(&entry.entry_id.to_le_bytes());
@@ -1864,6 +1873,7 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
         record[36..44].copy_from_slice(&entry.experiment_peptide_qvalue.to_le_bytes());
         record[44..52].copy_from_slice(&entry.pep.to_le_bytes());
         record[52..60].copy_from_slice(&entry.run_protein_qvalue.to_le_bytes());
+        record[60..68].copy_from_slice(&entry.experiment_aggregate_score.to_le_bytes());
         file.write_all(&record)
             .map_err(|e| OspreyError::OutputError(format!("Failed to write record: {}", e)))?;
     }
@@ -2102,6 +2112,8 @@ pub(crate) fn load_fdr_scores_sidecar(
             f64::from_le_bytes(data[off + 36..off + 44].try_into().unwrap());
         entry.pep = f64::from_le_bytes(data[off + 44..off + 52].try_into().unwrap());
         entry.run_protein_qvalue = f64::from_le_bytes(data[off + 52..off + 60].try_into().unwrap());
+        entry.experiment_aggregate_score =
+            f64::from_le_bytes(data[off + 60..off + 68].try_into().unwrap());
     }
     true
 }
@@ -3026,6 +3038,7 @@ pub(crate) fn load_fdr_stubs_from_parquet(
                 experiment_peptide_qvalue: 1.0,
                 experiment_protein_qvalue: 1.0,
                 pep: 1.0,
+                experiment_aggregate_score: 0.0,
                 modified_sequence: intern_seq(seq_interner, modseq_col.value(row)),
             });
         }
@@ -10576,6 +10589,7 @@ mod tests {
             experiment_peptide_qvalue: 1.0,
             experiment_protein_qvalue: 1.0,
             pep: 1.0,
+            experiment_aggregate_score: 0.0,
             modified_sequence: Arc::from("PEPTIDE"),
         }
     }
@@ -11692,6 +11706,7 @@ mod tests {
                     experiment_peptide_qvalue: 0.003,
                     experiment_protein_qvalue: 1.0,
                     pep: 0.005,
+                    experiment_aggregate_score: 0.0,
                     modified_sequence: Arc::from("PEPTIDEK"),
                 },
                 // PEPTIDEK+3: FAILS precursor (0.05) but passes peptide (0.003)
@@ -11713,6 +11728,7 @@ mod tests {
                     experiment_peptide_qvalue: 0.003,
                     experiment_protein_qvalue: 1.0,
                     pep: 0.05,
+                    experiment_aggregate_score: 0.0,
                     modified_sequence: Arc::from("PEPTIDEK"),
                 },
             ],
@@ -11808,6 +11824,7 @@ mod tests {
                     experiment_peptide_qvalue: 0.008,
                     experiment_protein_qvalue: 1.0,
                     pep: 0.02,
+                    experiment_aggregate_score: 0.0,
                     modified_sequence: Arc::from("WEAKPEPTIDE"),
                 },
                 // WEAKPEPTIDE+3: also fails precursor (0.04), worse than 2+
@@ -11829,6 +11846,7 @@ mod tests {
                     experiment_peptide_qvalue: 0.008,
                     experiment_protein_qvalue: 1.0,
                     pep: 0.04,
+                    experiment_aggregate_score: 0.0,
                     modified_sequence: Arc::from("WEAKPEPTIDE"),
                 },
             ],
@@ -12045,6 +12063,7 @@ mod tests {
             experiment_peptide_qvalue: q + 3.0e-9,
             experiment_protein_qvalue: 1.0,
             pep,
+            experiment_aggregate_score: 0.0,
             modified_sequence: "PEPTIDE".into(),
         }
     }
@@ -12426,6 +12445,7 @@ mod tests {
             experiment_peptide_qvalue: exp_peptide_q,
             experiment_protein_qvalue: 1.0,
             pep: 0.0,
+            experiment_aggregate_score: 0.0,
             modified_sequence: modseq.into(),
         }
     }
