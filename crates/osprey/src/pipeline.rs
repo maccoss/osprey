@@ -1922,7 +1922,7 @@ pub(crate) fn read_fdr_scores_experiment_q(
 /// `FdrScoresSidecar.ReadRecords` reads of bytes 4, 44 and 52.
 pub(crate) fn read_fdr_scores_pass1_scalars(
     path: &std::path::Path,
-) -> Option<HashMap<u32, (f64, f64, f64)>> {
+) -> Option<HashMap<u32, (f64, f64, f64, f64)>> {
     let data = std::fs::read(path).ok()?;
     if data.len() < FDR_SIDECAR_HEADER_LEN
         || &data[0..8] != FDR_SIDECAR_MAGIC
@@ -1942,7 +1942,11 @@ pub(crate) fn read_fdr_scores_pass1_scalars(
         let score = f64::from_le_bytes(r[4..12].try_into().ok()?);
         let pep = f64::from_le_bytes(r[44..52].try_into().ok()?);
         let run_protein_q = f64::from_le_bytes(r[52..60].try_into().ok()?);
-        out.insert(entry_id, (score, pep, run_protein_q));
+        let experiment_aggregate_score = f64::from_le_bytes(r[60..68].try_into().ok()?);
+        out.insert(
+            entry_id,
+            (score, pep, run_protein_q, experiment_aggregate_score),
+        );
     }
     Some(out)
 }
@@ -6368,10 +6372,17 @@ fn restore_pass1_scalars(
         };
         files_read += 1;
         for e in entries.iter_mut() {
-            if let Some(&(score, pep, run_protein_q)) = by_id.get(&e.entry_id) {
+            if let Some(&(score, pep, run_protein_q, experiment_aggregate_score)) =
+                by_id.get(&e.entry_id)
+            {
                 e.score = score;
                 e.pep = pep;
                 e.run_protein_qvalue = run_protein_q;
+                // The fourth field the five-of-eight map-back drops. It is cleared by the
+                // Stage 6 reset like `score`, and no frozen pass-2 mode writes it back, so
+                // without this seed it persists at 0.0 for every peak Stage 6 touched -
+                // roughly 39% of records, and disproportionately decoys.
+                e.experiment_aggregate_score = experiment_aggregate_score;
                 n_restored += 1;
             }
         }
@@ -6379,15 +6390,16 @@ fn restore_pass1_scalars(
 
     if !unreadable.is_empty() {
         log::warn!(
-            "1st-pass score/pep/run_protein_qvalue could not be restored for {} file(s) (no \
-             readable 1st-pass sidecar): [{}]. Their 2nd-pass sidecars will carry reset \
-             defaults for peaks Stage 6 changed.",
+            "1st-pass score/pep/run_protein_qvalue/experiment_aggregate_score could not be \
+             restored for {} file(s) (no readable 1st-pass sidecar): [{}]. Their 2nd-pass \
+             sidecars will carry reset defaults for peaks Stage 6 changed.",
             unreadable.len(),
             unreadable.join(", ")
         );
     }
     log::debug!(
-        "Restored 1st-pass score/pep/run_protein_qvalue onto {} survivor(s) across {} file(s).",
+        "Restored 1st-pass score/pep/run_protein_qvalue/experiment_aggregate_score onto {} \
+         survivor(s) across {} file(s).",
         n_restored,
         files_read
     );
