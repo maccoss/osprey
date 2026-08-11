@@ -1906,6 +1906,37 @@ pub(crate) fn read_fdr_scores_experiment_q(
     Some(out)
 }
 
+/// Read `entry_id -> (score, pep, run_protein_qvalue)` from an FDR scores sidecar. These are the
+/// three fields Stage 6's overlay resets that pass 2 does not reliably recompute. Returns `None`
+/// on any header/size mismatch, exactly as `read_fdr_scores_experiment_q` does. Mirrors the C#
+/// `FdrScoresSidecar.ReadRecords` reads of bytes 4, 44 and 52.
+pub(crate) fn read_fdr_scores_pass1_scalars(
+    path: &std::path::Path,
+) -> Option<HashMap<u32, (f64, f64, f64)>> {
+    let data = std::fs::read(path).ok()?;
+    if data.len() < FDR_SIDECAR_HEADER_LEN
+        || &data[0..8] != FDR_SIDECAR_MAGIC
+        || data[8] != FDR_SIDECAR_VERSION
+    {
+        return None;
+    }
+    let body = &data[FDR_SIDECAR_HEADER_LEN..];
+    if body.len() % FDR_SIDECAR_RECORD_LEN != 0 {
+        return None;
+    }
+    let n = body.len() / FDR_SIDECAR_RECORD_LEN;
+    let mut out = HashMap::with_capacity(n);
+    for i in 0..n {
+        let r = &body[i * FDR_SIDECAR_RECORD_LEN..(i + 1) * FDR_SIDECAR_RECORD_LEN];
+        let entry_id = u32::from_le_bytes(r[0..4].try_into().ok()?);
+        let score = f64::from_le_bytes(r[4..12].try_into().ok()?);
+        let pep = f64::from_le_bytes(r[44..52].try_into().ok()?);
+        let run_protein_q = f64::from_le_bytes(r[52..60].try_into().ok()?);
+        out.insert(entry_id, (score, pep, run_protein_q));
+    }
+    Some(out)
+}
+
 pub(crate) fn read_fdr_scores_scalars(path: &std::path::Path) -> Option<(Vec<u32>, Vec<f64>)> {
     let data = std::fs::read(path).ok()?;
     if data.len() < FDR_SIDECAR_HEADER_LEN
@@ -5666,6 +5697,23 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
 
             log::info!("");
             log::info!("Second-pass FDR");
+
+            // Stage 6's post-rescore overlay replaces each touched stub with a fresh
+            // `to_fdr_entry()`, resetting eight fields. Pass 2 recomputes only five of them, and
+            // which five depends on the mode and on whether a survivor is on-stratum, so three
+            // can reach the 2nd-pass sidecar at their reset defaults:
+            //   score              - no frozen mode wrote one back at all
+            //   pep                - written only on the on-stratum path
+            //   run_protein_qvalue - written by NO mode; first-pass protein FDR is its only
+            //                        producer, and the second-pass one writes
+            //                        experiment_protein_qvalue instead
+            // Seeding all three from the 1st-pass sidecar reproduces exactly what the
+            // distributed route has in hand here, which is why that route never showed the loss:
+            // it must rehydrate from that same sidecar. Whatever pass 2 genuinely recomputes then
+            // overwrites the seed. Ahead of the mode dispatch because the loss is not specific to
+            // one mode. Mirrors the C# Pass2FdrSidecar.RestorePass1Scalars.
+            restore_pass1_scalars(&mut per_file_entries, &per_file_cache_paths);
+
             match config.fdr_method {
                 FdrMethod::Percolator => {
                     // transfer-compete / protein-compact: recompute q for every survivor with the
@@ -6263,6 +6311,75 @@ fn build_protein_compact_stratum(
     stratum
 }
 
+/// Re-seed each survivor's `score`, `pep` and `run_protein_qvalue` from that file's
+/// `.1st-pass.fdr_scores.bin`.
+///
+/// These are the three of the eight fields Stage 6's overlay resets (it replaces the stub with a
+/// fresh `to_fdr_entry()`) that pass 2 does not reliably recompute: no frozen mode wrote `score`
+/// at all, `pep` is written only for on-stratum survivors, and `run_protein_qvalue` is written by
+/// no mode at all. Left unseeded they reach the 2nd-pass sidecar at their reset defaults, where a
+/// q of 1.0 reads as a confident rejection and a `score` of 0 sits exactly ON the discriminant's
+/// accept/reject boundary.
+///
+/// Seeding, not overriding: whatever pass 2 genuinely recomputes is written afterwards and wins.
+/// What is left is the pass-1 value, which is precisely what the distributed route holds at this
+/// point (it rehydrates from this same sidecar), so the routes agree by construction.
+///
+/// A missing or unreadable sidecar is warned about, not fatal: none of the three is an input to a
+/// pass-2 computation, and the frozen modes have their own fail-fast for a sidecar they genuinely
+/// need. Port of C# `Pass2FdrSidecar.RestorePass1Scalars`.
+fn restore_pass1_scalars(
+    per_file_entries: &mut [(String, Vec<FdrEntry>)],
+    per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
+) {
+    let mut n_restored = 0usize;
+    let mut files_read = 0usize;
+    let mut unreadable: Vec<String> = Vec::new();
+    for (file_name, entries) in per_file_entries.iter_mut() {
+        let sidecar = match per_file_cache_paths.get(file_name.as_str()) {
+            Some(cache) => {
+                let dir = cache.parent().unwrap_or_else(|| std::path::Path::new("."));
+                dir.join(format!("{}.1st-pass.fdr_scores.bin", file_name))
+            }
+            None => {
+                unreadable.push(file_name.clone());
+                continue;
+            }
+        };
+        let by_id = match read_fdr_scores_pass1_scalars(&sidecar) {
+            Some(m) => m,
+            None => {
+                unreadable.push(file_name.clone());
+                continue;
+            }
+        };
+        files_read += 1;
+        for e in entries.iter_mut() {
+            if let Some(&(score, pep, run_protein_q)) = by_id.get(&e.entry_id) {
+                e.score = score;
+                e.pep = pep;
+                e.run_protein_qvalue = run_protein_q;
+                n_restored += 1;
+            }
+        }
+    }
+
+    if !unreadable.is_empty() {
+        log::warn!(
+            "1st-pass score/pep/run_protein_qvalue could not be restored for {} file(s) (no \
+             readable 1st-pass sidecar): [{}]. Their 2nd-pass sidecars will carry reset \
+             defaults for peaks Stage 6 changed.",
+            unreadable.len(),
+            unreadable.join(", ")
+        );
+    }
+    log::debug!(
+        "Restored 1st-pass score/pep/run_protein_qvalue onto {} survivor(s) across {} file(s).",
+        n_restored,
+        files_read
+    );
+}
+
 /// Transfer-compete pass-2 recompute (OSPREY_PASS2_QVALUE=transfer-compete): score the
 /// reconciled survivors with the frozen 1st-pass model and recompute run/experiment q + PEP
 /// by a fresh target-decoy competition over the full pre-compaction population (the per-file
@@ -6395,6 +6512,7 @@ fn compute_pass2_transfer_compete(
         } else {
             None
         };
+
         for e in entries.iter_mut() {
             // Under a constrained stratum (protein-compact), an off-stratum survivor keeps its
             // already-passing 1st-pass q — the streaming competition returns q=1.0 for it, so it
@@ -6407,6 +6525,16 @@ fn compute_pass2_transfer_compete(
             // entry-id-keyed "this peak changed" signal, so it means the same thing in-process
             // and on a distributed merge node.
             let key = (file_idx, e.entry_id);
+
+            // Persist the score this entry COMPETED on above: the frozen-model score where its
+            // reconciled features resolved, otherwise the 1st-pass scalar that
+            // `restore_pass1_scalars` already seeded (which is also what the competition used
+            // for it). Written before the off-stratum branch below, because an off-stratum
+            // survivor needs its score persisted just the same.
+            if let Some(&frozen_score) = survivor_score_override.get(&key) {
+                e.score = frozen_score;
+            }
+
             if let Some(strat) = stratum_base_ids {
                 if !strat.contains(&(e.entry_id & 0x7FFF_FFFF)) {
                     // Off-stratum: only the RUN-level q of a peak Stage 6 changed is refreshed.
