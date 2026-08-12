@@ -141,7 +141,20 @@ impl FrozenLinearModel {
 /// * `stratum_base_ids`: `None` = full-population competition; `Some` = competition constrained
 ///   to those base_ids (protein-compact).
 ///
-/// Returns `(run_q, exp_q, pep)` keyed by `(file_idx, entry_id)` for exactly the survivors.
+/// Returns `(run_q, exp_q, pep, exp_aggregate)`. The first three are keyed by
+/// `(file_idx, entry_id)` for exactly the survivors; `exp_aggregate` is keyed by full
+/// `entry_id` (one value per entry, not per observation) and is the score this competition
+/// ranked that entry on — the caller writes it beside the experiment q it produced.
+///
+/// An `entry_id` ABSENT from `exp_aggregate` took no part in the experiment fold, which under
+/// protein-compact means an OFF-STRATUM entry; the caller must leave such an entry's pass-1
+/// aggregate untouched, because it keeps its pass-1 experiment q too. Absence (an `Option`
+/// from the lookup), never an in-band sentinel: the score is a signed discriminant, so 0.0 is
+/// an ordinary mid-distribution value and a consumer building a score-space acceptance
+/// boundary would take a minimum over fabricated zeros. NaN is rejected for the same reason it
+/// is on the C# side — it propagates silently, and the sidecar comparators test
+/// `(a - b).abs() <= tolerance`, which is FALSE for NaN against NaN, turning byte-identical
+/// files into a red gate.
 #[allow(clippy::type_complexity)]
 pub fn compute_full_population_fdr_streaming(
     n_files: usize,
@@ -153,6 +166,7 @@ pub fn compute_full_population_fdr_streaming(
     HashMap<(usize, u32), f64>,
     HashMap<(usize, u32), f64>,
     HashMap<(usize, u32), f64>,
+    HashMap<u32, f64>,
 ) {
     let survivor_set: HashSet<(usize, u32)> = survivors.iter().copied().collect();
     let mut survivor_entry_ids: HashSet<u32> = HashSet::new();
@@ -303,9 +317,27 @@ pub fn compute_full_population_fdr_streaming(
     let mut exp_is_decoy = vec![false; w];
     let mut exp_base_id = vec![0u32; w];
     let mut winner_loc: HashMap<u32, (usize, u32, f64)> = HashMap::with_capacity(w);
+    // The experiment aggregate score PER FULL ENTRY_ID (sidecar v4) — the score this
+    // competition ranked each entry on. Keyed by entry_id and not by base_id, exactly as the
+    // 1st-pass producer (`compute_fdr_from_stubs`) keys it: a target and its decoy are
+    // distinct entries with distinct aggregates even though the competition below pairs them.
+    // `winner_loc` cannot serve this purpose — it holds only the WINNER of each pair, so
+    // reading it for a decoy would hand back the target's score whenever the target won.
+    //
+    // `best_target` / `best_decoy` already carry exactly what is needed: each is the max over
+    // that entry's observations across every file, the same max-over-rows reduction the
+    // 1st-pass producer performs. Rust has no mean-best-N aggregation mode, so this max IS the
+    // aggregate — no branch needed. Mirrors C# `StreamingFdr`'s `aggByEntryId`.
+    let mut agg_by_entry_id: HashMap<u32, f64> = HashMap::with_capacity(w * 2);
     for (wi2, &bid) in base_ids.iter().enumerate() {
         let t = best_target.get(&bid).copied();
         let d = best_decoy.get(&bid).copied();
+        if let Some(tt) = t {
+            agg_by_entry_id.insert(tt.2, tt.0);
+        }
+        if let Some(dd) = d {
+            agg_by_entry_id.insert(dd.2, dd.0);
+        }
         // compete_from_indices: target wins strictly (t > d); ties go to the decoy. Scores are
         // finite SVM discriminants, so `t <= d` reproduces the C# `!(t.score > d.score)`.
         let decoy_wins = match (t, d) {
@@ -332,9 +364,19 @@ pub fn compute_full_population_fdr_streaming(
     let sorted_base_id: Vec<u32> = perm.iter().map(|&i| exp_base_id[i]).collect();
     let mut q_exp = vec![0.0f64; w];
     compute_conservative_qvalues(&sorted_score, &sorted_decoy, &mut q_exp);
-    let mut base_id_exp_q: HashMap<u32, f64> = HashMap::with_capacity(w);
+    // Keyed by the WINNER's full entry_id, decoy bit intact — never the shared base_id.
+    // `sorted_decoy` carries which side won, so the winner's entry_id is reconstructible here
+    // without a second array, leaving the competition's sort and tie-break untouched. See
+    // `compute_experiment_precursor_qvalues` (osprey-fdr) for the defect this closes: on
+    // base_id, a target whose DECOY won inherited the winner's q.
+    let mut exp_q_by_winner_id: HashMap<u32, f64> = HashMap::with_capacity(w);
     for i in 0..w {
-        base_id_exp_q.insert(sorted_base_id[i], q_exp[i]);
+        let winner_id = if sorted_decoy[i] {
+            sorted_base_id[i] | !BASE_ID_MASK
+        } else {
+            sorted_base_id[i]
+        };
+        exp_q_by_winner_id.insert(winner_id, q_exp[i]);
     }
 
     let pep_estimator = PepEstimator::fit_default(&exp_score, &exp_is_decoy);
@@ -347,8 +389,10 @@ pub fn compute_full_population_fdr_streaming(
         survivor_run_q.entry(key).or_insert(1.0);
 
         if multi_file {
-            // Experiment q = base_id winner q, floored up to this precursor's best run q.
-            let mut eq = base_id_exp_q.get(&bid).copied().unwrap_or(1.0);
+            // Experiment q = the winner's q, floored up to this precursor's best run q. Full
+            // entry_id: an entry takes the experiment q only when it was the side that WON its
+            // own target/decoy competition. The loser keeps 1.0.
+            let mut eq = exp_q_by_winner_id.get(&eid).copied().unwrap_or(1.0);
             let floor_q = min_run_q.get(&eid).copied().unwrap_or(1.0);
             if eq < floor_q {
                 eq = floor_q;
@@ -370,7 +414,12 @@ pub fn compute_full_population_fdr_streaming(
         survivor_pep.insert(key, pep);
     }
 
-    (survivor_run_q, survivor_exp_q, survivor_pep)
+    (
+        survivor_run_q,
+        survivor_exp_q,
+        survivor_pep,
+        agg_by_entry_id,
+    )
 }
 
 #[cfg(test)]
@@ -394,8 +443,16 @@ mod tests {
         let survivors = vec![(0usize, 1u32), (0, 2), (1, 1)];
         let overrides: HashMap<(usize, u32), f64> = HashMap::new();
 
-        let (run_q, exp_q, pep) =
+        let (run_q, exp_q, pep, agg) =
             compute_full_population_fdr_streaming(2, read, &overrides, &survivors, None);
+
+        // Every entry that took part in the (unstratified) experiment fold has an aggregate:
+        // the max of its score over the files it was observed in. base_id 1's target is seen
+        // at 5.0 and 4.5, so its aggregate is the larger.
+        assert_eq!(agg.get(&1u32).copied(), Some(5.0));
+        assert_eq!(agg.get(&(1 | DECOY)).copied(), Some(1.0));
+        assert_eq!(agg.get(&2u32).copied(), Some(2.0));
+        assert_eq!(agg.get(&(2 | DECOY)).copied(), Some(3.0));
 
         for key in &survivors {
             let rq = *run_q.get(key).expect("run_q missing a survivor");
@@ -417,13 +474,16 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert((0usize, 1u32), 9.0); // strong override for the target
 
-        let (run_q, exp_q, _pep) =
+        let (run_q, exp_q, _pep, agg) =
             compute_full_population_fdr_streaming(1, read, &overrides, &survivors, None);
 
         // Single file → experiment q == run q, and the survivor is covered.
         let rq = *run_q.get(&(0, 1)).expect("run_q missing");
         assert_eq!(rq, exp_q[&(0, 1)]);
         assert!(rq >= 0.0 && rq.is_finite());
+        // The aggregate is the score the competition ranked the entry on — the override, not
+        // the sidecar score it replaced.
+        assert_eq!(agg.get(&1u32).copied(), Some(9.0));
     }
 
     /// A non-null stratum restricts the competition to its base_ids: an off-stratum survivor
@@ -442,7 +502,7 @@ mod tests {
         let overrides: HashMap<(usize, u32), f64> = HashMap::new();
         let stratum: HashSet<u32> = [1u32].into_iter().collect(); // only base_id 1
 
-        let (run_q, _exp, _pep) =
+        let (run_q, _exp, _pep, agg) =
             compute_full_population_fdr_streaming(1, read, &overrides, &survivors, Some(&stratum));
 
         assert!(
@@ -453,6 +513,14 @@ mod tests {
             run_q.get(&(0, 2)).copied(),
             Some(1.0),
             "off-stratum survivor should fall to the default q=1.0"
+        );
+        // The experiment fold is the STRATUM only, so an off-stratum entry has no aggregate
+        // here — absence is the signal that tells the caller to keep its pass-1 value.
+        assert_eq!(agg.get(&1u32).copied(), Some(5.0));
+        assert_eq!(
+            agg.get(&2u32).copied(),
+            None,
+            "off-stratum entry must not get an aggregate from this competition"
         );
     }
 }

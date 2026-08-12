@@ -1339,19 +1339,32 @@ fn compute_per_run_peptide_qvalues(
 
 /// Compute experiment-level precursor q-values (across all files).
 ///
-/// Propagates the winner's q-value to every observation sharing the
-/// same `base_id` (target and decoy). The streaming path
-/// (`run_percolator_fdr_streaming` in `crates/osprey/src/pipeline.rs`)
-/// already does this via its `base_id_exp_prec_q` map; the direct
-/// path used to assign the q-value only to the single winner,
-/// leaving every non-winning per-file observation at q=1.0. That
-/// undercount silently broke downstream stages that gate on
-/// `experiment_precursor_qvalue` (Stage 6 consensus selection /
-/// calibration refit, Stage 7 protein FDR) on multi-file inputs
-/// using the direct path (Stellar 3-file, ~393K entries below the
-/// 600K streaming threshold). The OspreySharp port matched the
-/// streaming path's "propagate to all base_id observations"
+/// Propagates the winner's q-value to every observation of the WINNING
+/// entry — keyed by full `entry_id`, decoy bit intact. The streaming
+/// path (`compute_fdr_from_stubs`) does the same; the direct path used
+/// to assign the q-value only to the single winner, leaving every
+/// non-winning per-file observation at q=1.0. That undercount silently
+/// broke downstream stages that gate on `experiment_precursor_qvalue`
+/// (Stage 6 consensus selection / calibration refit, Stage 7 protein
+/// FDR) on multi-file inputs using the direct path (Stellar 3-file,
+/// ~393K entries below the 600K streaming threshold). The OspreySharp
+/// port matched the streaming path's "propagate to all observations"
 /// semantics, so the direct path was the divergent side.
+///
+/// What the propagation must NOT do is cross the target/decoy boundary,
+/// and keying on `base_id` did: a target and its decoy SHARE a base_id,
+/// so when the decoy won the competition the target inherited the
+/// winner's q. Measured on the 82-file SEA-AD run before the fix: 5
+/// accepted precursors carried their paired decoy's q to 12 decimal
+/// places while scoring below it — e.g. base 1205336, target aggregate
+/// -0.0521 against its decoy's +1.5943, both reporting q=0.004766. Those
+/// 5 are reported at q <= 1% having LOST their pair, and they drag any
+/// score-space acceptance boundary built from the accepted set onto the
+/// DECOY's scale. The loser of a competition is not in the ranking, so
+/// it keeps the 1.0 default, which is what target-decoy competition
+/// means — the same rule `clamp_experiment_q_to_best_run` already states
+/// for the run-level floors. Mirrors C#
+/// `PercolatorQValues.ComputeExperimentPrecursorQMap`.
 fn compute_experiment_precursor_qvalues(
     scores: &[f64],
     labels: &[bool],
@@ -1366,18 +1379,18 @@ fn compute_experiment_precursor_qvalues(
     let ws: Vec<f64> = winner_indices.iter().map(|&i| scores[i]).collect();
     compute_conservative_qvalues(&ws, &winner_is_decoy, &mut q);
 
-    // Build base_id -> winner q-value map (one entry per base_id, since
+    // Build winner entry_id -> q-value map (one entry per base_id, since
     // compete_all picks a single winner per base_id).
-    let mut base_id_q: HashMap<u32, f64> = HashMap::with_capacity(winner_indices.len());
+    let mut exp_q_by_winner_id: HashMap<u32, f64> = HashMap::with_capacity(winner_indices.len());
     for (rank, &idx) in winner_indices.iter().enumerate() {
-        let base_id = entry_ids[idx] & 0x7FFF_FFFF;
-        base_id_q.insert(base_id, q[rank]);
+        exp_q_by_winner_id.insert(entry_ids[idx], q[rank]);
     }
 
-    // Propagate winner's q-value to every observation of that base_id.
+    // Propagate the winner's q-value to every observation of the winning entry.
+    // Full entry_id, NOT the base id: an entry takes the q only when it was the
+    // side that won its own competition. See the doc comment for why.
     for i in 0..n {
-        let base_id = entry_ids[i] & 0x7FFF_FFFF;
-        if let Some(&qv) = base_id_q.get(&base_id) {
+        if let Some(&qv) = exp_q_by_winner_id.get(&entry_ids[i]) {
             qvalues[i] = qv;
         }
     }
@@ -2324,10 +2337,28 @@ pub fn compute_fdr_from_stubs(
         let mut exp_q = vec![1.0; exp_winners.len()];
         compute_conservative_qvalues(&exp_w_scores, &exp_w_decoy, &mut exp_q);
 
-        // Map base_id -> experiment precursor q-value (for winners only)
-        let mut base_id_exp_prec_q: HashMap<u32, f64> = HashMap::new();
-        for (rank, &(_, _, base_id)) in exp_winners.iter().enumerate() {
-            base_id_exp_prec_q.insert(base_id, exp_q[rank]);
+        // Map the WINNER's full entry_id (decoy bit intact) -> experiment precursor q-value.
+        //
+        // The reason for a map at all is unchanged: it assigns the q to every per-file
+        // observation of the winning precursor, so that non-winning observations of a
+        // multi-file precursor do not stay at q=1.0 and leave Stage 6 calibration refit and
+        // reconciliation missing the bulk of the consensus pool. An entry_id key still does
+        // that — all observations of one entry share an entry_id across files.
+        //
+        // What it must NOT do is cross the target/decoy boundary, and a base_id key did: a
+        // target and its decoy SHARE a base_id, so when the decoy won the competition the
+        // target inherited the winner's q. See `compute_experiment_precursor_qvalues` for the
+        // measurement. `is_decoy` carries which side won, so the winner's entry_id is
+        // reconstructible here without a second array, leaving the competition's sort and
+        // tie-break untouched. Mirrors C# `StreamingFirstPassQ.BuildExperimentPrecursorQMap`.
+        let mut exp_q_by_winner_id: HashMap<u32, f64> = HashMap::new();
+        for (rank, &(_, is_decoy, base_id)) in exp_winners.iter().enumerate() {
+            let winner_id = if is_decoy {
+                base_id | 0x8000_0000
+            } else {
+                base_id
+            };
+            exp_q_by_winner_id.insert(winner_id, exp_q[rank]);
         }
 
         drop(best_target);
@@ -2395,7 +2426,12 @@ pub fn compute_fdr_from_stubs(
                         continue;
                     }
                 }
-                let prec_q = base_id_exp_prec_q.get(&base_id).copied().unwrap_or(1.0);
+                // Full entry_id, NOT the base id: an entry takes the experiment q only when
+                // it was the side that WON its own competition. The loser keeps 1.0.
+                let prec_q = exp_q_by_winner_id
+                    .get(&entry.entry_id)
+                    .copied()
+                    .unwrap_or(1.0);
                 let pept_q = peptide_exp_q
                     .get(&*entry.modified_sequence)
                     .copied()
@@ -2805,6 +2841,40 @@ mod tests {
             qvalues[2] <= 1.0,
             "Best target should have a q-value assigned"
         );
+    }
+
+    /// The experiment precursor q propagates to every observation of the WINNING entry, and
+    /// stops at the target/decoy boundary: the side that LOST its competition keeps the 1.0
+    /// default. Keying the propagation on base_id (which a target and its decoy share) handed
+    /// the loser the winner's q — see `compute_experiment_precursor_qvalues`.
+    #[test]
+    fn test_experiment_precursor_q_does_not_cross_target_decoy() {
+        const DECOY: u32 = 0x8000_0000;
+        // base 1: target wins, observed twice (two files). bases 2 and 3: target wins.
+        // base 4: the DECOY wins, and it does so at a score good enough for a q below 1.
+        let scores = vec![10.0, 1.0, 9.5, 9.0, 0.9, 8.0, 0.8, -1.0, 5.0];
+        let labels = vec![false, true, false, false, true, false, true, false, true];
+        let entry_ids: Vec<u32> = vec![1, 1 | DECOY, 1, 2, 2 | DECOY, 3, 3 | DECOY, 4, 4 | DECOY];
+
+        let q = compute_experiment_precursor_qvalues(&scores, &labels, &entry_ids);
+
+        // Both observations of the winning target entry carry the winner's q — the reason the
+        // propagation exists at all.
+        assert_eq!(q[0], q[2], "every observation of the winner takes its q");
+        assert!(
+            q[0] < 1.0,
+            "the top target should win a real q, got {}",
+            q[0]
+        );
+        // The losing decoy of base 1 keeps the default.
+        assert_eq!(q[1], 1.0, "a decoy whose target won keeps q=1.0");
+        // base 4: the decoy won, so IT takes the q and its target keeps the default.
+        assert!(
+            q[8] < 1.0,
+            "the winning decoy should take a real q, got {}",
+            q[8]
+        );
+        assert_eq!(q[7], 1.0, "a target whose decoy won must NOT inherit its q");
     }
 
     /// Verifies that experiment-level peptide q-values aggregate by peptide sequence,

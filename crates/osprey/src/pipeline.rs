@@ -6510,7 +6510,7 @@ fn compute_pass2_transfer_compete(
             }
         }
     };
-    let (run_q, exp_q, pep) = crate::pass2_qvalue::compute_full_population_fdr_streaming(
+    let (run_q, exp_q, pep, exp_agg) = crate::pass2_qvalue::compute_full_population_fdr_streaming(
         n_files,
         read_file,
         &survivor_score_override,
@@ -6597,6 +6597,20 @@ fn compute_pass2_transfer_compete(
             // Precursor-level path: keep peptide q in step with precursor q for the reported set.
             e.run_peptide_qvalue = rq;
             e.experiment_peptide_qvalue = exp_q[&key];
+            // The aggregate MUST move with the q above. This mode recomputes experiment q from
+            // a fresh full-population competition, so the pass-1 aggregate
+            // `restore_pass1_scalars` seeded is no longer the score that q was ranked on — and
+            // this is the DEFAULT mode, so leaving it stale is not an edge case. Measured cost
+            // of the omission on the C# side: the co-assignment panel's experiment boundary is a
+            // minimum over accepted precursors' aggregates, so entries still holding the 0.0
+            // reset default dragged it to 0.0 and admitted the entire decoy pool.
+            //
+            // An absent entry_id never entered the experiment fold (off-stratum under
+            // protein-compact); those keep the pass-1 value, which is correct because they keep
+            // the pass-1 experiment q too — the branch above.
+            if let Some(&agg) = exp_agg.get(&e.entry_id) {
+                e.experiment_aggregate_score = agg;
+            }
             n_mapped += 1;
         }
     }
