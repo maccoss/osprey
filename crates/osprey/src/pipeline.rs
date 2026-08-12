@@ -5712,15 +5712,19 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             log::info!("Second-pass FDR");
 
             // Stage 6's post-rescore overlay replaces each touched stub with a fresh
-            // `to_fdr_entry()`, resetting eight fields. Pass 2 recomputes only five of them, and
-            // which five depends on the mode and on whether a survivor is on-stratum, so three
-            // can reach the 2nd-pass sidecar at their reset defaults:
-            //   score              - no frozen mode wrote one back at all
-            //   pep                - written only on the on-stratum path
-            //   experiment_protein_qvalue - written by NO mode; first-pass protein FDR is its only
-            //                        producer, and the second-pass one writes
-            //                        experiment_protein_qvalue instead
-            // Seeding all three from the 1st-pass sidecar reproduces exactly what the
+            // `to_fdr_entry()`, resetting eight fields - one for every scalar the v4 record
+            // carries. Pass 2 recomputes only five of them, and which five depends on the mode
+            // and on whether a survivor is on-stratum, so three can reach the 2nd-pass sidecar
+            // at their reset defaults:
+            //   score                      - no frozen mode wrote one back at all
+            //   pep                        - written only on the on-stratum path
+            //   experiment_aggregate_score - the third field of the same gap (sidecar v4); no
+            //                                frozen mode writes it back either
+            // `experiment_protein_qvalue` is the fourth field no 2nd-pass mode writes back, and
+            // it is deliberately NOT seeded here: its pass-2 producer is
+            // `patch_pass2_protein_qvalues`, which runs once the second-pass protein FDR has
+            // computed the value (#4559).
+            // Seeding those three from the 1st-pass sidecar reproduces exactly what the
             // distributed route has in hand here, which is why that route never showed the loss:
             // it must rehydrate from that same sidecar. Whatever pass 2 genuinely recomputes then
             // overwrites the seed. Ahead of the mode dispatch because the loss is not specific to
@@ -5921,11 +5925,6 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             parsimony.groups.len()
         );
 
-        // Stage 7 cross-impl bisection dump (no-op unless
-        // OSPREY_DUMP_STAGE7_PROTEIN_FDR=1). Fires before propagation so the
-        // dumped state captures the picked-protein computation in isolation.
-        crate::diagnostics::dump_stage7_protein_fdr(&parsimony, &protein_fdr_result);
-
         // Propagate the AUTHORITATIVE second-pass protein q-values onto the stubs, replacing
         // the first-pass values the Stage-5 call left there. Every gate that consumes the
         // first-pass value (compaction protein-rescue, consensus rescue) has already run, and
@@ -5935,7 +5934,18 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // The 2nd-pass sidecar was written before this protein FDR ran - it is one of its
         // inputs - so the protein column it carries is still the pass-1 value at this point.
         // Patch it now that the pass-2 value exists (issue #4559).
+        // This MUST precede the dump below: OSPREY_STAGE7_PROTEIN_FDR_ONLY ends the process
+        // there, and an unpatched record keeps whatever it held when the sidecar was written -
+        // the reset default for every entry Stage 6 rescored or gap-filled, since
+        // restore_pass1_scalars no longer seeds this field.
         patch_pass2_protein_qvalues(&per_file_entries, &config);
+
+        // Stage 7 cross-impl bisection dump (no-op unless
+        // OSPREY_DUMP_STAGE7_PROTEIN_FDR=1). It reads only the parsimony / FDR result, never
+        // the stubs, so its content is identical whether it runs before or after propagation;
+        // it sits after the patch so the *_ONLY early exit cannot skip that. Same order as the
+        // C# side in SecondPassFdrTask.RunProteinFdr.
+        crate::diagnostics::dump_stage7_protein_fdr(&parsimony, &protein_fdr_result);
 
         let protein_report_path = config.output_blib.with_extension("proteins.csv");
         if let Err(e) = protein::write_protein_report(
@@ -6385,6 +6395,15 @@ fn patch_pass2_protein_qvalues(
             continue;
         }
         let n = (data.len() - FDR_SIDECAR_HEADER_LEN) / FDR_SIDECAR_RECORD_LEN;
+        // The header's own record count must agree with the file length - the same identity the
+        // C# reader enforces (FdrScoresSidecar.TryComputeExpectedLen). A file truncated mid-write
+        // can still satisfy the stride test above, so without this a partial file would be
+        // silently patched and kept.
+        let header_count = u64::from_le_bytes(data[16..24].try_into().unwrap());
+        if header_count != n as u64 {
+            failed.push(file_name.clone());
+            continue;
+        }
         let mut patched_this_file = 0usize;
         for i in 0..n {
             let off = FDR_SIDECAR_HEADER_LEN + i * FDR_SIDECAR_RECORD_LEN;
@@ -6394,7 +6413,13 @@ fn patch_pass2_protein_qvalues(
                 patched_this_file += 1;
             }
         }
-        if std::fs::write(&path, &data).is_err() {
+        // Write-then-rename rather than std::fs::write, which truncates the destination and
+        // rewrites in place: an error or a kill part-way through that would DESTROY a complete
+        // sidecar. The C# side promises the same thing through FileSaver, and this is a patch of
+        // a file the run already produced, so losing it is worse than not patching it.
+        let tmp_path = path.with_extension("protein-patch.tmp");
+        if std::fs::write(&tmp_path, &data).is_err() || std::fs::rename(&tmp_path, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
             failed.push(file_name.clone());
             continue;
         }
@@ -6404,13 +6429,15 @@ fn patch_pass2_protein_qvalues(
 
     // Reported, not fatal: nothing in this process reads the 2nd-pass sidecar's protein column,
     // so a failed patch cannot corrupt this run's output. It DOES leave a file whose protein
-    // column is a pass-1 value while its header says pass 2, which is precisely the state #4559
-    // existed to remove - so the warning names that.
+    // column is not a pass-2 value while its header says pass 2, which is precisely the state
+    // #4559 existed to remove - so the warning names that.
     if !failed.is_empty() {
         log::warn!(
             "Could not patch the second-pass protein q-value into the 2nd-pass FDR sidecar for \
-             {} file(s): [{}]. Those files keep a FIRST-pass protein q-value in a pass-2 file; \
-             any consumer joining on it is reading the wrong pass.",
+             {} file(s): [{}]. Those files carry no pass-2 protein q-value: each record keeps \
+             what it held when the sidecar was written, which is the reset default for every \
+             entry Stage 6 rescored or gap-filled and a pass-1 value only for entries Stage 6 \
+             left alone. Any consumer joining on that column is reading the wrong pass.",
             failed.len(),
             failed.join(", ")
         );
@@ -6422,7 +6449,8 @@ fn patch_pass2_protein_qvalues(
     );
 }
 
-/// Re-seed each survivor's `score` and `pep` from that file's `.1st-pass.fdr_scores.bin`.
+/// Re-seed each survivor's `score`, `pep` and `experiment_aggregate_score` from that file's
+/// `.1st-pass.fdr_scores.bin`.
 ///
 /// These are the fields Stage 6's overlay resets (it replaces the stub with a fresh
 /// `to_fdr_entry()`) that pass 2 does not reliably recompute: no frozen mode wrote `score` at
