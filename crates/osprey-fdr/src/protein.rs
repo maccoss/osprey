@@ -845,27 +845,26 @@ pub fn collect_best_peptide_scores(
 
 /// Propagate protein q-values to FdrEntry stubs.
 ///
-/// Sets `run_protein_qvalue` and/or `experiment_protein_qvalue` on each entry
-/// based on the protein FDR results.
+/// Assigns by `modified_sequence` over EVERY entry, whether or not it passed anything - a
+/// peptide's protein q is a property of the peptide, so an entry that lost its own
+/// competition still carries its protein's value.
+///
+/// Both passes call this. Which pass produced a value is recorded by the sidecar it is
+/// written to, not by writing a second field: the first-pass call's result is captured into
+/// the 1st-pass sidecar, and the second-pass call overwrites it in memory before the 2nd-pass
+/// sidecar is patched. The former `set_run` / `set_experiment` pair existed only to feed two
+/// fields that were the same quantity from different passes.
 pub fn propagate_protein_qvalues(
     per_file_entries: &mut [(String, Vec<FdrEntry>)],
     protein_fdr: &ProteinFdrResult,
-    set_run: bool,
-    set_experiment: bool,
 ) {
     for (_, entries) in per_file_entries.iter_mut() {
         for entry in entries.iter_mut() {
-            let q = protein_fdr
+            entry.experiment_protein_qvalue = protein_fdr
                 .peptide_qvalues
                 .get(&*entry.modified_sequence)
                 .copied()
                 .unwrap_or(1.0);
-            if set_run {
-                entry.run_protein_qvalue = q;
-            }
-            if set_experiment {
-                entry.experiment_protein_qvalue = q;
-            }
         }
     }
 }
@@ -1350,7 +1349,6 @@ mod tests {
                     score: 3.0,
                     run_precursor_qvalue: 0.001,
                     run_peptide_qvalue: 0.002,
-                    run_protein_qvalue: 1.0,
                     experiment_precursor_qvalue: 1.0,
                     experiment_peptide_qvalue: 1.0,
                     experiment_protein_qvalue: 1.0,
@@ -1371,7 +1369,6 @@ mod tests {
                     score: 5.0,
                     run_precursor_qvalue: 0.05,
                     run_peptide_qvalue: 0.06,
-                    run_protein_qvalue: 1.0,
                     experiment_precursor_qvalue: 1.0,
                     experiment_peptide_qvalue: 1.0,
                     experiment_protein_qvalue: 1.0,

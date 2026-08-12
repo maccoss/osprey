@@ -3193,7 +3193,6 @@ mod tests {
             score,
             run_precursor_qvalue: 1.0,
             run_peptide_qvalue: 1.0,
-            run_protein_qvalue: 1.0,
             experiment_precursor_qvalue: 1.0,
             experiment_peptide_qvalue: 1.0,
             experiment_protein_qvalue: 1.0,

@@ -499,7 +499,7 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
     // `select_post_fdr_consensus` + downstream scoring see entries
     // that the in-process flow filtered out — observed as a 324-row
     // divergence in median_polish features (Session 5 bisection).
-    // The .fdr_scores.bin v3 sidecar carries `run_protein_qvalue`
+    // The .fdr_scores.bin v3 sidecar carries `experiment_protein_qvalue`
     // precisely so this step works whether or not `--protein-fdr` is
     // set.
     //
@@ -517,7 +517,7 @@ pub fn run_rescore(config: OspreyConfig, library: Vec<LibraryEntry>) -> Result<(
             for e in entries {
                 if !e.is_decoy
                     && (e.run_peptide_qvalue <= peptide_gate
-                        || e.run_protein_qvalue <= protein_gate)
+                        || e.experiment_protein_qvalue <= protein_gate)
                 {
                     first_pass_base_ids.insert(e.entry_id & 0x7FFF_FFFF);
                 }

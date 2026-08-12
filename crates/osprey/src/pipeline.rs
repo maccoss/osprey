@@ -1780,9 +1780,9 @@ fn fdr_scores_path_pass2(
 // including the information needed to apply the same compaction
 // predicate (peptide-FDR OR protein-rescue). The persist call is
 // placed AFTER `propagate_protein_qvalues` populates
-// `run_protein_qvalue` on every stub so the persisted value is
+// `experiment_protein_qvalue` on every stub so the persisted value is
 // real (not the default 1.0); see the v3 release note below for
-// why `run_protein_qvalue` is in the record. The call site is in
+// why `experiment_protein_qvalue` is in the record. The call site is in
 // the first-pass FDR block in `run_analysis`, just before the
 // compaction loop runs. Each
 // record carries the entry's `entry_id` for identity verification
@@ -1808,15 +1808,15 @@ fn fdr_scores_path_pass2(
 //                              [28..36] experiment_precursor_qvalue  f64 LE
 //                              [36..44] experiment_peptide_qvalue    f64 LE
 //                              [44..52] pep                          f64 LE
-//                              [52..60] run_protein_qvalue           f64 LE
+//                              [52..60] experiment_protein_qvalue    f64 LE
 //                              [60..68] experiment_aggregate_score   f64 LE
 //
 // Total file size is `32 + 68 * entry_count`.
 //
-// v2 → v3 (2026-05-02): added `run_protein_qvalue` to support the
+// v2 → v3 (2026-05-02): added `experiment_protein_qvalue` to support the
 // Stage 6 worker's compaction step. The in-process pipeline filters
 // pre-Stage-6 entries by `run_peptide_qvalue <= 0.01` OR
-// `run_protein_qvalue <= 0.01` (the protein-rescue branch); the v2
+// `experiment_protein_qvalue <= 0.01` (the protein-rescue branch); the v2
 // sidecar carried only the first half of that predicate, so a
 // rehydrated worker couldn't reproduce in-process compaction when
 // `--protein-fdr` is set. v3 closes that gap.
@@ -1872,7 +1872,7 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
         record[28..36].copy_from_slice(&entry.experiment_precursor_qvalue.to_le_bytes());
         record[36..44].copy_from_slice(&entry.experiment_peptide_qvalue.to_le_bytes());
         record[44..52].copy_from_slice(&entry.pep.to_le_bytes());
-        record[52..60].copy_from_slice(&entry.run_protein_qvalue.to_le_bytes());
+        record[52..60].copy_from_slice(&entry.experiment_protein_qvalue.to_le_bytes());
         record[60..68].copy_from_slice(&entry.experiment_aggregate_score.to_le_bytes());
         file.write_all(&record)
             .map_err(|e| OspreyError::OutputError(format!("Failed to write record: {}", e)))?;
@@ -1916,7 +1916,7 @@ pub(crate) fn read_fdr_scores_experiment_q(
     Some(out)
 }
 
-/// Read `entry_id -> (score, pep, run_protein_qvalue)` from an FDR scores sidecar. These are the
+/// Read `entry_id -> (score, pep, experiment_protein_qvalue)` from an FDR scores sidecar. These are the
 /// three fields Stage 6's overlay resets that pass 2 does not reliably recompute. Returns `None`
 /// on any header/size mismatch, exactly as `read_fdr_scores_experiment_q` does. Mirrors the C#
 /// `FdrScoresSidecar.ReadRecords` reads of bytes 4, 44 and 52.
@@ -2115,7 +2115,8 @@ pub(crate) fn load_fdr_scores_sidecar(
         entry.experiment_peptide_qvalue =
             f64::from_le_bytes(data[off + 36..off + 44].try_into().unwrap());
         entry.pep = f64::from_le_bytes(data[off + 44..off + 52].try_into().unwrap());
-        entry.run_protein_qvalue = f64::from_le_bytes(data[off + 52..off + 60].try_into().unwrap());
+        entry.experiment_protein_qvalue =
+            f64::from_le_bytes(data[off + 52..off + 60].try_into().unwrap());
         entry.experiment_aggregate_score =
             f64::from_le_bytes(data[off + 60..off + 68].try_into().unwrap());
     }
@@ -2711,7 +2712,6 @@ fn load_scores_parquet(path: &std::path::Path) -> Result<Vec<CoelutionScoredEntr
                 file_name: file_names.value(row).to_string(),
                 run_precursor_qvalue: 1.0,
                 run_peptide_qvalue: 1.0,
-                run_protein_qvalue: 1.0,
                 experiment_precursor_qvalue: 1.0,
                 experiment_peptide_qvalue: 1.0,
                 experiment_protein_qvalue: 1.0,
@@ -3037,7 +3037,6 @@ pub(crate) fn load_fdr_stubs_from_parquet(
                 score: 0.0,
                 run_precursor_qvalue: 1.0,
                 run_peptide_qvalue: 1.0,
-                run_protein_qvalue: 1.0,
                 experiment_precursor_qvalue: 1.0,
                 experiment_peptide_qvalue: 1.0,
                 experiment_protein_qvalue: 1.0,
@@ -4886,7 +4885,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     if can_skip_fdr {
         if config.expect_reconciled_input {
             // `--join-at-pass=2`: q-values come straight from the v3 sidecar
-            // record (entry_id + score + 4 q-values + pep + run_protein_qvalue).
+            // record (entry_id + score + 4 q-values + pep + experiment_protein_qvalue).
             // Calling compute_fdr_from_stubs would re-derive them from the
             // currently-loaded scores, which DRIFTS from the original Stage 5
             // run when the sidecar swap below kicks in (1st-pass scores during
@@ -4961,9 +4960,9 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // Persist first-pass SVM scores to sidecar files. In
         // The 1st-pass fdr_scores.bin sidecar write is deferred to AFTER
         // first-pass protein FDR runs below — v3 of the sidecar carries
-        // `run_protein_qvalue` so the Stage 6 worker can apply the same
+        // `experiment_protein_qvalue` so the Stage 6 worker can apply the same
         // protein-rescue compaction predicate the in-process pipeline
-        // does. Writing here would persist a default `run_protein_qvalue
+        // does. Writing here would persist a default `experiment_protein_qvalue
         // = 1.0` and silently break protein-rescue parity in the worker.
     }
 
@@ -4985,12 +4984,12 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // decoys paired with non-passing targets, leaving picked-protein with a
     // one-sided comparison.
     //
-    // Produces run_protein_qvalue on every FdrEntry stub. Used downstream for:
+    // Produces experiment_protein_qvalue on every FdrEntry stub. Used downstream for:
     //   (a) protein-aware compaction (rescue borderline peptides from strong proteins)
     //   (b) reconciliation consensus selection (strong proteins anchor consensus)
     //
     // For `--join-at-pass=2` we also run this even when `can_skip_fdr` is true:
-    // skipping it would leave `run_protein_qvalue` at its default 1.0, which
+    // skipping it would leave `experiment_protein_qvalue` at its default 1.0, which
     // makes the protein-rescue branch of compaction below silently inactive
     // and lets the second-pass protein FDR see a different (pre-compaction)
     // pool than the straight-through pipeline does.
@@ -5035,14 +5034,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             &protein_fdr_result.peptide_qvalues,
         );
 
-        // Write first-pass protein q-values into FdrEntry.run_protein_qvalue.
-        // Do not set experiment_protein_qvalue yet — second-pass will overwrite it.
-        protein::propagate_protein_qvalues(
-            &mut per_file_entries,
-            &protein_fdr_result,
-            true,  // set_run
-            false, // set_experiment
-        );
+        // Write first-pass protein q-values into FdrEntry.experiment_protein_qvalue. The
+        // second-pass protein FDR overwrites this later; the pass-1 value is captured on the
+        // way past, into the 1st-pass sidecar, which is where the compaction protein-rescue
+        // gate reads it back from.
+        protein::propagate_protein_qvalues(&mut per_file_entries, &protein_fdr_result);
 
         let n_at_1pct = protein_fdr_result
             .group_qvalues
@@ -5073,7 +5069,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     }
 
     // Persist the 1st-pass fdr_scores.bin sidecar AFTER first-pass
-    // protein FDR has populated `run_protein_qvalue` on every stub.
+    // protein FDR has populated `experiment_protein_qvalue` on every stub.
     // Sidecar v3 carries that field so the Stage 6 worker can apply
     // the same protein-rescue compaction predicate the in-process
     // pipeline runs at the next code block. Still pre-compaction —
@@ -5138,7 +5134,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             // admission point carries them through (mirrors C# FirstJoinTask's expanded gate).
             !e.is_decoy
                 && (e.run_peptide_qvalue <= peptide_compaction_gate
-                    || e.run_protein_qvalue <= protein_compaction_gate
+                    || e.experiment_protein_qvalue <= protein_compaction_gate
                     || protein_compact_stratum
                         .as_ref()
                         .is_some_and(|s| s.contains(&(e.entry_id & 0x7FFF_FFFF))))
@@ -5721,7 +5717,7 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             // can reach the 2nd-pass sidecar at their reset defaults:
             //   score              - no frozen mode wrote one back at all
             //   pep                - written only on the on-stratum path
-            //   run_protein_qvalue - written by NO mode; first-pass protein FDR is its only
+            //   experiment_protein_qvalue - written by NO mode; first-pass protein FDR is its only
             //                        producer, and the second-pass one writes
             //                        experiment_protein_qvalue instead
             // Seeding all three from the 1st-pass sidecar reproduces exactly what the
@@ -5930,15 +5926,16 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // dumped state captures the picked-protein computation in isolation.
         crate::diagnostics::dump_stage7_protein_fdr(&parsimony, &protein_fdr_result);
 
-        // Propagate protein q-values into FdrEntry stubs — experiment side only.
-        // The run side was already set by first-pass protein FDR and is used
-        // only as a gate (not for final output).
-        protein::propagate_protein_qvalues(
-            &mut per_file_entries,
-            &protein_fdr_result,
-            false, // set_run: leave first-pass values in place
-            true,  // set_experiment: AUTHORITATIVE
-        );
+        // Propagate the AUTHORITATIVE second-pass protein q-values onto the stubs, replacing
+        // the first-pass values the Stage-5 call left there. Every gate that consumes the
+        // first-pass value (compaction protein-rescue, consensus rescue) has already run, and
+        // the value itself is preserved in the 1st-pass sidecar.
+        protein::propagate_protein_qvalues(&mut per_file_entries, &protein_fdr_result);
+
+        // The 2nd-pass sidecar was written before this protein FDR ran - it is one of its
+        // inputs - so the protein column it carries is still the pass-1 value at this point.
+        // Patch it now that the pass-2 value exists (issue #4559).
+        patch_pass2_protein_qvalues(&per_file_entries, &config);
 
         let protein_report_path = config.output_blib.with_extension("proteins.csv");
         if let Err(e) = protein::write_protein_report(
@@ -6328,21 +6325,122 @@ fn build_protein_compact_stratum(
     stratum
 }
 
-/// Re-seed each survivor's `score`, `pep` and `run_protein_qvalue` from that file's
-/// `.1st-pass.fdr_scores.bin`.
+/// Patch every file's `.2nd-pass.fdr_scores.bin` with the SECOND-pass
+/// `experiment_protein_qvalue`, so that column is a pass-2 value like every other column in
+/// that file (issue #4559).
 ///
-/// These are the three of the eight fields Stage 6's overlay resets (it replaces the stub with a
-/// fresh `to_fdr_entry()`) that pass 2 does not reliably recompute: no frozen mode wrote `score`
-/// at all, `pep` is written only for on-stratum survivors, and `run_protein_qvalue` is written by
-/// no mode at all. Left unseeded they reach the 2nd-pass sidecar at their reset defaults, where a
-/// q of 1.0 reads as a confident rejection and a `score` of 0 sits exactly ON the discriminant's
-/// accept/reject boundary.
+/// Must be called AFTER the second-pass protein FDR has propagated onto the entries, which is
+/// necessarily after the sidecar itself is written - the sidecar feeds that protein FDR. Hence
+/// a patch rather than a reordering, and a patch rather than a rewrite: `clamp_experiment_q`
+/// runs after this point, so re-serializing the whole record here would capture columns the
+/// 2nd-pass sidecar is not supposed to carry yet.
+///
+/// Why the column was a pass-1 value before: no pass-2 q-value mode writes a protein q at all -
+/// the first- and second-pass protein FDRs are its only producers - so the value present at
+/// sidecar-write time was whatever pass 1 left on the stub. Both routes copied it identically,
+/// which is why no two-route comparison could see it.
+///
+/// One file is resident at a time. A file with no 2nd-pass sidecar is skipped silently: the
+/// sidecar exists only where Stage 6 produced a reconciled parquet. Port of C#
+/// `Pass2FdrSidecar.PatchPass2ProteinQvalues`.
+fn patch_pass2_protein_qvalues(
+    per_file_entries: &[(String, Vec<FdrEntry>)],
+    config: &OspreyConfig,
+) {
+    let mut files_patched = 0usize;
+    let mut n_patched = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for (file_name, entries) in per_file_entries.iter() {
+        let input_file = match input_path_for_file_name(config, file_name) {
+            Some(p) => p,
+            None => continue,
+        };
+        let output_dir = config.resolve_output_dir(&input_file);
+        let path = fdr_scores_path_pass2(&input_file, &output_dir);
+        if !path.exists() {
+            continue;
+        }
+
+        let by_id: HashMap<u32, f64> = entries
+            .iter()
+            .map(|e| (e.entry_id, e.experiment_protein_qvalue))
+            .collect();
+
+        let mut data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => {
+                failed.push(file_name.clone());
+                continue;
+            }
+        };
+        // Same header validation the readers apply: a file this does not fully understand is
+        // left untouched rather than half-patched.
+        if data.len() < FDR_SIDECAR_HEADER_LEN
+            || &data[0..8] != FDR_SIDECAR_MAGIC
+            || data[8] != FDR_SIDECAR_VERSION
+            || data[9] != 2
+            || (data.len() - FDR_SIDECAR_HEADER_LEN) % FDR_SIDECAR_RECORD_LEN != 0
+        {
+            failed.push(file_name.clone());
+            continue;
+        }
+        let n = (data.len() - FDR_SIDECAR_HEADER_LEN) / FDR_SIDECAR_RECORD_LEN;
+        let mut patched_this_file = 0usize;
+        for i in 0..n {
+            let off = FDR_SIDECAR_HEADER_LEN + i * FDR_SIDECAR_RECORD_LEN;
+            let entry_id = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            if let Some(&q) = by_id.get(&entry_id) {
+                data[off + 52..off + 60].copy_from_slice(&q.to_le_bytes());
+                patched_this_file += 1;
+            }
+        }
+        if std::fs::write(&path, &data).is_err() {
+            failed.push(file_name.clone());
+            continue;
+        }
+        files_patched += 1;
+        n_patched += patched_this_file;
+    }
+
+    // Reported, not fatal: nothing in this process reads the 2nd-pass sidecar's protein column,
+    // so a failed patch cannot corrupt this run's output. It DOES leave a file whose protein
+    // column is a pass-1 value while its header says pass 2, which is precisely the state #4559
+    // existed to remove - so the warning names that.
+    if !failed.is_empty() {
+        log::warn!(
+            "Could not patch the second-pass protein q-value into the 2nd-pass FDR sidecar for \
+             {} file(s): [{}]. Those files keep a FIRST-pass protein q-value in a pass-2 file; \
+             any consumer joining on it is reading the wrong pass.",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
+    log::debug!(
+        "Patched the second-pass protein q-value onto {} record(s) across {} file(s).",
+        n_patched,
+        files_patched
+    );
+}
+
+/// Re-seed each survivor's `score` and `pep` from that file's `.1st-pass.fdr_scores.bin`.
+///
+/// These are the fields Stage 6's overlay resets (it replaces the stub with a fresh
+/// `to_fdr_entry()`) that pass 2 does not reliably recompute: no frozen mode wrote `score` at
+/// all, and `pep` is written only for on-stratum survivors. Left unseeded they reach the
+/// 2nd-pass sidecar at their reset defaults, where a q of 1.0 reads as a confident rejection
+/// and a `score` of 0 sits exactly ON the discriminant's accept/reject boundary.
 ///
 /// Seeding, not overriding: whatever pass 2 genuinely recomputes is written afterwards and wins.
 /// What is left is the pass-1 value, which is precisely what the distributed route holds at this
 /// point (it rehydrates from this same sidecar), so the routes agree by construction.
 ///
-/// A missing or unreadable sidecar is warned about, not fatal: none of the three is an input to a
+/// `experiment_protein_qvalue` was seeded here too until issue #4559. It should not be: the
+/// 2nd-pass sidecar's protein column is a SECOND-pass value, written by
+/// `patch_pass2_protein_qvalues` once the second-pass protein FDR has run. Seeding it here made
+/// a pass-1 value the one that column carried on every route - and because both routes copied
+/// the same wrong value, no two-route comparison could see it. One producer, not two.
+///
+/// A missing or unreadable sidecar is warned about, not fatal: neither field is an input to a
 /// pass-2 computation, and the frozen modes have their own fail-fast for a sidecar they genuinely
 /// need. Port of C# `Pass2FdrSidecar.RestorePass1Scalars`.
 fn restore_pass1_scalars(
@@ -6372,16 +6470,18 @@ fn restore_pass1_scalars(
         };
         files_read += 1;
         for e in entries.iter_mut() {
-            if let Some(&(score, pep, run_protein_q, experiment_aggregate_score)) =
+            if let Some(&(score, pep, _protein_q, experiment_aggregate_score)) =
                 by_id.get(&e.entry_id)
             {
                 e.score = score;
                 e.pep = pep;
-                e.run_protein_qvalue = run_protein_q;
-                // The fourth field the five-of-eight map-back drops. It is cleared by the
-                // Stage 6 reset like `score`, and no frozen pass-2 mode writes it back, so
-                // without this seed it persists at 0.0 for every peak Stage 6 touched -
-                // roughly 39% of records, and disproportionately decoys.
+                // `experiment_protein_qvalue` is deliberately NOT seeded - see the doc
+                // comment. `patch_pass2_protein_qvalues` writes the second-pass value into
+                // the 2nd-pass sidecar after the second-pass protein FDR (#4559).
+                //
+                // The aggregate IS still seeded: it is cleared by the Stage 6 reset like
+                // `score`, and an off-stratum survivor keeps its pass-1 aggregate because it
+                // keeps its pass-1 experiment q, so the seed is that value's only source.
                 e.experiment_aggregate_score = experiment_aggregate_score;
                 n_restored += 1;
             }
@@ -6390,7 +6490,7 @@ fn restore_pass1_scalars(
 
     if !unreadable.is_empty() {
         log::warn!(
-            "1st-pass score/pep/run_protein_qvalue/experiment_aggregate_score could not be \
+            "1st-pass score/pep/experiment_aggregate_score could not be \
              restored for {} file(s) (no readable 1st-pass sidecar): [{}]. Their 2nd-pass \
              sidecars will carry reset defaults for peaks Stage 6 changed.",
             unreadable.len(),
@@ -6398,7 +6498,7 @@ fn restore_pass1_scalars(
         );
     }
     log::debug!(
-        "Restored 1st-pass score/pep/run_protein_qvalue/experiment_aggregate_score onto {} \
+        "Restored 1st-pass score/pep/experiment_aggregate_score onto {} \
          survivor(s) across {} file(s).",
         n_restored,
         files_read
@@ -8569,7 +8669,6 @@ fn compute_features_at_peak(
         file_name: ctx.file_name.to_string(),
         run_precursor_qvalue: 1.0,
         run_peptide_qvalue: 1.0,
-        run_protein_qvalue: 1.0,
         experiment_precursor_qvalue: 1.0,
         experiment_peptide_qvalue: 1.0,
         experiment_protein_qvalue: 1.0,
@@ -10308,7 +10407,6 @@ mod tests {
             file_name: "test".into(),
             run_precursor_qvalue: 1.0,
             run_peptide_qvalue: 1.0,
-            run_protein_qvalue: 1.0,
             experiment_precursor_qvalue: 1.0,
             experiment_peptide_qvalue: 1.0,
             experiment_protein_qvalue: 1.0,
@@ -10431,7 +10529,6 @@ mod tests {
             file_name: "test".to_string(),
             run_precursor_qvalue: run_qvalue,
             run_peptide_qvalue: 1.0,
-            run_protein_qvalue: 1.0,
             experiment_precursor_qvalue: 1.0,
             experiment_peptide_qvalue: 1.0,
             experiment_protein_qvalue: 1.0,
@@ -10610,7 +10707,6 @@ mod tests {
             score: 0.0,
             run_precursor_qvalue: 1.0,
             run_peptide_qvalue: 1.0,
-            run_protein_qvalue: 1.0,
             experiment_precursor_qvalue: 1.0,
             experiment_peptide_qvalue: 1.0,
             experiment_protein_qvalue: 1.0,
@@ -11727,7 +11823,6 @@ mod tests {
                     score: 3.0,
                     run_precursor_qvalue: 0.005,
                     run_peptide_qvalue: 0.003,
-                    run_protein_qvalue: 1.0,
                     experiment_precursor_qvalue: 0.005,
                     experiment_peptide_qvalue: 0.003,
                     experiment_protein_qvalue: 1.0,
@@ -11749,7 +11844,6 @@ mod tests {
                     score: 1.0,
                     run_precursor_qvalue: 0.05,
                     run_peptide_qvalue: 0.003,
-                    run_protein_qvalue: 1.0,
                     experiment_precursor_qvalue: 0.05,
                     experiment_peptide_qvalue: 0.003,
                     experiment_protein_qvalue: 1.0,
@@ -11845,7 +11939,6 @@ mod tests {
                     score: 2.0,
                     run_precursor_qvalue: 0.02,
                     run_peptide_qvalue: 0.008,
-                    run_protein_qvalue: 1.0,
                     experiment_precursor_qvalue: 0.02,
                     experiment_peptide_qvalue: 0.008,
                     experiment_protein_qvalue: 1.0,
@@ -11867,7 +11960,6 @@ mod tests {
                     score: 1.0,
                     run_precursor_qvalue: 0.04,
                     run_peptide_qvalue: 0.008,
-                    run_protein_qvalue: 1.0,
                     experiment_precursor_qvalue: 0.04,
                     experiment_peptide_qvalue: 0.008,
                     experiment_protein_qvalue: 1.0,
@@ -12084,7 +12176,6 @@ mod tests {
             score,
             run_precursor_qvalue: q,
             run_peptide_qvalue: q + 1.0e-9,
-            run_protein_qvalue: 1.0,
             experiment_precursor_qvalue: q + 2.0e-9,
             experiment_peptide_qvalue: q + 3.0e-9,
             experiment_protein_qvalue: 1.0,
@@ -12199,7 +12290,7 @@ mod tests {
         assert_eq!(e7.experiment_precursor_qvalue, 0.001 + 2.0e-9);
         assert_eq!(e7.experiment_peptide_qvalue, 0.001 + 3.0e-9);
         assert_eq!(e7.pep, 0.01);
-        assert_eq!(e7.run_protein_qvalue, 1.0);
+        assert_eq!(e7.experiment_protein_qvalue, 1.0);
 
         let e9 = entries.iter().find(|e| e.entry_id == 9).unwrap();
         assert_eq!(e9.score, 1.5);
@@ -12208,7 +12299,7 @@ mod tests {
         assert_eq!(e9.experiment_precursor_qvalue, 0.02 + 2.0e-9);
         assert_eq!(e9.experiment_peptide_qvalue, 0.02 + 3.0e-9);
         assert_eq!(e9.pep, 0.2);
-        assert_eq!(e9.run_protein_qvalue, 1.0);
+        assert_eq!(e9.experiment_protein_qvalue, 1.0);
 
         // The planner's action survived, joined from entry_id onto the stub's vec index.
         assert_eq!(inputs.reconciliation_actions.len(), 1);
@@ -12233,11 +12324,11 @@ mod tests {
             make_fdr_entry(1, -3.4, 0.002, 0.05),
             make_fdr_entry(2, -3.3, 0.003, 0.08),
         ];
-        // Distinct run_protein_qvalue per entry so the round-trip assertion
+        // Distinct experiment_protein_qvalue per entry so the round-trip assertion
         // catches a writer that drops the field or zeros it.
-        entries[0].run_protein_qvalue = 0.0042;
-        entries[1].run_protein_qvalue = 0.0123;
-        entries[2].run_protein_qvalue = 0.95;
+        entries[0].experiment_protein_qvalue = 0.0042;
+        entries[1].experiment_protein_qvalue = 0.0123;
+        entries[2].experiment_protein_qvalue = 0.95;
         write_fdr_scores_sidecar(&path, &entries, 1).unwrap();
 
         // Cross-impl byte-parity hook: when the harness runs this test
@@ -12283,8 +12374,8 @@ mod tests {
             );
             assert_eq!(orig.pep.to_bits(), got.pep.to_bits());
             assert_eq!(
-                orig.run_protein_qvalue.to_bits(),
-                got.run_protein_qvalue.to_bits()
+                orig.experiment_protein_qvalue.to_bits(),
+                got.experiment_protein_qvalue.to_bits()
             );
         }
     }
@@ -12466,7 +12557,6 @@ mod tests {
             score: 0.0,
             run_precursor_qvalue: run_precursor_q,
             run_peptide_qvalue: run_peptide_q,
-            run_protein_qvalue: 1.0,
             experiment_precursor_qvalue: exp_precursor_q,
             experiment_peptide_qvalue: exp_peptide_q,
             experiment_protein_qvalue: 1.0,
