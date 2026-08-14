@@ -1708,6 +1708,7 @@ mod tests {
             experiment_peptide_qvalue: 0.1,
             experiment_protein_qvalue: 1.0,
             pep: 0.5,
+            experiment_aggregate_score: 0.0,
             modified_sequence: Arc::from("PEPTIDE"),
         }
     }

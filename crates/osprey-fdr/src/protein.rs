@@ -1355,6 +1355,7 @@ mod tests {
                     experiment_peptide_qvalue: 1.0,
                     experiment_protein_qvalue: 1.0,
                     pep: 0.001, // good PEP
+                    experiment_aggregate_score: 0.0,
                     modified_sequence: Arc::from("PEPTIDEA"),
                 },
                 FdrEntry {
@@ -1375,6 +1376,7 @@ mod tests {
                     experiment_peptide_qvalue: 1.0,
                     experiment_protein_qvalue: 1.0,
                     pep: 0.20, // worse PEP
+                    experiment_aggregate_score: 0.0,
                     modified_sequence: Arc::from("PEPTIDEA"),
                 },
             ],
