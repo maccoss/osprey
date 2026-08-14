@@ -84,7 +84,8 @@ pub fn compute_consensus_rts(
             return false;
         }
         entry.run_peptide_qvalue <= consensus_fdr
-            || (protein_fdr_threshold > 0.0 && entry.run_protein_qvalue <= protein_fdr_threshold)
+            || (protein_fdr_threshold > 0.0
+                && entry.experiment_protein_qvalue <= protein_fdr_threshold)
     };
 
     // 1. Collect target peptides passing run-level FDR (or rescued by protein FDR).
@@ -1200,7 +1201,6 @@ mod tests {
             score: 0.0,
             run_precursor_qvalue: experiment_qvalue,
             run_peptide_qvalue: experiment_qvalue,
-            run_protein_qvalue: 1.0,
             experiment_precursor_qvalue: experiment_qvalue,
             experiment_peptide_qvalue: experiment_qvalue,
             experiment_protein_qvalue: 1.0,
@@ -1223,7 +1223,7 @@ mod tests {
         score: f64,
         run_precursor_qvalue: f64,
         run_peptide_qvalue: f64,
-        run_protein_qvalue: f64,
+        experiment_protein_qvalue: f64,
     ) -> FdrEntry {
         FdrEntry {
             entry_id,
@@ -1238,10 +1238,9 @@ mod tests {
             score,
             run_precursor_qvalue,
             run_peptide_qvalue,
-            run_protein_qvalue,
             experiment_precursor_qvalue: run_precursor_qvalue,
             experiment_peptide_qvalue: run_peptide_qvalue,
-            experiment_protein_qvalue: run_protein_qvalue,
+            experiment_protein_qvalue,
             pep: 1.0,
             experiment_aggregate_score: 0.0,
             modified_sequence: Arc::from(modified_sequence),

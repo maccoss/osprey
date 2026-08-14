@@ -797,7 +797,7 @@ impl SearchXicDump {
 /// stable human inspection; `Compare-Percolator.ps1` hash-joins on the
 /// composite key and is sort-order-agnostic.
 ///
-/// `run_protein_qvalue` is the default `1.0` when this dump fires from
+/// `experiment_protein_qvalue` is the default `1.0` when this dump fires from
 /// `pipeline.rs` (the dump runs BEFORE first-pass protein FDR populates
 /// real values), and the real persisted value when this dump fires from
 /// `rescore::run_rescore` (the worker hydrates the v3 sidecar which
@@ -846,7 +846,7 @@ pub fn dump_stage5_percolator(per_file_entries: &[(String, Vec<osprey_core::FdrE
             format_f64_roundtrip(e.pep),
             format_f64_roundtrip(e.run_precursor_qvalue),
             format_f64_roundtrip(e.run_peptide_qvalue),
-            format_f64_roundtrip(e.run_protein_qvalue),
+            format_f64_roundtrip(e.experiment_protein_qvalue),
             format_f64_roundtrip(e.experiment_precursor_qvalue),
             format_f64_roundtrip(e.experiment_peptide_qvalue),
         )
@@ -923,7 +923,7 @@ pub fn dump_stage6_rescored(per_file_entries: &[(String, Vec<osprey_core::FdrEnt
             format_f64_roundtrip(e.pep),
             format_f64_roundtrip(e.run_precursor_qvalue),
             format_f64_roundtrip(e.run_peptide_qvalue),
-            format_f64_roundtrip(e.run_protein_qvalue),
+            format_f64_roundtrip(e.experiment_protein_qvalue),
             format_f64_roundtrip(e.experiment_precursor_qvalue),
             format_f64_roundtrip(e.experiment_peptide_qvalue),
         )
@@ -1229,7 +1229,7 @@ pub fn dump_stage6_inv_predict(records: &[InvPredictRecord]) {
 /// run q-value, min across files). `score` is the input ranking
 /// (max SVM discriminant across files). `protein_qvalue` is the
 /// propagated output -- the value `propagate_protein_qvalues` will
-/// write to `FdrEntry.run_protein_qvalue` (1.0 if the peptide is
+/// write to `FdrEntry.experiment_protein_qvalue` (1.0 if the peptide is
 /// not in `protein_fdr.peptide_qvalues`, matching the
 /// `propagate_protein_qvalues` default). Rows sorted by
 /// `(is_decoy, modified_sequence)` for stable diff.
@@ -1703,7 +1703,6 @@ mod tests {
             score,
             run_precursor_qvalue: 0.1,
             run_peptide_qvalue: 0.1,
-            run_protein_qvalue: 1.0,
             experiment_precursor_qvalue: 0.1,
             experiment_peptide_qvalue: 0.1,
             experiment_protein_qvalue: 1.0,

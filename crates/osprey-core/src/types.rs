@@ -961,13 +961,14 @@ pub struct CoelutionScoredEntry {
     pub run_precursor_qvalue: f64,
     /// Run-level peptide q-value (modified_sequence only, default 1.0)
     pub run_peptide_qvalue: f64,
-    /// Run-level protein q-value (picked-protein FDR, default 1.0)
-    pub run_protein_qvalue: f64,
     /// Experiment-level precursor q-value (modified_sequence + charge, default 1.0)
     pub experiment_precursor_qvalue: f64,
     /// Experiment-level peptide q-value (modified_sequence only, default 1.0)
     pub experiment_peptide_qvalue: f64,
-    /// Experiment-level protein q-value (picked-protein FDR, default 1.0)
+    /// Picked-protein FDR q-value (default 1.0). Experiment-scope in BOTH passes - the
+    /// first-pass protein FDR pools its detected peptides over every file and propagates one
+    /// value per peptide, so there is no per-run protein q. Which pass produced the value is
+    /// recorded by the sidecar it is written to, not by a second field.
     pub experiment_protein_qvalue: f64,
     /// SVM discriminant score (from Percolator/Mokapot, same score used for q-value and PEP)
     pub score: f64,
@@ -998,7 +999,6 @@ impl CoelutionScoredEntry {
             score: self.score,
             run_precursor_qvalue: self.run_precursor_qvalue,
             run_peptide_qvalue: self.run_peptide_qvalue,
-            run_protein_qvalue: self.run_protein_qvalue,
             experiment_precursor_qvalue: self.experiment_precursor_qvalue,
             experiment_peptide_qvalue: self.experiment_peptide_qvalue,
             experiment_protein_qvalue: self.experiment_protein_qvalue,
@@ -1050,13 +1050,14 @@ pub struct FdrEntry {
     pub run_precursor_qvalue: f64,
     /// Run-level peptide q-value (modified_sequence only, mutated by FDR)
     pub run_peptide_qvalue: f64,
-    /// Run-level protein q-value (picked-protein FDR, default 1.0)
-    pub run_protein_qvalue: f64,
     /// Experiment-level precursor q-value (modified_sequence + charge, mutated by FDR)
     pub experiment_precursor_qvalue: f64,
     /// Experiment-level peptide q-value (modified_sequence only, mutated by FDR)
     pub experiment_peptide_qvalue: f64,
-    /// Experiment-level protein q-value (picked-protein FDR, default 1.0)
+    /// Picked-protein FDR q-value (default 1.0). Experiment-scope in BOTH passes - the
+    /// first-pass protein FDR pools its detected peptides over every file and propagates one
+    /// value per peptide, so there is no per-run protein q. Which pass produced the value is
+    /// recorded by the sidecar it is written to, not by a second field.
     pub experiment_protein_qvalue: f64,
     /// Posterior error probability (mutated by FDR)
     pub pep: f64,
@@ -1079,13 +1080,15 @@ impl FdrEntry {
     ///
     /// - `Precursor`: returns run_precursor_qvalue
     /// - `Peptide`: returns run_peptide_qvalue
-    /// - `Protein`: returns run_protein_qvalue
+    /// - `Protein`: returns experiment_protein_qvalue - there is no run-scope protein q to
+    ///   return, and there never was; the field that used to be named `run_protein_qvalue`
+    ///   held one value per peptide across every file
     /// - `Both`: returns max(run_precursor_qvalue, run_peptide_qvalue)
     pub fn effective_run_qvalue(&self, level: FdrLevel) -> f64 {
         match level {
             FdrLevel::Precursor => self.run_precursor_qvalue,
             FdrLevel::Peptide => self.run_peptide_qvalue,
-            FdrLevel::Protein => self.run_protein_qvalue,
+            FdrLevel::Protein => self.experiment_protein_qvalue,
             FdrLevel::Both => self.run_precursor_qvalue.max(self.run_peptide_qvalue),
         }
     }
