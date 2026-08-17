@@ -3,7 +3,6 @@
 //! Mirrors the C# Osprey `CarafeProteinIdNormalizer` (ProteoWizard/pwiz) so the two
 //! implementations report the same protein identities on a Carafe-built library.
 
-use log::warn;
 use osprey_core::LibraryEntry;
 use std::collections::{HashMap, HashSet};
 
@@ -29,7 +28,7 @@ const PEP_TOKEN: &str = "_pep";
 /// and every reported q-value is the carried-over first-pass value with no sign of failure in
 /// the output.
 ///
-/// **Call before [`super::deduplicate_library`].** Dedup groups on (modified sequence, charge)
+/// **Call before `deduplicate_library`.** Dedup groups on (modified sequence, charge)
 /// and merges the group's accessions through a sort + dedup; stripping afterwards would leave
 /// two entries that differed only by `_pepNNNNN` as duplicate identical accessions in that
 /// merge. Stripping first lets the existing merge collapse them, which is also what
@@ -93,7 +92,7 @@ pub fn normalize_carafe_protein_ids(entries: &mut [LibraryEntry]) -> usize {
     }
 
     let (example_id, example_clean) = example.unwrap_or_default();
-    warn!(
+    log::warn!(
         "Spectral library protein accessions carry Carafe's per-peptide '_pepNNNNN' suffix: \
          {} distinct accessions on {} entries collapse to {} real proteins (e.g. '{}' -> '{}'). \
          Stripping it - left in place every peptide is its own protein, which breaks protein \
@@ -149,11 +148,17 @@ mod tests {
     use super::*;
 
     fn make_entry(id: u32, protein_ids: &[&str]) -> LibraryEntry {
+        make_precursor(id, "PEPTIDEK", 2, protein_ids)
+    }
+
+    /// Distinct (sequence, charge) so a test can model several peptides of ONE protein -
+    /// entries that share a precursor would be collapsed by `deduplicate_library` downstream.
+    fn make_precursor(id: u32, sequence: &str, charge: u8, protein_ids: &[&str]) -> LibraryEntry {
         let mut entry = LibraryEntry::new(
             id,
-            "PEPTIDEK".to_string(),
-            "PEPTIDEK".to_string(),
-            2,
+            sequence.to_string(),
+            sequence.to_string(),
+            charge,
             500.0,
             10.0,
         );
@@ -213,9 +218,10 @@ mod tests {
 
     #[test]
     fn test_normalize_leaves_clean_libraries_untouched() {
-        // The no-op every non-Carafe library takes. Accession ORDER is preserved too: an
-        // untouched entry must not be silently re-sorted, or a clean library would stop
-        // reproducing its own goldens.
+        // The no-op every non-Carafe library takes: the map is empty, so the function
+        // returns before the rewrite loop. That early return is why this test canNOT also
+        // prove order preservation - see
+        // test_normalize_preserves_clean_entry_order_in_a_dirty_library for that arm.
         let mut entries = vec![make_entry(
             0,
             &["sp|Q9NP61|ARFG3_HUMAN", "sp|Q04726|TLE3_HUMAN"],
@@ -235,5 +241,74 @@ mod tests {
         ];
         assert_eq!(normalize_carafe_protein_ids(&mut entries), 1);
         assert_eq!(entries[1].protein_ids, vec!["sp|Q9NP61|ARFG3_HUMAN"]);
+    }
+
+    #[test]
+    fn test_normalize_preserves_clean_entry_order_in_a_dirty_library() {
+        // The DISCRIMINATING arm for the touched-only guard. A wholly clean library returns
+        // early on the empty map, so it cannot detect an unconditional sort - deleting the
+        // guard and sorting every entry leaves such a test green. Here the library IS dirty,
+        // so the rewrite loop runs, and the clean entry's deliberately un-sorted accessions
+        // must come through in their original order.
+        let mut entries = vec![
+            make_entry(0, &["sp|O95139_pep00019|NDUB6_HUMAN"]),
+            make_entry(1, &["sp|Q9NP61|ARFG3_HUMAN", "sp|Q04726|TLE3_HUMAN"]),
+        ];
+        assert_eq!(normalize_carafe_protein_ids(&mut entries), 1);
+        assert_eq!(entries[0].protein_ids, vec!["sp|O95139|NDUB6_HUMAN"]);
+        assert_eq!(
+            entries[1].protein_ids,
+            vec!["sp|Q9NP61|ARFG3_HUMAN", "sp|Q04726|TLE3_HUMAN"],
+            "an untouched entry must keep its loader's accession order"
+        );
+    }
+
+    #[test]
+    fn test_normalize_keeps_a_real_accession_containing_bare_pep() {
+        // Pinned at the normalize level, not only inside strip_pep_suffixes: an accession
+        // whose real name contains "_pep" with no digits after it must survive untouched,
+        // and must not by itself make the library look dirty.
+        let mut entries = vec![make_entry(0, &["sp|P00761_peptidase|TRYP_PIG"])];
+        assert_eq!(normalize_carafe_protein_ids(&mut entries), 0);
+        assert_eq!(entries[0].protein_ids, vec!["sp|P00761_peptidase|TRYP_PIG"]);
+    }
+
+    #[test]
+    fn test_strips_every_token_not_only_the_first() {
+        // Covers the scanner's re-synchronization after a match. With `copied` advanced to the
+        // wrong offset, a second token's digits leak back into the result.
+        assert_eq!(
+            strip_pep_suffixes("sp|A_pep00019|B_pep00020|C").as_deref(),
+            Some("sp|A|B|C")
+        );
+        // Overlapping token: the leading bare "_pep" has no digits and must survive.
+        assert_eq!(
+            strip_pep_suffixes("sp|A_pep_pep00019|B").as_deref(),
+            Some("sp|A_pep|B")
+        );
+        // A token at the very end of the string - the loop's last position.
+        assert_eq!(
+            strip_pep_suffixes("sp|A|B_pep00019").as_deref(),
+            Some("sp|A|B")
+        );
+    }
+
+    #[test]
+    fn test_normalize_collapses_distinct_peptides_of_one_protein() {
+        // The case the whole change exists for, and the one the other tests cannot model:
+        // N DIFFERENT peptides of the same protein. Same-precursor entries would be merged by
+        // deduplicate_library, so only distinct (sequence, charge) entries show that the
+        // protein reaches the >= 2 detected-peptide stratum after stripping.
+        let mut entries = vec![
+            make_precursor(0, "PEPTIDEK", 2, &["sp|O95139_pep00019|NDUB6_HUMAN"]),
+            make_precursor(1, "SAMPLERK", 3, &["sp|O95139_pep00020|NDUB6_HUMAN"]),
+        ];
+        assert_eq!(normalize_carafe_protein_ids(&mut entries), 2);
+        let distinct: HashSet<&str> = entries
+            .iter()
+            .flat_map(|e| e.protein_ids.iter().map(String::as_str))
+            .collect();
+        assert_eq!(distinct.len(), 1, "two peptides must name ONE protein");
+        assert!(distinct.contains("sp|O95139|NDUB6_HUMAN"));
     }
 }
