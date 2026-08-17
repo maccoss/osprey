@@ -7,11 +7,13 @@
 
 mod blib;
 mod cache;
+mod carafe;
 mod diann;
 mod elib;
 
 pub use blib::BlibLoader;
 pub use cache::{load_library_cache, save_library_cache};
+pub use carafe::normalize_carafe_protein_ids;
 pub use diann::DiannTsvLoader;
 pub use elib::ElibLoader;
 
@@ -87,12 +89,17 @@ pub fn load_library(
 
         if cache_ok {
             match cache::load_library_cache(&cache_path) {
-                Ok(entries) => {
+                Ok(mut entries) => {
                     log::info!(
                         "Loaded {} library entries from cache '{}'",
                         entries.len(),
                         cache_path.display()
                     );
+                    // Also on this path, not only the fresh parse: a cache written by a
+                    // binary that predates the strip carries the pseudo-accessions, and it
+                    // stays valid on mtime alone. Without this, whether a run sees real
+                    // proteins would depend on whether a cache happened to exist.
+                    normalize_carafe_protein_ids(&mut entries);
                     return Ok(entries);
                 }
                 Err(e) => {
@@ -124,6 +131,14 @@ pub fn load_library(
             )))
         }
     }?;
+
+    // BEFORE deduplicate_library, and the order is not incidental: dedup merges each
+    // (modified sequence, charge) group's accessions through a sort + dedup, so stripping
+    // afterwards would leave entries that differed only by _pepNNNNN as duplicate identical
+    // accessions in that merge. Stripping first lets the existing merge collapse them, which
+    // is what pre-stripping the source TSV produces - and the two must agree.
+    let mut entries = entries;
+    normalize_carafe_protein_ids(&mut entries);
 
     let deduped = deduplicate_library(entries);
 
