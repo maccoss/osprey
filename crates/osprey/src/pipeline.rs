@@ -6842,7 +6842,32 @@ fn run_percolator_fdr(
     // giving ~500K unique precursor observations with maximum peptide diversity.
     // Then subsample from those if still > max_train.
 
-    // Find best target and best decoy per base_id, tracking (file_idx, local_idx, score)
+    // Pick ONE observation per (base_id, is_decoy) by drawing a RUN uniformly, contributing
+    // that run's BEST candidate peak.
+    //
+    // This replaced a cross-run MAXIMUM. The maximum made every training row an extreme value
+    // over however many files were batched together, so the training population drifted away
+    // from the per-run population the model is then applied to, and drifted further as the
+    // batch grew: mean coelution_sum 1.19 at one file against 5.75 at 82, versus 1.18 in the
+    // scored population. At 82 SEA-AD files the uniform draw is worth +33.0% identifications
+    // at pass 1 and +49.8% at pass 2, both at matched true entrapment FDP.
+    //
+    // Both halves matter. Pass 1 is PRE-COMPACTION, so a precursor carries several
+    // candidate-peak rows per run; drawing per ROW rather than per RUN would weight a run by
+    // how many candidates it produced AND leave a random candidate as the training row, which
+    // measured -17.4% on 3-file Stellar in C#.
+    //
+    // Cross-impl: mirrors C# `PercolatorSampling.SelectBestPerPrecursor`. There is deliberately
+    // no opt-out here -- C# keeps `OSPREY_TRAIN_PICK_RUN=0` only as an A/B lever for the change
+    // itself, and Rust tracks the shipped default.
+    struct RunPick {
+        runs_seen: u32,
+        last_run: usize,
+        holder_is_current_run: bool,
+    }
+    // `file_idx` IS the run index: per_file_entries is iterated file by file, so rows arrive
+    // grouped by run without the cursor C# needs over its flattened arrays.
+    let mut run_pick: HashMap<u32, RunPick> = HashMap::new();
     let mut best_target: HashMap<u32, (usize, usize, f64)> = HashMap::new();
     let mut best_decoy: HashMap<u32, (usize, usize, f64)> = HashMap::new();
     for (file_idx, (_, entries)) in per_file_entries.iter().enumerate() {
@@ -6853,22 +6878,56 @@ fn run_percolator_fdr(
                     continue;
                 }
             }
+            // Targets and decoys of one base_id are separate precursors that share a base_id,
+            // so BOTH the counter key and the DRAW take the decoy bit. Masking it off would
+            // make a target and its paired decoy decide identically at every k and land on the
+            // same run for essentially every precursor.
+            let seen_key = base_id | if entry.is_decoy { 0x8000_0000 } else { 0 };
             let map = if entry.is_decoy {
                 &mut best_decoy
             } else {
                 &mut best_target
             };
-            map.entry(base_id)
-                .and_modify(|(best_fi, best_li, best_score)| {
-                    if entry.coelution_sum > *best_score {
+            match map.get_mut(&base_id) {
+                Some((best_fi, best_li, best_score)) => {
+                    let state = run_pick
+                        .get_mut(&seen_key)
+                        .expect("run_pick is inserted alongside every map entry");
+                    let replace = if file_idx == state.last_run {
+                        // Same run as this precursor's last row: the run-level draw already
+                        // happened, so resolve by score to keep that run's BEST peak.
+                        state.holder_is_current_run && entry.coelution_sum > *best_score
+                    } else {
+                        // First row of a NEW run: reservoir of size one over RUNS.
+                        let runs = state.runs_seen + 1;
+                        let takes =
+                            percolator::reservoir_takes_slot(seen_key, runs, perc_config.seed);
+                        state.runs_seen = runs;
+                        state.last_run = file_idx;
+                        state.holder_is_current_run = takes;
+                        takes
+                    };
+                    if replace {
                         *best_fi = file_idx;
                         *best_li = local_idx;
                         *best_score = entry.coelution_sum;
                     }
-                })
-                .or_insert((file_idx, local_idx, entry.coelution_sum));
+                }
+                None => {
+                    map.insert(base_id, (file_idx, local_idx, entry.coelution_sum));
+                    run_pick.insert(
+                        seen_key,
+                        RunPick {
+                            runs_seen: 1,
+                            last_run: file_idx,
+                            holder_is_current_run: true,
+                        },
+                    );
+                }
+            }
         }
     }
+    drop(run_pick);
 
     // Collect all best observations: (file_idx, local_idx) pairs
     let mut best_observations: Vec<(usize, usize)> =

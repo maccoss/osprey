@@ -1244,10 +1244,24 @@ pub fn pearson_correlation_raw(x: &[f64], y: &[f64]) -> f64 {
         sxy += xi * yi;
     }
 
-    let denom = ((dn * sx2 - sx * sx) * (dn * sy2 - sy * sy))
-        .max(1e-30)
-        .sqrt();
-    (dn * sxy - sx * sy) / denom
+    // Degenerate input -- a constant series, so zero variance -- has no defined
+    // correlation. Return 0.0 rather than clamping the denominator: flooring at
+    // 1e-30 and dividing by its root (1e-15) manufactures an arbitrary tiny value
+    // out of numerator noise, which is meaningless on its own terms AND diverges
+    // from C#, where BOTH helpers -- PearsonCorrelation.Pearson and the private
+    // TukeyMedianPolish.PearsonCorrelationRaw -- return 0.0 on this branch.
+    //
+    // Cross-impl: this surfaced on Astral as median_polish_residual_correlation
+    // = -8.47e-7 against C#'s exactly 0.0 (exactly zero because EVERY fragment
+    // pair of that precursor was degenerate, so every pairwise term was the
+    // guard's 0.0). That one feature moved one SVM score by 8.6e-8 -- about 48
+    // million ULPs at that magnitude, so not rounding noise -- and was the sole
+    // remaining failure in the end-to-end cross-impl gate.
+    let denom = (dn * sx2 - sx * sx) * (dn * sy2 - sy * sy);
+    if denom < 1e-30 {
+        return 0.0;
+    }
+    (dn * sxy - sx * sy) / denom.sqrt()
 }
 
 /// Compute FWHM with linear interpolation on a coefficient time series.
@@ -4345,14 +4359,24 @@ mod tests {
 
     #[test]
     fn test_pearson_constant_input() {
-        // Constant vector has zero variance — denom should be clamped, not NaN
+        // A constant series has zero variance, so the correlation is undefined.
+        // Assert the VALUE, not merely finiteness: both C# helpers return exactly
+        // 0.0 on this branch, and cross-impl bit-parity depends on matching it.
+        // The former assertion (is_finite) passed equally for the clamped
+        // 1e-30 form that diverged from C# by 8.47e-7 on Astral.
         let x = vec![5.0, 5.0, 5.0, 5.0];
         let y = vec![1.0, 2.0, 3.0, 4.0];
-        let r = pearson_correlation_raw(&x, &y);
-        assert!(
-            r.is_finite(),
-            "Constant input should not produce NaN, got {}",
-            r
+        assert_eq!(pearson_correlation_raw(&x, &y), 0.0);
+
+        // Both series constant, and the all-zeros case that arises when median
+        // polish fits its residuals to nothing.
+        assert_eq!(
+            pearson_correlation_raw(&[2.0, 2.0, 2.0], &[7.0, 7.0, 7.0]),
+            0.0
+        );
+        assert_eq!(
+            pearson_correlation_raw(&[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0]),
+            0.0
         );
     }
 

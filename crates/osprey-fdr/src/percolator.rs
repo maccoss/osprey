@@ -1797,6 +1797,38 @@ fn dump_stage5_perc_input(entries: &[PercolatorEntry], feature_names: Option<&[S
 
 /// Subsample entries by peptide group, keeping target-decoy pairs and charge states together.
 ///
+/// Reservoir decision for the first-pass training selection: does the `seen`-th run a
+/// precursor appears in take its training slot? True with probability `1/seen`, which
+/// leaves every run the precursor actually appears in equally likely to be the survivor,
+/// however few runs contain it.
+///
+/// Deterministic in `base_id`, `seen` and the training seed rather than drawn from a
+/// shared RNG. That makes the decision independent of how the ingest is SCHEDULED --
+/// thread interleaving cannot move it, as a shared RNG's draw order would -- and
+/// reproducible across re-runs. It does not make the winner independent of file ORDER:
+/// the surviving ordinal is fixed, so which run holds that ordinal follows the arrival
+/// sequence. Reproducibility therefore rests on the input file list being ordered.
+///
+/// Mixing is the SplitMix64 finalizer: the low bits of a raw base_id are far from uniform
+/// and comparing them directly would skew the draw.
+///
+/// Cross-impl: byte-for-byte the C# `PercolatorScorer.ReservoirTakesSlot`. The wrapping
+/// arithmetic is deliberate -- this is a hash mixer, not a quantity -- and C# performs it
+/// in an `unchecked` block, so `wrapping_*` here is the matching operation, not a
+/// convenience.
+pub fn reservoir_takes_slot(base_id: u32, seen: u32, seed: u64) -> bool {
+    if seen <= 1 {
+        return true;
+    }
+    let mut x = (base_id as u64)
+        .wrapping_add(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add((seen as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    x % (seen as u64) == 0
+}
+
 /// Groups entries by target peptide (via base_id), then randomly selects groups until
 /// the total entry count reaches `max_entries`. Returns sorted global indices.
 ///
@@ -3252,6 +3284,89 @@ mod tests {
                 *fwd_pep, rev_pep,
                 "PEP for entry {} differs across input orderings: {} vs {}",
                 eid, fwd_pep, rev_pep
+            );
+        }
+    }
+    /// Cross-impl vectors for [`reservoir_takes_slot`], shared with C#
+    /// `PercolatorScorer.ReservoirTakesSlot`. The C# side asserts UNIFORMITY (below), which
+    /// proves the statistical property but would not catch a transcription difference in the
+    /// mixer -- two different mixers can both be uniform. These pinned values are what makes
+    /// the two implementations byte-identical rather than merely both-correct, so a change to
+    /// either side that moves the draw turns this red.
+    #[test]
+    fn reservoir_takes_slot_matches_cross_impl_vectors() {
+        // (base_id, seen, expected) at the shipped training seed of 42. The high bit is the
+        // decoy flag, so vectors are included with and without it set.
+        const SEED: u64 = 42;
+        const VECTORS: &[(u32, u32, bool)] = &[
+            (0x0000_0000, 1, true),
+            (0x0000_0000, 2, false),
+            (0x0000_0001, 2, true),
+            (0x0000_0007, 3, false),
+            (0x0000_0000, 5, true),
+            (0x0000_000F, 5, true),
+            (0x0000_3039, 5, false),
+            (0x0000_0003, 7, true),
+            (0x0000_0005, 7, true),
+            (0x000F_422F, 7, false),
+            (0x0000_0124, 82, true),
+            (0x0000_0149, 82, true),
+            (0x0000_3039, 82, false),
+            (0x7FFF_FFFF, 2, false),
+            (0x8000_0000, 2, true),
+            (0x8000_0000, 5, true),
+            (0x8000_0000, 7, true),
+            (0x8000_006E, 82, true),
+            (0x8000_3039, 5, false),
+            (0x8000_3039, 82, false),
+            (0xFFFF_FFFF, 3, false),
+        ];
+        for &(base_id, seen, expected) in VECTORS {
+            assert_eq!(
+                reservoir_takes_slot(base_id, seen, SEED),
+                expected,
+                "base_id 0x{:08X}, seen {}",
+                base_id,
+                seen
+            );
+        }
+    }
+
+    /// The property the reservoir exists for: UNIFORMITY over the runs a precursor actually
+    /// appears in. Mirrors the C# `TestTrainingRunReservoir`. An earlier chosen-run rule fell
+    /// back to the first run seen whenever the precursor was missing from its chosen one, and
+    /// since runs stream in injection order that favoured early, higher-yield runs -- the same
+    /// bias family this change exists to remove.
+    #[test]
+    fn reservoir_spreads_winners_evenly_over_runs() {
+        const SEED: u64 = 42;
+        const N_RUNS: usize = 82;
+        const N_PRECURSORS: u32 = 200_000;
+
+        // The first run a precursor appears in always takes the slot; nothing to compare yet.
+        for base_id in 0..100u32 {
+            assert!(reservoir_takes_slot(base_id, 1, SEED));
+        }
+
+        let mut winners = vec![0usize; N_RUNS];
+        for base_id in 0..N_PRECURSORS {
+            let mut held = 0usize;
+            for run in 1..N_RUNS {
+                if reservoir_takes_slot(base_id, run as u32 + 1, SEED) {
+                    held = run;
+                }
+            }
+            winners[held] += 1;
+        }
+
+        let expected = N_PRECURSORS as usize / N_RUNS;
+        for (run, &won) in winners.iter().enumerate() {
+            assert!(
+                won.abs_diff(expected) < expected / 4,
+                "run {} won {} slots against an expected {}",
+                run,
+                won,
+                expected
             );
         }
     }
