@@ -75,6 +75,24 @@ OspreySharp together.
 
 ## Bug Fixes
 
+- **Experiment-scope q-values are read per ENTRY, not per file.** In the
+  protein-compact pass-2 map-back, an off-stratum survivor took its pass-1
+  experiment q from *this file's* `.1st-pass.fdr_scores.bin`. An entry whose
+  first pass left no record in the file being mapped - a row reconciliation
+  synthesized, or a peak it moved - missed that lookup and silently kept the
+  reset default, so one precursor could carry a different "experiment-wide"
+  value in each run of the same analysis. "Experiment-wide" means one value per
+  precursor for the whole analysis, and these values reach a user-facing blib,
+  which as a relational store should not be able to express the disagreement.
+  The lookup now unions every file's pass-1 values into one analysis-wide map
+  keyed by `entry_id`, and carries `experiment_aggregate_score` alongside the
+  two q-values so a record's q and the score it was ranked on come from the same
+  competition. Two files disagreeing about one entry is refused outright rather
+  than resolved first-wins - that would report a q-value no run computed - and
+  the caller falls back to the 2nd-pass retrain, which is its existing response
+  to inputs it cannot trust. Found by, and validated against, the OspreySharp
+  FDR sidecar scope split (pwiz #4486), whose analysis-wide experiment sidecar
+  makes the disagreement structurally unrepresentable.
 - **Calibration pass-2 refit no longer discards a good pass-1 calibration
   (#52).** Pass 2 reused pass 1's minimum-points floor, so a file whose pass-1
   count fell in the `[ABSOLUTE_MIN_CALIBRATION_POINTS, min_calibration_points)`
