@@ -1886,13 +1886,18 @@ fn write_fdr_scores_sidecar(path: &std::path::Path, entries: &[FdrEntry], pass: 
 /// population in file order, independent of any stub list. Used by the transfer-compete
 /// pass-2 recompute to stream the full pre-compaction 1st-pass population. Returns `None`
 /// on any header/size mismatch. Mirrors the C# `FdrScoresSidecar.ReadScalars`.
-/// Read `entry_id -> (experiment_precursor_qvalue, experiment_peptide_qvalue)` from an FDR
-/// scores sidecar. Used by the protein-compact map-back to carry an off-stratum peak's pass-1
-/// experiment q, which the post-rescore overlay has already zeroed in memory. Returns `None` on
-/// any header/size mismatch, exactly as `read_fdr_scores_scalars` does.
+/// Read `entry_id -> (experiment_precursor_qvalue, experiment_peptide_qvalue,
+/// experiment_aggregate_score)` from an FDR scores sidecar. Used by the protein-compact
+/// map-back to carry an off-stratum peak's pass-1 experiment values, which the post-rescore
+/// overlay has already zeroed in memory. Returns `None` on any header/size mismatch, exactly as
+/// `read_fdr_scores_scalars` does.
+///
+/// The aggregate travels with the two q-values because it is the score they were ranked on.
+/// Carrying the q without it leaves a record whose q and whose score describe different
+/// competitions, which is the defect the C# side measured at #4486.
 pub(crate) fn read_fdr_scores_experiment_q(
     path: &std::path::Path,
-) -> Option<HashMap<u32, (f64, f64)>> {
+) -> Option<HashMap<u32, (f64, f64, f64)>> {
     let data = std::fs::read(path).ok()?;
     if data.len() < FDR_SIDECAR_HEADER_LEN
         || &data[0..8] != FDR_SIDECAR_MAGIC
@@ -1911,9 +1916,75 @@ pub(crate) fn read_fdr_scores_experiment_q(
         let entry_id = u32::from_le_bytes(r[0..4].try_into().ok()?);
         let exp_prec = f64::from_le_bytes(r[28..36].try_into().ok()?);
         let exp_pep = f64::from_le_bytes(r[36..44].try_into().ok()?);
-        out.insert(entry_id, (exp_prec, exp_pep));
+        let exp_agg = f64::from_le_bytes(r[60..68].try_into().ok()?);
+        out.insert(entry_id, (exp_prec, exp_pep, exp_agg));
     }
     Some(out)
+}
+
+/// Union every file's pass-1 experiment-scope values into ONE analysis-wide map, keyed by
+/// `entry_id`.
+///
+/// "Experiment-wide" means one value per precursor for the whole analysis, so this map is the
+/// shape the quantity actually has. Reading it per FILE instead - which is what the map-back
+/// did until #4486 - silently substitutes a reset default for any entry whose first pass left
+/// no record in the file being mapped (a row Stage 6 synthesized, or a peak it moved). The
+/// entry then carries a different "experiment-wide" value in each run, which is a violation of
+/// the definition and, downstream, of the relational contract the blib is expected to satisfy.
+///
+/// Disagreement between two files is a hard refusal, not a first-wins merge. These are copies
+/// of one computed value; if they differ, the premise is already broken and picking one would
+/// report a q-value no run computed. The caller falls back to the 2nd-pass retrain, which is
+/// its documented response to inputs it cannot trust. Mirrors the C#
+/// `FdrExperimentAccumulator`, which throws on the same condition, and compares bit patterns
+/// for the same reason it does: a tolerance here would only decide how much of a wrong answer
+/// to accept.
+fn read_analysis_wide_experiment_q(
+    sidecar_paths: &[std::path::PathBuf],
+) -> Option<HashMap<u32, (f64, f64, f64)>> {
+    let mut merged: HashMap<u32, (f64, f64, f64)> = HashMap::new();
+    for path in sidecar_paths {
+        let per_file = match read_fdr_scores_experiment_q(path) {
+            Some(m) => m,
+            None => {
+                log::warn!(
+                    "transfer-compete: 1st-pass sidecar unreadable for the experiment-scope \
+                     map: {}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        for (entry_id, incoming) in per_file {
+            match merged.get(&entry_id) {
+                None => {
+                    merged.insert(entry_id, incoming);
+                }
+                Some(existing) => {
+                    if existing.0.to_bits() != incoming.0.to_bits()
+                        || existing.1.to_bits() != incoming.1.to_bits()
+                        || existing.2.to_bits() != incoming.2.to_bits()
+                    {
+                        log::warn!(
+                            "transfer-compete: experiment-scope values disagree across \
+                             observations of entry_id {}: precursor_q {} vs {}, peptide_q {} \
+                             vs {}, aggregate_score {} vs {}. These are experiment-scope, so \
+                             one entry cannot have two of them.",
+                            entry_id,
+                            existing.0,
+                            incoming.0,
+                            existing.1,
+                            incoming.1,
+                            existing.2,
+                            incoming.2
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    Some(merged)
 }
 
 /// Read `entry_id -> (score, pep, experiment_protein_qvalue)` from an FDR scores sidecar. These are the
@@ -6652,20 +6723,35 @@ fn compute_pass2_transfer_compete(
         return false;
     }
 
+    // Pass-1 experiment-scope values, needed only when stratified: an off-stratum peak keeps
+    // its pass-1 experiment values, and the post-rescore overlay already zeroed the in-memory
+    // copy for the ones Stage 6 changed.
+    //
+    // ANALYSIS-WIDE, not per file (#4486). The map is keyed by entry_id alone because that is
+    // the scope of the quantity: one value per precursor for the whole analysis. Built once
+    // ahead of the loop, so an entry whose first pass left no record in the file being mapped -
+    // a row Stage 6 synthesized, or a peak it moved - still resolves to the value its own first
+    // pass computed, instead of falling through to the reset default and giving one entry a
+    // different "experiment-wide" value in every run.
+    //
+    // Residency is O(distinct entries), not O(files x entries): the merge folds each file's
+    // map in and drops it.
+    let pass1_exp_q: Option<HashMap<u32, (f64, f64, f64)>> = if stratum_base_ids.is_some() {
+        match read_analysis_wide_experiment_q(&sidecar_paths) {
+            Some(m) => Some(m),
+            // Refusing here rather than mapping with a partial map: the caller's contract for
+            // a sidecar it cannot trust is the retrain, and a silently incomplete experiment
+            // map would put reset defaults on exactly the rows this exists to fix.
+            None => return false,
+        }
+    } else {
+        None
+    };
+
     // Map the recomputed q/PEP back onto the survivor stubs. Under a constrained stratum, an
     // off-stratum survivor is absent from run_q → keep its 1st-pass q (report = pass1 ∪ stratum).
     let mut n_mapped = 0usize;
     for (file_idx, (_file_name, entries)) in per_file_entries.iter_mut().enumerate() {
-        // Pass-1 experiment q for this file, needed only when stratified: an off-stratum peak
-        // keeps its pass-1 experiment q, and the post-rescore overlay already zeroed the
-        // in-memory copy for the ones Stage 6 changed. Read per file and dropped at the end of
-        // the iteration, so residency stays one file deep.
-        let pass1_exp_q: Option<HashMap<u32, (f64, f64)>> = if stratum_base_ids.is_some() {
-            read_fdr_scores_experiment_q(&sidecar_paths[file_idx])
-        } else {
-            None
-        };
-
         for e in entries.iter_mut() {
             // Under a constrained stratum (protein-compact), an off-stratum survivor keeps its
             // already-passing 1st-pass q — the streaming competition returns q=1.0 for it, so it
@@ -6699,6 +6785,10 @@ fn compute_pass2_transfer_compete(
                     // TOWARD that anchor rather than moving it, so a changed peak was not the
                     // one that set the maximum and cannot become it. Carrying the pass-1 value
                     // is therefore exact, and it is what keeps the re-scoping additive.
+                    //
+                    // The aggregate is carried with the two q-values because it is the score
+                    // they were ranked on; leaving it at the reset default gives the record a q
+                    // and a score from different competitions.
                     let rq_off = match run_q.get(&key) {
                         Some(&v) => v,
                         None => continue,
@@ -6706,9 +6796,10 @@ fn compute_pass2_transfer_compete(
                     e.run_precursor_qvalue = rq_off;
                     e.run_peptide_qvalue = rq_off;
                     if let Some(map) = pass1_exp_q.as_ref() {
-                        if let Some(&(prec, pep_q)) = map.get(&e.entry_id) {
+                        if let Some(&(prec, pep_q, agg)) = map.get(&e.entry_id) {
                             e.experiment_precursor_qvalue = prec;
                             e.experiment_peptide_qvalue = pep_q;
+                            e.experiment_aggregate_score = agg;
                         }
                     }
                     n_mapped += 1;
@@ -12798,5 +12889,98 @@ mod tests {
                 "lowest charge (z=2) end must win regardless of order (swap={swap})"
             );
         }
+    }
+
+    /// Write a v4 1st-pass FDR sidecar holding exactly the given
+    /// `(entry_id, experiment_precursor_q, experiment_peptide_q, experiment_aggregate_score)`.
+    /// The bytes are laid out here rather than through `write_fdr_scores_sidecar` so the test
+    /// pins the OFFSETS the reader depends on; going through the writer would let a matching
+    /// pair of layout edits pass unnoticed.
+    fn write_test_experiment_sidecar(path: &std::path::Path, records: &[(u32, f64, f64, f64)]) {
+        let mut bytes = vec![0u8; FDR_SIDECAR_HEADER_LEN];
+        bytes[0..8].copy_from_slice(FDR_SIDECAR_MAGIC);
+        bytes[8] = FDR_SIDECAR_VERSION;
+        bytes[9] = 1;
+        bytes[16..24].copy_from_slice(&(records.len() as u64).to_le_bytes());
+        for &(entry_id, exp_prec, exp_pep, exp_agg) in records {
+            let mut r = [0u8; FDR_SIDECAR_RECORD_LEN];
+            r[0..4].copy_from_slice(&entry_id.to_le_bytes());
+            r[28..36].copy_from_slice(&exp_prec.to_le_bytes());
+            r[36..44].copy_from_slice(&exp_pep.to_le_bytes());
+            r[60..68].copy_from_slice(&exp_agg.to_le_bytes());
+            bytes.extend_from_slice(&r);
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The defect #4486 names: an entry with no 1st-pass record in the file being mapped used to
+    /// miss a per-FILE lookup and keep its reset default, so the same entry carried a different
+    /// "experiment-wide" value in each run. The analysis-wide map must resolve it from the file
+    /// that does have it.
+    #[test]
+    fn analysis_wide_experiment_q_resolves_an_entry_absent_from_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("run_a.1st-pass.fdr_scores.bin");
+        let b = dir.path().join("run_b.1st-pass.fdr_scores.bin");
+        // entry 11989 has a real 1st-pass record only in run_a; run_b's first pass never saw it.
+        write_test_experiment_sidecar(
+            &a,
+            &[(11989, 0.003261, 0.003261, -6.5415), (7, 0.5, 0.5, 1.0)],
+        );
+        write_test_experiment_sidecar(&b, &[(7, 0.5, 0.5, 1.0)]);
+
+        let merged = read_analysis_wide_experiment_q(&[a, b]).expect("both sidecars are readable");
+
+        let &(prec, pep, agg) = merged
+            .get(&11989)
+            .expect("an entry present in ANY file must resolve, not just in its own file");
+        assert_eq!(
+            prec, 0.003261,
+            "experiment precursor q comes from the file that has it"
+        );
+        assert_eq!(
+            pep, 0.003261,
+            "experiment peptide q comes from the file that has it"
+        );
+        assert_eq!(
+            agg, -6.5415,
+            "the aggregate travels with the q-values; a reset 0.0 here would leave the record's \
+             q and score describing different competitions"
+        );
+    }
+
+    /// The collapse rests on the claim that every observation of an entry carries the same
+    /// experiment-scope values. Where it does not, first-wins would report a q no run computed,
+    /// so the merge refuses and the caller falls back to the retrain.
+    #[test]
+    fn analysis_wide_experiment_q_refuses_disagreeing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("run_a.1st-pass.fdr_scores.bin");
+        let b = dir.path().join("run_b.1st-pass.fdr_scores.bin");
+        write_test_experiment_sidecar(&a, &[(11989, 0.003261, 0.003261, -6.5415)]);
+        // The same entry at the ResetScores defaults - which is exactly what the per-file
+        // lookup used to leave behind.
+        write_test_experiment_sidecar(&b, &[(11989, 1.0, 1.0, 0.0)]);
+
+        assert!(
+            read_analysis_wide_experiment_q(&[a, b]).is_none(),
+            "two different experiment-wide values for one entry must refuse, not pick one"
+        );
+    }
+
+    /// An unreadable sidecar must not contribute an empty map: that would silently return
+    /// reset defaults for every entry the missing file was the only source of.
+    #[test]
+    fn analysis_wide_experiment_q_refuses_an_unreadable_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("run_a.1st-pass.fdr_scores.bin");
+        let b = dir.path().join("run_b.1st-pass.fdr_scores.bin");
+        write_test_experiment_sidecar(&a, &[(11989, 0.003261, 0.003261, -6.5415)]);
+        std::fs::write(&b, b"not a sidecar").unwrap();
+
+        assert!(
+            read_analysis_wide_experiment_q(&[a, b]).is_none(),
+            "a sidecar that cannot be decoded must refuse, not silently contribute nothing"
+        );
     }
 }
