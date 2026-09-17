@@ -235,6 +235,13 @@ A best-of-runs aggregate can never be more confident than its own best single ru
 
 The clamp is applied after Percolator FDR and again on the final post-Stage-6 pool, because Stage-6 reconciliation resets the run q-values of moved and gap-filled peaks after the first clamp.
 
+That final clamp runs **before** everything that reads or persists an experiment q — the 2nd-pass FDR sidecar and protein parsimony — and not after the protein block, where it used to sit. Two consumers were being served a value the pipeline then raised:
+
+- The **2nd-pass sidecar**, which Stage 7 (`--join-at-pass=2`) reads unconditionally, so a distributed or resumed run took its experiment q from records the straight-through run went on to correct in memory.
+- **Protein parsimony's detected-peptide set**, which is exactly `effective_experiment_qvalue(peptide_gate_level) <= experiment_fdr` (see [16-protein-parsimony.md](16-protein-parsimony.md)). Admitting a protein on a "detection" no run supports is the inverse of the case the floor exists for.
+
+Because the clamp only ever raises a q-value, moving it ahead of both is one-directional: protein groups drop out and none appear, and a persisted experiment q rises and never falls. The C# port applies the same floor at the same point — its pass-2 sweep folds the floors out of the per-file second-pass records it is already reading and raises the q-values before the analysis-wide experiment record is written. Rust fuses run and experiment scope into one per-file record where C# splits them, so "before they are written" is this one call site.
+
 ### Dual Precursor + Peptide FDR
 
 A precursor must pass FDR at **both** the precursor level (modified_sequence + charge) and the peptide level (modified_sequence only). This is enforced by taking the max of the two q-values:

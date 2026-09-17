@@ -4978,7 +4978,8 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             // run_percolator_fdr, but this HPC `--join-at-pass=2` recompute path
             // falls through (no early return) to the authoritative
             // clamp_experiment_q_to_best_run on the final post-Stage-6 pool, which
-            // runs before the blib gate -- the only consumer of experiment q.
+            // runs ahead of both consumers of experiment q -- protein FDR's
+            // detected-peptide gate and the blib gate.
             percolator::compute_fdr_from_stubs(&mut per_file_entries, config.run_fdr, None);
         }
     } else {
@@ -5907,6 +5908,36 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         }
     }
 
+    // Authoritative clamp of experiment q to each entry's best run q on the FINAL
+    // post-Stage-6 pool. The pass-1 (and any pass-2) Percolator already clamped, but
+    // Stage-6 reconciliation resets the run q of moved / gap-fill peaks (via
+    // to_fdr_entry defaults) AFTER that clamp, so a precursor whose only run-passing
+    // observation was relocated can otherwise keep a stale low experiment q with no
+    // surviving run support — reported with no run-level ID (the blib ID-line artifact).
+    //
+    // It runs HERE, ahead of everything that reads or persists an experiment q, and no
+    // longer after the protein block where it used to sit. Two consumers were being
+    // served a value the pipeline then raised:
+    //
+    //   * The 2nd-pass sidecar below, which Stage 7 (--join-at-pass=2) reads
+    //     unconditionally — so a distributed or resumed run took its experiment q from
+    //     records the straight-through run went on to correct in memory.
+    //   * Protein parsimony's detected-peptide set, which is exactly
+    //     `effective_experiment_qvalue(peptide_gate_level) <= experiment_fdr`. Admitting
+    //     a protein on a "detection" no run supports is the inverse of the case the floor
+    //     exists for.
+    //
+    // The clamp only ever raises a q-value, so moving it ahead of both is one-directional:
+    // protein groups drop, never appear, and a persisted experiment q rises, never falls.
+    //
+    // Mirrors the C# port, where the pass-2 sweep that builds the analysis-wide experiment
+    // records folds these floors out of the per-file second-pass records it is already
+    // reading and raises the q-values BEFORE they are written
+    // (Pass2FdrSidecar + FdrExperimentAccumulator::apply_run_q_floors), leaving nothing to
+    // re-clamp after Stage 7. Rust fuses run and experiment scope into one per-file record
+    // where C# splits them, so "before they are written" is this call site.
+    clamp_experiment_q_to_best_run(&mut per_file_entries);
+
     // Persist second-pass SVM scores to sidecar files (after reconciliation block closes).
     // Always written when FDR ran, regardless of reconciliation. In single-file
     // mode there is no rescore step, so the persisted scores equal the 1st-pass
@@ -6029,18 +6060,6 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             log::warn!("Failed to write protein report: {}", e);
         }
     }
-
-    // Authoritative re-clamp of experiment q to each entry's best run q on the
-    // FINAL post-Stage-6 pool. The pass-1 (and any pass-2) Percolator already
-    // clamped, but Stage-6 reconciliation resets the run q of moved / gap-fill
-    // peaks (via to_fdr_entry defaults) AFTER that clamp, so a precursor whose
-    // only run-passing observation was relocated can otherwise keep a stale low
-    // experiment q with no surviving run support — reported with no run-level ID
-    // (the blib ID-line artifact). Re-clamping here, against the run q's that
-    // actually feed the blib gate below, restores "reported => some run genuinely
-    // passed". Mirror of PercolatorEngine.ClampExperimentQToBestRun in
-    // MergeNodeTask.Run before WriteBlibOutput.
-    clamp_experiment_q_to_best_run(&mut per_file_entries);
 
     // Two-stage blib output gate.
     //
