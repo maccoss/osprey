@@ -555,6 +555,7 @@ Machine learning primitives: SVM, LDA, PEP, q-values.
 | `test_feature_standardizer` | Mean/std computed correctly |
 | `test_standardizer_zero_variance` | Zero variance handled |
 | `test_grid_search_c` | Grid search selects reasonable C |
+| `test_select_c_tolerance` | C selection keeps the most regularized C within the tolerance (same cases as C#) |
 | `test_count_passing_targets` | Passing targets counted correctly |
 | `test_count_passing_targets_clean` | Clean data all pass at FDR |
 | `test_xorshift_deterministic` | RNG deterministic with seed |

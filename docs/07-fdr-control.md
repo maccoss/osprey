@@ -182,7 +182,7 @@ For each cross-validation fold:
 
 2. **Build SVM training set**: selected targets (positive class) + all decoys (negative class).
 
-3. **Grid search for C** (every iteration): 6 values × 3 inner folds = 18 SVMs on the current training set. The best C is used for this iteration's SVM.
+3. **Grid search for C** (every iteration): 6 values × 3 inner folds = 18 SVMs on the current training set. The most regularized C whose inner-CV passing count is within `c_selection_tolerance` (1%) of the best is used for this iteration's SVM. Neighboring C values usually pass within noise of each other (on 3-file Stellar, C = 0.1, 1 and 10 passed 5,025, 5,037 and 5,002), so a strict maximum picks C by noise, and a weakly regularized C = 1 fit scores the second pass's reconciled peaks much worse. See `svm::select_c`.
 
 4. **Train linear SVM**: L2-regularized linear SVM with dual coordinate descent.
 
@@ -281,6 +281,7 @@ The native Percolator uses these defaults:
 | `n_folds` | 3 | Cross-validation folds |
 | `seed` | 42 | Random seed for reproducibility |
 | `c_values` | [0.001, 0.01, 0.1, 1.0, 10.0, 100.0] | Grid search C values |
+| `c_selection_tolerance` | 0.01 | Keep the most regularized C within this fraction of the best inner-CV count (0 = strict maximum) |
 | `train_fdr` | 0.01 | FDR threshold for positive training set selection |
 
 ## Mokapot (External)

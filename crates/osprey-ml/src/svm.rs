@@ -179,16 +179,23 @@ impl LinearSvm {
     }
 }
 
+/// Default `c_selection_tolerance` for [`grid_search_c`]: keep the most regularized C whose
+/// inner-CV passing count is within 1% of the best (see [`select_c`]).
+pub const DEFAULT_C_SELECTION_TOLERANCE: f64 = 0.01;
+
 /// Select the best C value via internal cross-validation
 ///
 /// For each candidate C, trains SVM on train folds and evaluates on held-out fold.
-/// Returns the C value that yields the most targets passing the FDR threshold.
+/// Returns the most regularized C whose total passing count is within
+/// `c_selection_tolerance` of the best (see [`select_c`]).
 ///
 /// # Arguments
 /// * `features` - Feature matrix for the training set
 /// * `labels` - Labels for the training set (true = decoy)
 /// * `entry_ids` - Entry IDs for target-decoy pairing
 /// * `c_values` - Candidate C values to try
+/// * `c_selection_tolerance` - Fraction of the best count a smaller C may fall short by
+///   and still be chosen; 0 keeps the strict maximum
 /// * `fold_assignments` - Pre-computed fold assignments for each sample
 /// * `n_folds` - Number of folds
 /// * `seed` - Random seed
@@ -199,6 +206,7 @@ pub fn grid_search_c(
     labels: &[bool],
     entry_ids: &[u32],
     c_values: &[f64],
+    c_selection_tolerance: f64,
     fold_assignments: &[usize],
     n_folds: usize,
     seed: u64,
@@ -256,25 +264,54 @@ pub fn grid_search_c(
         })
         .collect();
 
-    // Find best C (highest passing targets, first C as tiebreaker).
-    // Iterator::max_by_key returns the LAST element on a tie (per stdlib
-    // docs), so we scan manually with a strict `>` to get first-tied,
-    // matching the comment above and OspreySharp's GridSearchC. This is
-    // a parity fix: a tie between e.g. C=1 and C=10 previously yielded
-    // C=10 in Rust but C=1 in C#, and the former's higher-complexity
-    // model drove per-fold SVM weight drift between the two
-    // implementations on Stellar single-file.
-    let mut best_c = c_values[0];
-    let mut best_passing = 0usize;
-    for (c, count) in results {
-        if count > best_passing {
-            best_passing = count;
-            best_c = c;
+    // `par_iter().map().collect()` keeps grid order, so the counts line up with `c_values`.
+    let total_passing: Vec<usize> = results.iter().map(|&(_, count)| count).collect();
+    let best_c = select_c(c_values, &total_passing, c_selection_tolerance);
+
+    log::debug!(
+        "  Selected C={:.4} (best count {} passing targets)",
+        best_c,
+        total_passing.iter().max().copied().unwrap_or(0)
+    );
+    best_c
+}
+
+/// The C a grid search keeps: the smallest (most regularized) C whose inner-CV passing count
+/// is within `tolerance` (a fraction) of the best count. With a tolerance of 0 this is the
+/// strict maximum, the first C in grid order winning a tie.
+///
+/// Neighboring C values usually pass within noise of each other: on 3-file Stellar, C = 0.1,
+/// 1 and 10 passed 5,025, 5,037 and 5,002 inner-CV targets. A strict maximum therefore picks C
+/// by noise, and the pick matters: a weakly regularized C = 1 fit splits weight between
+/// correlated spectral features (apex-scan `xcorr` / `median_polish_cosine` against the
+/// multi-scan `sg_weighted_cosine`) in a way the second pass, which reuses the frozen
+/// first-pass model on reconciled peaks, handles much worse. Two Stellar libraries differing
+/// only by 1e-4 rounding gave 21,176 and 28,309 experiment precursors at the same entrapment
+/// FDP; keeping the most regularized C within 1% gave 30,316 and 30,485.
+///
+/// The strict maximum scans with `>` rather than using `Iterator::max_by_key`, which returns
+/// the LAST element on a tie (per stdlib docs); a tie between e.g. C=1 and C=10 once yielded
+/// C=10 in Rust but C=1 in C#.
+///
+/// Cross-impl: mirrors C# `PercolatorTrainer.SelectC`.
+pub fn select_c(c_values: &[f64], total_passing: &[usize], tolerance: f64) -> f64 {
+    let mut best = 0usize;
+    for (ci, &count) in total_passing.iter().enumerate().skip(1) {
+        if count > total_passing[best] {
+            best = ci;
         }
     }
-
-    log::debug!("  Best C={:.4} ({} passing targets)", best_c, best_passing);
-    best_c
+    if tolerance.is_nan() || tolerance <= 0.0 {
+        return c_values[best];
+    }
+    let floor = (1.0 - tolerance) * total_passing[best] as f64;
+    let mut selected = c_values[best];
+    for (&c, &count) in c_values.iter().zip(total_passing) {
+        if count as f64 >= floor && c < selected {
+            selected = c;
+        }
+    }
+    selected
 }
 
 /// Count targets passing FDR threshold using paired target-decoy competition
@@ -760,6 +797,7 @@ mod tests {
             &labels,
             &entry_ids,
             &c_values,
+            DEFAULT_C_SELECTION_TOLERANCE,
             &fold_assignments,
             3,
             42,
@@ -806,6 +844,7 @@ mod tests {
             &labels,
             &entry_ids,
             &c_values,
+            0.0, // the strict maximum, where the tiebreaker matters
             &fold_assignments,
             3,
             42,
@@ -817,6 +856,37 @@ mod tests {
             "first-C tiebreaker broken: expected {} but got {}",
             c_values[0], best_c
         );
+    }
+
+    #[test]
+    fn test_select_c_tolerance() {
+        // The same cases as C# FdrTest.TestSvmCSelectionTolerance. The first is a real
+        // 3-file Stellar inner-CV sweep.
+        let grid = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0];
+        let stellar = [4670, 4925, 5025, 5037, 5002, 4971];
+        // Strict maximum: C = 1 wins by 12 of 5,037.
+        assert_eq!(select_c(&grid, &stellar, 0.0), 1.0);
+        // Within 1% (>= 4,986.63): 0.1, 1 and 10 qualify and the most regularized is 0.1.
+        assert_eq!(
+            select_c(&grid, &stellar, DEFAULT_C_SELECTION_TOLERANCE),
+            0.1
+        );
+        // Wide enough to take in 0.01 as well.
+        assert_eq!(select_c(&grid, &stellar, 0.03), 0.01);
+
+        // A clear winner beyond the tolerance keeps its C.
+        assert_eq!(
+            select_c(&grid, &[100, 200, 300, 400, 500, 600], 0.01),
+            100.0
+        );
+        // A tie under the strict rule goes to the first C in grid order.
+        assert_eq!(select_c(&grid, &[10, 20, 30, 30, 20, 10], 0.0), 0.1);
+        // The smallest C VALUE wins, whatever the grid order.
+        let unordered = [1.0, 0.1, 10.0];
+        assert_eq!(select_c(&unordered, &[1000, 995, 900], 0.01), 0.1);
+        assert_eq!(select_c(&unordered, &[1000, 995, 900], 0.0), 1.0);
+        // No C passes anything: the first C, as before.
+        assert_eq!(select_c(&grid, &[0; 6], 0.01), 0.001);
     }
 
     #[test]
