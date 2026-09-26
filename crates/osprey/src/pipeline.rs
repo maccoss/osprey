@@ -4096,6 +4096,66 @@ pub(crate) fn rescore_per_file_loop(
     })
 }
 
+/// The load-time error for library entries that are decoys by protein prefix
+/// but that the pairing manifest lists as targets
+/// (`ManifestApplyStats::decoys_listed_as_targets`). Every row is listed, not
+/// the first: the provider can then fix them in one pass and see the class of
+/// defect behind them.
+fn describe_decoys_listed_as_targets(
+    library: &[LibraryEntry],
+    indices: &[usize],
+    manifest_path: &std::path::Path,
+) -> String {
+    let mut msg = format!(
+        "The library and its decoy pairing manifest disagree: {} library entries are \
+         decoys by their protein accessions, but the manifest {} lists their sequence \
+         as a target. This happens when a library merges a decoy with an identical real \
+         target into one row. Regenerate the library so each row is one or the other.",
+        indices.len(),
+        manifest_path.display()
+    );
+    for &i in indices {
+        msg.push_str("\n  ");
+        msg.push_str(&describe_library_entry(&library[i]));
+    }
+    msg
+}
+
+/// The load-time error for decoys that share an entry_id (see
+/// `osprey_core::find_shared_decoy_ids`), or `None` when every decoy id is
+/// unique. Checked at load because the same defect otherwise surfaces only in
+/// first-pass FDR, hours into a large run, as an experiment-scope q-value
+/// disagreement that says nothing about the library. Every group is listed,
+/// not the first.
+fn describe_shared_decoy_ids(library: &[LibraryEntry]) -> Option<String> {
+    let groups = osprey_core::find_shared_decoy_ids(library);
+    if groups.is_empty() {
+        return None;
+    }
+    let mut msg = format!(
+        "Library-decoy pairing gave {} entry_ids to more than one decoy. Each decoy must \
+         pair with a distinct target.",
+        groups.len()
+    );
+    for group in &groups {
+        msg.push_str(&format!("\n  entry_id {}:", library[group[0]].id));
+        for &i in group {
+            msg.push_str("\n    ");
+            msg.push_str(&describe_library_entry(&library[i]));
+        }
+    }
+    Some(msg)
+}
+
+fn describe_library_entry(entry: &LibraryEntry) -> String {
+    format!(
+        "{} z{} ({})",
+        entry.modified_sequence,
+        entry.charge,
+        entry.protein_ids.join(";")
+    )
+}
+
 pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
     // Sliding timer for [STAGE-WALL] per-stage perf markers. Reset at
     // each stage boundary (stage1to4 -> stage5 -> stage6 -> stage7 -> blib).
@@ -4241,6 +4301,15 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
                         ))
                     })?;
                 let stats = manifest.apply_to_library(&mut library, &mut pairing_state);
+                if !stats.decoys_listed_as_targets.is_empty() {
+                    return Err(OspreyError::LibraryLoadError(
+                        describe_decoys_listed_as_targets(
+                            &library,
+                            &stats.decoys_listed_as_targets,
+                            manifest_path,
+                        ),
+                    ));
+                }
                 (
                     stats.n_paired,
                     stats.n_newly_marked_decoy,
@@ -4309,6 +4378,9 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
             pairing_stats.n_unpaired_decoys,
             pairing_stats.n_unpaired_targets,
         );
+        if let Some(msg) = describe_shared_decoy_ids(&library) {
+            return Err(OspreyError::LibraryLoadError(msg));
+        }
         if pairing_stats.paired_fraction() < config.decoy_pair_min_fraction {
             return Err(OspreyError::config(format!(
                 "Library-decoy pairing failed: only {:.1}% of decoys paired with a target \

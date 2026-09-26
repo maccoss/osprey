@@ -66,7 +66,7 @@ impl PeptideKind {
 }
 
 /// Stats returned by `DecoyPairingManifest::apply_to_library`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ManifestApplyStats {
     /// Number of decoys paired with a target on this call (decoy.id rewritten
     /// so its `base_id` matches the target's `id`).
@@ -84,6 +84,13 @@ pub struct ManifestApplyStats {
     /// un-suffixed source-protein accessions so protein parsimony /
     /// picked-protein FDR work correctly).
     pub n_proteins_replaced: usize,
+    /// Library indices, in library order, of entries that are decoys (by the
+    /// protein-prefix rule) whose sequence the manifest lists as a target.
+    /// Nothing legitimate produces this - Carafe merging a decoy with an
+    /// identical real target into one `decoy_`-prefixed row did - so the
+    /// library and its manifest disagree. They are left out of pairing, and
+    /// the loader refuses the library, listing every one.
+    pub decoys_listed_as_targets: Vec<usize>,
 }
 
 /// One entry of manifest metadata for a given peptide sequence.
@@ -254,6 +261,12 @@ impl DecoyPairingManifest {
     /// processing, leaving Osprey's prefix scan unable to recognise the
     /// decoys. The manifest's `peptide_type` column is taken as the source
     /// of truth.
+    ///
+    /// The reverse is not applied: a library entry that is already a decoy is
+    /// never placed on the target side of a pair, even when the manifest lists
+    /// its sequence as `target` / `p_target`. Such entries are left unpaired
+    /// and returned in `ManifestApplyStats::decoys_listed_as_targets` so the
+    /// caller can refuse the library.
     pub fn apply_to_library(
         &self,
         library: &mut [LibraryEntry],
@@ -273,6 +286,7 @@ impl DecoyPairingManifest {
         // manifest's `proteins` column (collected here so we can apply the
         // replacement after the read-only scan).
         let mut protein_override: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut decoys_listed_as_targets: Vec<usize> = Vec::new();
         for (idx, entry) in library.iter().enumerate() {
             if entry.is_decoy && state.paired_decoys.contains(&idx) {
                 continue;
@@ -282,6 +296,15 @@ impl DecoyPairingManifest {
             }
             if let Some(info) = self.seq_to_info.get(&entry.sequence) {
                 let is_target_side = info.kind.is_target_side();
+                // A decoy is never a pairing target, even where the manifest
+                // calls its sequence one (Carafe merges a decoy with an
+                // identical real target into one `decoy_`-prefixed row). Its
+                // id already carries the decoy bit, so a decoy paired to it
+                // would copy that id and two decoys would share an entry_id.
+                if is_target_side && entry.is_decoy {
+                    decoys_listed_as_targets.push(idx);
+                    continue;
+                }
                 buckets
                     .entry((
                         info.pair_index,
@@ -375,6 +398,7 @@ impl DecoyPairingManifest {
             n_paired,
             n_newly_marked_decoy,
             n_proteins_replaced,
+            decoys_listed_as_targets,
         }
     }
 }
@@ -777,5 +801,53 @@ mod tests {
         let dec_b = lib.iter().find(|e| e.sequence == "EPBPTIDE").unwrap();
         assert_eq!(dec_a.id & 0x7FFF_FFFF, 1);
         assert_eq!(dec_b.id & 0x7FFF_FFFF, 3);
+    }
+
+    /// Carafe can merge a decoy with an identical real target into one row
+    /// whose ProteinID starts `decoy_` (SEA-AD 07-27 library: AQLKDTR,
+    /// `decoy_...LZTR1...;sp|Q9Y250|LZTS1`). The prefix marker makes it a
+    /// decoy, but the manifest lists AQLKDTR as the TARGET of pair 5, so
+    /// pairing its reversed decoy TDKLQAR to it copied an id that already
+    /// carried the decoy bit: two decoys, one entry_id. At 82 files
+    /// first-pass FDR then aborts on the experiment-scope check.
+    #[test]
+    fn manifest_never_pairs_a_decoy_as_the_target_side() {
+        use osprey_core::find_shared_decoy_ids;
+
+        let f = write_manifest(&[
+            "AQLKDTR\tNo\tprotT\ttarget\t5",
+            "TDKLQAR\tYes\tdecoy_protT\tdecoy\t5",
+        ]);
+        let m = DecoyPairingManifest::from_tsv(f.path()).unwrap();
+        // Both prefix-marked decoys, as apply_library_decoy_marking leaves them.
+        let mut lib = vec![
+            make_entry(10, "AQLKDTR", 2, true),
+            make_entry(11, "TDKLQAR", 2, true),
+        ];
+        let mut state = PairingState::new();
+        let stats = m.apply_to_library(&mut lib, &mut state);
+
+        assert_ne!(
+            lib[0].id, lib[1].id,
+            "two decoys must not share an entry_id"
+        );
+        assert_eq!(stats.n_paired, 0, "a decoy is not a target to pair against");
+        assert_eq!(lib[0].id & 0x7FFF_FFFF, 10);
+        assert_eq!(lib[1].id & 0x7FFF_FFFF, 11);
+        // The disagreement is reported, which the loader turns into an error listing it.
+        assert_eq!(stats.decoys_listed_as_targets, vec![0]);
+        assert!(find_shared_decoy_ids(&lib).is_empty());
+
+        // The backstop finds the state the old pairing produced, so any other
+        // route to it fails at load rather than in first-pass FDR - and
+        // reports every group whole.
+        lib[1].id = lib[0].id;
+        lib.push(make_entry(12, "LQKDTAR", 2, true));
+        lib[2].id = lib[0].id;
+        lib.push(make_entry(13, "TARGETK", 2, false));
+        lib[3].id = lib[0].id & 0x7FFF_FFFF;
+        let shared = find_shared_decoy_ids(&lib);
+        assert_eq!(shared.len(), 1, "one id shared, reported once");
+        assert_eq!(shared[0], vec![0, 1, 2], "targets are not decoys");
     }
 }

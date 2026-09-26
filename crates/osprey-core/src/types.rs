@@ -351,6 +351,36 @@ pub fn pair_library_decoys_by_composition(
     n_paired
 }
 
+/// Find decoys that share an entry_id, breaking the pairing invariant every later stage
+/// assumes: a decoy's id is its target's base id plus `DECOY_ID_BIT`, so two decoys on one
+/// id means one of them was paired to something that was not a target. Per-file
+/// deduplication then keeps whichever scores better, one entry_id carries two peptides, and
+/// first-pass FDR aborts hours later on the experiment-scope check.
+///
+/// Returns every shared id, each as the library indices that share it in library order, so
+/// a report can show the whole class of defect rather than one row at a time. Only decoys
+/// are considered. Empty when every decoy id is unique.
+pub fn find_shared_decoy_ids(library: &[LibraryEntry]) -> Vec<Vec<usize>> {
+    use std::collections::HashMap;
+
+    // Map from id to its slot in `groups`, so the groups come out in the order their
+    // first member appears in the library.
+    let mut slot_by_id: HashMap<u32, usize> = HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (idx, entry) in library.iter().enumerate() {
+        if !entry.is_decoy {
+            continue;
+        }
+        let slot = *slot_by_id.entry(entry.id).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[slot].push(idx);
+    }
+    groups.retain(|g| g.len() > 1);
+    groups
+}
+
 /// Fragment ion from library
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryFragment {
