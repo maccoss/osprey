@@ -183,7 +183,7 @@ First-pass protein q-values are used by:
 
 Runs after second-pass peptide FDR. Produces `experiment_protein_qvalue` on each FdrEntry.
 
-1. Build parsimony from peptides passing second-pass peptide FDR.
+1. Build parsimony from peptides passing second-pass peptide FDR. The experiment q-values read here have already been through the best-of-runs clamp (see [07-fdr-control.md](07-fdr-control.md)), which runs immediately ahead of this block: a precursor that passes experiment-level FDR only because its aggregate beat a thinner decoy null — with no run supporting it — is not a detection this gate should admit.
 2. Call `collect_best_peptide_scores()` on the compacted + reconciled + second-pass-scored `per_file_entries`. Scores now reflect reconciliation corrections.
 3. Same picked-protein algorithm as first pass (single best peptide per protein, pairwise picking, cumulative FDR on winners).
 4. Propagate into `experiment_protein_qvalue` (which feeds `--fdr-level protein` filtering and the protein CSV report).
