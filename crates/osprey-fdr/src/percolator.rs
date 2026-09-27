@@ -36,6 +36,11 @@ pub struct PercolatorConfig {
     pub seed: u64,
     /// Grid search C values for SVM cost parameter
     pub c_values: Vec<f64>,
+    /// How far below the best inner-CV passing count a smaller C may fall and still be chosen,
+    /// as a fraction of that count (default: 0.01). The grid search keeps the most regularized
+    /// C within it, because neighboring C values usually pass within noise of each other; 0
+    /// keeps the strict maximum. See `svm::select_c`.
+    pub c_selection_tolerance: f64,
     /// Optional feature names for logging (must match feature count)
     pub feature_names: Option<Vec<String>>,
     /// Maximum paired entries for SVM cross-validation (default: 300_000).
@@ -60,6 +65,7 @@ impl Default for PercolatorConfig {
             n_folds: 3,
             seed: 42,
             c_values: vec![0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
+            c_selection_tolerance: svm::DEFAULT_C_SELECTION_TOLERANCE,
             feature_names: None,
             max_train_size: 300_000,
             train_only: false,
@@ -739,6 +745,7 @@ fn train_fold(
             &svm_labels,
             &svm_entry_ids,
             &config.c_values,
+            config.c_selection_tolerance,
             &svm_fold_assignments,
             config.n_folds,
             config.seed,
