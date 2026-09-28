@@ -3163,12 +3163,14 @@ impl DecoyGenerator {
         let seq_len = target.sequence.len();
         let decoy_chars: Vec<char> = self.get_decoy_sequence_chars(target, position_mapping);
 
-        // Build modification mass map for decoy (by position)
+        // Modification mass by decoy position. Modifications that land on one residue add -
+        // an N-terminal acetyl and an oxidized first methionine both sit at position 0 - so
+        // every decoy ion spanning it carries both, as the target's ions do.
         let mut mod_masses: HashMap<usize, f64> = HashMap::new();
         for m in &target.modifications {
             // Find new position for this modification
             if let Some(new_pos) = position_mapping.iter().position(|&old| old == m.position) {
-                mod_masses.insert(new_pos, m.mass_delta);
+                *mod_masses.entry(new_pos).or_insert(0.0) += m.mass_delta;
             }
         }
 
@@ -5563,6 +5565,83 @@ mod tests {
         let ladder = generator.theoretical_ladder("EDITPEPK");
         assert!((decoy.fragments[0].mz - ladder[2 * (3 - 1)]).abs() < 1e-9);
         assert!((decoy.fragments[1].mz - ladder[2 * (4 - 1) + 1]).abs() < 1e-9);
+    }
+
+    /// The library loaders put an N-terminal modification on residue 0, where a modification
+    /// of the first residue also sits (`(UniMod:1)M(UniMod:35)`). Both travel with that residue
+    /// into the decoy, and every decoy fragment spanning it must carry both mass deltas, as the
+    /// target's fragments do. Keeping only the last one put those decoy ions 42 Da off.
+    #[test]
+    fn test_decoy_fragment_carries_stacked_modifications() {
+        const ACETYL: f64 = 42.010565;
+        const OXIDATION: f64 = 15.994915;
+        let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
+        let mut target = LibraryEntry::new(
+            1,
+            "MPEPTIDEK".into(),
+            "[+42.010565]M[+15.994915]PEPTIDEK".into(),
+            2,
+            550.0,
+            10.0,
+        );
+        for (unimod_id, mass_delta) in [(1, ACETYL), (35, OXIDATION)] {
+            target.modifications.push(Modification {
+                position: 0,
+                unimod_id: Some(unimod_id),
+                mass_delta,
+                name: None,
+            });
+        }
+        let fragment = |ion_type, ordinal| LibraryFragment {
+            mz: 300.0,
+            relative_intensity: 1.0,
+            annotation: FragmentAnnotation {
+                ion_type,
+                ordinal,
+                charge: 1,
+                neutral_loss: None,
+            },
+        };
+        target.fragments = vec![
+            fragment(IonType::B, 3),
+            fragment(IonType::B, 8),
+            fragment(IonType::Y, 2),
+            fragment(IonType::Y, 4),
+        ];
+
+        let decoy = generator.generate(&target).unwrap();
+        // The reversal keeps the C-terminal K and moves the methionine, with both of its
+        // modifications, to position 7.
+        assert_eq!(decoy.sequence, "EDITPEPMK");
+        assert_eq!(
+            decoy
+                .modifications
+                .iter()
+                .filter(|m| m.position == 7)
+                .count(),
+            2
+        );
+
+        let ladder = generator.theoretical_ladder("EDITPEPMK");
+        let stacked = ACETYL + OXIDATION;
+        let b = |k: usize| ladder[2 * (k - 1)];
+        let y = |k: usize| ladder[2 * (k - 1) + 1];
+        assert!(
+            (decoy.fragments[0].mz - b(3)).abs() < 1e-9,
+            "b3 does not reach the methionine"
+        );
+        assert!(
+            (decoy.fragments[1].mz - (b(8) + stacked)).abs() < 1e-9,
+            "b8"
+        );
+        assert!(
+            (decoy.fragments[2].mz - (y(2) + stacked)).abs() < 1e-9,
+            "y2"
+        );
+        assert!(
+            (decoy.fragments[3].mz - (y(4) + stacked)).abs() < 1e-9,
+            "y4"
+        );
     }
 
     #[test]
