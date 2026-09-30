@@ -468,9 +468,17 @@ impl BlibWriter {
         // because Skyline expects mass values, not UniMod references
         let clean_mod_seq = convert_unimod_to_mass(&strip_flanking_chars(peptide_mod_seq));
 
+        // Store peaks sorted by m/z, as BiblioSpec does and Skyline expects; a library's
+        // own fragment order (intensity, ion type) is not preserved. The sort is stable, so
+        // equal m/z keep their input order, matching the C# writer (BlibSpectrum).
+        let mut order: Vec<usize> = (0..mzs.len()).collect();
+        order.sort_by(|&a, &b| mzs[a].total_cmp(&mzs[b]));
+        let sorted_mzs: Vec<f64> = order.iter().map(|&i| mzs[i]).collect();
+        let sorted_intensities: Vec<f32> = order.iter().map(|&i| intensities[i]).collect();
+
         // Convert peaks to blobs - zlib-compressed when it reduces size
-        let mz_blob = compress_bytes(f64_vec_to_bytes(mzs));
-        let int_blob = compress_bytes(f32_vec_to_bytes(intensities));
+        let mz_blob = compress_bytes(f64_vec_to_bytes(&sorted_mzs));
+        let int_blob = compress_bytes(f32_vec_to_bytes(&sorted_intensities));
 
         let spec_id_in_file = self.next_spec_id.to_string();
         self.next_spec_id += 1;
@@ -1295,6 +1303,57 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// Verifies that peaks given in library order are stored sorted by m/z, each intensity
+    /// moving with its m/z, and equal m/z keeping their input order (a stable sort, as the
+    /// C# writer's).
+    #[test]
+    fn test_peaks_stored_sorted_by_mz() {
+        let temp = NamedTempFile::new().unwrap();
+        let mut writer = BlibWriter::create(temp.path()).unwrap();
+        let file_id = writer
+            .add_source_file("test.mzML", "library.tsv", 0.01)
+            .unwrap();
+
+        // Intensity order, as a DIA-NN library lists fragments; 288.2030 appears twice.
+        let mzs = [488.3191, 175.1190, 601.4032, 288.2030, 375.2351, 288.2030];
+        let intensities: [f32; 6] = [100.0, 80.0, 60.0, 45.0, 30.0, 10.0];
+
+        let ref_id = writer
+            .add_spectrum(
+                "PEPTIDE",
+                "PEPTIDE",
+                400.0,
+                2,
+                10.0,
+                9.0,
+                11.0,
+                &mzs,
+                &intensities,
+                0.005,
+                file_id,
+                1,
+                0.0,
+            )
+            .unwrap();
+
+        let (mz_blob, int_blob): (Vec<u8>, Vec<u8>) = writer
+            .conn
+            .query_row(
+                "SELECT peakMZ, peakIntensity FROM RefSpectraPeaks WHERE RefSpectraID = ?",
+                params![ref_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let read_mzs = bytes_to_f64_vec(&decompress_blob(&mz_blob, mzs.len() * 8));
+        let read_intensities = bytes_to_f32_vec(&decompress_blob(&int_blob, intensities.len() * 4));
+
+        assert_eq!(
+            read_mzs,
+            vec![175.1190, 288.2030, 288.2030, 375.2351, 488.3191, 601.4032]
+        );
+        assert_eq!(read_intensities, vec![80.0, 45.0, 10.0, 30.0, 100.0, 60.0]);
     }
 
     /// Verifies that UniMod notation in modified sequences is converted to mass notation in the database.
