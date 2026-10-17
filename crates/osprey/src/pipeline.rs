@@ -4242,7 +4242,11 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         config.library_source.path()
     );
     let lib_cache_dir = config.resolve_cache_dir(config.library_source.path());
-    let mut library = load_library(&config.library_source, &lib_cache_dir)?;
+    let mut library = load_library(
+        &config.library_source,
+        &lib_cache_dir,
+        &config.fragment_tolerance,
+    )?;
     log::info!("Loaded {} library entries", library.len());
 
     if library.is_empty() {

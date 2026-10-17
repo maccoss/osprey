@@ -4,19 +4,26 @@
 //! overhead of TSV/blib/elib parsing on repeated runs.
 
 use osprey_core::{
-    FragmentAnnotation, IonType, LibraryEntry, LibraryFragment, Modification, NeutralLoss,
-    OspreyError, Result,
+    tolerance_unit_code, FragmentAnnotation, FragmentToleranceConfig, IonType, LibraryEntry,
+    LibraryFragment, Modification, NeutralLoss, OspreyError, Result,
 };
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 /// Magic bytes at the start of every cache file.
 const MAGIC: &[u8; 8] = b"OSPRLBR\0";
-/// Current cache format version.
-const VERSION: u32 = 1;
+/// Current cache format version. 2: fragments in m/z order, one peak per m/z scaled to the
+/// base peak, typed from m/z within the fragment tolerance the header records
+/// (`osprey_core::fragment_typing`); a cache typed within another tolerance is not used.
+const VERSION: u32 = 2;
 
-/// Save library entries to a binary cache file.
-pub fn save_library_cache(entries: &[LibraryEntry], path: &Path) -> Result<()> {
+/// Save library entries to a binary cache file, recording the fragment tolerance their
+/// types were assigned within.
+pub fn save_library_cache(
+    entries: &[LibraryEntry],
+    path: &Path,
+    tolerance: &FragmentToleranceConfig,
+) -> Result<()> {
     // Write to local temp dir first, then copy to final destination.
     let tmp_path = std::env::temp_dir().join(format!(
         "osprey_{}_{}",
@@ -32,6 +39,10 @@ pub fn save_library_cache(entries: &[LibraryEntry], path: &Path) -> Result<()> {
 
     w.write_all(MAGIC).map_err(write_err)?;
     w.write_all(&VERSION.to_le_bytes()).map_err(write_err)?;
+    w.write_all(&tolerance.tolerance.to_le_bytes())
+        .map_err(write_err)?;
+    w.write_all(&[tolerance_unit_code(tolerance.unit)])
+        .map_err(write_err)?;
     w.write_all(&(entries.len() as u64).to_le_bytes())
         .map_err(write_err)?;
 
@@ -112,8 +123,11 @@ pub fn save_library_cache(entries: &[LibraryEntry], path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Load library entries from a binary cache file.
-pub fn load_library_cache(path: &Path) -> Result<Vec<LibraryEntry>> {
+/// Load library entries from a binary cache file written for a search within `tolerance`.
+pub fn load_library_cache(
+    path: &Path,
+    tolerance: &FragmentToleranceConfig,
+) -> Result<Vec<LibraryEntry>> {
     let file = std::fs::File::open(path)
         .map_err(|e| OspreyError::LibraryLoadError(format!("Failed to open cache file: {}", e)))?;
     let mut r = BufReader::new(file);
@@ -132,6 +146,18 @@ pub fn load_library_cache(path: &Path) -> Result<Vec<LibraryEntry>> {
         return Err(OspreyError::LibraryLoadError(format!(
             "Unsupported cache version {} (expected {})",
             version, VERSION
+        )));
+    }
+    let cached_tolerance = read_f64(&mut r)?;
+    let cached_unit = read_u8(&mut r)?;
+    if cached_tolerance != tolerance.tolerance || cached_unit != tolerance_unit_code(tolerance.unit)
+    {
+        return Err(OspreyError::LibraryLoadError(format!(
+            "Cache typed within another fragment tolerance ({} unit {}, expected {} unit {})",
+            cached_tolerance,
+            cached_unit,
+            tolerance.tolerance,
+            tolerance_unit_code(tolerance.unit)
         )));
     }
 
@@ -409,8 +435,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.libcache");
 
-        save_library_cache(&entries, &path).unwrap();
-        let loaded = load_library_cache(&path).unwrap();
+        let tolerance = FragmentToleranceConfig::default();
+        save_library_cache(&entries, &path, &tolerance).unwrap();
+        let loaded = load_library_cache(&path, &tolerance).unwrap();
 
         assert_eq!(loaded.len(), 2);
         for (orig, loaded) in entries.iter().zip(loaded.iter()) {
@@ -453,8 +480,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.libcache");
 
-        save_library_cache(&entries, &path).unwrap();
-        let loaded = load_library_cache(&path).unwrap();
+        let tolerance = FragmentToleranceConfig::default();
+        save_library_cache(&entries, &path, &tolerance).unwrap();
+        let loaded = load_library_cache(&path, &tolerance).unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -464,7 +492,7 @@ mod tests {
         let path = dir.path().join("bad.libcache");
         std::fs::write(&path, b"NOTVALID").unwrap();
 
-        let result = load_library_cache(&path);
+        let result = load_library_cache(&path, &FragmentToleranceConfig::default());
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("bad magic"));

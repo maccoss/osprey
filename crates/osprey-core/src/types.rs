@@ -478,9 +478,9 @@ impl NeutralLoss {
     /// Get the mass of the neutral loss
     pub fn mass(&self) -> f64 {
         match self {
-            NeutralLoss::H2O => 18.010565,
-            NeutralLoss::NH3 => 17.026549,
-            NeutralLoss::H3PO4 => 97.976896,
+            NeutralLoss::H2O => crate::fragment_typing::H2O_MASS,
+            NeutralLoss::NH3 => crate::fragment_typing::NH3_MASS,
+            NeutralLoss::H3PO4 => crate::fragment_typing::H3PO4_MASS,
             NeutralLoss::Custom(m) => *m,
         }
     }

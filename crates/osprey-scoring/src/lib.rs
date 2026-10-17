@@ -46,8 +46,9 @@ pub mod pipeline;
 pub mod xcorr_pool;
 
 use osprey_core::{
-    BinConfig, FragmentAnnotation, IonType, LibraryEntry, LibraryFragment, Modification, Result,
-    Spectrum, ToleranceUnit,
+    calculate_fragment_mz, residue_mass, top_fragment_indices, BinConfig, FragmentAnnotation,
+    IonType, LibraryEntry, LibraryFragment, Modification, Result, Spectrum, ToleranceUnit,
+    H2O_MASS, PROTON_MASS,
 };
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -82,17 +83,7 @@ pub fn has_any_top_fragment_match(
     }
 
     // Consider only the top 6 fragments by intensity
-    let top_indices: Vec<usize> = if library_fragments.len() <= 6 {
-        (0..library_fragments.len()).collect()
-    } else {
-        let mut indexed: Vec<(usize, f32)> = library_fragments
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (i, f.relative_intensity))
-            .collect();
-        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-        indexed.iter().take(6).map(|(i, _)| *i).collect()
-    };
+    let top_indices: Vec<usize> = top_fragment_indices(library_fragments, 6);
 
     for &idx in &top_indices {
         let lib_mz = library_fragments[idx].mz;
@@ -123,17 +114,7 @@ pub fn has_topn_fragment_match(
 
     // Get indices of top 6 fragments by intensity
     let n_top = library_fragments.len().min(6);
-    let top_indices: Vec<usize> = if library_fragments.len() <= 6 {
-        (0..library_fragments.len()).collect()
-    } else {
-        let mut indexed: Vec<(usize, f32)> = library_fragments
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (i, f.relative_intensity))
-            .collect();
-        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-        indexed.iter().take(6).map(|(i, _)| *i).collect()
-    };
+    let top_indices: Vec<usize> = top_fragment_indices(library_fragments, 6);
 
     // Require at least 2 of the top 6 to have matches
     // For entries with only 1 fragment, accept 1 match
@@ -180,13 +161,7 @@ pub fn get_top_n_fragment_indices(library_fragments: &[LibraryFragment], n: usiz
         return (0..library_fragments.len()).collect();
     }
 
-    let mut indexed: Vec<(usize, f32)> = library_fragments
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (i, f.relative_intensity))
-        .collect();
-    indexed.sort_by(|a, b| b.1.total_cmp(&a.1)); // Sort by intensity descending
-    indexed.iter().take(n).map(|(i, _)| *i).collect()
+    top_fragment_indices(library_fragments, n)
 }
 
 /// Check if a library m/z has a matching peak in the spectrum
@@ -244,13 +219,7 @@ pub fn topn_fragment_match_with_errors(
     let mut top_indices: Vec<usize> = (0..n_top).collect();
 
     if library_fragments.len() > 6 {
-        let mut indexed: Vec<(usize, f32)> = library_fragments
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (i, f.relative_intensity))
-            .collect();
-        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-        top_indices = indexed.iter().take(6).map(|(i, _)| *i).collect();
+        top_indices = top_fragment_indices(library_fragments, 6);
     }
 
     let mut has_match = false;
@@ -522,21 +491,7 @@ pub fn extract_fragment_xics(
 
     // Select top N fragments by relative intensity
     let n_top = library_fragments.len().min(max_fragments);
-    let top_indices: Vec<usize> = if library_fragments.len() <= max_fragments {
-        (0..library_fragments.len()).collect()
-    } else {
-        let mut indexed: Vec<(usize, f32)> = library_fragments
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (i, f.relative_intensity))
-            .collect();
-        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-        indexed
-            .iter()
-            .take(max_fragments)
-            .map(|(i, _)| *i)
-            .collect()
-    };
+    let top_indices: Vec<usize> = top_fragment_indices(library_fragments, max_fragments);
 
     let mut results = Vec::with_capacity(n_top);
 
@@ -2908,8 +2863,6 @@ pub struct DecoyGenerator {
     method: DecoyMethod,
     /// Enzyme used for digestion
     enzyme: Enzyme,
-    /// Amino acid masses for fragment calculation
-    aa_masses: HashMap<char, f64>,
 }
 
 /// Decoy generation method
@@ -2951,43 +2904,12 @@ impl DecoyGenerator {
         Self {
             method,
             enzyme: Enzyme::default(),
-            aa_masses: Self::standard_aa_masses(),
         }
     }
 
     /// Create a decoy generator with specified enzyme
     pub fn with_enzyme(method: DecoyMethod, enzyme: Enzyme) -> Self {
-        Self {
-            method,
-            enzyme,
-            aa_masses: Self::standard_aa_masses(),
-        }
-    }
-
-    /// Standard monoisotopic amino acid residue masses
-    fn standard_aa_masses() -> HashMap<char, f64> {
-        let mut masses = HashMap::new();
-        masses.insert('A', 71.037114);
-        masses.insert('R', 156.101111);
-        masses.insert('N', 114.042927);
-        masses.insert('D', 115.026943);
-        masses.insert('C', 103.009185);
-        masses.insert('E', 129.042593);
-        masses.insert('Q', 128.058578);
-        masses.insert('G', 57.021464);
-        masses.insert('H', 137.058912);
-        masses.insert('I', 113.084064);
-        masses.insert('L', 113.084064);
-        masses.insert('K', 128.094963);
-        masses.insert('M', 131.040485);
-        masses.insert('F', 147.068414);
-        masses.insert('P', 97.052764);
-        masses.insert('S', 87.032028);
-        masses.insert('T', 101.047679);
-        masses.insert('W', 186.079313);
-        masses.insert('Y', 163.063329);
-        masses.insert('V', 99.068414);
-        masses
+        Self { method, enzyme }
     }
 
     /// Generate a decoy from a target library entry
@@ -3232,7 +3154,7 @@ impl DecoyGenerator {
         }
 
         // Calculate new m/z based on the decoy sequence
-        let new_mz = self.calculate_fragment_mz(
+        let new_mz = calculate_fragment_mz(
             new_ion_type,
             new_ordinal as usize,
             annotation.charge,
@@ -3251,69 +3173,6 @@ impl DecoyGenerator {
                 neutral_loss: annotation.neutral_loss,
             },
         })
-    }
-
-    /// Calculate fragment m/z from sequence
-    fn calculate_fragment_mz(
-        &self,
-        ion_type: IonType,
-        ordinal: usize,
-        charge: u8,
-        sequence: &[char],
-        mod_masses: &HashMap<usize, f64>,
-        neutral_loss: Option<f64>,
-    ) -> Option<f64> {
-        const PROTON_MASS: f64 = 1.007276;
-        const H2O_MASS: f64 = 18.010565;
-
-        let seq_len = sequence.len();
-
-        // Sum amino acid masses
-        let (start, end) = match ion_type {
-            IonType::B => (0, ordinal),                 // b-ions: N-terminal fragment
-            IonType::Y => (seq_len - ordinal, seq_len), // y-ions: C-terminal fragment
-            _ => return None,
-        };
-
-        if end > seq_len {
-            return None;
-        }
-
-        let mut mass = 0.0;
-
-        // Sum residue masses
-        for i in start..end {
-            let aa = sequence.get(i)?;
-            mass += self.aa_masses.get(aa)?;
-
-            // Add modification mass if present
-            if let Some(&mod_mass) = mod_masses.get(&i) {
-                mass += mod_mass;
-            }
-        }
-
-        // Add terminal groups and ion-specific masses
-        match ion_type {
-            IonType::B => {
-                // b-ion: [M + H]+ - loses C-terminal OH
-                mass += PROTON_MASS;
-            }
-            IonType::Y => {
-                // y-ion: [M + H]+ + H2O - keeps C-terminal OH, gains H on N-terminal
-                mass += H2O_MASS + PROTON_MASS;
-            }
-            _ => {}
-        }
-
-        // Subtract neutral loss if present
-        if let Some(loss) = neutral_loss {
-            mass -= loss;
-        }
-
-        // Calculate m/z for charge state
-        let mz = (mass + (charge as f64 - 1.0) * PROTON_MASS) / charge as f64;
-
-        Some(mz)
     }
 
     /// Generate decoys for all entries in a library (legacy method without collision detection)
@@ -3369,9 +3228,6 @@ impl DecoyGenerator {
     /// the same residue masses and terminal adjustments as `calculate_fragment_mz`. Ions
     /// spanning an unknown residue are skipped rather than aborting the ladder.
     fn theoretical_ladder(&self, sequence: &str) -> Vec<f64> {
-        const PROTON_MASS: f64 = 1.007276;
-        const H2O_MASS: f64 = 18.010565;
-
         let chars: Vec<char> = sequence.chars().collect();
         let len = chars.len();
         if len < 2 {
@@ -3387,7 +3243,7 @@ impl DecoyGenerator {
         // UniProt-derived libraries.
         let mut prefix = vec![0.0f64; len + 1];
         for i in 0..len {
-            prefix[i + 1] = match self.aa_masses.get(&chars[i]) {
+            prefix[i + 1] = match residue_mass(chars[i]) {
                 Some(m) if !prefix[i].is_nan() => prefix[i] + m,
                 _ => f64::NAN,
             };
@@ -3395,7 +3251,7 @@ impl DecoyGenerator {
         let mut suffix = vec![0.0f64; len + 1];
         for i in (0..len).rev() {
             let n = len - i;
-            suffix[n] = match self.aa_masses.get(&chars[i]) {
+            suffix[n] = match residue_mass(chars[i]) {
                 Some(m) if !suffix[n - 1].is_nan() => suffix[n - 1] + m,
                 _ => f64::NAN,
             };
@@ -5725,20 +5581,21 @@ mod tests {
     fn test_ladder_drops_only_the_ions_spanning_an_unknown_residue() {
         let generator = DecoyGenerator::with_enzyme(DecoyMethod::Reverse, Enzyme::Trypsin);
 
-        // Selenocysteine (U) is absent from the standard residue table and is real in
-        // UniProt-derived libraries (GPX1, GPX4, SELENOP, TXNRD1). A LEADING unknown is the
-        // case that matters: deriving y ions as (total - prefix) makes total NaN and empties
-        // the whole ladder, and an empty ladder is read as "accept", which silently switches
-        // the gate off for exactly those peptides.
+        // The ambiguity codes (B, J, O, X, Z) are absent from the residue table and do occur
+        // in UniProt-derived libraries; selenocysteine (U) has a mass now, so it no longer
+        // drops an ion. A LEADING unknown is the case that matters: deriving y ions as
+        // (total - prefix) makes total NaN and empties the whole ladder, and an empty ladder
+        // is read as "accept", which silently switches the gate off for exactly those peptides.
         assert_eq!(
-            generator.theoretical_ladder("UPEPTIDEK").len(),
+            generator.theoretical_ladder("XPEPTIDEK").len(),
             8,
-            "Every b ion spans the leading U, but all eight y ions survive"
+            "Every b ion spans the leading X, but all eight y ions survive"
         );
+        assert_eq!(generator.theoretical_ladder("UPEPTIDEK").len(), 16);
 
         // An interior unknown drops the ions that span it from both series, and only those:
-        // b1-b3 and y1-y4 of PEPUIDEK never cross position 4.
-        assert_eq!(generator.theoretical_ladder("PEPUIDEK").len(), 7);
+        // b1-b3 and y1-y4 of PEPXIDEK never cross position 4.
+        assert_eq!(generator.theoretical_ladder("PEPXIDEK").len(), 7);
 
         // Control: a clean sequence yields the full 2*(n-1) ladder.
         assert_eq!(generator.theoretical_ladder("PEPTIDEK").len(), 14);
