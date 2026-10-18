@@ -453,14 +453,18 @@ struct PrecursorData {
 fn strip_flanking_chars(seq: &str) -> String {
     let trimmed = seq.trim_matches(|c| c == '_' || c == '.' || c == '-');
 
-    // Also handle internal patterns like "K.PEPTIDE.R" -> "PEPTIDE"
-    if let Some(start) = trimmed.find('.') {
-        if let Some(end) = trimmed.rfind('.') {
-            if start < end {
-                // Extract the middle part between the first and last dots
-                return trimmed[start + 1..end].to_string();
-            }
-        }
+    // Flanking residues, "K.PEPTIDE.R" -> "PEPTIDE": one residue and a dot at each end. Only
+    // there: a mass bracket has a dot of its own (C[+57.021464]), and taking the text between
+    // the first and last dot cut a peptide with two such brackets down to what lay between its
+    // two masses.
+    let bytes = trimmed.as_bytes();
+    if bytes.len() > 4
+        && bytes[1] == b'.'
+        && bytes[bytes.len() - 2] == b'.'
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[bytes.len() - 1].is_ascii_alphabetic()
+    {
+        return trimmed[2..trimmed.len() - 2].to_string();
     }
 
     trimmed.to_string()
@@ -613,6 +617,23 @@ mod tests {
         assert_eq!(strip_modifications("PEP[+15.99]TIDE"), "PEPTIDE");
         assert_eq!(strip_modifications("(UniMod:1)PEPTIDE"), "PEPTIDE");
         assert_eq!(strip_modifications("PEPTM[Oxidation]IDE"), "PEPTMIDE");
+    }
+
+    /// Flanking residues are one residue and a dot at each end; the dots of mass brackets are
+    /// not flanks. The old first-to-last-dot rule cut "_KDC[+57.021464]PWPC[+57.021464]PK_"
+    /// down to "021464]PWPC[+57", one wrong modification on the wrong residue.
+    #[test]
+    fn test_strip_flanking_chars_leaves_mass_brackets_whole() {
+        assert_eq!(strip_flanking_chars("K.PEPTIDE.R"), "PEPTIDE");
+        assert_eq!(strip_flanking_chars("_PEPTIDE_"), "PEPTIDE");
+        assert_eq!(
+            strip_flanking_chars("_KDC[+57.021464]PWPC[+57.021464]PK_"),
+            "KDC[+57.021464]PWPC[+57.021464]PK"
+        );
+        assert_eq!(
+            strip_flanking_chars("R.C[+57.021464]PK.A"),
+            "C[+57.021464]PK"
+        );
     }
 
     /// Verifies that bracketed mass shift modifications are parsed with correct position and mass delta.

@@ -17,7 +17,9 @@ pub use carafe::normalize_carafe_protein_ids;
 pub use diann::DiannTsvLoader;
 pub use elib::ElibLoader;
 
-use osprey_core::{LibraryEntry, LibrarySource, OspreyError, Result};
+use osprey_core::{
+    prepare_library, FragmentToleranceConfig, LibraryEntry, LibrarySource, OspreyError, Result,
+};
 use std::collections::HashMap;
 
 /// Shortest peptide a library may contain.
@@ -63,6 +65,7 @@ pub fn validate_peptide_length(sequence: &str) -> Result<()> {
 pub fn load_library(
     source: &LibrarySource,
     cache_dir: &std::path::Path,
+    fragment_tolerance: &FragmentToleranceConfig,
 ) -> Result<Vec<LibraryEntry>> {
     let source_path = source.path();
     // Library cache filename ("<library-name>.libcache"), placed in cache_dir
@@ -88,7 +91,7 @@ pub fn load_library(
         };
 
         if cache_ok {
-            match cache::load_library_cache(&cache_path) {
+            match cache::load_library_cache(&cache_path, fragment_tolerance) {
                 Ok(mut entries) => {
                     log::info!(
                         "Loaded {} library entries from cache '{}'",
@@ -132,18 +135,30 @@ pub fn load_library(
         }
     }?;
 
+    // Every entry's peaks in m/z order, one peak per m/z scaled to the base peak, typed from
+    // m/z within the search's fragment tolerance - whatever the file stated, so a library is
+    // the same object whichever format it came from (osprey_core::fragment_typing).
+    let mut entries = entries;
+    let (typed, total) = prepare_library(&mut entries, fragment_tolerance);
+    log::info!(
+        "Typed {} of {} library peaks as b or y ions within {} {:?}",
+        typed,
+        total,
+        fragment_tolerance.tolerance,
+        fragment_tolerance.unit
+    );
+
     // BEFORE deduplicate_library, and the order is not incidental: dedup merges each
     // (modified sequence, charge) group's accessions through a sort + dedup, so stripping
     // afterwards would leave entries that differed only by _pepNNNNN as duplicate identical
     // accessions in that merge. Stripping first lets the existing merge collapse them, which
     // is what pre-stripping the source TSV produces - and the two must agree.
-    let mut entries = entries;
     normalize_carafe_protein_ids(&mut entries);
 
     let deduped = deduplicate_library(entries);
 
     // Save cache for future runs
-    match cache::save_library_cache(&deduped, &cache_path) {
+    match cache::save_library_cache(&deduped, &cache_path, fragment_tolerance) {
         Ok(()) => {
             log::info!(
                 "Saved library cache ({} entries) to '{}'",
