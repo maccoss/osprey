@@ -9504,7 +9504,7 @@ fn run_search(
                         // --- Peak selection ---
                         // For boundary overrides (forced/imputed): map given RTs to XIC indices.
                         // For normal search: CWT consensus peak detection with fallbacks.
-                        if let Some((target_apex, target_start, target_end)) = has_override {
+                        if let Some((_, target_start, target_end)) = has_override {
                             if ref_xic.len() < 3 {
                                 return None;
                             }
@@ -9519,23 +9519,24 @@ fn run_search(
                                 .partition_point(|(rt, _)| *rt < target_end)
                                 .min(ref_xic.len() - 1);
 
-                            let apex_index = ref_xic
-                                .partition_point(|(rt, _)| *rt < target_apex)
-                                .min(ref_xic.len() - 1);
-                            // Pick closer neighbor for apex
-                            let apex_index = if apex_index > 0
-                                && (ref_xic[apex_index - 1].0 - target_apex).abs()
-                                    < (ref_xic[apex_index].0 - target_apex).abs()
-                            {
-                                apex_index - 1
-                            } else {
-                                apex_index
-                            };
-                            let apex_index = apex_index.clamp(start_index, end_index);
-
                             if end_index <= start_index + 1 {
                                 return None;
                             }
+
+                            // The apex is the reference XIC's maximum within the bounds, as the
+                            // CWT path below picks it, not the scan nearest the consensus apex RT.
+                            // That scan can carry no reference signal while the rest of the peak
+                            // does, giving peak_apex = 0 with a normal peak_area: a combination a
+                            // first-pass peak never has (its apex is this maximum, so a zero apex
+                            // means a zero area), so the model never trains on it. A model weighting
+                            // peak_apex negatively scored such re-scored decoys near +14 and emptied
+                            // the protein stratum of a library-decoy search.
+                            let apex_index = ref_xic[start_index..=end_index]
+                                .iter()
+                                .enumerate()
+                                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+                                .map(|(i, _)| start_index + i)
+                                .unwrap_or(start_index);
 
                             let raw_ints: Vec<f64> = ref_xic.iter().map(|(_, v)| *v).collect();
                             let area = trapezoidal_area(&ref_xic[start_index..=end_index]);
