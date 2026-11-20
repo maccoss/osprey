@@ -1922,6 +1922,29 @@ pub(crate) fn read_fdr_scores_experiment_q(
     Some(out)
 }
 
+/// Every file's `.1st-pass.fdr_scores.bin` path, a sibling of its parquet cache (the convention
+/// `restore_pass1_scalars` and the frozen pass-2 recompute use), or `None` when a file has no
+/// cache path or its sidecar is missing.
+fn first_pass_sidecar_paths(
+    per_file_entries: &[(String, Vec<FdrEntry>)],
+    per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
+) -> Option<Vec<std::path::PathBuf>> {
+    per_file_entries
+        .iter()
+        .map(|(file_name, _)| {
+            let cache = per_file_cache_paths.get(file_name.as_str())?;
+            let dir = cache.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let sidecar = dir.join(format!("{}.1st-pass.fdr_scores.bin", file_name));
+            if sidecar.exists() {
+                Some(sidecar)
+            } else {
+                log::warn!("1st-pass sidecar not found: {}", sidecar.display());
+                None
+            }
+        })
+        .collect()
+}
+
 /// Union every file's pass-1 experiment-scope values into ONE analysis-wide map, keyed by
 /// `entry_id`.
 ///
@@ -6084,12 +6107,32 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // comes from config.protein_fdr (default 0.01).
         let protein_fdr_threshold = config.protein_fdr;
         log::info!("Second-pass protein FDR");
-        // Collect best peptide scores from compacted + reconciled + second-pass-scored stubs
-        let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
-
-        // Savitski gate: 1 x run_fdr (same as peptide-level threshold)
+        // Every library protein competes, by parsimony group, scored from the FIRST pass: the
+        // experiment aggregate of every scored precursor, targets and decoys, recorded in the
+        // 1st-pass sidecars before compaction dropped most of the decoys. The compacted pool
+        // cannot supply the decoy side - decoy proteins scored from the few survivors look
+        // weaker than they are - and library-supplied decoys are not named `DECOY_` + target,
+        // so decoys are paired by base id. Absence is FATAL: there is no second source, and a
+        // protein FDR without those decoys reports q-values far below the real error rate.
+        // Port of C# `SecondPassFdrTask.ReadFirstPassProteinScores` +
+        // `ProteinFdr.ComputeLibraryPickedProteinFdr`.
+        let first_pass_records = first_pass_sidecar_paths(&per_file_entries, &per_file_cache_paths)
+            .and_then(|paths| read_analysis_wide_experiment_q(&paths))
+            .ok_or_else(|| {
+                OspreyError::ConfigError(
+                    "Second-pass protein FDR could not read the first-pass scores in the \
+                     .1st-pass.fdr_scores.bin sidecars. Rerun without the score cache to \
+                     rewrite them."
+                        .to_string(),
+                )
+            })?;
+        let mut library_scores = protein::LibraryProteinScores::new(&library);
+        for (&entry_id, &(_, _, aggregate)) in &first_pass_records {
+            library_scores.add(entry_id, aggregate);
+        }
+        drop(first_pass_records);
         let protein_fdr_result =
-            protein::compute_protein_fdr(&parsimony, &best_scores, config.run_fdr);
+            protein::compute_library_picked_protein_fdr(&parsimony, &library_scores.by_protein());
 
         let n_passing = protein_fdr_result
             .group_qvalues
@@ -6707,9 +6750,10 @@ fn restore_pass1_scalars(
 /// explicitly requested, the caller treats that as a hard error (fail-fast) rather than
 /// silently degrading to the anti-conservative retrain.
 ///
-/// `stratum_base_ids`: `None` = full-population (transfer-compete); `Some` = constrained
-/// competition (protein-compact, feature #3 — the map-back then leaves off-stratum survivors
-/// on their 1st-pass q). Port of C# `Pass2FdrSidecar.ComputePass2TransferCompeteFull`.
+/// `stratum_base_ids`: `None` = full-population (transfer-compete); `Some` = stratified
+/// competition (protein-compact): the stratum and its complement each compete against their own
+/// paired decoys, at run and at experiment scope, and the map-back reports both. Port of C#
+/// `Pass2FdrSidecar.ComputePass2TransferCompeteFull`.
 fn compute_pass2_transfer_compete(
     per_file_entries: &mut [(String, Vec<FdrEntry>)],
     per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
@@ -6804,12 +6848,44 @@ fn compute_pass2_transfer_compete(
             }
         }
     };
+    // Pass-1 experiment-scope values, needed only when stratified: the complement's experiment
+    // competition ranks every entry on its pass-1 aggregate, and an off-stratum survivor carries
+    // that aggregate beside the q it produced.
+    //
+    // ANALYSIS-WIDE, not per file (#4486). The map is keyed by entry_id alone because that is
+    // the scope of the quantity: one value per precursor for the whole analysis. It holds every
+    // complement base_id, non-survivors included, which is what the complement's competition
+    // needs. Residency is O(distinct entries), not O(files x entries): the merge folds each
+    // file's map in and drops it.
+    let pass1_exp_q: Option<HashMap<u32, (f64, f64, f64)>> = if stratum_base_ids.is_some() {
+        match read_analysis_wide_experiment_q(&sidecar_paths) {
+            Some(m) => Some(m),
+            // Refusing here rather than competing a partial map: the caller's contract for a
+            // sidecar it cannot trust is a hard error, and a silently incomplete map would
+            // understate the complement's null.
+            None => return false,
+        }
+    } else {
+        None
+    };
+    // The stratum's complement competes against its OWN decoys at experiment scope too, on the
+    // aggregate scores the 1st pass ranked every entry on. Port of C#
+    // `StreamingFdr.ComputeComplementExperimentQ`.
+    let complement_exp_q: Option<HashMap<u32, f64>> = match (stratum_base_ids, &pass1_exp_q) {
+        (Some(strat), Some(map)) => Some(crate::pass2_qvalue::compute_complement_experiment_q(
+            map.iter().map(|(&eid, &(_, _, agg))| (eid, agg)),
+            strat,
+        )),
+        _ => None,
+    };
+
     let (run_q, exp_q, pep, exp_agg) = crate::pass2_qvalue::compute_full_population_fdr_streaming(
         n_files,
         read_file,
         &survivor_score_override,
         &survivors,
         stratum_base_ids,
+        complement_exp_q.as_ref(),
     );
     if read_failed.get() {
         log::warn!(
@@ -6818,46 +6894,30 @@ fn compute_pass2_transfer_compete(
         return false;
     }
 
-    // Pass-1 experiment-scope values, needed only when stratified: an off-stratum peak keeps
-    // its pass-1 experiment values, and the post-rescore overlay already zeroed the in-memory
-    // copy for the ones Stage 6 changed.
-    //
-    // ANALYSIS-WIDE, not per file (#4486). The map is keyed by entry_id alone because that is
-    // the scope of the quantity: one value per precursor for the whole analysis. Built once
-    // ahead of the loop, so an entry whose first pass left no record in the file being mapped -
-    // a row Stage 6 synthesized, or a peak it moved - still resolves to the value its own first
-    // pass computed, instead of falling through to the reset default and giving one entry a
-    // different "experiment-wide" value in every run.
-    //
-    // Residency is O(distinct entries), not O(files x entries): the merge folds each file's
-    // map in and drops it.
-    let pass1_exp_q: Option<HashMap<u32, (f64, f64, f64)>> = if stratum_base_ids.is_some() {
-        match read_analysis_wide_experiment_q(&sidecar_paths) {
-            Some(m) => Some(m),
-            // Refusing here rather than mapping with a partial map: the caller's contract for
-            // a sidecar it cannot trust is the retrain, and a silently incomplete experiment
-            // map would put reset defaults on exactly the rows this exists to fix.
-            None => return false,
+    // protein-compact: the experiment PEPTIDE competition over the stratum's aggregates, grouped
+    // by the target peptide of each base_id as the survivors name it (never the library, which a
+    // distributed node holds without its generated decoys). Port of C#
+    // `ExperimentQFloors.TargetPeptideFor` + `StreamedCompetitionState.CompetePeptides`.
+    let mut target_peptides: HashMap<u32, Arc<str>> = HashMap::new();
+    if stratum_base_ids.is_some() {
+        for (_, entries) in per_file_entries.iter() {
+            for e in entries {
+                if !e.is_decoy && !e.modified_sequence.is_empty() {
+                    target_peptides
+                        .entry(e.entry_id)
+                        .or_insert_with(|| e.modified_sequence.clone());
+                }
+            }
         }
-    } else {
-        None
-    };
+    }
+    let peptides = stratum_base_ids
+        .map(|_| crate::pass2_qvalue::compete_experiment_peptides(&exp_agg, &target_peptides));
 
-    // Map the recomputed q/PEP back onto the survivor stubs. Under a constrained stratum, an
-    // off-stratum survivor is absent from run_q → keep its 1st-pass q (report = pass1 ∪ stratum).
+    // Map the recomputed q/PEP back onto the survivor stubs. Every survivor has a run q (1.0
+    // when it won no competition in its file) and an experiment q, on- or off-stratum.
     let mut n_mapped = 0usize;
     for (file_idx, (_file_name, entries)) in per_file_entries.iter_mut().enumerate() {
         for e in entries.iter_mut() {
-            // Under a constrained stratum (protein-compact), an off-stratum survivor keeps its
-            // already-passing 1st-pass q — the streaming competition returns q=1.0 for it, so it
-            // must be skipped rather than written (report = pass1 ∪ stratum passers).
-            //
-            // EXCEPT where Stage 6 changed the peak. A changed peak competed above on its
-            // recalculated score, so it has an EARNED q here; skipping it would leave it on the
-            // q=1 sentinel the post-rescore overlay wrote, which reads as a confident rejection
-            // rather than "not yet computed". Presence in survivor_score_override is the
-            // entry-id-keyed "this peak changed" signal, so it means the same thing in-process
-            // and on a distributed merge node.
             let key = (file_idx, e.entry_id);
 
             // Persist the score this entry COMPETED on above: the frozen-model score where its
@@ -6871,29 +6931,27 @@ fn compute_pass2_transfer_compete(
 
             if let Some(strat) = stratum_base_ids {
                 if !strat.contains(&(e.entry_id & 0x7FFF_FFFF)) {
-                    // Off-stratum: only the RUN-level q of a peak Stage 6 changed is refreshed.
-                    // An unchanged one never competed, so it is absent from run_q and keeps
-                    // everything from pass 1.
+                    // Off-stratum survivors take the q of the stratum's COMPLEMENT, competed
+                    // against its own decoys at run and experiment scope. They used to keep
+                    // their 1st-pass experiment q, which was earned against a null diluted by
+                    // the stratum's true targets while the decoys the stratum left behind
+                    // counted against no one.
                     //
-                    // The EXPERIMENT q is never recomputed here. It is a pass-1 property
-                    // anchored on the best-scoring peak, and reconciliation corrects peaks
-                    // TOWARD that anchor rather than moving it, so a changed peak was not the
-                    // one that set the maximum and cannot become it. Carrying the pass-1 value
-                    // is therefore exact, and it is what keeps the re-scoping additive.
-                    //
-                    // The aggregate is carried with the two q-values because it is the score
-                    // they were ranked on; leaving it at the reset default gives the record a q
-                    // and a score from different competitions.
+                    // The aggregate and PEP stay the pass-1 values: the complement competed on
+                    // that aggregate, and its PEP is the pass-1 winner fact for the same ranking
+                    // (`restore_pass1_scalars` seeded it). The complement's competition is at the
+                    // precursor level, so its q stands in for the peptide q as well.
                     let rq_off = match run_q.get(&key) {
                         Some(&v) => v,
                         None => continue,
                     };
+                    let eq_off = exp_q[&key];
                     e.run_precursor_qvalue = rq_off;
                     e.run_peptide_qvalue = rq_off;
+                    e.experiment_precursor_qvalue = eq_off;
+                    e.experiment_peptide_qvalue = eq_off;
                     if let Some(map) = pass1_exp_q.as_ref() {
-                        if let Some(&(prec, pep_q, agg)) = map.get(&e.entry_id) {
-                            e.experiment_precursor_qvalue = prec;
-                            e.experiment_peptide_qvalue = pep_q;
+                        if let Some(&(_, _, agg)) = map.get(&e.entry_id) {
                             e.experiment_aggregate_score = agg;
                         }
                     }
@@ -6908,9 +6966,16 @@ fn compute_pass2_transfer_compete(
             e.run_precursor_qvalue = rq;
             e.experiment_precursor_qvalue = exp_q[&key];
             e.pep = pep[&key];
-            // Precursor-level path: keep peptide q in step with precursor q for the reported set.
+            // The RUN peptide q stays in step with the run precursor q: replacing it would move
+            // the protein FDR gate, which reads run peptide q. The EXPERIMENT peptide q comes
+            // from the peptide-level competition over the same aggregates under protein-compact,
+            // so every charge state of a peptide gets one peptide q; transfer-compete keeps the
+            // precursor q.
             e.run_peptide_qvalue = rq;
-            e.experiment_peptide_qvalue = exp_q[&key];
+            e.experiment_peptide_qvalue = match peptides.as_ref() {
+                Some(p) => p.qvalue(e.entry_id),
+                None => exp_q[&key],
+            };
             // The aggregate MUST move with the q above. This mode recomputes experiment q from
             // a fresh full-population competition, so the pass-1 aggregate
             // `restore_pass1_scalars` seeded is no longer the score that q was ranked on — and
@@ -6919,9 +6984,9 @@ fn compute_pass2_transfer_compete(
             // minimum over accepted precursors' aggregates, so entries still holding the 0.0
             // reset default dragged it to 0.0 and admitted the entire decoy pool.
             //
-            // An absent entry_id never entered the experiment fold (off-stratum under
-            // protein-compact); those keep the pass-1 value, which is correct because they keep
-            // the pass-1 experiment q too — the branch above.
+            // An absent entry_id never entered the stratum's experiment fold; the complement's
+            // entries took the pass-1 value in the branch above, which is the aggregate their own
+            // competition ranked on.
             if let Some(&agg) = exp_agg.get(&e.entry_id) {
                 e.experiment_aggregate_score = agg;
             }
