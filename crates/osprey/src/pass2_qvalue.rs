@@ -25,9 +25,13 @@
 //! the high-scoring decoys, and the decoys it leaves behind must still count against the
 //! complement's targets. Port of C# `StreamingFdr.ComputeComplementExperimentQ` and the split
 //! `CompeteOneFile`.
+//!
+//! The stratum's experiment PEPTIDE q comes from a peptide-level competition over the same
+//! per-entry aggregates (`compete_experiment_peptides`), port of C#
+//! `StreamedCompetitionState.CompetePeptides`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use osprey_fdr::percolator::{compete_from_indices, compute_conservative_qvalues};
 use osprey_ml::pep::PepEstimator;
@@ -504,6 +508,107 @@ fn winner_q_by_entry_id(
     exp_q_by_winner_id
 }
 
+/// A peptide identity in the second-pass peptide competition: the TARGET modified sequence of
+/// a base_id, or the base_id alone when no target with it was observed among the survivors (a
+/// peptide of its own). The variant split is what the C# `"#" + base_id` key encodes; no named
+/// peptide can collide with an unnamed one.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+enum PeptideKey {
+    Named(Arc<str>),
+    Unnamed(u32),
+}
+
+fn peptide_key(target_peptides: &HashMap<u32, Arc<str>>, base_id: u32) -> PeptideKey {
+    match target_peptides.get(&base_id) {
+        Some(seq) => PeptideKey::Named(seq.clone()),
+        None => PeptideKey::Unnamed(base_id),
+    }
+}
+
+/// The result of [`compete_experiment_peptides`]: one q-value per peptide and side, read by
+/// entry_id. Every precursor of a peptide reads the same value, which is what makes this a
+/// peptide-level answer.
+pub struct PeptideCompetition<'a> {
+    winners: HashMap<(PeptideKey, bool), f64>,
+    target_peptides: &'a HashMap<u32, Arc<str>>,
+}
+
+impl PeptideCompetition<'_> {
+    /// The experiment peptide q-value of this entry's peptide, or 1.0 when its side lost the
+    /// peptide competition.
+    pub fn qvalue(&self, entry_id: u32) -> f64 {
+        let base_id = entry_id & BASE_ID_MASK;
+        let key = (
+            peptide_key(self.target_peptides, base_id),
+            entry_id != base_id,
+        );
+        self.winners.get(&key).copied().unwrap_or(1.0)
+    }
+}
+
+/// The experiment-level PEPTIDE competition over the per-entry aggregates the stratum's
+/// precursor competition ranked (`exp_aggregate` from
+/// [`compute_full_population_fdr_streaming`]), grouped by peptide: each peptide's best target
+/// and best decoy precursor, competed by base_id with conservative q - the same computation the
+/// first pass does in `compute_experiment_peptide_qvalues`, over the second pass's scores.
+/// Without it the second pass gave each entry its precursor q as its peptide q, so the charge
+/// states of one peptide could disagree.
+///
+/// `target_peptides` maps a TARGET entry_id (= its base_id) to its modified sequence, taken
+/// from the survivor entries rather than the library, so a decoy precursor groups with the
+/// other decoys of the same target peptide. A base_id it cannot name is a peptide of its own.
+/// Port of C# `StreamedCompetitionState.CompetePeptides` (the peptide PEP it also fits is a
+/// C#-only blib column and is not ported).
+pub fn compete_experiment_peptides<'a>(
+    exp_aggregate: &HashMap<u32, f64>,
+    target_peptides: &'a HashMap<u32, Arc<str>>,
+) -> PeptideCompetition<'a> {
+    // Each peptide's best precursor per side; on a tied score the lower base_id, so the choice
+    // does not depend on hash order.
+    let mut best_by_peptide: HashMap<(PeptideKey, bool), (f64, u32)> = HashMap::new();
+    for (&eid, &score) in exp_aggregate {
+        let base_id = eid & BASE_ID_MASK;
+        let key = (peptide_key(target_peptides, base_id), eid != base_id);
+        match best_by_peptide.get(&key) {
+            Some(&(cur, cur_bid)) if !(score > cur || (score == cur && base_id < cur_bid)) => {}
+            _ => {
+                best_by_peptide.insert(key, (score, base_id));
+            }
+        }
+    }
+
+    let n = best_by_peptide.len();
+    let mut keys: Vec<(PeptideKey, bool)> = Vec::with_capacity(n);
+    let mut scores: Vec<f64> = Vec::with_capacity(n);
+    let mut labels: Vec<bool> = Vec::with_capacity(n);
+    let mut entry_ids: Vec<u32> = Vec::with_capacity(n);
+    for (key, (score, base_id)) in best_by_peptide {
+        let is_decoy = key.1;
+        scores.push(score);
+        labels.push(is_decoy);
+        entry_ids.push(if is_decoy {
+            base_id | !BASE_ID_MASK
+        } else {
+            base_id
+        });
+        keys.push(key);
+    }
+    // A base_id names one peptide, so each side holds at most one best per base_id and the
+    // competition below pairs exactly as the C# CompeteFromDicts does.
+    let all_idx: Vec<usize> = (0..n).collect();
+    let (wi, ws, wd) = compete_from_indices(&scores, &labels, &entry_ids, &all_idx);
+    let mut q = vec![0.0f64; wi.len()];
+    compute_conservative_qvalues(&ws, &wd, &mut q);
+    let mut winners: HashMap<(PeptideKey, bool), f64> = HashMap::with_capacity(wi.len());
+    for (rank, &idx) in wi.iter().enumerate() {
+        winners.insert(keys[idx].clone(), q[rank]);
+    }
+    PeptideCompetition {
+        winners,
+        target_peptides,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +815,61 @@ mod tests {
         assert_eq!(q.get(&4u32).copied(), Some(0.4));
         assert_eq!(q.get(&(5 | DECOY)).copied(), Some(0.6));
         assert_eq!(q.get(&(2 | DECOY)), None);
+    }
+
+    /// The experiment peptide competition groups the charge states of one peptide (and their
+    /// paired decoys, through the TARGET peptide of each base_id) under one identity, so every
+    /// precursor of a peptide reads the same q, and a base_id the survivors cannot name is a
+    /// peptide of its own.
+    #[test]
+    fn peptide_competition_groups_precursors_by_target_peptide() {
+        let mut target_peptides: HashMap<u32, Arc<str>> = HashMap::new();
+        for (bid, pep) in [
+            (10u32, "PEPA"),
+            (11, "PEPA"),
+            (12, "PEPB"),
+            (14, "PEPC"),
+            (15, "PEPD"),
+            (16, "PEPE"),
+        ] {
+            target_peptides.insert(bid, Arc::from(pep));
+        }
+        let agg: HashMap<u32, f64> = [
+            (10u32, 9.0),
+            (10 | DECOY, 1.0),
+            (11, 4.0),
+            (11 | DECOY, 2.0),
+            (12, 3.0),
+            (12 | DECOY, 5.0), // PEPB's decoy beats its target
+            (13, 2.5),         // unnamed: a peptide of its own
+            (14, 8.0),
+            (15, 7.5),
+            (16, 7.0),
+        ]
+        .into_iter()
+        .collect();
+
+        let peptides = compete_experiment_peptides(&agg, &target_peptides);
+
+        // Peptide bests: PEPA target 9.0 (base 10), PEPA decoy 2.0 (base 11) - so base 10 and
+        // base 11 each win unopposed - PEPB 3.0 vs 5.0 on base 12, #13 target 2.5, and three
+        // unpaired targets. Sorted winners: T10 9.0, T14, T15, T16, D12 5.0, T13 2.5, D11 2.0.
+        // Forward (d+1)/t: 1, 1/2, 1/3, 1/4, 2/4, 2/5, 3/5 -> backward min:
+        // .25 .25 .25 .25 .4 .4 .6
+        assert_eq!(peptides.qvalue(10), 0.25);
+        assert_eq!(
+            peptides.qvalue(11),
+            0.25,
+            "every charge state of PEPA reads PEPA's q"
+        );
+        assert_eq!(peptides.qvalue(12), 1.0, "PEPB's target lost: default 1.0");
+        assert_eq!(peptides.qvalue(12 | DECOY), 0.4);
+        assert_eq!(peptides.qvalue(13), 0.4);
+        assert_eq!(peptides.qvalue(11 | DECOY), 0.6);
+        assert_eq!(
+            peptides.qvalue(10 | DECOY),
+            0.6,
+            "decoys group by their target's peptide"
+        );
     }
 }

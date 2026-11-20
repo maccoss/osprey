@@ -589,6 +589,264 @@ pub fn compute_protein_fdr(
     }
 }
 
+/// Base id = entry id with the decoy high bit cleared.
+const BASE_ID_MASK: u32 = 0x7FFF_FFFF;
+
+/// The best target and decoy score of a protein; `None` on a side with no score.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ProteinScorePair {
+    pub target: Option<f64>,
+    pub decoy: Option<f64>,
+}
+
+impl ProteinScorePair {
+    /// Raise each side to the given score where that is higher; `None` leaves a side as it is.
+    pub fn include(&mut self, target: Option<f64>, decoy: Option<f64>) {
+        self.target = max_scored(self.target, target);
+        self.decoy = max_scored(self.decoy, decoy);
+    }
+}
+
+/// `max` over optional scores, matching .NET `Math.Max` on the signed zeros (+0 over -0) so the
+/// reported best score is bit-identical cross-impl.
+fn max_scored(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(x), Some(y)) => {
+            if y > x || (y == x && x.is_sign_negative() && !y.is_sign_negative()) {
+                Some(y)
+            } else {
+                Some(x)
+            }
+        }
+    }
+}
+
+/// The best first-pass score of every library protein on each side of the target/decoy
+/// competition, for [`compute_library_picked_protein_fdr`].
+///
+/// Fed one score per entry_id from the first pass's experiment-wide records, which hold every
+/// scored precursor, targets and decoys, before compaction. The second-pass pool cannot supply
+/// this: compaction has dropped most decoys that lost their competition, and a decoy protein
+/// scored from the few that survived looks weaker than it is, so the competition reports more
+/// proteins than its q-values allow.
+///
+/// A decoy is filed under its target's proteins through the base id the two share, never
+/// through its own sequence or accessions. Generated decoys are named `DECOY_` + the target
+/// sequence, but decoys supplied by the library are not, and looking them up by that name finds
+/// none: every protein then wins its competition unopposed and every q-value is 0. Port of C#
+/// `LibraryProteinScores`.
+pub struct LibraryProteinScores<'a> {
+    library: &'a [LibraryEntry],
+    // Best score by base id; None where no precursor with that base id was scored.
+    target_best: Vec<Option<f64>>,
+    decoy_best: Vec<Option<f64>>,
+}
+
+impl<'a> LibraryProteinScores<'a> {
+    pub fn new(library: &'a [LibraryEntry]) -> Self {
+        let max_base_id = library
+            .iter()
+            .map(|e| e.id & BASE_ID_MASK)
+            .max()
+            .unwrap_or(0) as usize;
+        Self {
+            library,
+            target_best: vec![None; max_base_id + 1],
+            decoy_best: vec![None; max_base_id + 1],
+        }
+    }
+
+    /// Fold in the score of one entry_id. A decoy's entry_id is its target's base id with the
+    /// high bit set. An id beyond the library's range is ignored.
+    pub fn add(&mut self, entry_id: u32, score: f64) {
+        let base_id = (entry_id & BASE_ID_MASK) as usize;
+        let best = if entry_id & !BASE_ID_MASK != 0 {
+            &mut self.decoy_best
+        } else {
+            &mut self.target_best
+        };
+        if base_id >= best.len() {
+            return;
+        }
+        match best[base_id] {
+            Some(cur) if score <= cur => {}
+            _ => best[base_id] = Some(score),
+        }
+    }
+
+    /// Best target and decoy score of each accession named by a target library entry. A side
+    /// with no scored precursor is `None`.
+    pub fn by_protein(&self) -> HashMap<String, ProteinScorePair> {
+        let mut by_protein: HashMap<String, ProteinScorePair> = HashMap::new();
+        for entry in self.library {
+            if entry.is_decoy {
+                continue;
+            }
+            let base_id = (entry.id & BASE_ID_MASK) as usize;
+            let (t, d) = (self.target_best[base_id], self.decoy_best[base_id]);
+            for accession in &entry.protein_ids {
+                by_protein
+                    .entry(accession.clone())
+                    .or_default()
+                    .include(t, d);
+            }
+        }
+        by_protein
+    }
+}
+
+/// Picked-protein FDR (Savitski et al. 2015) over every protein in the library, scored from
+/// `protein_scores` - the first pass's best score of each protein on each side, decoys paired
+/// with targets by base id (see [`LibraryProteinScores`]). This is the SECOND-pass protein FDR,
+/// whose q-values are the ones reported; the first pass keeps [`compute_protein_fdr`].
+///
+/// 1. **Units.** Each parsimony group, plus each library protein in no group. A group scores the
+///    best of its accessions on each side. Every protein competes, whether or not anything was
+///    detected from it: a competition limited to proteins with a detected target admits only the
+///    decoys that happen to share one, and that undercounts false proteins.
+/// 2. **Pairwise picking.** Each unit yields one winner, the target on `target >= decoy` and
+///    otherwise the decoy; a unit scored on one side only wins that side. Neither side is gated
+///    on a q-value.
+/// 3. **Cumulative FDR** over the winners sorted by score descending, ties broken by the
+///    sorted-accessions key: `q = min(1, decoys / targets)`, then a backward sweep for
+///    monotonicity.
+/// 4. **Output** as [`compute_protein_fdr`]: target-winning groups get a q-value and score, the
+///    rest of the units are the null only, and each peptide takes the best q-value of its groups.
+///
+/// Measured on the C# side with foreign-species entrapment (Arabidopsis peptides in a human
+/// library, three runs each of Astral and Stellar HeLa, library decoys): protein groups at
+/// q <= 0.01 had a false discovery proportion of 0.82% and 0.72%, where the previous second pass
+/// gave every group q = 0 at a true FDP of 6.7% and 3.4%. Port of C#
+/// `ProteinFdr.ComputeLibraryPickedProteinFdr`; the protein-group PEP it also computes is a C#
+/// addition and is not ported (see "Do NOT use protein-level PEP" in CLAUDE.md).
+pub fn compute_library_picked_protein_fdr(
+    parsimony: &ProteinParsimonyResult,
+    protein_scores: &HashMap<String, ProteinScorePair>,
+) -> ProteinFdrResult {
+    struct Winner {
+        group_id: Option<ProteinGroupId>, // None for a library protein in no parsimony group
+        sort_key: String,
+        score: f64,
+        is_decoy: bool,
+    }
+    fn add_winner(
+        winners: &mut Vec<Winner>,
+        group_id: Option<ProteinGroupId>,
+        sort_key: String,
+        pair: &ProteinScorePair,
+    ) {
+        match (pair.target, pair.decoy) {
+            (Some(t), None) => winners.push(Winner {
+                group_id,
+                sort_key,
+                score: t,
+                is_decoy: false,
+            }),
+            (Some(t), Some(d)) if t >= d => winners.push(Winner {
+                group_id,
+                sort_key,
+                score: t,
+                is_decoy: false,
+            }),
+            (_, Some(d)) => winners.push(Winner {
+                group_id,
+                sort_key,
+                score: d,
+                is_decoy: true,
+            }),
+            _ => {}
+        }
+    }
+
+    let mut winners: Vec<Winner> = Vec::new();
+    let mut grouped: HashSet<&str> = HashSet::new();
+    for group in &parsimony.groups {
+        let mut sorted_accs = group.accessions.clone();
+        sorted_accs.sort();
+        let mut pair = ProteinScorePair::default();
+        for accession in &group.accessions {
+            grouped.insert(accession.as_str());
+            if let Some(acc_pair) = protein_scores.get(accession) {
+                pair.include(acc_pair.target, acc_pair.decoy);
+            }
+        }
+        add_winner(&mut winners, Some(group.id), sorted_accs.join(";"), &pair);
+    }
+    for (accession, pair) in protein_scores {
+        if !grouped.contains(accession.as_str()) {
+            add_winner(&mut winners, None, accession.clone(), pair);
+        }
+    }
+
+    // Keys are unique: a parsimony group's accession list is unique to it, and an ungrouped
+    // protein is a single accession no group holds.
+    winners.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.sort_key.cmp(&b.sort_key))
+    });
+
+    let mut raw_qvalues: Vec<f64> = Vec::with_capacity(winners.len());
+    let mut cum_targets = 0usize;
+    let mut cum_decoys = 0usize;
+    for w in &winners {
+        if w.is_decoy {
+            cum_decoys += 1;
+        } else {
+            cum_targets += 1;
+        }
+        raw_qvalues.push(if cum_targets > 0 {
+            (cum_decoys as f64 / cum_targets as f64).min(1.0)
+        } else {
+            1.0
+        });
+    }
+
+    let mut group_qvalues: HashMap<ProteinGroupId, f64> = HashMap::new();
+    let mut group_scores: HashMap<ProteinGroupId, f64> = HashMap::new();
+    let mut min_q = 1.0f64;
+    for i in (0..winners.len()).rev() {
+        min_q = min_q.min(raw_qvalues[i]);
+        let w = &winners[i];
+        if let (false, Some(gid)) = (w.is_decoy, w.group_id) {
+            group_qvalues.insert(gid, min_q);
+            group_scores.insert(gid, w.score);
+        }
+    }
+
+    if crate::diagnostics::stage7_winners_enabled() {
+        let winner_scores: Vec<f64> = winners.iter().map(|w| w.score).collect();
+        let winner_is_decoys: Vec<bool> = winners.iter().map(|w| w.is_decoy).collect();
+        crate::diagnostics::dump_stage7_winners(&winner_scores, &winner_is_decoys, &raw_qvalues);
+    }
+
+    let mut peptide_qvalues: HashMap<String, f64> = HashMap::new();
+    for (peptide, group_ids) in &parsimony.peptide_to_groups {
+        let best_q = group_ids
+            .iter()
+            .filter_map(|gid| group_qvalues.get(gid))
+            .copied()
+            .fold(1.0f64, f64::min);
+        peptide_qvalues.insert(peptide.clone(), best_q);
+    }
+
+    let n_target_winners = winners.iter().filter(|w| !w.is_decoy).count();
+    log::info!(
+        "Library picked-protein FDR: {} winners ({} target, {} decoy); {} target groups at 1% FDR",
+        winners.len(),
+        n_target_winners,
+        winners.len() - n_target_winners,
+        group_qvalues.values().filter(|&&q| q <= 0.01).count(),
+    );
+
+    ProteinFdrResult {
+        group_qvalues,
+        group_scores,
+        peptide_qvalues,
+    }
+}
+
 /// Write a protein-level CSV report.
 ///
 /// Each row is a protein group that passes the FDR threshold. Columns include
@@ -1831,5 +2089,97 @@ mod tests {
             "P2 best-peptide SVM should be 5.0 from shared peptide, got {}",
             p2_score
         );
+    }
+
+    /// The second-pass library competition scores every library protein from first-pass
+    /// records, pairs decoys by base id (library decoys carry no `DECOY_` name here), and lets a
+    /// protein with no detected peptide - so in no parsimony group - compete as its own unit.
+    /// The ungrouped protein's decoy win counts against the grouped targets.
+    #[test]
+    fn test_library_picked_protein_fdr_competes_every_protein() {
+        const D: u32 = 0x8000_0000;
+        let library = vec![
+            make_lib_entry(1, "PEPA", vec!["P1"], false),
+            make_lib_entry(2, "PEPB", vec!["P1"], false),
+            make_lib_entry(3, "PEPC", vec!["P2"], false),
+            make_lib_entry(4, "PEPD", vec!["P3"], false),
+            make_lib_entry(1 | D, "XEPA", vec!["P1"], true),
+            make_lib_entry(3 | D, "XEPC", vec!["P2"], true),
+            make_lib_entry(4 | D, "XEPD", vec!["P3"], true),
+        ];
+        let detected: HashSet<String> = ["PEPA", "PEPB", "PEPC"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, Some(&detected));
+
+        let mut scores = LibraryProteinScores::new(&library);
+        scores.add(1, 5.0);
+        scores.add(2, 6.0);
+        scores.add(1 | D, 2.0);
+        scores.add(1 | D, 1.5); // lower: does not replace the best
+        scores.add(3, 4.0);
+        scores.add(3 | D, 1.0);
+        scores.add(4, 1.0);
+        scores.add(4 | D, 7.0);
+        scores.add(999, 100.0); // outside the library: ignored
+        let by_protein = scores.by_protein();
+        assert_eq!(by_protein["P1"].target, Some(6.0));
+        assert_eq!(by_protein["P1"].decoy, Some(2.0));
+        assert_eq!(by_protein["P3"].decoy, Some(7.0));
+
+        let result = compute_library_picked_protein_fdr(&parsimony, &by_protein);
+
+        let group_of = |acc: &str| {
+            parsimony
+                .groups
+                .iter()
+                .find(|g| g.accessions.contains(&acc.to_string()))
+                .map(|g| g.id)
+        };
+        let p1 = group_of("P1").unwrap();
+        let p2 = group_of("P2").unwrap();
+        assert!(group_of("P3").is_none(), "P3 has no detected peptide");
+        // Winners: D(P3) 7.0, T(P1) 6.0, T(P2) 4.0 -> raw 1, 1, 1/2 -> monotone 0.5 each.
+        assert_eq!(result.group_qvalues[&p1], 0.5);
+        assert_eq!(result.group_qvalues[&p2], 0.5);
+        assert_eq!(result.group_scores[&p1], 6.0);
+        assert_eq!(result.group_qvalues.len(), 2, "only target-winning groups");
+        assert_eq!(result.peptide_qvalues["PEPA"], 0.5);
+    }
+
+    /// A unit's target wins its pair on a tie (`target >= decoy`), and a unit with a decoy
+    /// score only is a decoy winner.
+    #[test]
+    fn test_library_picked_protein_fdr_tie_goes_to_target() {
+        let library = vec![
+            make_lib_entry(1, "PEPA", vec!["P1"], false),
+            make_lib_entry(2, "PEPB", vec!["P2"], false),
+        ];
+        let parsimony = build_protein_parsimony(&library, SharedPeptideMode::All, None);
+        let mut by_protein: HashMap<String, ProteinScorePair> = HashMap::new();
+        by_protein.insert(
+            "P1".to_string(),
+            ProteinScorePair {
+                target: Some(3.0),
+                decoy: Some(3.0),
+            },
+        );
+        by_protein.insert(
+            "P2".to_string(),
+            ProteinScorePair {
+                target: None,
+                decoy: Some(9.0),
+            },
+        );
+        let result = compute_library_picked_protein_fdr(&parsimony, &by_protein);
+        let p1 = parsimony
+            .groups
+            .iter()
+            .find(|g| g.accessions.contains(&"P1".to_string()))
+            .unwrap();
+        // Winners: D(P2) 9.0, T(P1) 3.0 -> raw 1, 1 -> P1 q = 1.0, but it is a target winner.
+        assert_eq!(result.group_qvalues.get(&p1.id).copied(), Some(1.0));
+        assert_eq!(result.group_qvalues.len(), 1);
     }
 }

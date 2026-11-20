@@ -1922,6 +1922,29 @@ pub(crate) fn read_fdr_scores_experiment_q(
     Some(out)
 }
 
+/// Every file's `.1st-pass.fdr_scores.bin` path, a sibling of its parquet cache (the convention
+/// `restore_pass1_scalars` and the frozen pass-2 recompute use), or `None` when a file has no
+/// cache path or its sidecar is missing.
+fn first_pass_sidecar_paths(
+    per_file_entries: &[(String, Vec<FdrEntry>)],
+    per_file_cache_paths: &HashMap<String, std::path::PathBuf>,
+) -> Option<Vec<std::path::PathBuf>> {
+    per_file_entries
+        .iter()
+        .map(|(file_name, _)| {
+            let cache = per_file_cache_paths.get(file_name.as_str())?;
+            let dir = cache.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let sidecar = dir.join(format!("{}.1st-pass.fdr_scores.bin", file_name));
+            if sidecar.exists() {
+                Some(sidecar)
+            } else {
+                log::warn!("1st-pass sidecar not found: {}", sidecar.display());
+                None
+            }
+        })
+        .collect()
+}
+
 /// Union every file's pass-1 experiment-scope values into ONE analysis-wide map, keyed by
 /// `entry_id`.
 ///
@@ -6084,12 +6107,32 @@ pub fn run_analysis(mut config: OspreyConfig) -> Result<()> {
         // comes from config.protein_fdr (default 0.01).
         let protein_fdr_threshold = config.protein_fdr;
         log::info!("Second-pass protein FDR");
-        // Collect best peptide scores from compacted + reconciled + second-pass-scored stubs
-        let best_scores = protein::collect_best_peptide_scores(&per_file_entries);
-
-        // Savitski gate: 1 x run_fdr (same as peptide-level threshold)
+        // Every library protein competes, by parsimony group, scored from the FIRST pass: the
+        // experiment aggregate of every scored precursor, targets and decoys, recorded in the
+        // 1st-pass sidecars before compaction dropped most of the decoys. The compacted pool
+        // cannot supply the decoy side - decoy proteins scored from the few survivors look
+        // weaker than they are - and library-supplied decoys are not named `DECOY_` + target,
+        // so decoys are paired by base id. Absence is FATAL: there is no second source, and a
+        // protein FDR without those decoys reports q-values far below the real error rate.
+        // Port of C# `SecondPassFdrTask.ReadFirstPassProteinScores` +
+        // `ProteinFdr.ComputeLibraryPickedProteinFdr`.
+        let first_pass_records = first_pass_sidecar_paths(&per_file_entries, &per_file_cache_paths)
+            .and_then(|paths| read_analysis_wide_experiment_q(&paths))
+            .ok_or_else(|| {
+                OspreyError::ConfigError(
+                    "Second-pass protein FDR could not read the first-pass scores in the \
+                     .1st-pass.fdr_scores.bin sidecars. Rerun without the score cache to \
+                     rewrite them."
+                        .to_string(),
+                )
+            })?;
+        let mut library_scores = protein::LibraryProteinScores::new(&library);
+        for (&entry_id, &(_, _, aggregate)) in &first_pass_records {
+            library_scores.add(entry_id, aggregate);
+        }
+        drop(first_pass_records);
         let protein_fdr_result =
-            protein::compute_protein_fdr(&parsimony, &best_scores, config.run_fdr);
+            protein::compute_library_picked_protein_fdr(&parsimony, &library_scores.by_protein());
 
         let n_passing = protein_fdr_result
             .group_qvalues
@@ -6851,6 +6894,25 @@ fn compute_pass2_transfer_compete(
         return false;
     }
 
+    // protein-compact: the experiment PEPTIDE competition over the stratum's aggregates, grouped
+    // by the target peptide of each base_id as the survivors name it (never the library, which a
+    // distributed node holds without its generated decoys). Port of C#
+    // `ExperimentQFloors.TargetPeptideFor` + `StreamedCompetitionState.CompetePeptides`.
+    let mut target_peptides: HashMap<u32, Arc<str>> = HashMap::new();
+    if stratum_base_ids.is_some() {
+        for (_, entries) in per_file_entries.iter() {
+            for e in entries {
+                if !e.is_decoy && !e.modified_sequence.is_empty() {
+                    target_peptides
+                        .entry(e.entry_id)
+                        .or_insert_with(|| e.modified_sequence.clone());
+                }
+            }
+        }
+    }
+    let peptides = stratum_base_ids
+        .map(|_| crate::pass2_qvalue::compete_experiment_peptides(&exp_agg, &target_peptides));
+
     // Map the recomputed q/PEP back onto the survivor stubs. Every survivor has a run q (1.0
     // when it won no competition in its file) and an experiment q, on- or off-stratum.
     let mut n_mapped = 0usize;
@@ -6904,9 +6966,16 @@ fn compute_pass2_transfer_compete(
             e.run_precursor_qvalue = rq;
             e.experiment_precursor_qvalue = exp_q[&key];
             e.pep = pep[&key];
-            // Precursor-level path: keep peptide q in step with precursor q for the reported set.
+            // The RUN peptide q stays in step with the run precursor q: replacing it would move
+            // the protein FDR gate, which reads run peptide q. The EXPERIMENT peptide q comes
+            // from the peptide-level competition over the same aggregates under protein-compact,
+            // so every charge state of a peptide gets one peptide q; transfer-compete keeps the
+            // precursor q.
             e.run_peptide_qvalue = rq;
-            e.experiment_peptide_qvalue = exp_q[&key];
+            e.experiment_peptide_qvalue = match peptides.as_ref() {
+                Some(p) => p.qvalue(e.entry_id),
+                None => exp_q[&key],
+            };
             // The aggregate MUST move with the q above. This mode recomputes experiment q from
             // a fresh full-population competition, so the pass-1 aggregate
             // `restore_pass1_scalars` seeded is no longer the score that q was ranked on — and
