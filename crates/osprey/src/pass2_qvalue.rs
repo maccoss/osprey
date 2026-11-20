@@ -18,8 +18,13 @@
 //! decoy-depleted null loses.
 //!
 //! The streaming competition takes an optional `stratum_base_ids`: `None` is the full-
-//! population transfer-compete path; a non-null stratum is the CONSTRAINED competition used
-//! by the (upcoming) protein-compact mode. Building the hook now keeps that feature additive.
+//! population transfer-compete path; a non-null stratum is the STRATIFIED competition used by
+//! protein-compact. The stratum and its complement compete separately, each against its own
+//! paired decoys, at run scope and at experiment scope (C# issue #4581): the stratum is chosen
+//! by target evidence, so it takes most of the high-scoring targets and only the base rate of
+//! the high-scoring decoys, and the decoys it leaves behind must still count against the
+//! complement's targets. Port of C# `StreamingFdr.ComputeComplementExperimentQ` and the split
+//! `CompeteOneFile`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -138,8 +143,15 @@ impl FrozenLinearModel {
 /// * `survivor_score_override[(file_idx, entry_id)]` swaps in the frozen-model score for each
 ///   reconciled survivor.
 /// * `survivors` is every reported (post-reconciliation) entry as `(file_idx, entry_id)`.
-/// * `stratum_base_ids`: `None` = full-population competition; `Some` = competition constrained
-///   to those base_ids (protein-compact).
+/// * `stratum_base_ids`: `None` = full-population competition; `Some` = STRATIFIED competition
+///   (protein-compact): these base_ids and their complement compete separately, each against
+///   its own paired decoys. Within each file the run competition splits in two by base_id; the
+///   experiment fold below is the stratum only.
+/// * `complement_experiment_q`: protein-compact only — the experiment q of the stratum's
+///   complement, from [`compute_complement_experiment_q`], merged into the winner-q map so a
+///   complement survivor's experiment q is its own competition's (still floored to its best run
+///   q). Its base_ids are disjoint from the stratum's, so the two never share a key. `None`
+///   leaves complement entries at experiment q 1.0.
 ///
 /// Returns `(run_q, exp_q, pep, exp_aggregate)`. The first three are keyed by
 /// `(file_idx, entry_id)` for exactly the survivors; `exp_aggregate` is keyed by full
@@ -147,8 +159,8 @@ impl FrozenLinearModel {
 /// ranked that entry on — the caller writes it beside the experiment q it produced.
 ///
 /// An `entry_id` ABSENT from `exp_aggregate` took no part in the experiment fold, which under
-/// protein-compact means an OFF-STRATUM entry; the caller must leave such an entry's pass-1
-/// aggregate untouched, because it keeps its pass-1 experiment q too. Absence (an `Option`
+/// protein-compact means an OFF-STRATUM entry; the caller carries its pass-1 aggregate, because
+/// the complement's experiment competition ranked it on that aggregate. Absence (an `Option`
 /// from the lookup), never an in-band sentinel: the score is a signed discriminant, so 0.0 is
 /// an ordinary mid-distribution value and a consumer building a score-space acceptance
 /// boundary would take a minimum over fabricated zeros. NaN is rejected for the same reason it
@@ -162,6 +174,7 @@ pub fn compute_full_population_fdr_streaming(
     survivor_score_override: &HashMap<(usize, u32), f64>,
     survivors: &[(usize, u32)],
     stratum_base_ids: Option<&HashSet<u32>>,
+    complement_experiment_q: Option<&HashMap<u32, f64>>,
 ) -> (
     HashMap<(usize, u32), f64>,
     HashMap<(usize, u32), f64>,
@@ -188,96 +201,75 @@ pub fn compute_full_population_fdr_streaming(
         let (entry_ids, mut scores) = read_file_scalars(file_idx);
         let m = entry_ids.len();
         let mut labels = vec![false; m];
-        // Marks the observations Stage 6 actually CHANGED (see the note below).
-        let mut changed_flags = vec![false; m];
         for i in 0..m {
             let eid = entry_ids[i];
             labels[i] = (eid & !BASE_ID_MASK) != 0; // decoy high bit set
             if let Some(&ov) = survivor_score_override.get(&(file_idx, eid)) {
-                // BIT-EXACT inequality is the "changed" discriminator: an unchanged survivor's
-                // reconciled features ARE its original Stage-4 features (unchanged rows stream
-                // through untouched) and the sidecar score came from those same features under
-                // this same averaged model, so the recomputation reproduces it exactly. A moved
-                // peak carries rescored features, so its score differs.
-                if ov != scores[i] {
-                    changed_flags[i] = true;
-                }
                 scores[i] = ov; // swap in the reconciled survivor's frozen-model score
             }
         }
 
-        // protein-compact: a peak Stage 6 CHANGED (reconciliation moved it, or gap-fill created
-        // it) carries a NEW composite score and no longer has a valid pass-1 run q — the old q
-        // described a peak that no longer exists, and the post-rescore overlay zeroes it
-        // precisely to say so. Such a peak must EARN a fresh run q here, exactly the way
-        // on-stratum members do; neither inheriting the prior q nor keeping the q=1 sentinel is
-        // a calibrated answer. The "changed" signal is a frozen-model score that DIFFERS from
-        // the entry's 1st-pass sidecar score, computed above — NOT mere presence in
-        // `survivor_score_override`. That map holds every post-reconciliation survivor whose
-        // identity resolves in the effective parquet, including files Stage 6 never touched
-        // (the effective path falls back to the ORIGINAL parquet), so keying on presence
-        // admitted most of the survivor pool and quietly widened the very stratum this mode
-        // exists to enforce. The score comparison is keyed by entry_id, so it means the same
-        // thing in-process and on a distributed merge node.
+        // Run-level: compete within this file, conservative q on the winners. Stratified
+        // (protein-compact), the file splits in TWO by base_id - the stratum and its complement -
+        // and each half competes against its OWN paired decoys. Both halves are reported, so
+        // both need a calibrated q.
         //
-        // Admitted BY BASE_ID so a target and its paired decoy always enter together —
-        // admitting a lone target would let it auto-win its competition and inflate the null.
-        let changed_base_ids: Option<HashSet<u32>> = stratum_base_ids.map(|_| {
-            (0..m)
-                .filter(|&i| changed_flags[i])
-                .map(|i| entry_ids[i] & BASE_ID_MASK)
-                .collect()
-        });
-        let admit = |bid: u32| -> bool {
-            match stratum_base_ids {
-                None => true,
-                Some(strat) => {
-                    strat.contains(&bid)
-                        || changed_base_ids
-                            .as_ref()
-                            .is_some_and(|changed| changed.contains(&bid))
+        // The complement is not optional. The stratum is chosen by TARGET evidence (proteins with
+        // 2 or more detected target peptides), so it takes most of the high-scoring targets and
+        // only the base rate of the high-scoring decoys; the decoys it leaves behind are
+        // concentrated in the complement. When the complement's targets kept the q they earned
+        // against the whole population, those decoys counted against no one. Competing the
+        // complement against its own decoys gives every decoy the same protein evidence as its
+        // paired target - each counts in the half its target is in.
+        //
+        // A peak Stage 6 changed (reconciliation moved it, or gap-fill created it) competes on its
+        // new score in whichever half its base_id belongs to. Membership is protein evidence
+        // alone, decided before Stage 6, and base_id keeps a target and its paired decoy in the
+        // same half always.
+        let mut compete_half = |indices: &[usize]| {
+            let (wi, ws, wd) = compete_from_indices(&scores, &labels, &entry_ids, indices);
+            let mut q = vec![0.0f64; wi.len()];
+            compute_conservative_qvalues(&ws, &wd, &mut q);
+            for rank in 0..wi.len() {
+                let eid = entry_ids[wi[rank]];
+                if !survivor_entry_ids.contains(&eid) {
+                    continue;
+                }
+                let qv = q[rank];
+                let key = (file_idx, eid);
+                if survivor_set.contains(&key) {
+                    survivor_run_q.insert(key, qv);
+                }
+                match min_run_q.get(&eid) {
+                    Some(&cur) if qv >= cur => {}
+                    _ => {
+                        min_run_q.insert(eid, qv);
+                    }
                 }
             }
         };
-
-        // Run-level: compete within this file (stratum members plus changed peaks when
-        // stratified).
-        let all_idx: Vec<usize> = (0..m)
-            .filter(|&i| admit(entry_ids[i] & BASE_ID_MASK))
-            .collect();
-        let (wi, ws, wd) = compete_from_indices(&scores, &labels, &entry_ids, &all_idx);
-        let mut q = vec![0.0f64; wi.len()];
-        compute_conservative_qvalues(&ws, &wd, &mut q);
-        for rank in 0..wi.len() {
-            let eid = entry_ids[wi[rank]];
-            if !survivor_entry_ids.contains(&eid) {
-                continue;
+        match stratum_base_ids {
+            None => {
+                let all_idx: Vec<usize> = (0..m).collect();
+                compete_half(&all_idx);
             }
-            let qv = q[rank];
-            let key = (file_idx, eid);
-            if survivor_set.contains(&key) {
-                survivor_run_q.insert(key, qv);
-            }
-            match min_run_q.get(&eid) {
-                Some(&cur) if qv >= cur => {}
-                _ => {
-                    min_run_q.insert(eid, qv);
-                }
+            Some(strat) => {
+                let (in_idx, off_idx): (Vec<usize>, Vec<usize>) =
+                    (0..m).partition(|&i| strat.contains(&(entry_ids[i] & BASE_ID_MASK)));
+                compete_half(&in_idx);
+                compete_half(&off_idx);
             }
         }
 
         // Experiment-level: fold every observation into the per-base_id bests. When stratified
-        // this is the STRATUM ONLY — deliberately not the run-level admitted set, which also
-        // carries the changed off-stratum peaks.
+        // this is the STRATUM ONLY. The complement's experiment q is competed from the
+        // analysis-wide 1st-pass experiment records instead (`compute_complement_experiment_q`),
+        // which hold every base_id the complement needs - its non-survivors included - without a
+        // per-file best for each of them.
         //
-        // An off-stratum peak would be admitted only in the files that CHANGED it, so its best
-        // would be a max over that subset while every stratum member maxes over all files. And
-        // because reconciliation anchors on the best-scoring peak and corrects the others toward
-        // it, a changed peak is never the one that supplied the maximum — so maxing over changed
-        // observations alone is GUARANTEED to understate the precursor's experiment-wide score.
-        // The correct value is the pass-1 experiment q, which by that same anchor argument
-        // reconciliation cannot have invalidated; the caller carries it through instead, which is
-        // what keeps the re-scoping additive.
+        // A pass-1 aggregate is the right score for the complement because reconciliation
+        // anchors on the best-scoring peak and corrects the others toward it, so a changed peak
+        // is never the one that supplied the maximum.
         for i in 0..m {
             let eid = entry_ids[i];
             let bid = eid & BASE_ID_MASK;
@@ -352,31 +344,13 @@ pub fn compute_full_population_fdr_streaming(
         winner_loc.insert(bid, (win.1, win.2, win.0));
     }
 
-    // Sort winners by score desc, base_id asc (unique base_id ⇒ total order).
-    let mut perm: Vec<usize> = (0..w).collect();
-    perm.sort_by(|&a, &b| {
-        exp_score[b]
-            .total_cmp(&exp_score[a])
-            .then_with(|| exp_base_id[a].cmp(&exp_base_id[b]))
-    });
-    let sorted_score: Vec<f64> = perm.iter().map(|&i| exp_score[i]).collect();
-    let sorted_decoy: Vec<bool> = perm.iter().map(|&i| exp_is_decoy[i]).collect();
-    let sorted_base_id: Vec<u32> = perm.iter().map(|&i| exp_base_id[i]).collect();
-    let mut q_exp = vec![0.0f64; w];
-    compute_conservative_qvalues(&sorted_score, &sorted_decoy, &mut q_exp);
-    // Keyed by the WINNER's full entry_id, decoy bit intact — never the shared base_id.
-    // `sorted_decoy` carries which side won, so the winner's entry_id is reconstructible here
-    // without a second array, leaving the competition's sort and tie-break untouched. See
-    // `compute_experiment_precursor_qvalues` (osprey-fdr) for the defect this closes: on
-    // base_id, a target whose DECOY won inherited the winner's q.
-    let mut exp_q_by_winner_id: HashMap<u32, f64> = HashMap::with_capacity(w);
-    for i in 0..w {
-        let winner_id = if sorted_decoy[i] {
-            sorted_base_id[i] | !BASE_ID_MASK
-        } else {
-            sorted_base_id[i]
-        };
-        exp_q_by_winner_id.insert(winner_id, q_exp[i]);
+    let mut exp_q_by_winner_id = winner_q_by_entry_id(&exp_score, &exp_is_decoy, &exp_base_id);
+    // protein-compact: the stratum's complement competed separately. Its base_ids are disjoint
+    // from the stratum's, so the two maps never share a key.
+    if let Some(complement) = complement_experiment_q {
+        for (&eid, &q) in complement {
+            exp_q_by_winner_id.insert(eid, q);
+        }
     }
 
     let pep_estimator = PepEstimator::fit_default(&exp_score, &exp_is_decoy);
@@ -422,6 +396,114 @@ pub fn compute_full_population_fdr_streaming(
     )
 }
 
+/// The experiment q of the stratum's COMPLEMENT under protein-compact: one target/decoy
+/// competition per base_id over every base_id NOT in `stratum_base_ids`, on the per-entry
+/// experiment aggregate score the 1st pass ranked it on, with the same tie rule, sort and
+/// conservative q as the stratum's own experiment competition. Keyed by the WINNER's full
+/// entry_id; a loser is absent and reads as 1.0.
+///
+/// The stratum holds the base_ids of proteins with 2 or more detected TARGET peptides, so it
+/// takes most of the high-scoring targets and only the base rate of the high-scoring decoys.
+/// The complement is therefore decoy-rich, and the pass-1 experiment q its targets used to keep
+/// was earned against a null diluted by the stratum's true targets. Competing the complement
+/// against its own decoys makes the two halves each calibrated, and so the reported union.
+///
+/// `aggregate_scores` is every analysis-wide 1st-pass experiment record as
+/// `(entry_id, aggregate score)`, targets and decoys alike. Order does not matter: the
+/// competition is a per-base_id reduction followed by a total sort. Port of C#
+/// `StreamingFdr.ComputeComplementExperimentQ`.
+pub fn compute_complement_experiment_q(
+    aggregate_scores: impl IntoIterator<Item = (u32, f64)>,
+    stratum_base_ids: &HashSet<u32>,
+) -> HashMap<u32, f64> {
+    let mut best_target: HashMap<u32, f64> = HashMap::new();
+    let mut best_decoy: HashMap<u32, f64> = HashMap::new();
+    for (eid, score) in aggregate_scores {
+        let bid = eid & BASE_ID_MASK;
+        if stratum_base_ids.contains(&bid) {
+            continue;
+        }
+        let best = if (eid & !BASE_ID_MASK) != 0 {
+            &mut best_decoy
+        } else {
+            &mut best_target
+        };
+        match best.get(&bid) {
+            Some(&cur) if score <= cur => {}
+            _ => {
+                best.insert(bid, score);
+            }
+        }
+    }
+    let mut base_ids: HashSet<u32> = HashSet::new();
+    base_ids.extend(best_target.keys().copied());
+    base_ids.extend(best_decoy.keys().copied());
+    let w = base_ids.len();
+    let mut exp_score = Vec::with_capacity(w);
+    let mut exp_is_decoy = Vec::with_capacity(w);
+    let mut exp_base_id = Vec::with_capacity(w);
+    for bid in base_ids {
+        let t = best_target.get(&bid).copied();
+        let d = best_decoy.get(&bid).copied();
+        // The stratum's rule: target wins strictly (t > d); ties go to the decoy.
+        let (score, decoy_wins) = match (t, d) {
+            (Some(tt), Some(dd)) => {
+                if tt > dd {
+                    (tt, false)
+                } else {
+                    (dd, true)
+                }
+            }
+            (Some(tt), None) => (tt, false),
+            (None, Some(dd)) => (dd, true),
+            (None, None) => unreachable!("base_id came from one of the two maps"),
+        };
+        exp_score.push(score);
+        exp_is_decoy.push(decoy_wins);
+        exp_base_id.push(bid);
+    }
+    winner_q_by_entry_id(&exp_score, &exp_is_decoy, &exp_base_id)
+}
+
+/// Conservative experiment q for one winner per base_id, keyed by the WINNER's full entry_id.
+/// Shared by the stratum's competition and its complement's so the two halves rank, break ties
+/// and estimate q identically.
+fn winner_q_by_entry_id(
+    exp_score: &[f64],
+    exp_is_decoy: &[bool],
+    exp_base_id: &[u32],
+) -> HashMap<u32, f64> {
+    let w = exp_score.len();
+    // Sort winners by score desc, base_id asc (unique base_id ⇒ total order).
+    let mut perm: Vec<usize> = (0..w).collect();
+    perm.sort_by(|&a, &b| {
+        exp_score[b]
+            .total_cmp(&exp_score[a])
+            .then_with(|| exp_base_id[a].cmp(&exp_base_id[b]))
+    });
+    let sorted_score: Vec<f64> = perm.iter().map(|&i| exp_score[i]).collect();
+    let sorted_decoy: Vec<bool> = perm.iter().map(|&i| exp_is_decoy[i]).collect();
+    let sorted_base_id: Vec<u32> = perm.iter().map(|&i| exp_base_id[i]).collect();
+    let mut q_exp = vec![0.0f64; w];
+    compute_conservative_qvalues(&sorted_score, &sorted_decoy, &mut q_exp);
+    // Keyed by the WINNER's full entry_id, decoy bit intact — never the shared base_id.
+    // `sorted_decoy` carries which side won, so the winner's entry_id is reconstructible here
+    // without a second array, leaving the competition's sort and tie-break untouched. See
+    // `compute_experiment_precursor_qvalues` (osprey-fdr) for the defect this closes: on
+    // base_id, a target whose DECOY won inherited the winner's q.
+    let mut exp_q_by_winner_id: HashMap<u32, f64> = HashMap::with_capacity(w);
+    for i in 0..w {
+        let winner_id = if sorted_decoy[i] {
+            sorted_base_id[i] | !BASE_ID_MASK
+        } else {
+            sorted_base_id[i]
+        };
+        exp_q_by_winner_id.insert(winner_id, q_exp[i]);
+    }
+
+    exp_q_by_winner_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,7 +526,7 @@ mod tests {
         let overrides: HashMap<(usize, u32), f64> = HashMap::new();
 
         let (run_q, exp_q, pep, agg) =
-            compute_full_population_fdr_streaming(2, read, &overrides, &survivors, None);
+            compute_full_population_fdr_streaming(2, read, &overrides, &survivors, None, None);
 
         // Every entry that took part in the (unstratified) experiment fold has an aggregate:
         // the max of its score over the files it was observed in. base_id 1's target is seen
@@ -475,7 +557,7 @@ mod tests {
         overrides.insert((0usize, 1u32), 9.0); // strong override for the target
 
         let (run_q, exp_q, _pep, agg) =
-            compute_full_population_fdr_streaming(1, read, &overrides, &survivors, None);
+            compute_full_population_fdr_streaming(1, read, &overrides, &survivors, None, None);
 
         // Single file → experiment q == run q, and the survivor is covered.
         let rq = *run_q.get(&(0, 1)).expect("run_q missing");
@@ -486,41 +568,147 @@ mod tests {
         assert_eq!(agg.get(&1u32).copied(), Some(9.0));
     }
 
-    /// A non-null stratum restricts the competition to its base_ids: an off-stratum survivor
-    /// never wins a (stratum-filtered) competition, so it falls to the default q=1.0 — the
-    /// signal the orchestrator uses to leave it on its 1st-pass q. Protein-compact (#3) relies
-    /// on this. (The in-stratum survivor is competed; here it is a lone target+decoy pair, so
-    /// its conservative q is also 1.0 — the exact values are a parity-gate concern.)
+    /// Stratified (protein-compact), the run competition splits by base_id into the stratum and
+    /// its complement, and each half competes against its own paired decoys. The stratum holds
+    /// four strong targets; the complement holds three weaker targets and the one decoy that
+    /// outscores them. In one population that decoy is diluted by the stratum's targets; in its
+    /// own half it counts against the complement's targets alone.
     #[test]
-    fn stratum_routes_off_stratum_to_default_q() {
-        let files = [(
-            vec![1u32, 1 | DECOY, 2, 2 | DECOY],
-            vec![5.0, 1.0, 4.0, 2.0],
-        )];
-        let read = |i: usize| files[i].clone();
-        let survivors = vec![(0usize, 1u32), (0, 2)];
+    fn stratum_and_complement_compete_separately_at_run_scope() {
+        let mut ids = Vec::new();
+        let mut scores = Vec::new();
+        for (bid, t) in [
+            (1u32, 10.0),
+            (2, 9.5),
+            (3, 9.0),
+            (4, 8.5),
+            (5, 3.0),
+            (6, 2.9),
+            (7, 2.8),
+        ] {
+            ids.extend([bid, bid | DECOY]);
+            scores.extend([t, 0.1]);
+        }
+        ids.push(9 | DECOY); // unpaired complement decoy that outscores the complement targets
+        scores.push(5.0);
+        let files = [(ids, scores)];
+        let survivors = vec![(0usize, 1u32), (0, 5), (0, 7)];
         let overrides: HashMap<(usize, u32), f64> = HashMap::new();
-        let stratum: HashSet<u32> = [1u32].into_iter().collect(); // only base_id 1
+        let stratum: HashSet<u32> = [1u32, 2, 3, 4].into_iter().collect();
 
-        let (run_q, _exp, _pep, agg) =
-            compute_full_population_fdr_streaming(1, read, &overrides, &survivors, Some(&stratum));
-
-        assert!(
-            run_q.contains_key(&(0, 1)),
-            "in-stratum survivor should be covered"
-        );
-        assert_eq!(
-            run_q.get(&(0, 2)).copied(),
-            Some(1.0),
-            "off-stratum survivor should fall to the default q=1.0"
-        );
-        // The experiment fold is the STRATUM only, so an off-stratum entry has no aggregate
-        // here — absence is the signal that tells the caller to keep its pass-1 value.
-        assert_eq!(agg.get(&1u32).copied(), Some(5.0));
-        assert_eq!(
-            agg.get(&2u32).copied(),
+        let read = |i: usize| files[i].clone();
+        let (run_q, exp_q, _pep, agg) = compute_full_population_fdr_streaming(
+            1,
+            read,
+            &overrides,
+            &survivors,
+            Some(&stratum),
             None,
-            "off-stratum entry must not get an aggregate from this competition"
         );
+        // Stratum half: four target winners -> (0+1)/4.
+        assert_eq!(run_q[&(0, 1)], 0.25);
+        // Complement half: D(5.0) T(3.0) T(2.9) T(2.8) -> forward 1, 2/1, 2/2, 2/3; the
+        // backward sweep gives every complement target 2/3.
+        assert_eq!(run_q[&(0, 5)], 2.0 / 3.0);
+        assert_eq!(run_q[&(0, 7)], 2.0 / 3.0);
+        // Single file: experiment q == run q in both halves.
+        assert_eq!(exp_q[&(0, 5)], 2.0 / 3.0);
+        // The experiment fold is the stratum only, so an off-stratum entry has no aggregate
+        // here; the caller carries its pass-1 aggregate.
+        assert_eq!(agg.get(&1u32).copied(), Some(10.0));
+        assert_eq!(agg.get(&5u32).copied(), None);
+
+        // Unstratified, the same file is one competition and the decoy sits behind seven
+        // targets' worth of null: the complement targets get 2/7.
+        let read = |i: usize| files[i].clone();
+        let (run_q_all, _, _, _) =
+            compute_full_population_fdr_streaming(1, read, &overrides, &survivors, None, None);
+        assert_eq!(run_q_all[&(0, 5)], 2.0 / 7.0);
+        assert_eq!(run_q_all[&(0, 1)], 0.25);
+    }
+
+    /// Multi-file, a complement survivor takes the complement's experiment q (merged into the
+    /// winner map), floored to its best run q; without the complement map it reads 1.0.
+    #[test]
+    fn complement_experiment_q_reaches_off_stratum_survivors() {
+        // Stratum: base 1. Complement: bases 3, 4, 5, three strong targets per file, so each
+        // complement target's run q is (0+1)/3 in each file.
+        let file = |shift: f64| -> (Vec<u32>, Vec<f64>) {
+            let mut ids = Vec::new();
+            let mut scores = Vec::new();
+            for (bid, t) in [(1u32, 9.0), (3, 6.0), (4, 5.0), (5, 4.0)] {
+                ids.extend([bid, bid | DECOY]);
+                scores.extend([t - shift, 0.1]);
+            }
+            (ids, scores)
+        };
+        let files = [file(0.0), file(0.5)];
+        let survivors = vec![(0usize, 1u32), (0, 3), (1, 3)];
+        let overrides: HashMap<(usize, u32), f64> = HashMap::new();
+        let stratum: HashSet<u32> = [1u32].into_iter().collect();
+
+        let run = |complement: Option<&HashMap<u32, f64>>| {
+            let read = |i: usize| files[i].clone();
+            compute_full_population_fdr_streaming(
+                2,
+                read,
+                &overrides,
+                &survivors,
+                Some(&stratum),
+                complement,
+            )
+        };
+
+        let below_floor: HashMap<u32, f64> = [(3u32, 0.25)].into_iter().collect();
+        let (run_q, exp_q, _, _) = run(Some(&below_floor));
+        assert_eq!(run_q[&(0, 3)], 1.0 / 3.0);
+        assert_eq!(exp_q[&(0, 3)], 1.0 / 3.0, "floored up to the best run q");
+
+        let above_floor: HashMap<u32, f64> = [(3u32, 0.5)].into_iter().collect();
+        let (_, exp_q, _, _) = run(Some(&above_floor));
+        assert_eq!(
+            exp_q[&(1, 3)],
+            0.5,
+            "the complement's own q when above the floor"
+        );
+
+        // No complement map: the loser default 1.0.
+        let (_, exp_q, _, _) = run(None);
+        assert_eq!(exp_q[&(0, 3)], 1.0);
+    }
+
+    /// The complement's experiment competition excludes stratum base_ids, takes the best
+    /// aggregate per side per base_id, gives ties to the decoy, and keys q by the winner's full
+    /// entry_id (the loser is absent).
+    #[test]
+    fn complement_experiment_q_competes_off_stratum_only() {
+        let stratum: HashSet<u32> = [1u32].into_iter().collect();
+        let records = vec![
+            (1u32, 100.0),     // stratum: excluded
+            (1 | DECOY, 50.0), // stratum: excluded
+            (2, 9.0),
+            (2, 3.0), // a lower aggregate for the same entry does not replace the best
+            (2 | DECOY, 1.0),
+            (6, 8.5),
+            (7, 8.4),
+            (8, 8.3),
+            (3, 8.0),
+            (3 | DECOY, 8.0), // tie -> decoy wins
+            (4, 7.0),
+            (5 | DECOY, 6.0), // unpaired decoy wins its base_id
+        ];
+        let q = compute_complement_experiment_q(records, &stratum);
+
+        assert!(!q.contains_key(&1u32) && !q.contains_key(&(1 | DECOY)));
+        // Sorted winners: T2 9.0, T6, T7, T8, D3 8.0, T4 7.0, D5 6.0.
+        // Forward (d+1)/t: 1, 1/2, 1/3, 1/4, 2/4, 2/5, 3/5 -> backward min:
+        // .25 .25 .25 .25 .4 .4 .6
+        assert_eq!(q.get(&2u32).copied(), Some(0.25));
+        assert_eq!(q.get(&8u32).copied(), Some(0.25));
+        assert_eq!(q.get(&(3 | DECOY)).copied(), Some(0.4));
+        assert_eq!(q.get(&3u32), None, "the target lost its tie");
+        assert_eq!(q.get(&4u32).copied(), Some(0.4));
+        assert_eq!(q.get(&(5 | DECOY)).copied(), Some(0.6));
+        assert_eq!(q.get(&(2 | DECOY)), None);
     }
 }
